@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import hashlib
 import json
 import math
 import os
@@ -19,6 +21,7 @@ from .kernels.mxfp8_gemm import MXFP8GemmConfig, compile_mxfp8_gemm
 from .kernels.mxfp8_quant import (
     MXFP8QuantConfig,
     compile_mxfp8_dual_quant,
+    compile_mxfp8_quant,
 )
 
 if TYPE_CHECKING:
@@ -48,16 +51,52 @@ class MXFP8PrequantConfig:
         scale_role="tma",
         scale_layout="mma128",
     )
+    # A dual launch has less launch overhead, while independent launches can
+    # use different schedules for M and N and may overlap better on a stream.
+    quant_launches: str = "dual"
+    weight_quant: MXFP8QuantConfig | None = None
     weight_scale_layout: str | None = None
+    # cudaLimitMaxL2FetchGranularity is process-global. It is represented so
+    # experiments and selected winners are reproducible; the tuner restores
+    # the previous value between candidates.
+    l2_fetch_granularity: int | None = None
+
+    def resolved_weight_quant(self) -> MXFP8QuantConfig:
+        layout = self.weight_scale_layout or self.quant.scale_layout
+        if self.weight_quant is None:
+            return replace(self.quant, scale_layout=layout)
+        if self.weight_scale_layout is not None and (
+            self.weight_quant.scale_layout != self.weight_scale_layout
+        ):
+            return replace(self.weight_quant, scale_layout=self.weight_scale_layout)
+        return self.weight_quant
+
+    def normalized(self) -> "MXFP8PrequantConfig":
+        """Collapse equivalent inherited/explicit W schedules to one key."""
+
+        weight = self.resolved_weight_quant()
+        if replace(weight, scale_layout=self.quant.scale_layout) == self.quant:
+            weight_layout = (
+                None
+                if weight.scale_layout == self.quant.scale_layout
+                else weight.scale_layout
+            )
+            return replace(
+                self,
+                weight_quant=None,
+                weight_scale_layout=weight_layout,
+            )
+        return replace(self, weight_quant=weight, weight_scale_layout=None)
 
     def rejection(self, problem: MXFP8Problem) -> str | None:
         x_rejection = self.quant.rejection(problem.m, problem.k)
         if x_rejection is not None:
             return f"activation quantizer: {x_rejection}"
-        weight_config = replace(
-            self.quant,
-            scale_layout=self.weight_scale_layout or self.quant.scale_layout,
-        )
+        if self.quant_launches not in ("dual", "separate"):
+            return "quant_launches must be dual or separate"
+        if self.l2_fetch_granularity not in (None, 0, 32, 64, 128):
+            return "L2 fetch granularity must be None, 0, 32, 64, or 128"
+        weight_config = self.resolved_weight_quant()
         weight_rejection = weight_config.rejection(problem.n, problem.k)
         if weight_rejection is not None:
             return f"weight quantizer: {weight_rejection}"
@@ -73,6 +112,14 @@ class MXFP8PrequantConfig:
                 f"GEMM scale layout {self.gemm.scale_layout} requires "
                 f"quantizer layouts {expected}, got {actual}"
             )
+        if self.quant_launches == "dual":
+            # The combined kernel shares one instruction/launch schedule and
+            # permits only the physical scale layout to differ per operand.
+            if replace(weight_config, scale_layout=self.quant.scale_layout) != self.quant:
+                return (
+                    "dual quantization requires identical X/W schedules except "
+                    "for scale_layout"
+                )
         return self.gemm.rejection(problem)
 
 
@@ -81,13 +128,90 @@ DEFAULT_MXFP8_PREQUANT_CONFIG = MXFP8PrequantConfig()
 
 _CONFIGS: dict[str, MXFP8FwdConfig] = {}
 _PREQUANT_CONFIGS: dict[str, MXFP8PrequantConfig] = {}
+_PREQUANT_AUTOTUNE_REQUESTS: dict[str, "_PrequantAutotuneRequest"] = {}
+_PREQUANT_AUTOTUNE_SELECTIONS: dict[tuple[object, ...], str] = {}
 _PREQUANT_RUNNERS: dict[
     tuple[object, ...],
-    tuple[object, object, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    "_PrequantRunner",
 ] = {}
-_INDUCTOR_PREQUANT_LAUNCHERS: dict[str, object] = {}
-_INDUCTOR_PREQUANT_LAUNCHER_IDS: dict[str, str] = {}
+
+
+class _InductorPrequantLauncherRegistry(dict[str, object]):
+    def __missing__(self, config_key: str) -> object:
+        with _CONFIG_LOCK:
+            launcher = self.get(config_key)
+            if launcher is None:
+                launcher = _InductorPrequantLauncher(config_key)
+                self[config_key] = launcher
+        return launcher
+
+
+_INDUCTOR_PREQUANT_LAUNCHERS = _InductorPrequantLauncherRegistry()
 _CONFIG_LOCK = RLock()
+_CUDA_RUNTIME: object | None = None
+_CURRENT_L2_FETCH_GRANULARITY: int | None = None
+
+
+def _set_l2_fetch_granularity(value: int) -> int:
+    """Set CUDA's process-global L2 fetch limit and return its old value."""
+
+    global _CUDA_RUNTIME, _CURRENT_L2_FETCH_GRANULARITY
+    if _CUDA_RUNTIME is None:
+        site_packages = Path(torch.__file__).resolve().parent.parent
+        candidates = tuple((site_packages / "nvidia").glob("cu*/lib/libcudart.so.*"))
+        if not candidates:
+            raise RuntimeError("could not locate libcudart for the L2 fetch limit")
+        runtime = ctypes.CDLL(str(candidates[0]))
+        runtime.cudaDeviceGetLimit.argtypes = [
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_int,
+        ]
+        runtime.cudaDeviceSetLimit.argtypes = [ctypes.c_int, ctypes.c_size_t]
+        _CUDA_RUNTIME = runtime
+    runtime = _CUDA_RUNTIME
+    previous = ctypes.c_size_t()
+    if runtime.cudaDeviceGetLimit(ctypes.byref(previous), 5) != 0:
+        raise RuntimeError("cudaDeviceGetLimit(MaxL2FetchGranularity) failed")
+    if runtime.cudaDeviceSetLimit(5, value) != 0:
+        raise RuntimeError("cudaDeviceSetLimit(MaxL2FetchGranularity) failed")
+    _CURRENT_L2_FETCH_GRANULARITY = value
+    return int(previous.value)
+
+
+def _ensure_l2_fetch_granularity(value: int | None) -> None:
+    if value is not None and _CURRENT_L2_FETCH_GRANULARITY != value:
+        _set_l2_fetch_granularity(value)
+
+
+@dataclass(slots=True)
+class _PrequantRunner:
+    quant_launches: str
+    quant_x: object
+    quant_w: object | None
+    gemm: object
+    qx: torch.Tensor
+    qw: torch.Tensor
+    sx: torch.Tensor
+    sw: torch.Tensor
+    l2_fetch_granularity: int | None
+
+    def __call__(self, x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> None:
+        _ensure_l2_fetch_granularity(self.l2_fetch_granularity)
+        if self.quant_launches == "dual":
+            self.quant_x(x, weight, self.qx, self.qw, self.sx, self.sw)
+        else:
+            self.quant_x(x, self.qx, self.sx)
+            assert self.quant_w is not None
+            self.quant_w(weight, self.qw, self.sw)
+        self.gemm(self.qx, self.qw, self.sx, self.sw, out)
+
+
+@dataclass(frozen=True, slots=True)
+class _PrequantAutotuneRequest:
+    mode: AutotuneMode
+    policy: object | None
+    cache_dir: str | None
+    initial: MXFP8PrequantConfig
 
 
 def _intern_config(config: MXFP8FwdConfig) -> str:
@@ -97,10 +221,38 @@ def _intern_config(config: MXFP8FwdConfig) -> str:
     return key
 
 
+@torch.compiler.assume_constant_result
 def _intern_prequant_config(config: MXFP8PrequantConfig) -> str:
+    config = config.normalized()
     key = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
     with _CONFIG_LOCK:
         _PREQUANT_CONFIGS[key] = config
+    return key
+
+
+@torch.compiler.assume_constant_result
+def _intern_prequant_autotune_request(
+    mode: AutotuneMode,
+    policy: object | None,
+    cache_dir: Path | str | None,
+    initial: MXFP8PrequantConfig,
+) -> str:
+    policy_value = None if policy is None else asdict(policy)
+    payload = {
+        "mode": mode,
+        "policy": policy_value,
+        "cache_dir": None if cache_dir is None else str(Path(cache_dir).expanduser()),
+        "initial": asdict(initial),
+    }
+    digest = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    key = "autotune:" + hashlib.sha256(digest.encode()).hexdigest()[:24]
+    with _CONFIG_LOCK:
+        _PREQUANT_AUTOTUNE_REQUESTS[key] = _PrequantAutotuneRequest(
+            mode=mode,
+            policy=policy,
+            cache_dir=payload["cache_dir"],
+            initial=initial,
+        )
     return key
 
 
@@ -212,6 +364,41 @@ def _build_prequant_runner(
     problem = MXFP8Problem(
         m=int(x.shape[0]), n=int(weight.shape[0]), k=int(x.shape[1])
     )
+    request = _PREQUANT_AUTOTUNE_REQUESTS.get(config_key)
+    if request is not None:
+        selection_key = (
+            config_key,
+            x.device.index,
+            problem.m,
+            problem.n,
+            problem.k,
+        )
+        selected_key = _PREQUANT_AUTOTUNE_SELECTIONS.get(selection_key)
+        if selected_key is None:
+            from .prequant_autotune import (
+                load_cached_mxfp8_prequant_config,
+                tune_mxfp8_prequant,
+            )
+
+            if request.mode == "coordinate":
+                result = tune_mxfp8_prequant(
+                    x,
+                    weight,
+                    policy=request.policy,
+                    initial=request.initial,
+                    cache_dir=request.cache_dir,
+                    progress=print,
+                )
+                selected = result.config
+            else:
+                selected = load_cached_mxfp8_prequant_config(
+                    problem,
+                    device=x.device,
+                    cache_dir=request.cache_dir,
+                )
+            selected_key = _intern_prequant_config(selected or request.initial)
+            _PREQUANT_AUTOTUNE_SELECTIONS[selection_key] = selected_key
+        return _build_prequant_runner(x, weight, selected_key)
     try:
         config = _PREQUANT_CONFIGS[config_key]
     except KeyError as exc:
@@ -219,6 +406,8 @@ def _build_prequant_runner(
     rejection = config.rejection(problem)
     if rejection is not None:
         raise RuntimeError(f"prequant MXFP8 cannot run this problem: {rejection}")
+    if config.l2_fetch_granularity is not None:
+        _set_l2_fetch_granularity(config.l2_fetch_granularity)
     major, _minor = torch.cuda.get_device_capability(x.device)
     if major != 12:
         raise RuntimeError(
@@ -227,24 +416,38 @@ def _build_prequant_runner(
         )
     qx = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     qw = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
-    weight_scale_layout = (
-        config.weight_scale_layout or config.quant.scale_layout
-    )
+    weight_config = config.resolved_weight_quant()
+    weight_scale_layout = weight_config.scale_layout
     sx = _allocate_scales(
         x.shape[0], x.shape[1], config.quant.scale_layout, x.device
     )
     sw = _allocate_scales(
         weight.shape[0], weight.shape[1], weight_scale_layout, x.device
     )
-    quant = compile_mxfp8_dual_quant(
-        problem.m,
-        problem.n,
-        problem.k,
-        config.quant,
-        weight_scale_layout=config.weight_scale_layout,
-    )
+    if config.quant_launches == "dual":
+        quant_x = compile_mxfp8_dual_quant(
+            problem.m,
+            problem.n,
+            problem.k,
+            config.quant,
+            weight_scale_layout=weight_scale_layout,
+        )
+        quant_w = None
+    else:
+        quant_x = compile_mxfp8_quant(problem.m, problem.k, config.quant)
+        quant_w = compile_mxfp8_quant(problem.n, problem.k, weight_config)
     gemm = compile_mxfp8_gemm(problem, config.gemm)
-    return quant, gemm, qx, qw, sx, sw
+    return _PrequantRunner(
+        config.quant_launches,
+        quant_x,
+        quant_w,
+        gemm,
+        qx,
+        qw,
+        sx,
+        sw,
+        config.l2_fetch_granularity,
+    )
 
 
 def _launch_prequant_out(
@@ -271,9 +474,7 @@ def _launch_prequant_out(
             if runner is None:
                 runner = _build_prequant_runner(x_c, weight_c, config_key)
                 _PREQUANT_RUNNERS[runner_key] = runner
-    quant, gemm, qx, qw, sx, sw = runner
-    quant(x_c, weight_c, qx, qw, sx, sw)
-    gemm(qx, qw, sx, sw, out)
+    runner(x_c, weight_c, out)
 
 
 class _InductorPrequantLauncher:
@@ -307,21 +508,14 @@ class _InductorPrequantLauncher:
                         x, weight, self.config_key
                     )
                     self.runners[key] = runner
-        quant, gemm, qx, qw, sx, sw = runner
-        quant(x, weight, qx, qw, sx, sw)
-        gemm(qx, qw, sx, sw, out)
+        runner(x, weight, out)
 
 
 def _inductor_prequant_launcher_name(config_key: str) -> str:
-    with _CONFIG_LOCK:
-        launcher_id = _INDUCTOR_PREQUANT_LAUNCHER_IDS.get(config_key)
-        if launcher_id is None:
-            launcher_id = f"launcher_{len(_INDUCTOR_PREQUANT_LAUNCHERS)}"
-            _INDUCTOR_PREQUANT_LAUNCHER_IDS[config_key] = launcher_id
-            _INDUCTOR_PREQUANT_LAUNCHERS[launcher_id] = (
-                _InductorPrequantLauncher(config_key)
-            )
-    return f"torch._rtx_mxfp8_prequant_launchers[{launcher_id!r}]"
+    # Generated wrappers may be loaded from Inductor's on-disk cache without
+    # executing this lowering again. The registry's __missing__ constructs the
+    # shape/config launcher lazily in that process.
+    return f"torch._rtx_mxfp8_prequant_launchers[{config_key!r}]"
 
 
 @torch.library.custom_op(
@@ -467,19 +661,28 @@ def mxfp8_linear(
     use_prequant = backend == "prequant" or (
         backend == "auto"
         and config is None
-        and autotune is not True
-        and autotune != "coordinate"
         and selected_prequant.rejection(problem) is None
     )
     if use_prequant:
         rejection = selected_prequant.rejection(problem)
         if rejection is not None:
             raise RuntimeError(f"prequant MXFP8 backend is unavailable: {rejection}")
-        key = (
-            _DEFAULT_MXFP8_PREQUANT_KEY
-            if prequant_config is None
-            else _intern_prequant_config(selected_prequant)
-        )
+        mode = _autotune_mode(autotune)
+        if prequant_config is not None or mode == "off":
+            key = (
+                _DEFAULT_MXFP8_PREQUANT_KEY
+                if prequant_config is None
+                else _intern_prequant_config(selected_prequant)
+            )
+        else:
+            # This request token survives torch.compile tracing. The generated
+            # launcher resolves/tunes it against real tensors on first use.
+            key = _intern_prequant_autotune_request(
+                mode,
+                tuning_policy,
+                autotune_cache_dir,
+                selected_prequant,
+            )
         out = _run_prequant(x_2d, weight, key)
         return out.reshape(*leading_shape, weight.shape[0])
     selected_config = _resolve_fwd_config(
@@ -585,9 +788,17 @@ class MXFP8Linear(nn.Module):
         self.autotune_cache_dir = autotune_cache_dir
         self.backend = backend
         self.prequant_config = prequant_config
-        self._prequant_config_key = _intern_prequant_config(
-            prequant_config or DEFAULT_MXFP8_PREQUANT_CONFIG
-        )
+        selected_prequant = prequant_config or DEFAULT_MXFP8_PREQUANT_CONFIG
+        mode = _autotune_mode(autotune)
+        if prequant_config is not None or mode == "off":
+            self._prequant_config_key = _intern_prequant_config(selected_prequant)
+        else:
+            self._prequant_config_key = _intern_prequant_autotune_request(
+                mode,
+                tuning_policy,
+                autotune_cache_dir,
+                selected_prequant,
+            )
         self.weight = nn.Parameter(
             torch.empty(
                 (out_features, in_features), device=device, dtype=torch.bfloat16
@@ -599,7 +810,21 @@ class MXFP8Linear(nn.Module):
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.backend == "prequant":
+        use_prequant = self.backend == "prequant"
+        if (
+            self.backend == "auto"
+            and self.config is None
+            and x.ndim >= 1
+            and x.shape[-1] == self.in_features
+        ):
+            candidate = self.prequant_config or DEFAULT_MXFP8_PREQUANT_CONFIG
+            problem = MXFP8Problem(
+                x.reshape(-1, self.in_features).shape[0],
+                self.out_features,
+                self.in_features,
+            )
+            use_prequant = candidate.rejection(problem) is None
+        if use_prequant:
             if x.ndim < 1 or x.shape[-1] != self.in_features:
                 raise ValueError(
                     f"expected activation [..., {self.in_features}], got {x.shape}"
@@ -607,11 +832,7 @@ class MXFP8Linear(nn.Module):
             leading_shape = x.shape[:-1]
             x_2d = x.reshape(-1, self.in_features)
             _check_inputs(x_2d, self.weight)
-            out = _run_prequant(
-                x_2d,
-                self.weight,
-                self._prequant_config_key,
-            )
+            out = _run_prequant(x_2d, self.weight, self._prequant_config_key)
             return out.reshape(*leading_shape, self.out_features)
         return mxfp8_linear(
             x,

@@ -124,6 +124,20 @@ class MXFP8GemmConfig:
             return "scale eviction and cache modifiers are mutually exclusive"
         if self.scale_role not in ("consumers", "producer", "tma"):
             return "scale_role must be consumers, producer, or tma"
+        if self.scale_role == "tma" and (
+            self.scale_schedule != "before_wait"
+            or self.scale_load_vec != 4
+            or self.scale_l2_prefetch != "none"
+            or self.scale_l1_evict != "default"
+            or self.scale_cache != "default"
+        ):
+            return "scalar scale-staging controls are inactive for TMA scales"
+        if self.scale_load_vec == 1 and (
+            self.scale_l2_prefetch != "none"
+            or self.scale_l1_evict != "default"
+            or self.scale_cache != "default"
+        ):
+            return "vector-load cache controls are inactive for scalar scale loads"
         if self.scale_layout not in ("row_major", "mma128", "mma64x128"):
             return "scale_layout must be row_major, mma128, or mma64x128"
         if self.scale_layout == "mma128" and (

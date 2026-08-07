@@ -8,7 +8,8 @@ The MXFP8 frontend has three selection modes:
 - `coordinate`: run/resume coordinate descent on first use and then execute the
   winner.
 
-An explicit `MXFP8FwdConfig` always wins over autotuning.
+An explicit `MXFP8FwdConfig` or `MXFP8PrequantConfig` always wins over
+autotuning.
 
 ## Executable search space
 
@@ -118,6 +119,10 @@ Environment-controlled first-use tuning is also supported:
 export RTX_MXFP8_AUTOTUNE=coordinate
 export RTX_MXFP8_AUTOTUNE_SECONDS=1800
 export RTX_MXFP8_AUTOTUNE_PASSES=4
+export RTX_MXFP8_AUTOTUNE_RESTARTS=2
+export RTX_MXFP8_AUTOTUNE_WARMUP=10
+export RTX_MXFP8_AUTOTUNE_SAMPLES=11
+export RTX_MXFP8_AUTOTUNE_CALLS_PER_SAMPLE=50
 ```
 
 Set `RTX_MXFP8_AUTOTUNE=cache` for inference/training jobs that must never
@@ -172,12 +177,59 @@ those measurements.
 
 ## Native-scale prequant backend
 
-The materialize-once backend has two independent persistent coordinate sweeps.
-They validate every candidate before timing it and atomically replace their JSON
-state after every completed trial, so an interrupted process resumes without
-repeating successful, rejected, or failed configurations.
+The production materialize-once backend has a joint end-to-end tuner. It times
+X quantization, W quantization, and GEMM in the same event interval; component
+minima are never added together. Run the complete search for thirty minutes:
 
-Tune native-layout E4M3/E8M0 quantization:
+```bash
+.venv/bin/python -m rtx.prequant_autotune \
+  --m 512 --n 1536 --k 1536 \
+  --seconds 1800 --passes 4 --restarts 2 \
+  --warmup 10 --samples 11 --calls-per-sample 50 \
+  --log-file autotune_logs/mxfp8_prequant_512x1536x1536.log
+```
+
+The joint search has real coordinates for:
+
+- row-major M64/M128/M256 scale staging through consumer or producer warps;
+- M64 hybrid and M128 tensor-core-native physical scales moved by TMA;
+- one combined quantizer launch or independent X/W launches and schedules;
+- independent X/W vector/load widths, arithmetic, amax/reduction path,
+  warps, persistent waves, register caps, and native scale-store width;
+- CTA/RMEM geometry, operand stages, independent A/B LDSM issue width and
+  SMEM swizzle, and independent scale-fragment S2R width;
+- scale load placement, vector width, L1 eviction/cache modifier, and L2
+  prefetch size;
+- producer/consumer/PTXAS register budgets, direct or TMA output, store width,
+  raster direction, CTA grouping, and CUDA's global L2 fetch granularity.
+
+Coupled transitions are tested as one candidate when their intermediate states
+would be illegal or misleading. In particular, a W-only schedule can cross
+from dual to separate quantization in the same trial, native physical layouts
+move quantizer/GEMM scale layouts and transport together, and large CTA tiles
+move to their required low-SMEM stage/epilogue at admission. Values which fail
+shape, tensor-core layout, SMEM, or launch legality are recorded as rejections;
+they are not benchmarked as no-ops.
+
+The L2 fetch limit is process-global. Each tuning trial restores the previous
+value; if a non-default value wins, the frontend applies it when building that
+shape's runner. Use separate processes when comparing this coordinate against
+unrelated concurrent workloads.
+
+`mxfp8_linear(..., autotune="coordinate")` and `MXFP8Linear(...,
+autotune="coordinate")` use this tuner for the prequant backend. The request is
+resolved in the runtime launcher, so first-use tuning also works through
+`torch.compile` tracing. `autotune="cache"` loads a compatible winner without
+benchmarking and otherwise uses the built-in native-scale schedule.
+
+Every trial and the provisional winner are written atomically under a file lock.
+The key includes the exact shape, GPU/software fingerprint, kernel revision, and
+the digest of all joint coordinates. Interrupted runs reuse successful,
+rejected, and failed trials.
+
+The older component tuners remain useful for diagnosis, but their independent
+winners are not production selection. Tune native-layout E4M3/E8M0
+quantization alone:
 
 ```bash
 PYTHONPATH=. .venv/bin/python benchmarks/tune_mxfp8_native_quant.py \
