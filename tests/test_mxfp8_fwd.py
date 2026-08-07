@@ -138,6 +138,8 @@ class MXFP8CudaTests(unittest.TestCase):
             normalize_fwd_config(quant_vec=2),
             normalize_fwd_config(quant_vec=4),
             normalize_fwd_config(quant_vec=8),
+            normalize_fwd_config(quant_vec=8, quant_math="bf16x2"),
+            normalize_fwd_config(quant_vec=8, quant_amax="bf16_bits"),
             normalize_fwd_config(quant_vec=8, reduction="redux"),
             normalize_fwd_config(mxfp8_stages=2),
             normalize_fwd_config(mxfp8_stages=3),
@@ -271,6 +273,37 @@ class MXFP8CudaTests(unittest.TestCase):
                 bf16_stages=4,
                 bf16_swizzle="64b",
                 quant_vec=8,
+            ),
+        )(x, weight, actual)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
+
+    def test_vectorized_packed_quantizer_matches_baseline(self) -> None:
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("native kernel requires SM120/SM121")
+        problem = MXFP8Problem(128, 128, 128)
+        torch.manual_seed(811)
+        x = torch.randn(
+            problem.m, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        weight = torch.randn(
+            problem.n, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        baseline = torch.empty(
+            (problem.m, problem.n), device="cuda", dtype=torch.bfloat16
+        )
+        actual = torch.empty_like(baseline)
+        compile_mxfp8_fwd(problem, MXFP8FwdConfig())(x, weight, baseline)
+        compile_mxfp8_fwd(
+            problem,
+            normalize_fwd_config(
+                load_engine="tma",
+                bf16_tile_k=32,
+                bf16_swizzle="none",
+                quant_vec=8,
+                quant_math="bf16x2",
+                quant_amax="bf16_bits",
+                quant_load_bits=128,
             ),
         )(x, weight, actual)
         torch.cuda.synchronize()

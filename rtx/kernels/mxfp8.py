@@ -23,6 +23,8 @@ Schedule = Literal[
 ]
 MmaIssue = Literal["sync"]
 Reduction = Literal["redux", "shuffle"]
+QuantMath = Literal["fp32", "bf16x2"]
+QuantAmax = Literal["fp32", "bf16_bits"]
 Swizzle = Literal["none", "32b", "64b", "128b"]
 Raster = Literal["m", "n"]
 Reuse = Literal["none", "x", "weight"]
@@ -79,6 +81,13 @@ class MXFP8FwdConfig:
     # legal.  Since abs(FP32) bit patterns have the same ordering as their
     # numerical values, the redux variant lowers amax to redux.sync.max.u32.
     reduction: Reduction = "shuffle"
+    # Quantization arithmetic/conversion backend.  The packed path uses native
+    # two-lane BF16 arithmetic and the SM120 BF16x2 -> E4M3x2 converter.
+    quant_math: QuantMath = "fp32"
+    quant_amax: QuantAmax = "fp32"
+    # Per-thread BF16 quantizer load width. Wider choices map to explicit
+    # vector loads and are independently tuned from quant_vec/math.
+    quant_load_bits: int = 16
     quant_vec: int = 1
     k_unroll: int = 1
 
@@ -191,6 +200,12 @@ class MXFP8FwdConfig:
             return "BF16 SMEM swizzle exceeds the transport tile's contiguous bytes"
         if self.mxfp8_stages not in (1, 2, 3, 4):
             return "mxfp8_stages must be one of 1, 2, 3, 4"
+        if self.quant_load_bits not in (16, 32, 64, 128):
+            return "quantizer BF16 load width must be 16, 32, 64, or 128 bits"
+        if self.quant_load_bits > self.quant_vec * 16:
+            return "quantizer BF16 load width exceeds quant_vec"
+        if (self.quant_vec * 16) % self.quant_load_bits:
+            return "quant_vec must contain an integer number of BF16 vector loads"
         if self.a_ldmatrix_matrices not in (1, 2, 4):
             return "A ldmatrix width must be one of x1, x2, x4"
         if self.b_ldmatrix_matrices not in (1, 2, 4):
@@ -255,6 +270,18 @@ class MXFP8FwdConfig:
             or problem.k % self.bf16_tile_k
         ):
             return "cp.async staging currently requires full M/N/K tiles"
+        if self.quant_load_bits > 16 and (
+            problem.m % self.tile_m
+            or problem.n % self.tile_n
+            or problem.k % self.bf16_tile_k
+        ):
+            return "vector quantizer loads currently require full M/N/K tiles"
+        if (
+            self.quant_load_bits > 16
+            and self.load_engine != "scalar"
+            and self.bf16_swizzle != "none"
+        ):
+            return "vector quantizer loads currently require unswizzled BF16 SMEM"
         if self.schedule == "pingpong":
             return "ping-pong warp specialization is not implemented"
         if self.schedule == "warp_specialized" and self.load_engine != "tma":
@@ -321,6 +348,9 @@ class MXFP8FwdConfig:
             "num_mma_warps",
             "quantizer_warps",
             "reduction",
+            "quant_math",
+            "quant_amax",
+            "quant_load_bits",
             "load_engine",
             "schedule",
             "bf16_tile_k",
@@ -362,7 +392,7 @@ class MXFP8FwdConfig:
 
 
 DEFAULT_MXFP8_FWD_CONFIG = MXFP8FwdConfig()
-MXFP8_FWD_KERNEL_REVISION = 11
+MXFP8_FWD_KERNEL_REVISION = 12
 
 
 # Block coordinates supplement, rather than replace, their primitive fields.
@@ -420,6 +450,9 @@ FWD_SEARCH_SPACE: dict[str, tuple[object, ...]] = {
     "mxfp8_stages": (1, 2, 3, 4),
     "quantizer_warps": (1, 2, 4, 8),
     "reduction": ("redux", "shuffle"),
+    "quant_math": ("fp32", "bf16x2"),
+    "quant_amax": ("fp32", "bf16_bits"),
+    "quant_load_bits": (16, 32, 64, 128),
     "quant_vec": (1, 2, 4, 8),
     "k_unroll": (1, 2, 4),
     "maxrregcount": (128, 160, 192, 224, 255),
@@ -454,6 +487,9 @@ FWD_COORDINATE_ORDER: tuple[str, ...] = (
     # TMA candidate illegal and strand ordinary coordinate descent.
     "load_engine",
     "quant_vec",
+    "quant_math",
+    "quant_amax",
+    "quant_load_bits",
     "tile_m",
     "tile_n",
     "tile_k",
