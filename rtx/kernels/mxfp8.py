@@ -392,7 +392,7 @@ class MXFP8FwdConfig:
 
 
 DEFAULT_MXFP8_FWD_CONFIG = MXFP8FwdConfig()
-MXFP8_FWD_KERNEL_REVISION = 12
+MXFP8_FWD_KERNEL_REVISION = 13
 
 
 # Block coordinates supplement, rather than replace, their primitive fields.
@@ -448,7 +448,7 @@ FWD_SEARCH_SPACE: dict[str, tuple[object, ...]] = {
     "bf16_swizzle": ("none", "32b", "64b", "128b"),
     "bf16_stages": (1, 2, 3, 4),
     "mxfp8_stages": (1, 2, 3, 4),
-    "quantizer_warps": (1, 2, 4, 8),
+    "quantizer_warps": (1, 2, 4, 8, 16),
     "reduction": ("redux", "shuffle"),
     "quant_math": ("fp32", "bf16x2"),
     "quant_amax": ("fp32", "bf16_bits"),

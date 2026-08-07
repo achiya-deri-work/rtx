@@ -292,22 +292,25 @@ class MXFP8CudaTests(unittest.TestCase):
         baseline = torch.empty(
             (problem.m, problem.n), device="cuda", dtype=torch.bfloat16
         )
-        actual = torch.empty_like(baseline)
         compile_mxfp8_fwd(problem, MXFP8FwdConfig())(x, weight, baseline)
-        compile_mxfp8_fwd(
-            problem,
-            normalize_fwd_config(
-                load_engine="tma",
-                bf16_tile_k=32,
-                bf16_swizzle="none",
-                quant_vec=8,
-                quant_math="bf16x2",
-                quant_amax="bf16_bits",
-                quant_load_bits=128,
-            ),
-        )(x, weight, actual)
-        torch.cuda.synchronize()
-        torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
+        for tile_m in (64, 128):
+            with self.subTest(tile_m=tile_m):
+                actual = torch.empty_like(baseline)
+                compile_mxfp8_fwd(
+                    problem,
+                    normalize_fwd_config(
+                        tile_m=tile_m,
+                        load_engine="tma",
+                        bf16_tile_k=32,
+                        bf16_swizzle="none",
+                        quant_vec=8,
+                        quant_math="bf16x2",
+                        quant_amax="bf16_bits",
+                        quant_load_bits=128,
+                    ),
+                )(x, weight, actual)
+                torch.cuda.synchronize()
+                torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
 
     def test_tma_epilogue_full_tiles_match_direct_store(self) -> None:
         if torch.cuda.get_device_capability()[0] != 12:

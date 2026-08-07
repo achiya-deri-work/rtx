@@ -1024,6 +1024,14 @@ def _cli() -> None:
         "--correctness", choices=("baseline", "torch", "none"), default="baseline"
     )
     parser.add_argument("--cache-dir", type=Path)
+    parser.add_argument(
+        "--initial-config",
+        type=Path,
+        help=(
+            "seed from a JSON config, a tuner result containing 'config', or "
+            "a benchmark artifact containing 'selected.config'"
+        ),
+    )
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--randomize-coordinates", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
@@ -1054,6 +1062,17 @@ def _cli() -> None:
         randomize_coordinates=args.randomize_coordinates,
         seed=args.seed,
     )
+    initial = DEFAULT_MXFP8_FWD_CONFIG
+    if args.initial_config is not None:
+        document = json.loads(args.initial_config.read_text(encoding="utf-8"))
+        config_values = document.get("config")
+        if config_values is None:
+            config_values = document.get("selected", {}).get("config")
+        if not isinstance(config_values, dict):
+            parser.error(
+                "--initial-config must contain 'config' or 'selected.config'"
+            )
+        initial = fwd_config_from_dict(config_values)
     log_stream: TextIO | None = None
     if args.log_file is not None:
         args.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1071,6 +1090,7 @@ def _cli() -> None:
             x,
             weight,
             policy=policy,
+            initial=initial,
             cache_dir=args.cache_dir,
             progress=progress,
         )

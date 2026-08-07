@@ -1,0 +1,60 @@
+{
+  "backend": "dynamic_bf16_to_mxfp8_prequant_gemm",
+  "correctness": {
+    "gemm_reference": "dequantized FP32 matmul followed by BF16 cast",
+    "output_atol": 0.5,
+    "output_rtol": 0.05,
+    "quantized_values_and_scales": "bit_exact"
+  },
+  "gemm_config": {
+    "a_ldmatrix_matrices": 4,
+    "a_swizzle": "64b",
+    "atom_layout_m": 8,
+    "atom_layout_n": 2,
+    "b_ldmatrix_matrices": 4,
+    "b_swizzle": "64b",
+    "consumer_registers": 192,
+    "epilogue": "tma",
+    "grid_swizzle": 2,
+    "maxrregcount": 255,
+    "producer_registers": 48,
+    "raster": "n",
+    "sfa_s2r_bits": 8,
+    "sfb_s2r_bits": 8,
+    "stages": 2,
+    "store_vec": 4,
+    "tile_k": 128,
+    "tile_m": 128,
+    "tile_n": 128
+  },
+  "measurement": {
+    "calls_per_sample": 100,
+    "max_ms": 0.022479679584503174,
+    "median_ms": 0.022383038997650147,
+    "min_ms": 0.02233920097351074,
+    "samples": 51,
+    "tflops": 107.9352586685674,
+    "warmup_calls": 50
+  },
+  "quant_config": {
+    "load_bits": 64,
+    "maxrregcount": 128,
+    "num_warps": 8,
+    "persistent_waves": 4,
+    "quant_amax": "bf16_bits",
+    "quant_math": "bf16x2",
+    "quant_vec": 4,
+    "reduction": "shuffle"
+  },
+  "shape": {
+    "k": 1536,
+    "m": 512,
+    "n": 1536
+  },
+  "torchao_comparison": {
+    "latency_reduction_percent": 29.253569696159946,
+    "rowwise_median_ms": 0.031638400554656984,
+    "speedup": 1.4134988800215422,
+    "source": "torchao_fp8_rowwise_m512_n1536_k1536.json"
+  }
+}
