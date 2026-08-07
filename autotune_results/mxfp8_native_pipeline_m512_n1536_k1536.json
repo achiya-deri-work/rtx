@@ -1,0 +1,83 @@
+{
+  "backend": "dynamic_bf16_to_mxfp8_native_scale_gemm",
+  "correctness": {
+    "combined_quantizer": "bit_exact versus independent quantizers",
+    "native_scale_layout": "bit_exact logical E8M0 values",
+    "native_tma_gemm": "bit_exact versus row-major scale staging",
+    "test_suite": "27 passed"
+  },
+  "frontend_measurement": {
+    "calls_per_sample": 100,
+    "dynamic_weight": true,
+    "fullgraph": true,
+    "max_ms": 0.034918079376220705,
+    "median_ms": 0.030303680896759035,
+    "min_ms": 0.02914975881576538,
+    "samples": 51,
+    "tflops": 79.72361879834808,
+    "warmup_calls": 50
+  },
+  "gemm_config": {
+    "a_ldmatrix_matrices": 4,
+    "a_swizzle": "64b",
+    "atom_layout_m": 4,
+    "atom_layout_n": 2,
+    "b_ldmatrix_matrices": 4,
+    "b_swizzle": "128b",
+    "consumer_registers": 232,
+    "epilogue": "tma",
+    "grid_swizzle": 2,
+    "maxrregcount": 255,
+    "producer_registers": 64,
+    "raster": "n",
+    "scale_layout": "mma128",
+    "scale_role": "tma",
+    "sfa_s2r_bits": 8,
+    "sfb_s2r_bits": 8,
+    "stages": 2,
+    "store_vec": 4,
+    "tile_k": 128,
+    "tile_m": 128,
+    "tile_n": 128
+  },
+  "kernel_measurement": {
+    "calls_per_sample": 200,
+    "max_ms": 0.016887199878692628,
+    "median_ms": 0.01670896053314209,
+    "min_ms": 0.01663648009300232,
+    "samples": 51,
+    "tflops": 144.58823451094062,
+    "warmup_calls": 100
+  },
+  "quant_config": {
+    "load_bits": 32,
+    "maxrregcount": 96,
+    "native_scale_store": "scalar",
+    "num_warps": 8,
+    "persistent_waves": 6,
+    "quant_amax": "fp32",
+    "quant_math": "fp32",
+    "quant_vec": 4,
+    "reduction": "shuffle",
+    "scale_layout": "mma128"
+  },
+  "shape": {
+    "k": 1536,
+    "m": 512,
+    "n": 1536
+  },
+  "torchao_comparison": {
+    "compiled_frontend_latency_reduction_percent": 4.385967815729486,
+    "compiled_frontend_speedup": 1.045871591392325,
+    "kernel_latency_reduction_percent": 47.2799659016863,
+    "kernel_speedup": 1.8968121267432678,
+    "rowwise_median_ms": 0.031693758964538576,
+    "source": "benchmarks/benchmark_torchao_fp8_rowwise.py"
+  },
+  "tuning": {
+    "gemm_trials": 85,
+    "gemm_tuner_result": "mxfp8_native_gemm_m512_n1536_k1536.json",
+    "quant_trials": 72,
+    "quant_tuner_result": "mxfp8_native_quant_m512_n1536_k1536.json"
+  }
+}

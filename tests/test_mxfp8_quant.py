@@ -4,7 +4,11 @@ import unittest
 
 import torch
 
-from rtx.kernels.mxfp8_quant import MXFP8QuantConfig, compile_mxfp8_quant
+from rtx.kernels.mxfp8_quant import (
+    MXFP8QuantConfig,
+    compile_mxfp8_dual_quant,
+    compile_mxfp8_quant,
+)
 from rtx.kernels.mxfp8 import MXFP8Problem
 from rtx.kernels.mxfp8_gemm import MXFP8GemmConfig, compile_mxfp8_gemm
 
@@ -44,6 +48,49 @@ class MXFP8QuantConfigTests(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class MXFP8QuantCudaTests(unittest.TestCase):
+    def _assert_native_scales(
+        self,
+        native: torch.Tensor,
+        row_major: torch.Tensor,
+        tile_rows: int,
+    ) -> None:
+        rows, scale_blocks = row_major.shape
+        row = torch.arange(rows, device="cuda")[:, None]
+        block = torch.arange(scale_blocks, device="cuda")[None, :]
+        row_group = (row // 32) % (tile_rows // 32)
+        physical = (row % 32) * 16 + row_group * 4 + block % 4
+        unpacked = native[row // tile_rows, block // 4, physical]
+        torch.testing.assert_close(unpacked, row_major, rtol=0, atol=0)
+
+    def test_dual_quantizer_matches_two_independent_quantizers(self) -> None:
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("native kernel requires SM120/SM121")
+        x_rows, weight_rows, k = 64, 192, 256
+        torch.manual_seed(1703)
+        x = torch.randn(x_rows, k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(
+            weight_rows, k, device="cuda", dtype=torch.bfloat16
+        )
+        expected_qx, expected_sx = _reference(x)
+        expected_qw, expected_sw = _reference(weight)
+        actual_qx = torch.empty_like(expected_qx)
+        actual_qw = torch.empty_like(expected_qw)
+        actual_sx = torch.empty_like(expected_sx)
+        actual_sw = torch.empty_like(expected_sw)
+        compile_mxfp8_dual_quant(x_rows, weight_rows, k)(
+            x,
+            weight,
+            actual_qx,
+            actual_qw,
+            actual_sx,
+            actual_sw,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual_qx, expected_qx, rtol=0, atol=0)
+        torch.testing.assert_close(actual_qw, expected_qw, rtol=0, atol=0)
+        torch.testing.assert_close(actual_sx, expected_sx, rtol=0, atol=0)
+        torch.testing.assert_close(actual_sw, expected_sw, rtol=0, atol=0)
+
     def test_dynamic_quantizer_variants_match_reference(self) -> None:
         if torch.cuda.get_device_capability()[0] != 12:
             self.skipTest("native kernel requires SM120/SM121")
@@ -104,6 +151,84 @@ class MXFP8QuantCudaTests(unittest.TestCase):
                 )
                 torch.cuda.synchronize()
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_native_scale_tma_paths_match_row_major(self) -> None:
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("native kernel requires SM120/SM121")
+        problem = MXFP8Problem(128, 128, 256)
+        torch.manual_seed(1704)
+        x = torch.randn(
+            problem.m, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        weight = torch.randn(
+            problem.n, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        qx = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        qw = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+        sx = torch.empty(
+            problem.m,
+            problem.k // 32,
+            device="cuda",
+            dtype=torch.float8_e8m0fnu,
+        )
+        sw = torch.empty(
+            problem.n,
+            problem.k // 32,
+            device="cuda",
+            dtype=torch.float8_e8m0fnu,
+        )
+        compile_mxfp8_dual_quant(problem.m, problem.n, problem.k)(
+            x, weight, qx, qw, sx, sw
+        )
+        row_out = torch.empty(
+            problem.m, problem.n, device="cuda", dtype=torch.bfloat16
+        )
+        compile_mxfp8_gemm(
+            problem,
+            MXFP8GemmConfig(tile_m=64, atom_layout_m=2, stages=1),
+        )(qx, qw, sx, sw, row_out)
+
+        for tile_rows, scale_layout, gemm_layout, tile_m, atom_m in (
+            (128, "mma128", "mma128", 128, 8),
+            (64, "mma64", "mma64x128", 64, 2),
+        ):
+            with self.subTest(scale_layout=scale_layout):
+                native_sx = torch.empty(
+                    problem.m // tile_rows,
+                    problem.k // 128,
+                    512,
+                    device="cuda",
+                    dtype=torch.float8_e8m0fnu,
+                )
+                native_sw = torch.empty(
+                    problem.n // 128,
+                    problem.k // 128,
+                    512,
+                    device="cuda",
+                    dtype=torch.float8_e8m0fnu,
+                )
+                compile_mxfp8_dual_quant(
+                    problem.m,
+                    problem.n,
+                    problem.k,
+                    MXFP8QuantConfig(scale_layout=scale_layout),
+                    weight_scale_layout="mma128",
+                )(x, weight, qx, qw, native_sx, native_sw)
+                native_out = torch.empty_like(row_out)
+                compile_mxfp8_gemm(
+                    problem,
+                    MXFP8GemmConfig(
+                        tile_m=tile_m,
+                        atom_layout_m=atom_m,
+                        stages=1,
+                        scale_role="tma",
+                        scale_layout=gemm_layout,
+                    ),
+                )(qx, qw, native_sx, native_sw, native_out)
+                torch.cuda.synchronize()
+                self._assert_native_scales(native_sx, sx, tile_rows)
+                self._assert_native_scales(native_sw, sw, 128)
+                torch.testing.assert_close(native_out, row_out, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

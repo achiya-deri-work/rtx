@@ -169,3 +169,43 @@ respected by later cache-only module calls.
 Because timings describe the current system load, do not promote a database
 created while the GPU is busy. Use `--force` during a quiet tuning run to replace
 those measurements.
+
+## Native-scale prequant backend
+
+The materialize-once backend has two independent persistent coordinate sweeps.
+They validate every candidate before timing it and atomically replace their JSON
+state after every completed trial, so an interrupted process resumes without
+repeating successful, rejected, or failed configurations.
+
+Tune native-layout E4M3/E8M0 quantization:
+
+```bash
+PYTHONPATH=. .venv/bin/python benchmarks/tune_mxfp8_native_quant.py \
+  --m 512 --n 1536 --k 1536 --passes 2
+```
+
+Tune the prequantized native-scale GEMM independently:
+
+```bash
+PYTHONPATH=. .venv/bin/python benchmarks/tune_mxfp8_native_gemm.py \
+  --m 512 --n 1536 --k 1536 --passes 2
+```
+
+The quantizer sweep covers vector/load width, FP32 versus BF16x2 arithmetic,
+amax implementation, shuffle versus hardware redux, warp/wave launch shape,
+register cap, and scalar versus packed physical-scale stores. The GEMM sweep
+covers pipeline depth and MMA warp geometry, independent A/B LDSM width,
+independent SMEM swizzles, scale S2R width, producer/consumer register budgets,
+TMA versus direct epilogue, store width, raster direction, and CTA grouping.
+
+Use the component benchmark to separate quantization, GEMM, and launch effects:
+
+```bash
+PYTHONPATH=. .venv/bin/python benchmarks/benchmark_mxfp8_prequant.py \
+  --scale-layout mma128 --component e2e
+```
+
+Use `benchmarks/benchmark_mxfp8_frontend.py` to measure the registered
+dynamic-weight op through `torch.compile(fullgraph=True, dynamic=False)`. Kernel
+timings and standalone compiled-op timings are deliberately reported separately:
+the latter also includes graph-output allocation and host submission gaps.

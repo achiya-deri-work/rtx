@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from rtx import mxfp8_linear
+from rtx import MXFP8Linear, mxfp8_linear
 from rtx.kernels.mxfp8 import MXFP8FwdConfig, MXFP8Problem, normalize_fwd_config
 from rtx.kernels.mxfp8_fwd import compile_mxfp8_fwd
 
@@ -104,6 +104,20 @@ class MXFP8ConfigTests(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class MXFP8CudaTests(unittest.TestCase):
+    def test_prequant_frontend_is_fullgraph_compileable(self) -> None:
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("native kernel requires SM120/SM121")
+        torch.manual_seed(122)
+        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        layer = MXFP8Linear(
+            128, 128, device="cuda", dtype=torch.bfloat16, backend="prequant"
+        ).eval().requires_grad_(False)
+        expected = layer(x)
+        compiled = torch.compile(layer, fullgraph=True, dynamic=False)
+        actual = compiled(x)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_fused_mxfp8_matches_floor_reference(self) -> None:
         if torch.cuda.get_device_capability()[0] != 12:
             self.skipTest("native kernel requires SM120/SM121")
