@@ -1,0 +1,96 @@
+{
+  "kernel": "mxfp8_fwd",
+  "kernel_revision": 10,
+  "problem": {
+    "m": 512,
+    "n": 1536,
+    "k": 1536
+  },
+  "search": {
+    "passes": 4,
+    "restarts": 12,
+    "time_budget_s": 1800,
+    "elapsed_s": 1530.1217008929962,
+    "warmup": 10,
+    "samples": 15,
+    "calls_per_sample": 10,
+    "correctness": "torch",
+    "new_trials": 5650,
+    "memoized_trials": 2480,
+    "status_counts": {
+      "ok": 2299,
+      "architecture_rejected": 2364,
+      "implementation_rejected": 987,
+      "compile_error": 0,
+      "runtime_error": 0,
+      "correctness_error": 0
+    }
+  },
+  "artifacts": {
+    "database": "/tmp/rtx-autotune-wave4-v10-all-r12/mxfp8_fwd/0539be78d20d5f5b307f/m512_n1536_k1536_fc34a928de1f.json",
+    "log": "autotune_logs/m512_n1536_k1536_wave4_v10_all_r12.log"
+  },
+  "selected": {
+    "config_id": "8b61137f868c8c635b65",
+    "search_median_ms": 0.08272320032119751,
+    "verification_median_ms": 0.08290464401245118,
+    "verification_min_ms": 0.08258432388305664,
+    "verification_max_ms": 0.08318079948425293,
+    "verification_max_abs_error": 0.25,
+    "config": {
+      "a_ldmatrix_matrices": 4,
+      "a_swizzle": "none",
+      "atom_layout_m": 8,
+      "atom_layout_n": 2,
+      "b_ldmatrix_matrices": 2,
+      "b_swizzle": "none",
+      "bf16_stages": 2,
+      "bf16_swizzle": "none",
+      "bf16_tile_k": 32,
+      "consumer_registers": 160,
+      "epilogue": "tma",
+      "epilogue_stages": 1,
+      "grid_swizzle": 4,
+      "k_unroll": 4,
+      "load_engine": "tma",
+      "maxrregcount": 128,
+      "mma_issue": "sync",
+      "mxfp8_stages": 1,
+      "num_mma_warps": 16,
+      "num_threads": 544,
+      "persistent": false,
+      "persistent_waves": 1,
+      "producer_registers": 40,
+      "producer_warps": 1,
+      "quant_vec": 8,
+      "quantizer_registers": 96,
+      "quantizer_warps": 16,
+      "raster": "m",
+      "reduction": "shuffle",
+      "reuse": "none",
+      "schedule": "warp_specialized",
+      "sfa_s2r_bits": 8,
+      "sfb_s2r_bits": 8,
+      "store_vec": 2,
+      "tile_k": 128,
+      "tile_m": 128,
+      "tile_n": 128
+    }
+  },
+  "verification": {
+    "warmup": 50,
+    "samples": 51,
+    "calls_per_sample": 100,
+    "correctness": "torch",
+    "finalists": [
+      {"label": "global", "config_id": "8b61137f868c8c635b65", "median_ms": 0.08290464401245118, "min_ms": 0.08258432388305664, "max_ms": 0.08318079948425293, "max_abs_error": 0.25},
+      {"label": "cooperative", "config_id": "7759487ca5deb7ae4c89", "median_ms": 0.08584223747253418, "min_ms": 0.08553407669067382, "max_ms": 0.0859939193725586, "max_abs_error": 0.25},
+      {"label": "direct", "config_id": "2e8b48c62f5219b4eb97", "median_ms": 0.08921055793762207, "min_ms": 0.08886655807495117, "max_ms": 0.0893228816986084, "max_abs_error": 0.25},
+      {"label": "tile64", "config_id": "2499b8fa5e6ab0c82cad", "median_ms": 0.1584335994720459, "min_ms": 0.1583471965789795, "max_ms": 0.15889280319213867, "max_abs_error": 0.25},
+      {"label": "three_role", "config_id": "4c3ed049c273734ca51c", "median_ms": 0.2212518310546875, "min_ms": 0.22106176376342773, "max_ms": 0.22142847061157225, "max_abs_error": 0.25},
+      {"label": "persistent_none", "config_id": "81f6bc42f0f957aa08f2", "median_ms": 0.09337920188903809, "min_ms": 0.09307104110717773, "max_ms": 0.09348159790039062, "max_abs_error": 0.25},
+      {"label": "persistent_x", "config_id": "d2d18c1c945811eed498", "median_ms": 0.09407872200012207, "min_ms": 0.0937276840209961, "max_ms": 0.09423487663269042, "max_abs_error": 0.25},
+      {"label": "persistent_weight", "config_id": "37d6010891eed84c36ed", "median_ms": 0.09347007751464843, "min_ms": 0.09316287994384766, "max_ms": 0.09352992057800293, "max_abs_error": 0.25}
+    ]
+  }
+}
