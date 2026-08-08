@@ -8,6 +8,13 @@ from .adapters import (
     make_mxfp8_prequant_adapter,
     make_mxfp8_weight_prequant_adapter,
 )
+from .bandit import (
+    AdaptiveBanditScheduler,
+    ArmStatistics,
+    DiscountedArmStatistics,
+    UCB1Scheduler,
+    contextual_ucb_scores,
+)
 from .calibration import calibrate_device
 from .core import (
     ComposableTuningResult,
@@ -46,12 +53,9 @@ from .legacy import (
     tune_mxfp8_fwd,
 )
 from .orchestrator import (
-    AdaptiveBanditScheduler,
-    ArmStatistics,
     AutotuneOrchestrator,
     ConfirmationPolicy,
     SequentialScheduler,
-    UCB1Scheduler,
 )
 from .migration import import_legacy_json_database
 from .recipes import HybridTuningPolicy, make_hybrid_autotuner
@@ -74,13 +78,18 @@ from .strategies import (
 
 def __getattr__(name: str):
     if name in {
+        "export_bundle",
+        "normalized_rows",
+    }:
+        from . import dataset_export
+
+        return getattr(dataset_export, name)
+    if name in {
         "AnytimeRunPolicy",
         "DatasetCampaign",
         "DatasetBackend",
         "DatasetJob",
         "DatasetManifest",
-        "export_bundle",
-        "normalized_rows",
         "register_dataset_backend",
     }:
         from . import dataset
@@ -108,6 +117,7 @@ __all__ = [
     "CostModelGuidedSearch",
     "CostModelLocalSearch",
     "DeviceFingerprint",
+    "DiscountedArmStatistics",
     "DatasetCampaign",
     "DatasetBackend",
     "DatasetJob",
@@ -140,6 +150,7 @@ __all__ = [
     "architecture_profile",
     "calibrate_device",
     "compiled_resource_metadata",
+    "contextual_ucb_scores",
     "compiler_profile",
     "device_properties",
     "export_bundle",

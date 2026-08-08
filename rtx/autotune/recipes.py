@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Generic, Literal
+from typing import Literal
 
+from .bandit import AdaptiveBanditScheduler
 from .core import ConfigT, KernelAdapter, TuningBudget
 from .cost_model import GradientBoostedCostModel, GradientBoostedFeasibilityModel
 from .orchestrator import (
-    AdaptiveBanditScheduler,
     AutotuneOrchestrator,
     ConfirmationPolicy,
     SequentialScheduler,

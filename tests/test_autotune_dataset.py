@@ -9,10 +9,12 @@ from types import SimpleNamespace
 import unittest
 
 from rtx.autotune import (
+    DiscountedArmStatistics,
     DiscreteKernelAdapter,
     JsonlTuningStore,
     KernelContext,
     TrialOutcome,
+    contextual_ucb_scores,
 )
 from rtx.autotune.core import Proposal, evaluate_proposal
 from rtx.autotune.dataset import (
@@ -79,17 +81,27 @@ class DatasetTests(unittest.TestCase):
             "c": ("mxfp8_bwd", shape_c, "rotate"),
         }
         arms = {
-            key: dataset_module._ContextArmStatistics() for key in descriptors
+            key: DiscountedArmStatistics() for key in descriptors
         }
         arms["a"].update(0.8, 1.0, True)
         arms["c"].update(-0.2, 1.0, False)
-        scores = dataset_module._context_bandit_scores(
-            tuple(descriptors), arms, descriptors, 0.1
+        scores = contextual_ucb_scores(
+            tuple(descriptors),
+            arms,
+            lambda left, right: dataset_module._context_similarity(
+                descriptors[left], descriptors[right]
+            ),
+            0.1,
         )
         self.assertEqual(scores["b"], float("inf"))
         arms["b"].update(0.0, 1.0, True)
-        scores = dataset_module._context_bandit_scores(
-            tuple(descriptors), arms, descriptors, 0.1
+        scores = contextual_ucb_scores(
+            tuple(descriptors),
+            arms,
+            lambda left, right: dataset_module._context_similarity(
+                descriptors[left], descriptors[right]
+            ),
+            0.1,
         )
         self.assertGreater(scores["b"], scores["c"])
 

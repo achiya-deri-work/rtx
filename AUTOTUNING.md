@@ -89,7 +89,7 @@ Ping-pong scheduling remains explicitly rejected.
 Tune one actual flattened linear shape for up to thirty minutes:
 
 ```bash
-.venv/bin/python -m rtx.autotune \
+rtx-autotune-legacy \
   --m 8192 --n 4096 --k 4096 \
   --seconds 1800 --passes 4 --restarts 8 \
   --correctness baseline

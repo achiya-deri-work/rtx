@@ -61,6 +61,29 @@ The equivalent dependency lists are in `requirements.txt` and
 `requirements-dev.txt`. An editable install is recommended while kernels are
 changing because every dataset bundle records a hash of the installed source.
 
+## Repository layout
+
+```text
+rtx/
+├── rtx/
+│   ├── configs/        # immutable kernel and inference configuration models
+│   ├── formats/        # TorchAO-backed MXFP8/NVFP4 tensor contracts
+│   ├── kernels/        # lazily imported CuTe DSL kernel implementations
+│   └── autotune/       # adapters, bandits, cost models, stores, and campaigns
+├── autotune_manifests/ # immutable portable campaign specifications
+├── benchmarks/         # focused developer benchmarks and tuning utilities
+└── tests/              # CPU contracts plus CUDA-gated kernel tests
+```
+
+The public runtime surface is `rtx.MXFP8Linear`, `rtx.NVFP4Linear`, their
+functional forms, and packed tensor types. Kernel modules remain lazy so
+importing `rtx` on a non-Blackwell or CPU-only machine does not initialize
+CuTe. Legacy coordinate tuners remain as compatibility modules; new search
+policy work belongs under `rtx.autotune`.
+
+See [`autotune_manifests/README.md`](autotune_manifests/README.md) for campaign
+status and [`benchmarks/README.md`](benchmarks/README.md) for focused tools.
+
 ## Python frontend
 
 ```python
@@ -339,7 +362,8 @@ GPU kernel tests are skipped automatically when a compatible CUDA target is
 not available.
 
 Additional kernel design and autotuning details are in `AUTOTUNING.md` and
-`rtx/autotune/README.md`.
+`rtx/autotune/README.md`. The RTX-specific hardware boundary and upstream
+attribution are documented in `sm120_hardware.md`.
 
 ## License
 

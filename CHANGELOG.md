@@ -14,6 +14,8 @@ project follows semantic versioning while it is in active alpha development.
   cross-device hierarchical-bandit manifest.
 - Preserve the v2 manifest and sequential/breadth-first behavior as compatible
   control policies.
+- Separate reusable bandit policy math from execution and dataset campaign
+  lifecycle, and document repository, manifest, and benchmark boundaries.
 
 ## 0.5.1
 

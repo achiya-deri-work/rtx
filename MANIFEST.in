@@ -1,10 +1,13 @@
 include README.md
 include LICENSE
 include AUTOTUNING.md
+include sm120_hardware.md
 include CHANGELOG.md
 include requirements.txt
 include requirements-cu130.txt
 include requirements-dev.txt
 recursive-include autotune_manifests *.json
+recursive-include autotune_manifests *.md
 recursive-include benchmarks *.py
+recursive-include benchmarks *.md
 recursive-include tests *.py

@@ -20,6 +20,26 @@ kernel-specific coordinate tuner:
 The existing `CoordinateDescentTuner` API is re-exported unchanged from the
 package compatibility module.
 
+## Module boundaries
+
+| Module | Responsibility |
+| --- | --- |
+| `core.py` | Context, proposal, observation, budget, and adapter contracts |
+| `bandit.py` | Reusable arm state, UCB policies, rewards, and contextual scoring |
+| `strategies.py` | Random, learned-global, coordinate, and model-local proposals |
+| `cost_model.py` | Small latency and feasibility gradient-boosted models |
+| `orchestrator.py` | Single-context evaluation loop and strategy routing |
+| `store.py` | Append-only JSONL and in-memory persistence |
+| `dataset.py` | Multi-context campaign harnesses, verification, and CLI |
+| `dataset_export.py` | CPU-only bundle normalization and CSV/Parquet export |
+| `adapters.py` | RTX kernel configuration spaces behind the generic contracts |
+| `hardware.py` | Architecture/SKU features and resource estimates |
+| `legacy.py` | Compatibility coordinate tuner; no new orchestration code |
+
+Policy mathematics must not import dataset harnesses or kernel implementations.
+Campaign code composes public policies and adapters rather than embedding a
+second private tuner.
+
 ## Default learned-global then local composition
 
 ```python
