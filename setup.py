@@ -18,6 +18,8 @@ setup(
     description="Trainable MXFP8 linear kernels and cross-device autotuning for RTX Blackwell",
     long_description=(ROOT / "README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
+    license="Apache-2.0",
+    license_files=["LICENSE"],
     python_requires=">=3.11",
     packages=find_packages(include=("rtx", "rtx.*")),
     package_data={"rtx": ["py.typed"]},
