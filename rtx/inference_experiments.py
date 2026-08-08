@@ -11,7 +11,8 @@ import torch
 
 from .autotune.hardware import compiled_resource_metadata
 from .configs import MXFP8FullyPrequantConfig, MXFP8WeightPrequantConfig
-from .formats import MXFP8Tensor
+from .formats import MXFP8Tensor, make_mxfp8_tensor
+from .formats.mxfp8 import mxfp8_qdata_2d, mxfp8_scales_for_kernel
 from .fp8 import (
     _allocate_scales,
     _ensure_l2_fetch_granularity,
@@ -44,7 +45,9 @@ def _materialize(
     data = torch.empty_like(source, dtype=torch.float8_e4m3fn)
     scales = _allocate_scales(rows, k, config.scale_layout, source.device)
     compile_mxfp8_quant(rows, k, config)(source, data, scales)
-    return MXFP8Tensor(data, scales, tuple(source.shape), config.scale_layout)
+    return make_mxfp8_tensor(
+        data, scales, tuple(source.shape), config.scale_layout
+    )
 
 
 @dataclass(slots=True)
@@ -70,8 +73,15 @@ class _InferenceRunner:
             qx, sx = self.qx, self.sx
         else:
             assert packed_x is not None
-            qx, sx = packed_x.data, packed_x.scales
-        self.gemm(qx, packed_weight.data, sx, packed_weight.scales, out)
+            qx = mxfp8_qdata_2d(packed_x)
+            sx = mxfp8_scales_for_kernel(packed_x)
+        self.gemm(
+            qx,
+            mxfp8_qdata_2d(packed_weight),
+            sx,
+            mxfp8_scales_for_kernel(packed_weight),
+            out,
+        )
 
 
 @dataclass(slots=True)
@@ -286,13 +296,21 @@ class MXFP8InferenceBenchmarkHarness(PrequantBenchmarkHarness):
             ]
         first_x, first_w = self._inputs[0]
         packed_x, packed_w = runner.packed_pairs[_pair_key(first_x, first_w)]
-        qx = runner.qx if packed_x is None else packed_x.data
-        sx = runner.sx if packed_x is None else packed_x.scales
+        qx = runner.qx if packed_x is None else mxfp8_qdata_2d(packed_x)
+        sx = (
+            runner.sx
+            if packed_x is None
+            else mxfp8_scales_for_kernel(packed_x)
+        )
         assert qx is not None and sx is not None
         results["gemm_hot_packed"] = [
             self._time_callable(
                 lambda _index: runner.gemm(
-                    qx, packed_w.data, sx, packed_w.scales, prepared.out
+                    qx,
+                    mxfp8_qdata_2d(packed_w),
+                    sx,
+                    mxfp8_scales_for_kernel(packed_w),
+                    prepared.out,
                 ),
                 component_calls,
             )

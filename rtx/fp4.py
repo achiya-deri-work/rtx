@@ -13,8 +13,19 @@ from typing import TYPE_CHECKING, Literal
 import torch
 from torch import nn
 
-from .formats import NVFP4Tensor
-from .formats.common import SCALE_LAYOUT_CODES, reject_packed_dtype_conversion
+from .formats import NVFP4Tensor, make_nvfp4_tensor
+from .formats.common import (
+    PACKED_OPERAND_SCHEMA_VERSION,
+    SCALE_LAYOUT_CODES,
+    reject_packed_dtype_conversion,
+)
+from .formats.nvfp4 import (
+    nvfp4_matrix_shape,
+    nvfp4_orientation,
+    nvfp4_scale_layout,
+    nvfp4_tensor_scale,
+    validate_nvfp4_tensor,
+)
 
 if TYPE_CHECKING:
     from .kernels.mxfp8_bwd import MXFP8BwdConfig
@@ -55,7 +66,7 @@ def _launch_nvfp4_forward(
 
 
 def quantize_nvfp4(tensor: torch.Tensor) -> NVFP4Tensor:
-    """Prequantize one NVFP4 operand when the RTX kernel becomes available."""
+    """Return a TorchAO ``NVFP4Tensor`` once the RTX quantizer is available."""
 
     if tensor.ndim < 1 or tensor.dtype is not torch.bfloat16:
         raise TypeError("NVFP4 quantization requires a BF16 tensor")
@@ -244,23 +255,26 @@ def nvfp4_linear(
     """
 
     if isinstance(weight, NVFP4Tensor):
-        n, k = weight.matrix_shape
+        validate_nvfp4_tensor(weight)
+        n, k = nvfp4_matrix_shape(weight)
+        weight_layout = nvfp4_scale_layout(weight)
         if isinstance(x, NVFP4Tensor):
-            m, x_k = x.matrix_shape
+            validate_nvfp4_tensor(x)
+            m, x_k = nvfp4_matrix_shape(x)
             if x_k != k or x.device != weight.device:
                 raise ValueError("packed NVFP4 X/W shape or device mismatch")
             out = _nvfp4_linear_prequantized_op(
-                x.data,
-                weight.data,
-                x.block_scales,
-                weight.block_scales,
-                x.tensor_scale,
-                weight.tensor_scale,
+                x.qdata,
+                weight.qdata,
+                x.scale,
+                weight.scale,
+                nvfp4_tensor_scale(x),
+                nvfp4_tensor_scale(weight),
                 m,
                 n,
                 k,
-                x.scale_layout,
-                weight.scale_layout,
+                nvfp4_scale_layout(x),
+                weight_layout,
                 "unimplemented",
             )
             return out.reshape(*x.shape[:-1], n)
@@ -278,12 +292,12 @@ def nvfp4_linear(
         x_2d = x.reshape(-1, k)
         out = _nvfp4_linear_dynamic_x_prequant_w_op(
             x_2d,
-            weight.data,
-            weight.block_scales,
-            weight.tensor_scale,
+            weight.qdata,
+            weight.scale,
+            nvfp4_tensor_scale(weight),
             n,
             k,
-            weight.scale_layout,
+            weight_layout,
             "unimplemented",
         )
         return out.reshape(*leading, n)
@@ -353,31 +367,35 @@ class NVFP4Linear(nn.Module):
             )
             self.reset_parameters()
         else:
+            validate_nvfp4_tensor(packed_weight)
             if packed_weight.shape != (out_features, in_features):
                 raise ValueError(
                     f"packed NVFP4 weight must have shape {(out_features, in_features)}"
                 )
-            if packed_weight.orientation != "row_major":
+            if nvfp4_orientation(packed_weight) != "row_major":
                 raise ValueError("packed linear weights must be row-major")
             if device is not None:
                 packed_weight = packed_weight.to(device)
+            packed_layout = nvfp4_scale_layout(packed_weight)
             self.register_parameter("weight", None)
-            self.register_buffer("weight_data", packed_weight.data)
-            self.register_buffer("weight_block_scales", packed_weight.block_scales)
-            self.register_buffer("weight_tensor_scale", packed_weight.tensor_scale)
+            self.register_buffer("weight_data", packed_weight.qdata)
+            self.register_buffer("weight_block_scales", packed_weight.scale)
+            self.register_buffer(
+                "weight_tensor_scale", nvfp4_tensor_scale(packed_weight)
+            )
             self.register_buffer(
                 "weight_packing_meta",
                 torch.tensor(
                     [
-                        packed_weight.schema_version,
-                        SCALE_LAYOUT_CODES[packed_weight.scale_layout],
+                        PACKED_OPERAND_SCHEMA_VERSION,
+                        SCALE_LAYOUT_CODES[packed_layout],
                     ],
                     dtype=torch.int64,
                     device=packed_weight.device,
                 ),
             )
-            self._weight_scale_layout = packed_weight.scale_layout
-            self._weight_packing_schema = packed_weight.schema_version
+            self._weight_scale_layout = packed_layout
+            self._weight_packing_schema = PACKED_OPERAND_SCHEMA_VERSION
             self.training = False
 
     @property
@@ -425,13 +443,12 @@ class NVFP4Linear(nn.Module):
     def packed_weight(self) -> NVFP4Tensor | None:
         if self.weight_mode != "prequantized":
             return None
-        return NVFP4Tensor(
+        return make_nvfp4_tensor(
             self.weight_data,
             self.weight_block_scales,
             self.weight_tensor_scale,
             (self.out_features, self.in_features),
             self._weight_scale_layout,
-            schema_version=self._weight_packing_schema,
         )
 
     @classmethod

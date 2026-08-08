@@ -1,143 +1,145 @@
-"""Portable logical container for two-level-scaled NVFP4 operands."""
+"""TorchAO-backed NVFP4 operand helpers for the future RTX kernel."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from math import ceil
 
 import torch
-from torch.utils import _pytree
+from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
 
-from .common import (
-    Orientation,
-    PACKED_OPERAND_SCHEMA_VERSION,
-    ScaleLayout,
-    flattened_matrix_shape,
-    move_tensor,
-)
+from .common import Orientation, ScaleLayout, flattened_matrix_shape
 
 
-@dataclass(frozen=True, slots=True)
-class NVFP4Tensor:
-    """Packed E2M1 values, E4M3 scales per 16 values, and one FP32 scale.
+def make_nvfp4_tensor(
+    qdata: torch.Tensor,
+    scales: torch.Tensor,
+    tensor_scale: torch.Tensor,
+    shape: tuple[int, ...],
+    scale_layout: ScaleLayout = "row_major",
+) -> NVFP4Tensor:
+    rows, k = flattened_matrix_shape(shape)
+    if k % 16:
+        raise ValueError("NVFP4 packed K must be divisible by 16")
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if qdata.dtype not in (torch.uint8, fp4_dtype):
+        raise TypeError(
+            "NVFP4 qdata must use TorchAO's uint8 container or "
+            "torch.float4_e2m1fn_x2"
+        )
+    if qdata.numel() != rows * (k // 2):
+        raise ValueError(
+            f"NVFP4 qdata has {qdata.numel()} packed values, expected "
+            f"{rows * (k // 2)}"
+        )
+    if scales.dtype is not torch.float8_e4m3fn:
+        raise TypeError("NVFP4 block scales must use float8_e4m3fn")
+    if tensor_scale.dtype is not torch.float32 or tensor_scale.numel() != 1:
+        raise TypeError("NVFP4 per-tensor scale must be one FP32 value")
+    if not (qdata.device == scales.device == tensor_scale.device):
+        raise ValueError("NVFP4 qdata and both scale levels must share one device")
+    if scale_layout == "row_major":
+        expected_scales = rows * (k // 16)
+        scale_shape = (*shape[:-1], k // 16)
+    elif scale_layout == "mma128":
+        expected_scales = ceil(rows / 128) * ceil(k / 64) * 512
+        scale_shape = (ceil(rows / 128) * 32, ceil(k / 64) * 16)
+    else:
+        raise ValueError(
+            "TorchAO NVFP4 supports row-major or standard blocked scales"
+        )
+    if scales.numel() != expected_scales:
+        raise ValueError(
+            f"NVFP4 {scale_layout} scales have {scales.numel()} values, "
+            f"expected {expected_scales}"
+        )
+    value = NVFP4Tensor(
+        qdata.view(*shape[:-1], k // 2),
+        scales.view(scale_shape),
+        16,
+        torch.bfloat16,
+        tensor_scale.reshape(()),
+        is_swizzled_scales=scale_layout != "row_major",
+    )
+    value._rtx_scale_layout = scale_layout
+    return value
 
-    ``shape`` is the logical BF16/FP4 shape. PyTorch's
-    ``float4_e2m1fn_x2`` tensor shape counts packed bytes, so ``data`` has
-    half as many columns as the logical matrix.
-    """
 
-    data: torch.Tensor
-    block_scales: torch.Tensor
-    tensor_scale: torch.Tensor
-    shape: tuple[int, ...]
-    scale_layout: ScaleLayout = "row_major"
-    orientation: Orientation = "row_major"
-    schema_version: int = PACKED_OPERAND_SCHEMA_VERSION
-
-    def __post_init__(self) -> None:
-        rows, k = flattened_matrix_shape(self.shape)
-        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-        if self.schema_version != PACKED_OPERAND_SCHEMA_VERSION:
-            raise ValueError(
-                f"unsupported NVFP4 packed schema {self.schema_version}"
-            )
-        if k % 16:
-            raise ValueError("NVFP4 packed K must be divisible by 16")
-        if fp4_dtype is None or self.data.dtype is not fp4_dtype:
-            raise TypeError("NVFP4 data must use torch.float4_e2m1fn_x2")
-        if self.block_scales.dtype is not torch.float8_e4m3fn:
-            raise TypeError("NVFP4 block scales must use float8_e4m3fn")
-        if self.tensor_scale.dtype is not torch.float32 or self.tensor_scale.numel() != 1:
-            raise TypeError("NVFP4 tensor_scale must be one FP32 value")
-        if not (
-            self.data.device == self.block_scales.device == self.tensor_scale.device
+def validate_nvfp4_tensor(value: NVFP4Tensor) -> None:
+    if value.block_size != 16:
+        raise ValueError(f"RTX NVFP4 requires block_size=16, got {value.block_size}")
+    if value.orig_dtype is not torch.bfloat16:
+        raise TypeError(
+            f"RTX NVFP4 requires BF16 logical dtype, got {value.orig_dtype}"
+        )
+    rows, k = nvfp4_matrix_shape(value)
+    if k % 16:
+        raise ValueError("RTX NVFP4 requires K divisible by 16")
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if value.qdata.dtype not in (torch.uint8, fp4_dtype):
+        raise TypeError("RTX NVFP4 requires uint8 or float4_e2m1fn_x2 qdata")
+    if value.qdata.numel() != rows * (k // 2):
+        raise ValueError("TorchAO NVFP4 qdata does not match its logical shape")
+    if value.scale.dtype is not torch.float8_e4m3fn:
+        raise TypeError("RTX NVFP4 requires E4M3 block scales")
+    if value.per_tensor_scale is not None:
+        if (
+            value.per_tensor_scale.dtype is not torch.float32
+            or value.per_tensor_scale.numel() != 1
         ):
-            raise ValueError("NVFP4 data and both scale levels must share one device")
-        expected_data = (rows, k // 2)
-        if tuple(self.data.shape) != expected_data:
-            raise ValueError(
-                f"NVFP4 packed data shape must be {expected_data} for logical "
-                f"shape {(rows, k)}, got {tuple(self.data.shape)}"
-            )
-        if self.scale_layout == "row_major":
-            expected = (rows, k // 16)
-            if tuple(self.block_scales.shape) != expected:
-                raise ValueError(
-                    f"NVFP4 row-major scales must have shape {expected}, "
-                    f"got {tuple(self.block_scales.shape)}"
-                )
-        elif self.scale_layout in ("mma64", "mma128"):
-            raise ValueError(
-                "tensor-core-native NVFP4 scale layouts are reserved but not "
-                "defined until the NVFP4 kernel is implemented"
-            )
-        else:
-            raise ValueError(f"unknown NVFP4 scale layout {self.scale_layout!r}")
-        if self.orientation not in ("row_major", "transpose"):
-            raise ValueError(f"unknown NVFP4 orientation {self.orientation!r}")
-
-    @property
-    def device(self) -> torch.device:
-        return self.data.device
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.data.dtype
-
-    @property
-    def matrix_shape(self) -> tuple[int, int]:
-        return flattened_matrix_shape(self.shape)
-
-    def to(
-        self,
-        device: torch.device | str | None = None,
-        *,
-        non_blocking: bool = False,
-    ) -> "NVFP4Tensor":
-        return NVFP4Tensor(
-            move_tensor(self.data, device, non_blocking),
-            move_tensor(self.block_scales, device, non_blocking),
-            move_tensor(self.tensor_scale, device, non_blocking),
-            self.shape,
-            self.scale_layout,
-            self.orientation,
-            self.schema_version,
-        )
-
-    def detach(self) -> "NVFP4Tensor":
-        return NVFP4Tensor(
-            self.data.detach(),
-            self.block_scales.detach(),
-            self.tensor_scale.detach(),
-            self.shape,
-            self.scale_layout,
-            self.orientation,
-            self.schema_version,
+            raise TypeError("RTX NVFP4 per_tensor_scale must be one FP32 value")
+        if value.per_tensor_scale.device != value.qdata.device:
+            raise ValueError("NVFP4 qdata and per-tensor scale must share a device")
+    if value.qdata.device != value.scale.device:
+        raise ValueError("NVFP4 qdata and block scales must share one device")
+    layout = nvfp4_scale_layout(value)
+    expected_scales = (
+        rows * (k // 16)
+        if layout == "row_major"
+        else ceil(rows / 128) * ceil(k / 64) * 512
+    )
+    if value.scale.numel() != expected_scales:
+        raise ValueError(
+            f"NVFP4 {layout} scale storage has {value.scale.numel()} values, "
+            f"expected {expected_scales}"
         )
 
 
-def _flatten(value: NVFP4Tensor):
-    return [value.data, value.block_scales, value.tensor_scale], (
-        value.shape,
-        value.scale_layout,
-        value.orientation,
-        value.schema_version,
-    )
+def nvfp4_orientation(value: NVFP4Tensor) -> Orientation:
+    if value.qdata.is_contiguous():
+        return "row_major"
+    if value.qdata.ndim == 2 and value.qdata.t().is_contiguous():
+        return "transpose"
+    raise ValueError("RTX kernels require row-major or logical-transpose qdata")
 
 
-def _unflatten(values, context):
-    shape, scale_layout, orientation, schema_version = context
-    return NVFP4Tensor(
-        values[0],
-        values[1],
-        values[2],
-        shape,
-        scale_layout,
-        orientation,
-        schema_version,
-    )
+def nvfp4_matrix_shape(value: NVFP4Tensor) -> tuple[int, int]:
+    return flattened_matrix_shape(tuple(int(dim) for dim in value.shape))
 
 
-_pytree.register_pytree_node(NVFP4Tensor, _flatten, _unflatten)
+def nvfp4_scale_layout(value: NVFP4Tensor) -> ScaleLayout:
+    marker = getattr(value, "_rtx_scale_layout", None)
+    if marker == "row_major" and not value.is_swizzled_scales:
+        return marker
+    if marker == "mma128" and value.is_swizzled_scales:
+        return marker
+    return "mma128" if value.is_swizzled_scales else "row_major"
 
 
-__all__ = ["NVFP4Tensor"]
+def nvfp4_tensor_scale(value: NVFP4Tensor) -> torch.Tensor:
+    """Return TorchAO's optional global decode scale as an explicit scalar."""
+
+    validate_nvfp4_tensor(value)
+    if value.per_tensor_scale is None:
+        return torch.ones((), dtype=torch.float32, device=value.qdata.device)
+    return value.per_tensor_scale.reshape(())
+
+
+__all__ = [
+    "NVFP4Tensor",
+    "make_nvfp4_tensor",
+    "nvfp4_matrix_shape",
+    "nvfp4_orientation",
+    "nvfp4_scale_layout",
+    "nvfp4_tensor_scale",
+    "validate_nvfp4_tensor",
+]

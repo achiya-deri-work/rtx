@@ -24,16 +24,6 @@ def flattened_matrix_shape(shape: tuple[int, ...]) -> tuple[int, int]:
     return prod(shape[:-1]) if len(shape) > 1 else 1, shape[-1]
 
 
-def move_tensor(
-    tensor: torch.Tensor,
-    device: torch.device | str | None,
-    non_blocking: bool,
-) -> torch.Tensor:
-    if device is None:
-        return tensor
-    return tensor.to(device=device, non_blocking=non_blocking)
-
-
 def reject_packed_dtype_conversion(
     args: tuple[object, ...],
     kwargs: dict[str, object],
@@ -61,6 +51,5 @@ __all__ = [
     "SCALE_LAYOUT_NAMES",
     "ScaleLayout",
     "flattened_matrix_shape",
-    "move_tensor",
     "reject_packed_dtype_conversion",
 ]

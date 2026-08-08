@@ -5,6 +5,7 @@ from ._version import __version__
 
 _LAZY_EXPORTS = {
     # Stable public format and frontend API.
+    "MXTensor": ("formats", "MXTensor"),
     "MXFP8Tensor": ("formats", "MXFP8Tensor"),
     "NVFP4Tensor": ("formats", "NVFP4Tensor"),
     "LinearOperandState": ("formats", "LinearOperandState"),

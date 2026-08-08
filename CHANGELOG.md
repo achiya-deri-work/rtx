@@ -3,6 +3,19 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.5.0
+
+- Replace the project-local packed operand dataclasses with TorchAO's canonical
+  `MXTensor` and `NVFP4Tensor` tensor subclasses.
+- Accept TorchAO-produced row-major and blocked-scale MXFP8 operands directly,
+  including zero-copy views into the CuTe kernel-native scale shapes.
+- Preserve the `rtx.MXFP8Tensor` spelling as an alias and additionally export
+  TorchAO's canonical `rtx.MXTensor` name.
+- Keep packed module state dictionaries as raw qdata/scales and versioned RTX
+  layout metadata, independent of tensor-subclass serialization internals.
+- Remove the old project-local dataclass constructor signatures; callers which
+  construct operands manually should use TorchAO factories and attributes.
+
 ## 0.4.0
 
 - Add distinct AOT-weight and fully-packed MXFP8 tuning families.

@@ -25,6 +25,7 @@ change.
 - Python 3.11+
 - an RTX Blackwell GPU and a compatible NVIDIA driver
 - a CUDA-enabled PyTorch build with Blackwell support
+- TorchAO 0.18.x
 - CUDA Python 13.x
 - NVIDIA CUTLASS Python DSL 4.7.x
 
@@ -90,11 +91,17 @@ with torch.inference_mode():
     y_prequantized = packed_weight(packed_x)  # pure packed GEMM
 ```
 
-`rtx.MXFP8Tensor` stores E4M3 values, E8M0 block scales, logical shape,
-orientation, physical scale layout, and packing schema version. The analogous
-`rtx.NVFP4Tensor` stores packed E2M1 values, E4M3 scales per 16 values, and its
-FP32 tensor scale. Packed module weights are persistent buffers and do not
-retain a BF16 master weight.
+`rtx.MXTensor` and the compatibility spelling `rtx.MXFP8Tensor` are direct
+aliases of TorchAO's
+[`MXTensor`](https://github.com/pytorch/ao/blob/main/torchao/prototype/mx_formats/mx_tensor.py).
+Likewise, `rtx.NVFP4Tensor` is TorchAO's
+[`NVFP4Tensor`](https://github.com/pytorch/ao/blob/main/torchao/prototype/mx_formats/nvfp4_tensor.py).
+RTX-produced E4M3/E8M0 storage is wrapped without copying; TorchAO blocked
+scales are exposed to CuTe through zero-copy kernel-shape views. NVFP4 uses
+TorchAO's packed qdata, E4M3 block scale, and optional FP32
+`per_tensor_scale` fields; an absent global scale is treated as exactly one.
+Packed module weights remain persistent raw buffers and do not retain a BF16
+master weight.
 
 MXFP8 implements all three state boundaries. `NVFP4Linear` and
 `NVFP4Tensor` expose the same dispatcher/fake/module contract, but execution

@@ -16,6 +16,7 @@ authors = [
 dependencies = [
   "numpy>=2.0,<3",
   "torch>=2.9",
+  "torchao>=0.18,<0.19",
   "cuda-python>=13.0,<14",
   "nvidia-cutlass-dsl>=4.7,<4.8",
 ]

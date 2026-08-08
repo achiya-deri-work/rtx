@@ -9,6 +9,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 import rtx
+from rtx.formats import make_mxfp8_tensor, make_nvfp4_tensor
 
 
 class LinearFrontendContractTests(unittest.TestCase):
@@ -33,8 +34,47 @@ class LinearFrontendContractTests(unittest.TestCase):
         )
 
     def test_public_package_exposes_versioned_packed_operand_types(self) -> None:
-        self.assertIs(rtx.MXFP8Tensor, __import__("rtx.formats", fromlist=["MXFP8Tensor"]).MXFP8Tensor)
-        self.assertIs(rtx.NVFP4Tensor, __import__("rtx.formats", fromlist=["NVFP4Tensor"]).NVFP4Tensor)
+        from torchao.prototype.mx_formats.mx_tensor import MXTensor
+        from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+
+        self.assertIs(rtx.MXTensor, MXTensor)
+        self.assertIs(rtx.MXFP8Tensor, MXTensor)
+        self.assertIs(rtx.NVFP4Tensor, NVFP4Tensor)
+
+    def test_external_torchao_mx_tensors_map_to_rtx_kernel_layouts(self) -> None:
+        from torchao.prototype.mx_formats.mx_tensor import MXTensor
+
+        from rtx.formats.mxfp8 import (
+            mxfp8_scale_layout,
+            mxfp8_scales_for_kernel,
+        )
+
+        for rows, expected_layout in ((64, "mma64"), (128, "mma128")):
+            with self.subTest(rows=rows):
+                value = MXTensor.from_qdata_and_scales(
+                    torch.empty(rows, 128, dtype=torch.float8_e4m3fn),
+                    torch.empty(32, 16, dtype=torch.float8_e8m0fnu),
+                    torch.bfloat16,
+                    block_size=32,
+                    is_swizzled_scales=True,
+                )
+                self.assertEqual(mxfp8_scale_layout(value), expected_layout)
+                self.assertEqual(
+                    mxfp8_scales_for_kernel(value).shape,
+                    (1, 1, 512),
+                )
+
+    def test_external_torchao_nvfp4_tensor_is_accepted(self) -> None:
+        from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+
+        value = NVFP4Tensor(
+            torch.empty(64, 64, dtype=torch.uint8),
+            torch.empty(64, 8, dtype=torch.float8_e4m3fn),
+            16,
+            torch.bfloat16,
+        )
+        layer = rtx.NVFP4Linear(128, 64, packed_weight=value)
+        self.assertIsInstance(layer.packed_weight, NVFP4Tensor)
 
     def test_mxfp8_is_no_bias_nn_linear_compatible(self) -> None:
         layer = rtx.MXFP8Linear(128, 64, bias=False, device="cpu")
@@ -122,7 +162,7 @@ class LinearFrontendContractTests(unittest.TestCase):
         with FakeTensorMode():
             qw = torch.empty(64, 128, device="cuda", dtype=torch.float8_e4m3fn)
             sw = torch.empty(64, 4, device="cuda", dtype=torch.float8_e8m0fnu)
-            packed = rtx.MXFP8Tensor(qw, sw, (64, 128))
+            packed = make_mxfp8_tensor(qw, sw, (64, 128))
             layer = rtx.MXFP8Linear(128, 64, packed_weight=packed)
             self.assertEqual(layer.weight_mode, "prequantized")
             self.assertIsNone(layer.weight)
@@ -136,12 +176,12 @@ class LinearFrontendContractTests(unittest.TestCase):
         qw = torch.zeros(64, 128, device="cpu", dtype=torch.float8_e4m3fn)
         sw = torch.zeros(64, 4, device="cpu", dtype=torch.float8_e8m0fnu)
         source = rtx.MXFP8Linear(
-            128, 64, packed_weight=rtx.MXFP8Tensor(qw, sw, (64, 128))
+            128, 64, packed_weight=make_mxfp8_tensor(qw, sw, (64, 128))
         )
         target = rtx.MXFP8Linear(
             128,
             64,
-            packed_weight=rtx.MXFP8Tensor(
+            packed_weight=make_mxfp8_tensor(
                 torch.empty_like(qw), torch.empty_like(sw), (64, 128)
             ),
         )
@@ -165,8 +205,8 @@ class LinearFrontendContractTests(unittest.TestCase):
             qw = torch.empty(64, 128, device="cuda", dtype=torch.float8_e4m3fn)
             sx = torch.empty(2, 4, device="cuda", dtype=torch.float8_e8m0fnu)
             sw = torch.empty(64, 4, device="cuda", dtype=torch.float8_e8m0fnu)
-            packed_x = rtx.MXFP8Tensor(qx, sx, (2, 128))
-            packed_w = rtx.MXFP8Tensor(qw, sw, (64, 128))
+            packed_x = make_mxfp8_tensor(qx, sx, (2, 128))
+            packed_w = make_mxfp8_tensor(qw, sw, (64, 128))
             layer = rtx.MXFP8Linear(128, 64, packed_weight=packed_w)
             self.assertEqual(layer(x).shape, (2, 64))
             self.assertEqual(layer(packed_x).shape, (2, 64))
@@ -181,7 +221,7 @@ class LinearFrontendContractTests(unittest.TestCase):
 
         data = torch.empty(64, 128, dtype=torch.float8_e4m3fn)
         scales = torch.empty(64, 4, dtype=torch.float8_e8m0fnu)
-        weight = rtx.MXFP8Tensor(data, scales, (64, 128))
+        weight = make_mxfp8_tensor(data, scales, (64, 128))
         key = fp8._packed_inference_config_key(
             MXFP8Problem(32, 64, 128),
             weight,
@@ -234,15 +274,15 @@ class LinearFrontendContractTests(unittest.TestCase):
         data = torch.empty(64, 64, dtype=fp4_dtype)
         scales = torch.empty(64, 8, dtype=torch.float8_e4m3fn)
         tensor_scale = torch.ones((), dtype=torch.float32)
-        packed = rtx.NVFP4Tensor(
+        packed = make_nvfp4_tensor(
             data, scales, tensor_scale, shape=(64, 128)
         )
         layer = rtx.NVFP4Linear(128, 64, packed_weight=packed)
         self.assertEqual(layer.weight_data.shape, (64, 64))
         self.assertIsNone(layer.weight)
         self.assertFalse(layer.training)
-        with self.assertRaisesRegex(ValueError, "packed data shape"):
-            rtx.NVFP4Tensor(
+        with self.assertRaisesRegex(ValueError, "qdata has"):
+            make_nvfp4_tensor(
                 torch.empty(64, 128, dtype=fp4_dtype),
                 scales,
                 tensor_scale,

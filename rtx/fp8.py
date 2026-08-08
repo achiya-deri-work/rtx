@@ -15,8 +15,20 @@ import torch
 from torch import nn
 from torch._library._out_variant import register_out_variant
 
-from .formats import MXFP8Tensor
-from .formats.common import SCALE_LAYOUT_CODES, reject_packed_dtype_conversion
+from .formats import MXFP8Tensor, make_mxfp8_tensor
+from .formats.common import (
+    PACKED_OPERAND_SCHEMA_VERSION,
+    SCALE_LAYOUT_CODES,
+    reject_packed_dtype_conversion,
+)
+from .formats.mxfp8 import (
+    mxfp8_matrix_shape,
+    mxfp8_orientation,
+    mxfp8_qdata_2d,
+    mxfp8_scale_layout,
+    mxfp8_scales_for_kernel,
+    validate_mxfp8_tensor,
+)
 from .configs import MXFP8GemmConfig, MXFP8QuantConfig
 from .kernels.mxfp8 import DEFAULT_MXFP8_FWD_CONFIG, MXFP8FwdConfig, MXFP8Problem
 from .runtime import load_kernel_symbol
@@ -248,7 +260,13 @@ class _WeightPrequantRunner:
     ) -> None:
         _ensure_l2_fetch_granularity(self.l2_fetch_granularity)
         self.quant_x(x, self.qx, self.sx)
-        self.gemm(self.qx, weight.data, self.sx, weight.scales, out)
+        self.gemm(
+            self.qx,
+            mxfp8_qdata_2d(weight),
+            self.sx,
+            mxfp8_scales_for_kernel(weight),
+            out,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,7 +464,7 @@ def quantize_mxfp8(
     *,
     config: MXFP8QuantConfig | None = None,
 ) -> MXFP8Tensor:
-    """Prequantize a BF16 operand once for an MXFP8 inference path."""
+    """Prequantize BF16 once and return TorchAO's canonical ``MXTensor``."""
 
     if tensor.ndim < 1:
         raise ValueError("MXFP8 quantization requires at least one dimension")
@@ -482,11 +500,8 @@ def quantize_mxfp8(
     # both materialized outputs have become ready on the launch stream.
     data._base_inputs = (source,)
     scales._base_inputs = (source,)
-    return MXFP8Tensor(
-        data=data,
-        scales=scales,
-        shape=leading_shape,
-        scale_layout=selected.scale_layout,
+    return make_mxfp8_tensor(
+        data, scales, leading_shape, selected.scale_layout
     )
 
 
@@ -765,17 +780,24 @@ def _packed_weight_from_tensors(
     k: int,
     scale_layout: str,
 ) -> MXFP8Tensor:
-    return MXFP8Tensor(data, scales, (n, k), scale_layout)  # type: ignore[arg-type]
+    return make_mxfp8_tensor(
+        data, scales, (n, k), scale_layout  # type: ignore[arg-type]
+    )
 
 
 def _validate_packed_linear_operands(
     x: MXFP8Tensor,
     weight: MXFP8Tensor,
 ) -> MXFP8Problem:
-    if x.orientation != "row_major" or weight.orientation != "row_major":
+    validate_mxfp8_tensor(x)
+    validate_mxfp8_tensor(weight)
+    if (
+        mxfp8_orientation(x) != "row_major"
+        or mxfp8_orientation(weight) != "row_major"
+    ):
         raise ValueError("public packed linear operands must be row-major logical views")
-    m, k = x.matrix_shape
-    n, weight_k = weight.matrix_shape
+    m, k = mxfp8_matrix_shape(x)
+    n, weight_k = mxfp8_matrix_shape(weight)
     if k != weight_k:
         raise ValueError(f"packed linear K mismatch: X={k}, W={weight_k}")
     if x.device != weight.device:
@@ -821,7 +843,8 @@ def _launch_weight_prequant_out(
         raise ValueError("internal dynamic-X/prequant-W op expects 2D X")
     if x.device.type != "cuda" or x.dtype is not torch.bfloat16:
         raise TypeError("dynamic-X/prequant-W MXFP8 expects CUDA BF16 X")
-    n, k = weight.matrix_shape
+    n, k = mxfp8_matrix_shape(weight)
+    weight_layout = mxfp8_scale_layout(weight)
     if x.shape[1] != k or x.device != weight.device:
         raise ValueError("dynamic X and packed W have incompatible shape/device")
     x_c = x if x.is_contiguous() else x.contiguous()
@@ -836,7 +859,7 @@ def _launch_weight_prequant_out(
     config = _packed_gemm_config(
         problem,
         requested.quant.scale_layout,
-        weight.scale_layout,
+        weight_layout,
         config_key,
     )
     rejection = config.quant.rejection(problem.m, problem.k)
@@ -849,7 +872,7 @@ def _launch_weight_prequant_out(
         problem.m,
         problem.n,
         problem.k,
-        weight.scale_layout,
+        weight_layout,
         config_key,
     )
     runner = _WEIGHT_PREQUANT_RUNNERS.get(runner_key)
@@ -941,12 +964,21 @@ def _mxfp8_linear_prequantized_op(
         problem, weight, x=x, config_key=config_key
     )
     config = _packed_gemm_config(
-        problem, x.scale_layout, weight.scale_layout, config_key
+        problem,
+        mxfp8_scale_layout(x),
+        mxfp8_scale_layout(weight),
+        config_key,
     )
     _ensure_l2_fetch_granularity(config.l2_fetch_granularity)
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     launcher = compile_mxfp8_gemm(problem, config.gemm)
-    launcher(x.data, weight.data, x.scales, weight.scales, out)
+    launcher(
+        mxfp8_qdata_2d(x),
+        mxfp8_qdata_2d(weight),
+        mxfp8_scales_for_kernel(x),
+        mxfp8_scales_for_kernel(weight),
+        out,
+    )
     out._base_inputs = (x_data, weight_data, x_scales, weight_scales)
     return out
 
@@ -972,14 +1004,14 @@ def _run_weight_prequantized(
     weight: MXFP8Tensor,
     config_key: str,
 ) -> torch.Tensor:
-    n, k = weight.matrix_shape
+    n, k = mxfp8_matrix_shape(weight)
     return _mxfp8_linear_dynamic_x_prequant_w_op(
         x,
-        weight.data,
-        weight.scales,
+        mxfp8_qdata_2d(weight),
+        mxfp8_scales_for_kernel(weight),
         n,
         k,
-        weight.scale_layout,
+        mxfp8_scale_layout(weight),
         config_key,
     )
 
@@ -991,15 +1023,15 @@ def _run_fully_prequantized(
 ) -> torch.Tensor:
     problem = _validate_packed_linear_operands(x, weight)
     return _mxfp8_linear_prequantized_op(
-        x.data,
-        weight.data,
-        x.scales,
-        weight.scales,
+        mxfp8_qdata_2d(x),
+        mxfp8_qdata_2d(weight),
+        mxfp8_scales_for_kernel(x),
+        mxfp8_scales_for_kernel(weight),
         problem.m,
         problem.n,
         problem.k,
-        x.scale_layout,
-        weight.scale_layout,
+        mxfp8_scale_layout(x),
+        mxfp8_scale_layout(weight),
         config_key,
     )
 
@@ -1009,8 +1041,9 @@ def _default_packed_inference_config(
     weight: MXFP8Tensor,
     x: MXFP8Tensor | None,
 ) -> MXFP8PrequantConfig:
+    weight_layout = mxfp8_scale_layout(weight)
     if x is None:
-        if weight.scale_layout == "row_major":
+        if weight_layout == "row_major":
             layouts = ("row_major", "row_major")
         elif problem.m % 128 == 0:
             layouts = ("mma128", "mma128")
@@ -1022,7 +1055,7 @@ def _default_packed_inference_config(
                 "activation scale layout"
             )
     else:
-        layouts = (x.scale_layout, weight.scale_layout)
+        layouts = (mxfp8_scale_layout(x), weight_layout)
     if layouts == ("row_major", "row_major"):
         return DEFAULT_MXFP8_INFERENCE_CONFIG
     if layouts == ("mma128", "mma128"):
@@ -1068,6 +1101,8 @@ def _resolve_packed_inference_config(
     if explicit is not None:
         return explicit
     fallback = _default_packed_inference_config(problem, weight, x)
+    weight_layout = mxfp8_scale_layout(weight)
+    x_layout = None if x is None else mxfp8_scale_layout(x)
     mode = _autotune_mode(autotune)
     if (
         mode == "off"
@@ -1081,8 +1116,8 @@ def _resolve_packed_inference_config(
         problem.m,
         problem.n,
         problem.k,
-        None if x is None else x.scale_layout,
-        weight.scale_layout,
+        x_layout,
+        weight_layout,
         mode,
         None if cache_dir is None else str(Path(cache_dir).expanduser()),
     )
@@ -1100,7 +1135,7 @@ def _resolve_packed_inference_config(
         from .configs import MXFP8WeightPrequantConfig
 
         family = "mxfp8_weight_prequant_fwd"
-        variant = f"w-{weight.scale_layout}"
+        variant = f"w-{weight_layout}"
         key = runtime_winner_key(
             family, problem, device=weight.device, variant=variant
         )
@@ -1112,7 +1147,7 @@ def _resolve_packed_inference_config(
                 config.rejection(problem)
                 or (
                     "cached weight scale layout does not match packed W"
-                    if config.operand_scale_layouts[1] != weight.scale_layout
+                    if config.operand_scale_layouts[1] != weight_layout
                     else None
                 )
             ),
@@ -1124,7 +1159,7 @@ def _resolve_packed_inference_config(
             selected = tune_mxfp8_inference_state(
                 problem,
                 state="weight_prequantized",
-                weight_layout=weight.scale_layout,
+                weight_layout=weight_layout,
                 device=weight.device,
                 cache_dir=cache_dir,
                 policy=tuning_policy,
@@ -1143,7 +1178,8 @@ def _resolve_packed_inference_config(
     from .configs import MXFP8FullyPrequantConfig
 
     family = "mxfp8_fully_prequant_fwd"
-    variant = f"x-{x.scale_layout}_w-{weight.scale_layout}"
+    assert x_layout is not None
+    variant = f"x-{x_layout}_w-{weight_layout}"
     key = runtime_winner_key(
         family, problem, device=weight.device, variant=variant
     )
@@ -1156,7 +1192,7 @@ def _resolve_packed_inference_config(
             or (
                 "cached operand layouts do not match packed X/W"
                 if config.operand_scale_layouts
-                != (x.scale_layout, weight.scale_layout)
+                != (x_layout, weight_layout)
                 else None
             )
         ),
@@ -1168,8 +1204,8 @@ def _resolve_packed_inference_config(
         selected = tune_mxfp8_inference_state(
             problem,
             state="fully_prequantized",
-            activation_layout=x.scale_layout,
-            weight_layout=weight.scale_layout,
+            activation_layout=x_layout,
+            weight_layout=weight_layout,
             device=weight.device,
             cache_dir=cache_dir,
             policy=tuning_policy,
@@ -1274,6 +1310,7 @@ def mxfp8_linear(
     """
 
     if isinstance(weight, MXFP8Tensor):
+        validate_mxfp8_tensor(weight)
         if isinstance(x, MXFP8Tensor):
             if x.shape[-1] != weight.shape[-1]:
                 raise ValueError("packed activation and weight K must match")
@@ -1288,7 +1325,7 @@ def mxfp8_linear(
                 cache_dir=autotune_cache_dir,
             )
             out = _run_fully_prequantized(x, weight, key)
-            return out.reshape(*x.shape[:-1], weight.matrix_shape[0])
+            return out.reshape(*x.shape[:-1], mxfp8_matrix_shape(weight)[0])
         if x.ndim < 1 or x.shape[-1] != weight.shape[-1]:
             raise ValueError(
                 f"expected activation [..., {weight.shape[-1]}], got {x.shape}"
@@ -1306,9 +1343,8 @@ def mxfp8_linear(
             )
         leading_shape = x.shape[:-1]
         x_2d = x.reshape(-1, x.shape[-1])
-        problem = MXFP8Problem(
-            int(x_2d.shape[0]), weight.matrix_shape[0], weight.matrix_shape[1]
-        )
+        weight_rows, weight_k = mxfp8_matrix_shape(weight)
+        problem = MXFP8Problem(int(x_2d.shape[0]), weight_rows, weight_k)
         key = _packed_inference_config_key(
             problem,
             weight,
@@ -1319,7 +1355,7 @@ def mxfp8_linear(
             cache_dir=autotune_cache_dir,
         )
         out = _run_weight_prequantized(x_2d, weight, key)
-        return out.reshape(*leading_shape, weight.matrix_shape[0])
+        return out.reshape(*leading_shape, weight_rows)
     if isinstance(x, MXFP8Tensor):
         raise TypeError("a prequantized MXFP8 activation requires a prequantized weight")
 
@@ -1537,31 +1573,33 @@ class MXFP8Linear(nn.Module):
             )
             self.reset_parameters()
         else:
+            validate_mxfp8_tensor(packed_weight)
             if packed_weight.shape != (out_features, in_features):
                 raise ValueError(
                     "packed MXFP8 weight shape must equal "
                     f"{(out_features, in_features)}, got {packed_weight.shape}"
                 )
-            if packed_weight.orientation != "row_major":
+            if mxfp8_orientation(packed_weight) != "row_major":
                 raise ValueError("packed linear weights must be row-major")
             if device is not None:
                 packed_weight = packed_weight.to(device)
+            packed_layout = mxfp8_scale_layout(packed_weight)
             self.register_parameter("weight", None)
-            self.register_buffer("weight_data", packed_weight.data)
-            self.register_buffer("weight_scales", packed_weight.scales)
+            self.register_buffer("weight_data", mxfp8_qdata_2d(packed_weight))
+            self.register_buffer("weight_scales", packed_weight.scale)
             self.register_buffer(
                 "weight_packing_meta",
                 torch.tensor(
                     [
-                        packed_weight.schema_version,
-                        SCALE_LAYOUT_CODES[packed_weight.scale_layout],
+                        PACKED_OPERAND_SCHEMA_VERSION,
+                        SCALE_LAYOUT_CODES[packed_layout],
                     ],
                     dtype=torch.int64,
                     device=packed_weight.device,
                 ),
             )
-            self._weight_scale_layout = packed_weight.scale_layout
-            self._weight_packing_schema = packed_weight.schema_version
+            self._weight_scale_layout = packed_layout
+            self._weight_packing_schema = PACKED_OPERAND_SCHEMA_VERSION
             self.training = False
 
     @property
@@ -1609,12 +1647,11 @@ class MXFP8Linear(nn.Module):
     def packed_weight(self) -> MXFP8Tensor | None:
         if self.weight_mode != "prequantized":
             return None
-        return MXFP8Tensor(
+        return make_mxfp8_tensor(
             self.weight_data,
             self.weight_scales,
             (self.out_features, self.in_features),
             self._weight_scale_layout,
-            schema_version=self._weight_packing_schema,
         )
 
     @classmethod
