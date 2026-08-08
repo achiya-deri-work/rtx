@@ -1,0 +1,11 @@
+# CUDA 13.0 fallback for systems which cannot use the preferred CUDA 13.2
+# PyTorch wheels. Jetson users should use NVIDIA's platform PyTorch build.
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.13.0+cu130
+torchao>=0.18.0
+numpy>=2.0,<3
+cuda-python>=13.0,<14
+nvidia-cutlass-dsl[cu13]>=4.7,<4.8
+pyarrow>=16
+apache-tvm-ffi==0.1.13.post2
+einops

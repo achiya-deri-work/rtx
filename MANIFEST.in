@@ -3,6 +3,7 @@ include LICENSE
 include AUTOTUNING.md
 include CHANGELOG.md
 include requirements.txt
+include requirements-cu130.txt
 include requirements-dev.txt
 recursive-include autotune_manifests *.json
 recursive-include benchmarks *.py

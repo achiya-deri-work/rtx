@@ -16,9 +16,12 @@ authors = [
 dependencies = [
   "numpy>=2.0,<3",
   "torch>=2.9",
-  "torchao>=0.18,<0.19",
+  "torchao>=0.18.0",
   "cuda-python>=13.0,<14",
-  "nvidia-cutlass-dsl>=4.7,<4.8",
+  "nvidia-cutlass-dsl[cu13]>=4.7,<4.8",
+  "pyarrow>=16",
+  "apache-tvm-ffi==0.1.13.post2",
+  "einops",
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -38,8 +41,7 @@ Repository = "https://github.com/achiya-deri-work/rtx"
 Issues = "https://github.com/achiya-deri-work/rtx/issues"
 
 [project.optional-dependencies]
-parquet = ["pyarrow>=16"]
-dev = ["pytest>=8", "pyarrow>=16", "build>=1.2", "twine>=5"]
+dev = ["pytest>=8", "build>=1.2", "twine>=5"]
 
 [project.scripts]
 rtx-autotune = "rtx.autotune.dataset:main"

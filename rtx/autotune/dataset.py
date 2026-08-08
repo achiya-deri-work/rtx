@@ -1482,10 +1482,10 @@ def export_parquet(rows: Sequence[Mapping[str, object]], destination: Path | str
     try:
         import pyarrow as pa
         import pyarrow.parquet as pq
-    except ImportError as exc:  # pragma: no cover - optional dependency.
+    except ImportError as exc:  # pragma: no cover - broken/incomplete install.
         raise RuntimeError(
-            "Parquet export requires pyarrow; from the source checkout run "
-            "pip install -e '.[parquet]'"
+            "Parquet export requires the core pyarrow dependency; reinstall rtx "
+            "or run `python -m pip install pyarrow`."
         ) from exc
     path = Path(destination)
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -24,24 +24,37 @@ change.
 - Linux
 - Python 3.11+
 - an RTX Blackwell GPU and a compatible NVIDIA driver
-- a CUDA-enabled PyTorch build with Blackwell support
-- TorchAO 0.18.x
+- a CUDA 13.x-enabled PyTorch build with Blackwell support (CUDA 13.2 preferred)
+- TorchAO 0.18.0 or newer
 - CUDA Python 13.x
-- NVIDIA CUTLASS Python DSL 4.7.x
+- NVIDIA CUTLASS Python DSL 4.7.x with its `cu13` runtime extra
+- PyArrow, Apache TVM FFI 0.1.13.post2, and Einops
 
-Install the correct CUDA-enabled PyTorch build for the machine first. Then:
+For discrete Blackwell GPUs, `requirements.txt` selects PyTorch's official
+CUDA 13.2 wheel channel and installs the full runtime:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 python -m pip install -e .
 ```
 
-For Parquet export and development tools:
+CUDA 13.0 is available as a fallback for machines which cannot yet use 13.2:
 
 ```bash
-python -m pip install -e '.[parquet,dev]'
+python -m pip install -r requirements-cu130.txt
+python -m pip install -e .
+```
+
+Jetson/SM110 users should install NVIDIA's platform-specific CUDA-enabled
+PyTorch build first and then install the project normally. PyArrow is a core
+dependency, so CSV and Parquet export are available in every supported install.
+For development tools:
+
+```bash
+python -m pip install -e '.[dev]'
 ```
 
 The equivalent dependency lists are in `requirements.txt` and
@@ -148,7 +161,7 @@ rtx-autotune run autotune_manifests/cross_device_dataset_v2.json \
   --calibration hardware_calibration.json
 ```
 
-Use `--format parquet` or `--format both` when the Parquet extra is installed.
+Use `--format parquet` or `--format both` to emit Parquet datasets.
 Every accepted observation is fsync'd to JSONL before the next candidate, so
 rerunning the same command resumes after interruption.
 

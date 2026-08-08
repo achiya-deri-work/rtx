@@ -3,6 +3,15 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.5.1
+
+- Prefer official PyTorch CUDA 13.2 wheels in `requirements.txt` and add a
+  CUDA 13.0 fallback requirements file.
+- Require TorchAO 0.18.0 or newer and install CUTLASS DSL with its `cu13`
+  runtime extra.
+- Make PyArrow a core dependency and add Apache TVM FFI 0.1.13.post2 and
+  Einops to both distribution metadata and requirements.
+
 ## 0.5.0
 
 - Replace the project-local packed operand dataclasses with TorchAO's canonical

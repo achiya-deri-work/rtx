@@ -1,6 +1,12 @@
-# Install a CUDA-enabled PyTorch build appropriate for the machine first.
-torch>=2.9
-torchao>=0.18,<0.19
+# Preferred discrete-Blackwell install: official PyTorch CUDA 13.2 wheels.
+# Jetson users should install NVIDIA's platform PyTorch build first, then use
+# `python -m pip install -e .` so that the existing torch satisfies metadata.
+--extra-index-url https://download.pytorch.org/whl/cu132
+torch==2.13.0+cu132
+torchao>=0.18.0
 numpy>=2.0,<3
 cuda-python>=13.0,<14
-nvidia-cutlass-dsl>=4.7,<4.8
+nvidia-cutlass-dsl[cu13]>=4.7,<4.8
+pyarrow>=16
+apache-tvm-ffi==0.1.13.post2
+einops
