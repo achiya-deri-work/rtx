@@ -65,6 +65,26 @@ ExportFormat = Literal["csv", "parquet", "both", "none"]
 
 
 @dataclass(frozen=True, slots=True)
+class AnytimeRunPolicy:
+    """Breadth-first campaign scheduling for useful preemptible runs."""
+
+    wall_time_s: float
+    context_slice_s: float = 120.0
+    trial_milestones: tuple[int, ...] = (32, 96, 192, 384, 512)
+    initial_promote: int = 2
+
+    def __post_init__(self) -> None:
+        if self.wall_time_s <= 0 or self.context_slice_s <= 0:
+            raise ValueError("anytime wall time and context slice must be positive")
+        if not self.trial_milestones or any(value <= 0 for value in self.trial_milestones):
+            raise ValueError("anytime trial milestones must be positive")
+        if tuple(sorted(set(self.trial_milestones))) != self.trial_milestones:
+            raise ValueError("anytime trial milestones must be unique and increasing")
+        if self.initial_promote <= 0:
+            raise ValueError("anytime initial promotion count must be positive")
+
+
+@dataclass(frozen=True, slots=True)
 class DatasetBackend:
     """Pluggable bridge from a manifest family to its harness and adapter."""
 
@@ -629,12 +649,16 @@ class DatasetCampaign:
         *,
         device: torch.device | str = "cuda",
         calibration: Mapping[str, object] | None = None,
+        anytime: AnytimeRunPolicy | None = None,
+        adopt_existing_context_identity: bool = False,
         progress=print,
     ) -> None:
         self.manifest = manifest
         self.output_dir = Path(output_dir)
         self.device = torch.device(device)
         self.progress = progress
+        self.anytime = anytime
+        self.adopt_existing_context_identity = adopt_existing_context_identity
         self.fingerprint = DeviceFingerprint.current(self.device)
         if self.fingerprint.capability[0] != 12:
             raise RuntimeError(
@@ -649,7 +673,39 @@ class DatasetCampaign:
             / str(self.machine["machine_id"])
             / f"shard-{manifest.shard_index:03d}-of-{manifest.shard_count:03d}"
         )
+        self.context_source = self.machine["source"]
+        if adopt_existing_context_identity:
+            self.context_source = self._existing_context_source()
         self.verification = ExperimentJournal(self.bundle / "verification.jsonl")
+
+    def _existing_context_source(self) -> Mapping[str, object]:
+        """Adopt v2 context tags after runner-only source changes.
+
+        This is deliberately opt-in: kernel changes should normally create new
+        context identifiers, while scheduler/CLI changes may safely continue an
+        existing append-only v2 bundle.
+        """
+
+        machine_path = self.bundle / "machine.json"
+        manifest_path = self.bundle / "manifest.json"
+        if not machine_path.exists() or not manifest_path.exists():
+            raise RuntimeError(
+                "--adopt-existing-context-identity requires an existing bundle at "
+                f"{self.bundle}"
+            )
+        try:
+            prior_machine = json.loads(machine_path.read_text(encoding="utf-8"))
+            prior_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"cannot read existing v2 bundle identity: {exc}") from exc
+        if prior_machine.get("machine_id") != self.machine.get("machine_id"):
+            raise RuntimeError("existing bundle machine identity does not match this device")
+        if _digest(prior_manifest) != self.manifest.digest:
+            raise RuntimeError("existing bundle manifest does not match the requested manifest")
+        source = prior_machine.get("source")
+        if not isinstance(source, dict) or not source.get("python_source_sha256"):
+            raise RuntimeError("existing bundle has no reusable source identity")
+        return source
 
     def _log(self, message: str) -> None:
         if self.progress is not None:
@@ -666,9 +722,9 @@ class DatasetCampaign:
             "campaign": self.manifest.name,
             "manifest_digest": self.manifest.digest,
             "machine_id": self.machine["machine_id"],
-            "source_sha256": self.machine["source"]["python_source_sha256"],  # type: ignore[index]
-            "git_commit": self.machine["source"].get("git_commit"),  # type: ignore[union-attr]
-            "git_dirty": self.machine["source"].get("git_dirty"),  # type: ignore[union-attr]
+            "source_sha256": self.context_source["python_source_sha256"],
+            "git_commit": self.context_source.get("git_commit"),
+            "git_dirty": self.context_source.get("git_dirty"),
         }
         return _BACKENDS[job.family].make_adapter(
             self, job, shape, regime, harness, tags
@@ -820,47 +876,293 @@ class DatasetCampaign:
             "winner_config": adapter.serialize(incumbent),
         }
 
-    def run(self, *, export_format: ExportFormat = "csv") -> Path:
-        self.bundle.mkdir(parents=True, exist_ok=True)
-        _atomic_json(self.bundle / "manifest.json", self.manifest.as_dict())
-        _atomic_json(self.bundle / "machine.json", self.machine)
-        results: list[dict[str, object]] = []
-        status = "complete"
-        started = time.monotonic()
-        try:
-            for job in self.manifest.jobs:
-                for shape in job.shapes:
-                    for regime in job.regimes:
-                        if not _assigned(self.manifest, job.family, shape, regime):
-                            continue
-                        self._log(f"START   {job.family} {shape.key} {regime}")
+    def _assigned_contexts(
+        self,
+    ) -> list[tuple[DatasetJob, ShapeSpec, CacheRegime]]:
+        contexts = [
+            (job, shape, regime)
+            for job in self.manifest.jobs
+            for shape in job.shapes
+            for regime in job.regimes
+            if _assigned(self.manifest, job.family, shape, regime)
+        ]
+        if self.anytime is None:
+            return contexts
+
+        family_order = {
+            "mxfp8_fused_fwd": 0,
+            "mxfp8_prequant_fwd": 1,
+            "mxfp8_bwd": 2,
+        }
+
+        def shape_priority(shape: ShapeSpec) -> int:
+            name = (shape.name or "").lower()
+            if "balanced" in name:
+                return 0
+            if "underfill" in name:
+                return 1
+            if any(token in name for token in ("one_m", "tiny", "short")):
+                return 2
+            if "wide" in name:
+                return 3
+            if any(token in name for token in ("long", "tall")):
+                return 4
+            if "deep" in name:
+                return 5
+            if not name:
+                return 6
+            if "large_cube" in name:
+                return 7
+            if "mlp" in name:
+                return 8
+            return 6
+
+        return sorted(
+            contexts,
+            key=lambda item: (
+                shape_priority(item[1]),
+                0 if item[2] == "hot" else 1,
+                family_order.get(item[0].family, 99),
+                item[1].m,
+                item[1].n,
+                item[1].k,
+            ),
+        )
+
+    @staticmethod
+    def _context_trials(store: JsonlTuningStore, adapter: KernelAdapter) -> int:
+        return sum(1 for _record in store.records(adapter.context))
+
+    def _run_context(
+        self,
+        job: DatasetJob,
+        shape: ShapeSpec,
+        regime: CacheRegime,
+        *,
+        target_trials: int | None = None,
+        time_budget_s: float | None = None,
+        promote: int | None = None,
+        verify: bool = True,
+    ) -> tuple[dict[str, object], int, int]:
+        harness = self._make_harness(job, shape, regime)
+        adapter = self._make_adapter(job, shape, regime, harness)
+        store = JsonlTuningStore(self.bundle / "stores" / job.family / regime)
+        before = self._context_trials(store, adapter)
+        effective_job = job
+        if target_trials is not None or time_budget_s is not None:
+            effective_job = replace(
+                effective_job,
+                tuning=replace(
+                    effective_job.tuning,
+                    max_trials=(
+                        effective_job.tuning.max_trials
+                        if target_trials is None
+                        else min(target_trials, effective_job.tuning.max_trials)
+                    ),
+                    time_budget_s=(
+                        effective_job.tuning.time_budget_s
+                        if time_budget_s is None
+                        else min(time_budget_s, effective_job.tuning.time_budget_s)
+                    ),
+                ),
+            )
+        if promote is not None:
+            effective_job = replace(effective_job, promote=min(promote, job.promote))
+        tuner = make_hybrid_autotuner(
+            adapter,
+            store,
+            effective_job.tuning,
+            progress=self.progress,
+        )
+        tuned = tuner.tune()
+        after = self._context_trials(store, adapter)
+        verification = (
+            self._verify(adapter, harness, effective_job, shape, regime, store)
+            if verify
+            else {"status": "deferred"}
+        )
+        return (
+            {
+                "family": job.family,
+                "shape": shape.key,
+                "regime": regime,
+                "context_id": adapter.context.identifier,
+                "target_trials": target_trials,
+                "trials_before": before,
+                "trials_after": after,
+                "tuning_best_ms": tuned.median_ms,
+                "evaluated_trials": tuned.evaluated_trials,
+                "elapsed_s": tuned.elapsed_s,
+                "verification": verification,
+            },
+            before,
+            after,
+        )
+
+    def _run_sequential(self, results: list[dict[str, object]]) -> str:
+        for job, shape, regime in self._assigned_contexts():
+            self._log(f"START   {job.family} {shape.key} {regime}")
+            result, _before, _after = self._run_context(job, shape, regime)
+            results.append(result)
+        return "complete"
+
+    def _run_anytime(
+        self,
+        results: list[dict[str, object]],
+        *,
+        started: float,
+    ) -> str:
+        assert self.anytime is not None
+        policy = self.anytime
+        deadline = started + policy.wall_time_s
+        contexts = self._assigned_contexts()
+        milestones = tuple(
+            sorted(
+                set(policy.trial_milestones)
+                | {job.tuning.max_trials for job, _shape, _regime in contexts}
+            )
+        )
+        first_milestone = milestones[0]
+        total = len(contexts)
+        self._log(
+            f"ANYTIME contexts={total} wall={policy.wall_time_s:.0f}s "
+            f"slice={policy.context_slice_s:.0f}s milestones={milestones}"
+        )
+        for milestone in milestones:
+            phase_targets = {
+                index: min(milestone, job.tuning.max_trials)
+                for index, (job, _shape, _regime) in enumerate(contexts)
+            }
+            self._log(f"PHASE   target={milestone} trials/context")
+            blocked: set[int] = set()
+            while True:
+                phase_pending = False
+                sweep_progress = False
+                for index, (job, shape, regime) in enumerate(contexts):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._log("DEADLINE global anytime wall-time exhausted")
+                        return "time_budget_exhausted"
+                    if index in blocked:
+                        continue
+                    target = phase_targets[index]
+                    self._log(
+                        f"CONTEXT {index + 1}/{total} {job.family} "
+                        f"{shape.key} {regime} target={target}"
+                    )
+                    try:
                         harness = self._make_harness(job, shape, regime)
                         adapter = self._make_adapter(job, shape, regime, harness)
                         store = JsonlTuningStore(
                             self.bundle / "stores" / job.family / regime
                         )
-                        tuner = make_hybrid_autotuner(
-                            adapter,
-                            store,
-                            job.tuning,
-                            progress=self.progress,
-                        )
-                        tuned = tuner.tune()
-                        verification = self._verify(
-                            adapter, harness, job, shape, regime, store
+                        current = self._context_trials(store, adapter)
+                    except Exception as exc:
+                        blocked.add(index)
+                        self._log(
+                            f"SKIP    {job.family} {shape.key} {regime} "
+                            f"setup_error {type(exc).__name__}: {exc}"
                         )
                         results.append(
                             {
                                 "family": job.family,
                                 "shape": shape.key,
                                 "regime": regime,
-                                "context_id": adapter.context.identifier,
-                                "tuning_best_ms": tuned.median_ms,
-                                "evaluated_trials": tuned.evaluated_trials,
-                                "elapsed_s": tuned.elapsed_s,
-                                "verification": verification,
+                                "target_trials": target,
+                                "status": "setup_error",
+                                "error": f"{type(exc).__name__}: {exc}"[:4000],
                             }
                         )
+                        continue
+                    if current >= target:
+                        continue
+                    phase_pending = True
+                    budget = min(policy.context_slice_s, remaining)
+                    verify = target == job.tuning.max_trials
+                    promote = job.promote if verify else policy.initial_promote
+                    # The actual run builds its own harness. Drop this probe
+                    # harness first so large rotating-input pools cannot overlap.
+                    del harness, adapter, store
+                    try:
+                        result, before, after = self._run_context(
+                            job,
+                            shape,
+                            regime,
+                            target_trials=target,
+                            time_budget_s=budget,
+                            promote=promote,
+                            verify=False,
+                        )
+                        if after > before:
+                            sweep_progress = True
+                        reached = after >= target
+                        if reached and (milestone == first_milestone or verify):
+                            # Rebuilds are cached; verification is intentionally
+                            # done only at broad coverage and final depth.
+                            harness = self._make_harness(job, shape, regime)
+                            adapter = self._make_adapter(job, shape, regime, harness)
+                            store = JsonlTuningStore(
+                                self.bundle / "stores" / job.family / regime
+                            )
+                            verify_job = replace(job, promote=promote)
+                            result["verification"] = self._verify(
+                                adapter, harness, verify_job, shape, regime, store
+                            )
+                        results.append(result)
+                    except Exception as exc:
+                        blocked.add(index)
+                        self._log(
+                            f"SKIP    {job.family} {shape.key} {regime} "
+                            f"tuning_error {type(exc).__name__}: {exc}"
+                        )
+                        results.append(
+                            {
+                                "family": job.family,
+                                "shape": shape.key,
+                                "regime": regime,
+                                "target_trials": target,
+                                "status": "tuning_error",
+                                "error": f"{type(exc).__name__}: {exc}"[:4000],
+                            }
+                        )
+                if not phase_pending:
+                    break
+                if not sweep_progress:
+                    self._log(f"PHASE   target={milestone} stalled; advancing")
+                    break
+        return "complete"
+
+    def run(self, *, export_format: ExportFormat = "csv") -> Path:
+        self.bundle.mkdir(parents=True, exist_ok=True)
+        _atomic_json(self.bundle / "manifest.json", self.manifest.as_dict())
+        if self.adopt_existing_context_identity:
+            self._log(
+                "RESUME  adopting existing v2 context identity "
+                f"source={str(self.context_source['python_source_sha256'])[:12]}"
+            )
+            _atomic_json(
+                self.bundle / "runner.json",
+                {
+                    "schema_version": DATASET_SCHEMA_VERSION,
+                    "recorded_at": _utc_now(),
+                    "runner_source": self.machine["source"],
+                    "adopted_context_source": self.context_source,
+                },
+            )
+        else:
+            _atomic_json(self.bundle / "machine.json", self.machine)
+        results: list[dict[str, object]] = []
+        status = "complete"
+        started = time.monotonic()
+        try:
+            status = (
+                self._run_sequential(results)
+                if self.anytime is None
+                else self._run_anytime(results, started=started)
+            )
+        except KeyboardInterrupt:
+            status = "interrupted"
+            raise
         except BaseException:
             status = "failed"
             raise
@@ -874,6 +1176,13 @@ class DatasetCampaign:
                     "elapsed_s": time.monotonic() - started,
                     "manifest_digest": self.manifest.digest,
                     "machine_id": self.machine["machine_id"],
+                    "run_mode": "sequential" if self.anytime is None else "anytime",
+                    "anytime_policy": (
+                        None if self.anytime is None else asdict(self.anytime)
+                    ),
+                    "adopted_existing_context_identity": (
+                        self.adopt_existing_context_identity
+                    ),
                     "results": results,
                 },
             )
@@ -1122,6 +1431,38 @@ def export_bundle(
     return report
 
 
+def _parse_duration(value: str) -> float:
+    text = value.strip().lower()
+    multipliers = {"s": 1.0, "m": 60.0, "h": 3600.0}
+    suffix = text[-1:] if text else ""
+    if suffix in multipliers:
+        text = text[:-1]
+        multiplier = multipliers[suffix]
+    else:
+        multiplier = 1.0
+    try:
+        seconds = float(text) * multiplier
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "duration must be seconds or a number suffixed by s, m, or h"
+        ) from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("duration must be positive and finite")
+    return seconds
+
+
+def _parse_milestones(value: str) -> tuple[int, ...]:
+    try:
+        milestones = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("milestones must be comma-separated integers") from exc
+    if not milestones or any(item <= 0 for item in milestones):
+        raise argparse.ArgumentTypeError("milestones must be positive")
+    if tuple(sorted(set(milestones))) != milestones:
+        raise argparse.ArgumentTypeError("milestones must be unique and increasing")
+    return milestones
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1137,6 +1478,34 @@ def _build_parser() -> argparse.ArgumentParser:
         "--calibration",
         type=Path,
         help="JSON emitted by 'rtx-autotune calibrate' on this machine",
+    )
+    run.add_argument(
+        "--wall-time",
+        type=_parse_duration,
+        help="enable anytime scheduling with this global budget (e.g. 2h or 90m)",
+    )
+    run.add_argument(
+        "--context-slice",
+        type=_parse_duration,
+        default=120.0,
+        help="maximum time per context visit in anytime mode (default: 2m)",
+    )
+    run.add_argument(
+        "--trial-milestones",
+        type=_parse_milestones,
+        default=(32, 96, 192, 384, 512),
+        help="absolute breadth-first trial targets (default: 32,96,192,384,512)",
+    )
+    run.add_argument(
+        "--initial-promote",
+        type=int,
+        default=2,
+        help="finalists verified after the first coverage milestone (default: 2)",
+    )
+    run.add_argument(
+        "--adopt-existing-context-identity",
+        action="store_true",
+        help="resume a v2 bundle across runner-only source changes",
     )
 
     collect = subparsers.add_parser("collect", help="merge copied campaign bundles")
@@ -1215,6 +1584,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.output_dir,
         device=args.device,
         calibration=calibration,
+        anytime=(
+            None
+            if args.wall_time is None
+            else AnytimeRunPolicy(
+                wall_time_s=args.wall_time,
+                context_slice_s=args.context_slice,
+                trial_milestones=args.trial_milestones,
+                initial_promote=args.initial_promote,
+            )
+        ),
+        adopt_existing_context_identity=args.adopt_existing_context_identity,
         progress=None if args.quiet else print,
     )
     bundle = campaign.run(export_format=args.format)
@@ -1222,6 +1602,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 
 __all__ = [
+    "AnytimeRunPolicy",
     "DATASET_SCHEMA_VERSION",
     "DatasetBackend",
     "DatasetCampaign",

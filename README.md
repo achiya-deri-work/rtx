@@ -104,6 +104,47 @@ Use `--format parquet` or `--format both` when the Parquet extra is installed.
 Every accepted observation is fsync'd to JSONL before the next candidate, so
 rerunning the same command resumes after interruption.
 
+For rented or preemptible machines, use the anytime schedule. It visits a
+representative, interleaved set of forward, prequant-forward, and backward
+contexts breadth-first at absolute trial milestones. Longer runs deepen the
+same contexts; shorter runs still cover all kernel families and cache regimes.
+
+```bash
+rtx-autotune run autotune_manifests/cross_device_dataset_v2.json \
+  --device cuda:0 \
+  --output-dir autotune_datasets \
+  --format both \
+  --calibration hardware_calibration.json \
+  --wall-time 12h \
+  --context-slice 2m
+```
+
+The default milestones are 32, 96, 192, 384, and 512 total trials per
+context—not new trials per invocation. The first breadth pass verifies two
+finalists, and fully searched contexts use the manifest's full confirmation
+policy. The global wall time and every context visit are checkpoints, and
+Ctrl-C preserves all observations already printed as `SAVE`.
+
+If this scheduler is pulled while a v2 run made by an older checkout already
+exists, explicitly adopt that bundle's context identity so the old observations
+count toward the same milestones:
+
+```bash
+rtx-autotune run autotune_manifests/cross_device_dataset_v2.json \
+  --device cuda:0 \
+  --output-dir autotune_datasets \
+  --format both \
+  --calibration hardware_calibration.json \
+  --wall-time 12h \
+  --context-slice 2m \
+  --adopt-existing-context-identity
+```
+
+That flag is intentionally opt-in and should only cross runner/autotuner-only
+changes. Do not use it after changing kernel implementations or kernel revision
+numbers. Reuse the exact same calibration JSON, output directory, manifest, and
+shard arguments as the original run.
+
 For multiple processes on one machine, split whole workload contexts:
 
 ```bash

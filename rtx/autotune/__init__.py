@@ -65,6 +65,7 @@ from .strategies import (
 
 def __getattr__(name: str):
     if name in {
+        "AnytimeRunPolicy",
         "DatasetCampaign",
         "DatasetBackend",
         "DatasetJob",
@@ -85,6 +86,7 @@ def __getattr__(name: str):
 __all__ = [
     "ArmStatistics",
     "ArchitectureProfile",
+    "AnytimeRunPolicy",
     "AutotuneOrchestrator",
     "CalibratedBwdEvaluator",
     "CalibratedPrequantEvaluator",

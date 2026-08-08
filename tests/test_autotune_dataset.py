@@ -15,11 +15,14 @@ from rtx.autotune import (
 )
 from rtx.autotune.core import Proposal, evaluate_proposal
 from rtx.autotune.dataset import (
+    AnytimeRunPolicy,
+    DatasetCampaign,
     DatasetManifest,
     export_bundle,
     export_parquet,
     normalized_rows,
 )
+from rtx.autotune import dataset as dataset_module
 from rtx.prequant_experiments import ExperimentJournal
 
 
@@ -55,6 +58,55 @@ def _adapter() -> DiscreteKernelAdapter[_Config]:
 
 
 class DatasetTests(unittest.TestCase):
+    def test_anytime_policy_and_duration_parsing(self) -> None:
+        self.assertEqual(dataset_module._parse_duration("2h"), 7200.0)
+        self.assertEqual(dataset_module._parse_duration("90m"), 5400.0)
+        self.assertEqual(dataset_module._parse_duration("15"), 15.0)
+        self.assertEqual(dataset_module._parse_milestones("8,32,96"), (8, 32, 96))
+        with self.assertRaises(ValueError):
+            AnytimeRunPolicy(10.0, trial_milestones=(32, 16))
+
+    def test_anytime_context_order_is_breadth_first_across_families(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        manifest = DatasetManifest.load(
+            root / "autotune_manifests" / "cross_device_dataset_v2.json"
+        )
+        campaign = DatasetCampaign.__new__(DatasetCampaign)
+        campaign.manifest = manifest
+        campaign.anytime = AnytimeRunPolicy(60.0)
+        contexts = campaign._assigned_contexts()
+        first = [(job.family, shape.name, regime) for job, shape, regime in contexts[:3]]
+        self.assertEqual(
+            first,
+            [
+                ("mxfp8_fused_fwd", "balanced", "hot"),
+                ("mxfp8_prequant_fwd", "balanced", "hot"),
+                ("mxfp8_bwd", "balanced", "hot"),
+            ],
+        )
+        self.assertEqual(len(contexts), 54)
+
+    def test_existing_v2_context_identity_is_explicitly_reusable(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        manifest = DatasetManifest.load(
+            root / "autotune_manifests" / "cross_device_dataset_v2.json"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            source = {"python_source_sha256": "old-source", "git_commit": "old"}
+            (bundle / "machine.json").write_text(
+                json.dumps({"machine_id": "same-machine", "source": source}),
+                encoding="utf-8",
+            )
+            (bundle / "manifest.json").write_text(
+                json.dumps(manifest.as_dict()), encoding="utf-8"
+            )
+            campaign = DatasetCampaign.__new__(DatasetCampaign)
+            campaign.bundle = bundle
+            campaign.machine = {"machine_id": "same-machine"}
+            campaign.manifest = manifest
+            self.assertEqual(campaign._existing_context_source(), source)
+
     def test_repository_manifests_validate_and_round_trip(self) -> None:
         root = Path(__file__).resolve().parents[1]
         for name in (
