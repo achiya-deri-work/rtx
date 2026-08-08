@@ -52,6 +52,7 @@ from ..prequant_experiments import (
     _atomic_json,
     _device_properties,
     _nvidia_smi_snapshot,
+    _reference_prequant_config,
     probe_device,
     robust_summary,
 )
@@ -547,6 +548,7 @@ def _prequant_adapter(
     return make_mxfp8_prequant_adapter(
         shape.problem,
         evaluator,
+        initial=_reference_prequant_config(shape.problem),
         device=campaign.fingerprint,
         regime=regime,
         tags=tags,

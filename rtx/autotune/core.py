@@ -267,11 +267,17 @@ class DiscreteKernelAdapter(Generic[ConfigT]):
             steps = rng.randint(1, max(1, min(8, len(coordinates))))
             for _step in range(steps):
                 coordinate = rng.choice(coordinates)
-                candidate = self.update_fn(
+                proposal = self.update_fn(
                     candidate, coordinate, rng.choice(tuple(self.axes[coordinate]))
                 )
+                # Coupled hardware spaces are overwhelmingly sparse. Preserve
+                # legality after every random-walk step rather than applying a
+                # sequence of independent mutations and hoping the final point
+                # happens to repair every broken invariant.
+                if self.rejection(proposal) is None:
+                    candidate = proposal
             identifier = self.config_id(candidate)
-            if identifier in seen:
+            if identifier in seen or self.rejection(candidate) is not None:
                 continue
             seen.add(identifier)
             result.append(candidate)

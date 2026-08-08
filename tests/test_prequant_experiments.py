@@ -17,6 +17,7 @@ from rtx.prequant_experiments import (
     ExperimentJournal,
     ExperimentManifest,
     ShapeSpec,
+    _reference_prequant_config,
     config_in_shard,
     derived_features,
     export_journal_csv,
@@ -45,6 +46,17 @@ def _fingerprint() -> DeviceFingerprint:
 
 
 class PrequantExperimentTests(unittest.TestCase):
+    def test_reference_config_supports_64_row_campaign_shapes(self) -> None:
+        problem = MXFP8Problem(64, 1536, 1536)
+        config = _reference_prequant_config(problem)
+        self.assertIsNone(config.rejection(problem))
+        self.assertEqual(config.gemm.scale_layout, "row_major")
+        regular = MXFP8Problem(128, 1536, 1536)
+        self.assertEqual(
+            _reference_prequant_config(regular),
+            DEFAULT_MXFP8_PREQUANT_CONFIG,
+        )
+
     def test_manifest_round_trip_and_digest(self) -> None:
         manifest = ExperimentManifest(
             name="pilot",

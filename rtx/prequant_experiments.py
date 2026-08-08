@@ -597,6 +597,23 @@ class CandidateCorrectnessError(RuntimeError):
     pass
 
 
+def _reference_prequant_config(problem: MXFP8Problem) -> MXFP8PrequantConfig:
+    """Choose a stable legal reference family, including for 64-row shapes."""
+
+    if DEFAULT_MXFP8_PREQUANT_CONFIG.rejection(problem) is None:
+        return DEFAULT_MXFP8_PREQUANT_CONFIG
+    for updates in PREQUANT_SEARCH_SPACE["layout_transport"]:
+        candidate = update_prequant_config(DEFAULT_MXFP8_PREQUANT_CONFIG, updates)
+        if (
+            candidate.gemm.scale_layout == "row_major"
+            and candidate.rejection(problem) is None
+        ):
+            return candidate
+    raise RuntimeError(
+        f"no legal prequant correctness-reference configuration for {problem}"
+    )
+
+
 class PrequantBenchmarkHarness:
     """Own tensors and perform calibrated measurements for one shape/regime."""
 
@@ -655,10 +672,14 @@ class PrequantBenchmarkHarness:
         return ring
 
     def _make_reference(self) -> torch.Tensor:
+        # The global native mma128 default requires M/N/K multiples of 128.
+        # Campaigns deliberately include M=64, where row-major transport is
+        # used as the correctness reference instead.
+        reference_config = _reference_prequant_config(self.problem)
         runner = _build_prequant_runner(
             self.x,
             self.weight,
-            _intern_prequant_config(DEFAULT_MXFP8_PREQUANT_CONFIG),
+            _intern_prequant_config(reference_config),
         )
         out = torch.empty(
             (self.shape.m, self.shape.n), device=self.device, dtype=torch.bfloat16

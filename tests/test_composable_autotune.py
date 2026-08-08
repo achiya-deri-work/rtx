@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 import json
 from pathlib import Path
+import random
 import tempfile
 import unittest
 
@@ -333,6 +334,23 @@ class ComposableAutotuneTests(unittest.TestCase):
             )
             self.assertTrue(adapter.features(restored))
             self.assertTrue(adapter.coordinates())
+
+    def test_fused_random_walk_preserves_legality_and_explores(self) -> None:
+        adapter = make_mxfp8_fwd_adapter(
+            MXFP8Problem(128, 1536, 1536),
+            lambda _config: TrialOutcome("ok", median_ms=1.0),
+        )
+        candidates = adapter.sample(
+            random.Random(20260808),
+            32,
+            (adapter.initial_config,),
+        )
+        self.assertGreater(len(candidates), 1)
+        self.assertTrue(all(adapter.rejection(config) is None for config in candidates))
+        self.assertGreater(
+            len({adapter.config_id(config) for config in candidates}),
+            1,
+        )
 
     def test_adapter_rejects_unknown_axes_before_a_long_run(self) -> None:
         problem = MXFP8Problem(128, 128, 128)
