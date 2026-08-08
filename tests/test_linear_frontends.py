@@ -175,6 +175,25 @@ class LinearFrontendContractTests(unittest.TestCase):
                 rtx.mxfp8_linear(packed_x, packed_w).shape, (2, 64)
             )
 
+    def test_packed_cache_selection_is_deferred_behind_an_opaque_token(self) -> None:
+        from rtx import fp8
+        from rtx.kernels.mxfp8 import MXFP8Problem
+
+        data = torch.empty(64, 128, dtype=torch.float8_e4m3fn)
+        scales = torch.empty(64, 4, dtype=torch.float8_e8m0fnu)
+        weight = rtx.MXFP8Tensor(data, scales, (64, 128))
+        key = fp8._packed_inference_config_key(
+            MXFP8Problem(32, 64, 128),
+            weight,
+            x=None,
+            explicit=None,
+            autotune="cache",
+            tuning_policy=None,
+            cache_dir=None,
+        )
+        self.assertTrue(key.startswith("packed-autotune:"))
+        self.assertIn(key, fp8._PACKED_INFERENCE_AUTOTUNE_REQUESTS)
+
     def test_nvfp4_fake_dispatch_covers_packed_states(self) -> None:
         _ = rtx.NVFP4Linear
         fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)

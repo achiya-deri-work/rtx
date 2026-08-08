@@ -5,6 +5,11 @@ import unittest
 import torch
 
 import rtx
+from rtx.configs import MXFP8FullyPrequantConfig, MXFP8WeightPrequantConfig
+from rtx.inference_experiments import (
+    FullyPrequantBenchmarkHarness,
+    WeightPrequantBenchmarkHarness,
+)
 
 from rtx.kernels.mxfp8_quant import (
     MXFP8QuantConfig,
@@ -13,6 +18,7 @@ from rtx.kernels.mxfp8_quant import (
 )
 from rtx.kernels.mxfp8 import MXFP8Problem
 from rtx.kernels.mxfp8_gemm import MXFP8GemmConfig, compile_mxfp8_gemm
+from rtx.prequant_experiments import BenchmarkProtocol, ShapeSpec
 
 
 def _reference(src: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -256,9 +262,64 @@ class MXFP8QuantCudaTests(unittest.TestCase):
             fully_packed = rtx.mxfp8_linear(
                 packed_x, packed_weight, prequant_config=config
             )
+            layer = rtx.MXFP8Linear(
+                256,
+                128,
+                packed_weight=packed_weight,
+                autotune="cache",
+            )
+            compiled = torch.compile(layer, fullgraph=True, dynamic=False)
+            compiled_aot_weight = compiled(x)
+            compiled_fully_packed = compiled(packed_x)
         torch.cuda.synchronize()
         torch.testing.assert_close(aot_weight, dynamic, rtol=0, atol=0)
         torch.testing.assert_close(fully_packed, dynamic, rtol=0, atol=0)
+        torch.testing.assert_close(compiled_aot_weight, dynamic, rtol=0, atol=0)
+        torch.testing.assert_close(compiled_fully_packed, dynamic, rtol=0, atol=0)
+
+    def test_state_specific_harnesses_exclude_aot_packing_from_timing(self) -> None:
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("native kernel requires SM120/SM121")
+        shape = ShapeSpec(128, 128, 256)
+        protocol = BenchmarkProtocol(
+            warmup_calls=1,
+            samples=3,
+            confirm_samples=3,
+            race_rounds=3,
+            target_batch_ms=1.0,
+            max_calls_per_sample=16,
+            bootstrap_resamples=100,
+            telemetry=False,
+        )
+        cases = (
+            (
+                WeightPrequantBenchmarkHarness,
+                MXFP8WeightPrequantConfig(),
+                "x_quant",
+            ),
+            (
+                FullyPrequantBenchmarkHarness,
+                MXFP8FullyPrequantConfig(),
+                None,
+            ),
+        )
+        for harness_type, config, quant_component in cases:
+            with self.subTest(harness=harness_type.__name__):
+                harness = harness_type(
+                    shape, "hot", protocol, device="cuda", seed=1706
+                )
+                result = harness.measure(
+                    config, samples=3, seed=1707, components=True
+                )
+                self.assertEqual(result["status"], "ok", result.get("error"))
+                components = result["components"]
+                self.assertIn("gemm_hot_packed", components)
+                self.assertEqual(
+                    quant_component in components,
+                    quant_component is not None,
+                )
+                self.assertNotIn("w_quant", components)
+                self.assertNotIn("dual_quant", components)
 
 
 if __name__ == "__main__":

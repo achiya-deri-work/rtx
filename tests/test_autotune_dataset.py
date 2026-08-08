@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, replace
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 from rtx.autotune import (
@@ -113,12 +114,49 @@ class DatasetTests(unittest.TestCase):
             "dataset_pilot.json",
             "cross_device_dataset_v1.json",
             "cross_device_dataset_v2.json",
+            "inference_states_pilot_v1.json",
         ):
             manifest = DatasetManifest.load(root / "autotune_manifests" / name)
             restored = DatasetManifest.from_dict(manifest.as_dict())
             self.assertEqual(restored, manifest)
             self.assertEqual(restored.digest, manifest.digest)
             self.assertGreater(sum(len(job.shapes) for job in manifest.jobs), 0)
+
+    def test_every_registered_public_family_constructs_an_adapter(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        manifests = (
+            DatasetManifest.load(
+                root / "autotune_manifests" / "cross_device_dataset_v2.json"
+            ),
+            DatasetManifest.load(
+                root / "autotune_manifests" / "inference_states_pilot_v1.json"
+            ),
+        )
+        jobs = {
+            job.family: job for manifest in manifests for job in manifest.jobs
+        }
+        expected = {
+            "mxfp8_fused_fwd",
+            "mxfp8_prequant_fwd",
+            "mxfp8_weight_prequant_fwd",
+            "mxfp8_fully_prequant_fwd",
+            "mxfp8_bwd",
+        }
+        self.assertTrue(expected.issubset(jobs))
+        campaign = SimpleNamespace(
+            manifest=SimpleNamespace(seed=7),
+            hardware_profile={},
+        )
+        for family in expected:
+            with self.subTest(family=family):
+                job = jobs[family]
+                shape = job.shapes[0]
+                harness = SimpleNamespace(problem=shape.problem)
+                adapter = dataset_module._BACKENDS[family].make_adapter(
+                    campaign, job, shape, "hot", harness, {}
+                )
+                self.assertIsInstance(adapter, DiscreteKernelAdapter)
+                self.assertEqual(adapter.context.family, family)
 
     def test_normalized_export_joins_context_and_deduplicates(self) -> None:
         adapter = _adapter()

@@ -19,6 +19,8 @@ _LAZY_EXPORTS = {
     "MXFP8PrequantConfig": ("fp8", "MXFP8PrequantConfig"),
     "MXFP8QuantConfig": ("configs", "MXFP8QuantConfig"),
     "MXFP8GemmConfig": ("configs", "MXFP8GemmConfig"),
+    "MXFP8WeightPrequantConfig": ("configs", "MXFP8WeightPrequantConfig"),
+    "MXFP8FullyPrequantConfig": ("configs", "MXFP8FullyPrequantConfig"),
     "MXFP8FwdConfig": ("kernels.mxfp8", "MXFP8FwdConfig"),
     "MXFP8Problem": ("kernels.mxfp8", "MXFP8Problem"),
     "DEFAULT_MXFP8_BWD_CONFIG": ("fp8_bwd", "DEFAULT_MXFP8_BWD_CONFIG"),
@@ -43,6 +45,10 @@ _LAZY_EXPORTS = {
         "load_cached_mxfp8_prequant_config",
     ),
     "tune_mxfp8_prequant": ("prequant_autotune", "tune_mxfp8_prequant"),
+    "tune_mxfp8_inference_state": (
+        "inference_autotune",
+        "tune_mxfp8_inference_state",
+    ),
 }
 
 

@@ -150,12 +150,16 @@ DEFAULT_MXFP8_INFERENCE_CONFIG = MXFP8PrequantConfig(
 _CONFIGS: dict[str, MXFP8FwdConfig] = {}
 _PREQUANT_CONFIGS: dict[str, MXFP8PrequantConfig] = {}
 _PREQUANT_AUTOTUNE_REQUESTS: dict[str, "_PrequantAutotuneRequest"] = {}
+_PACKED_INFERENCE_AUTOTUNE_REQUESTS: dict[
+    str, "_PackedInferenceAutotuneRequest"
+] = {}
 _PREQUANT_AUTOTUNE_SELECTIONS: dict[tuple[object, ...], str] = {}
 _PREQUANT_RUNNERS: dict[
     tuple[object, ...],
     "_PrequantRunner",
 ] = {}
 _WEIGHT_PREQUANT_RUNNERS: dict[tuple[object, ...], "_WeightPrequantRunner"] = {}
+_PACKED_INFERENCE_SELECTIONS: dict[tuple[object, ...], MXFP8PrequantConfig] = {}
 
 
 class _InductorPrequantLauncherRegistry(dict[str, object]):
@@ -255,6 +259,13 @@ class _PrequantAutotuneRequest:
     initial: MXFP8PrequantConfig
 
 
+@dataclass(frozen=True, slots=True)
+class _PackedInferenceAutotuneRequest:
+    mode: AutotuneMode
+    policy: object | None
+    cache_dir: str | None
+
+
 def _intern_config(config: MXFP8FwdConfig) -> str:
     key = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
     with _CONFIG_LOCK:
@@ -293,6 +304,31 @@ def _intern_prequant_autotune_request(
             policy=policy,
             cache_dir=payload["cache_dir"],
             initial=initial,
+        )
+    return key
+
+
+@torch.compiler.assume_constant_result
+def _intern_packed_inference_autotune_request(
+    mode: AutotuneMode,
+    policy: object | None,
+    cache_dir: Path | str | None,
+) -> str:
+    policy_value = None if policy is None else asdict(policy)
+    payload = {
+        "mode": mode,
+        "policy": policy_value,
+        "cache_dir": None if cache_dir is None else str(Path(cache_dir).expanduser()),
+    }
+    digest = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    key = "packed-autotune:" + hashlib.sha256(digest.encode()).hexdigest()[:24]
+    with _CONFIG_LOCK:
+        _PACKED_INFERENCE_AUTOTUNE_REQUESTS[key] = (
+            _PackedInferenceAutotuneRequest(
+                mode=mode,
+                policy=policy,
+                cache_dir=payload["cache_dir"],
+            )
         )
     return key
 
@@ -790,6 +826,9 @@ def _launch_weight_prequant_out(
         raise ValueError("dynamic X and packed W have incompatible shape/device")
     x_c = x if x.is_contiguous() else x.contiguous()
     problem = MXFP8Problem(int(x_c.shape[0]), n, k)
+    config_key = _resolve_packed_inference_request(
+        problem, weight, x=None, config_key=config_key
+    )
     try:
         requested = _PREQUANT_CONFIGS[config_key]
     except KeyError as exc:
@@ -898,9 +937,13 @@ def _mxfp8_linear_prequantized_op(
         weight_data, weight_scales, n, k, weight_scale_layout
     )
     problem = _validate_packed_linear_operands(x, weight)
+    config_key = _resolve_packed_inference_request(
+        problem, weight, x=x, config_key=config_key
+    )
     config = _packed_gemm_config(
         problem, x.scale_layout, weight.scale_layout, config_key
     )
+    _ensure_l2_fetch_granularity(config.l2_fetch_granularity)
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     launcher = compile_mxfp8_gemm(problem, config.gemm)
     launcher(x.data, weight.data, x.scales, weight.scales, out)
@@ -961,6 +1004,240 @@ def _run_fully_prequantized(
     )
 
 
+def _default_packed_inference_config(
+    problem: MXFP8Problem,
+    weight: MXFP8Tensor,
+    x: MXFP8Tensor | None,
+) -> MXFP8PrequantConfig:
+    if x is None:
+        if weight.scale_layout == "row_major":
+            layouts = ("row_major", "row_major")
+        elif problem.m % 128 == 0:
+            layouts = ("mma128", "mma128")
+        elif problem.m % 64 == 0:
+            layouts = ("mma64", "mma128")
+        else:
+            raise RuntimeError(
+                "native packed W requires M divisible by 64 for a compatible "
+                "activation scale layout"
+            )
+    else:
+        layouts = (x.scale_layout, weight.scale_layout)
+    if layouts == ("row_major", "row_major"):
+        return DEFAULT_MXFP8_INFERENCE_CONFIG
+    if layouts == ("mma128", "mma128"):
+        gemm = MXFP8GemmConfig(
+            atom_layout_m=4,
+            scale_role="tma",
+            scale_layout="mma128",
+            epilogue="direct",
+            store_vec=1,
+        )
+    elif layouts == ("mma64", "mma128"):
+        gemm = MXFP8GemmConfig(
+            tile_m=64,
+            atom_layout_m=2,
+            stages=1,
+            scale_role="tma",
+            scale_layout="mma64x128",
+            epilogue="direct",
+            store_vec=1,
+        )
+    else:
+        raise RuntimeError(
+            f"no MXFP8 GEMM transport accepts packed layouts {layouts}"
+        )
+    return MXFP8PrequantConfig(
+        quant=replace(MXFP8QuantConfig(), scale_layout=layouts[0]),
+        weight_quant=replace(MXFP8QuantConfig(), scale_layout=layouts[1]),
+        gemm=gemm,
+        quant_launches="separate",
+    )
+
+
+def _resolve_packed_inference_config(
+    problem: MXFP8Problem,
+    weight: MXFP8Tensor,
+    *,
+    x: MXFP8Tensor | None,
+    explicit: MXFP8PrequantConfig | None,
+    autotune: AutotuneMode | bool | None,
+    tuning_policy: object | None,
+    cache_dir: Path | str | None,
+) -> MXFP8PrequantConfig:
+    if explicit is not None:
+        return explicit
+    fallback = _default_packed_inference_config(problem, weight, x)
+    mode = _autotune_mode(autotune)
+    if (
+        mode == "off"
+        or torch.compiler.is_compiling()
+        or not torch.cuda.is_available()
+    ):
+        return fallback
+    selection_key = (
+        "fully_prequantized" if x is not None else "weight_prequantized",
+        weight.device.index,
+        problem.m,
+        problem.n,
+        problem.k,
+        None if x is None else x.scale_layout,
+        weight.scale_layout,
+        mode,
+        None if cache_dir is None else str(Path(cache_dir).expanduser()),
+    )
+    cached_selection = _PACKED_INFERENCE_SELECTIONS.get(selection_key)
+    if cached_selection is not None:
+        return cached_selection
+    from .autotune.winners import load_runtime_winner, runtime_winner_key
+    from .inference_autotune import (
+        fully_prequant_config_from_dict,
+        tune_mxfp8_inference_state,
+        weight_prequant_config_from_dict,
+    )
+
+    if x is None:
+        from .configs import MXFP8WeightPrequantConfig
+
+        family = "mxfp8_weight_prequant_fwd"
+        variant = f"w-{weight.scale_layout}"
+        key = runtime_winner_key(
+            family, problem, device=weight.device, variant=variant
+        )
+        selected = load_runtime_winner(
+            key,
+            weight_prequant_config_from_dict,
+            root=cache_dir,
+            rejection=lambda config: (
+                config.rejection(problem)
+                or (
+                    "cached weight scale layout does not match packed W"
+                    if config.operand_scale_layouts[1] != weight.scale_layout
+                    else None
+                )
+            ),
+        )
+        if selected is None:
+            if mode != "coordinate":
+                _PACKED_INFERENCE_SELECTIONS[selection_key] = fallback
+                return fallback
+            selected = tune_mxfp8_inference_state(
+                problem,
+                state="weight_prequantized",
+                weight_layout=weight.scale_layout,
+                device=weight.device,
+                cache_dir=cache_dir,
+                policy=tuning_policy,
+            )
+        assert isinstance(selected, MXFP8WeightPrequantConfig)
+        resolved = MXFP8PrequantConfig(
+            quant=selected.quant_x,
+            weight_quant=selected.weight_packing_quant(),
+            gemm=selected.gemm,
+            quant_launches="separate",
+            l2_fetch_granularity=selected.l2_fetch_granularity,
+        )
+        _PACKED_INFERENCE_SELECTIONS[selection_key] = resolved
+        return resolved
+
+    from .configs import MXFP8FullyPrequantConfig
+
+    family = "mxfp8_fully_prequant_fwd"
+    variant = f"x-{x.scale_layout}_w-{weight.scale_layout}"
+    key = runtime_winner_key(
+        family, problem, device=weight.device, variant=variant
+    )
+    selected = load_runtime_winner(
+        key,
+        fully_prequant_config_from_dict,
+        root=cache_dir,
+        rejection=lambda config: (
+            config.rejection(problem)
+            or (
+                "cached operand layouts do not match packed X/W"
+                if config.operand_scale_layouts
+                != (x.scale_layout, weight.scale_layout)
+                else None
+            )
+        ),
+    )
+    if selected is None:
+        if mode != "coordinate":
+            _PACKED_INFERENCE_SELECTIONS[selection_key] = fallback
+            return fallback
+        selected = tune_mxfp8_inference_state(
+            problem,
+            state="fully_prequantized",
+            activation_layout=x.scale_layout,
+            weight_layout=weight.scale_layout,
+            device=weight.device,
+            cache_dir=cache_dir,
+            policy=tuning_policy,
+        )
+    assert isinstance(selected, MXFP8FullyPrequantConfig)
+    resolved = MXFP8PrequantConfig(
+        quant=selected.activation_packing_quant(),
+        weight_quant=selected.weight_packing_quant(),
+        gemm=selected.gemm,
+        quant_launches="separate",
+        l2_fetch_granularity=selected.l2_fetch_granularity,
+    )
+    _PACKED_INFERENCE_SELECTIONS[selection_key] = resolved
+    return resolved
+
+
+def _resolve_packed_inference_request(
+    problem: MXFP8Problem,
+    weight: MXFP8Tensor,
+    *,
+    x: MXFP8Tensor | None,
+    config_key: str,
+) -> str:
+    request = _PACKED_INFERENCE_AUTOTUNE_REQUESTS.get(config_key)
+    if request is None:
+        return config_key
+    selected = _resolve_packed_inference_config(
+        problem,
+        weight,
+        x=x,
+        explicit=None,
+        autotune=request.mode,
+        tuning_policy=request.policy,
+        cache_dir=request.cache_dir,
+    )
+    return _intern_prequant_config(selected)
+
+
+def _packed_inference_config_key(
+    problem: MXFP8Problem,
+    weight: MXFP8Tensor,
+    *,
+    x: MXFP8Tensor | None,
+    explicit: MXFP8PrequantConfig | None,
+    autotune: AutotuneMode | bool | None,
+    tuning_policy: object | None,
+    cache_dir: Path | str | None,
+) -> str:
+    mode = _autotune_mode(autotune)
+    if explicit is not None or mode == "off":
+        selected = _resolve_packed_inference_config(
+            problem,
+            weight,
+            x=x,
+            explicit=explicit,
+            autotune=mode,
+            tuning_policy=tuning_policy,
+            cache_dir=cache_dir,
+        )
+        return _intern_prequant_config(selected)
+    # The request token remains opaque to Dynamo/Inductor. The custom-op
+    # implementation resolves it against the real device, shape, and physical
+    # operand layouts on first execution.
+    return _intern_packed_inference_autotune_request(
+        mode, tuning_policy, cache_dir
+    )
+
+
 def _launch_training_forward(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -997,11 +1274,19 @@ def mxfp8_linear(
     """
 
     if isinstance(weight, MXFP8Tensor):
-        selected = prequant_config or DEFAULT_MXFP8_INFERENCE_CONFIG
-        key = _intern_prequant_config(selected)
         if isinstance(x, MXFP8Tensor):
             if x.shape[-1] != weight.shape[-1]:
                 raise ValueError("packed activation and weight K must match")
+            problem = _validate_packed_linear_operands(x, weight)
+            key = _packed_inference_config_key(
+                problem,
+                weight,
+                x=x,
+                explicit=prequant_config,
+                autotune=autotune,
+                tuning_policy=tuning_policy,
+                cache_dir=autotune_cache_dir,
+            )
             out = _run_fully_prequantized(x, weight, key)
             return out.reshape(*x.shape[:-1], weight.matrix_shape[0])
         if x.ndim < 1 or x.shape[-1] != weight.shape[-1]:
@@ -1021,6 +1306,18 @@ def mxfp8_linear(
             )
         leading_shape = x.shape[:-1]
         x_2d = x.reshape(-1, x.shape[-1])
+        problem = MXFP8Problem(
+            int(x_2d.shape[0]), weight.matrix_shape[0], weight.matrix_shape[1]
+        )
+        key = _packed_inference_config_key(
+            problem,
+            weight,
+            x=None,
+            explicit=prequant_config,
+            autotune=autotune,
+            tuning_policy=tuning_policy,
+            cache_dir=autotune_cache_dir,
+        )
         out = _run_weight_prequantized(x_2d, weight, key)
         return out.reshape(*leading_shape, weight.matrix_shape[0])
     if isinstance(x, MXFP8Tensor):
@@ -1342,7 +1639,7 @@ class MXFP8Linear(nn.Module):
             module.out_features,
             bias=False,
             device=module.weight.device,
-            prequant_config=selected,
+            prequant_config=prequant_config,
             packed_weight=packed,
         )
 
@@ -1370,7 +1667,11 @@ class MXFP8Linear(nn.Module):
             tuning_policy=self.tuning_policy,
             autotune_cache_dir=self.autotune_cache_dir,
             backend=self.backend,
-            prequant_config=selected,
+            prequant_config=(
+                prequant_config
+                if prequant_config is not None
+                else self.prequant_config
+            ),
             backward_config=self.backward_config,
             packed_weight=packed,
         )
@@ -1382,9 +1683,10 @@ class MXFP8Linear(nn.Module):
             return mxfp8_linear(
                 x,
                 packed_weight,
-                prequant_config=(
-                    self.prequant_config or DEFAULT_MXFP8_INFERENCE_CONFIG
-                ),
+                autotune=self.autotune,
+                tuning_policy=self.tuning_policy,
+                autotune_cache_dir=self.autotune_cache_dir,
+                prequant_config=self.prequant_config,
             )
         if isinstance(x, MXFP8Tensor):
             raise TypeError(

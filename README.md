@@ -264,10 +264,25 @@ count:
 }
 ```
 
-Supported families are `mxfp8_fused_fwd`, `mxfp8_prequant_fwd`, and
-`mxfp8_bwd`. Additional kernel families can register a `DatasetBackend` with
+Supported families are `mxfp8_fused_fwd`, `mxfp8_prequant_fwd`,
+`mxfp8_weight_prequant_fwd`, `mxfp8_fully_prequant_fwd`, and `mxfp8_bwd`.
+The two persistent inference families never time their AOT packing work and do
+not expose inactive quantizer coordinates. Additional kernel families can
+register a `DatasetBackend` with
 `rtx.autotune.register_dataset_backend`; campaign orchestration, persistence,
 verification, and export do not need to change.
+
+After the active v2 campaign is collected, run the bounded inference pilot:
+
+```bash
+rtx-autotune run autotune_manifests/inference_states_pilot_v1.json \
+  --device cuda:0 --output-dir autotune_datasets --format both
+```
+
+Every verified winner is also written below the bundle's `runtime_winners/`
+directory. Point a packed layer's `autotune_cache_dir` at that bundle to use a
+matching hot-regime winner. Cache identity includes exact device/software
+fingerprint, M/N/K, operand state, and physical scale layouts.
 
 ## Tests
 

@@ -7,16 +7,31 @@ AOT-weight or fully packed inference states introduced by the public packed
 operand API. Historical family names remain frozen so active datasets resume
 without relabeling observations.
 
+Persistent inference uses separate families:
+
+- `mxfp8_weight_prequant_fwd` measures X quantization plus GEMM and treats W
+  packing as untimed AOT work;
+- `mxfp8_fully_prequant_fwd` measures GEMM only and treats both packing steps
+  as untimed AOT work.
+
+Their search spaces structurally remove inactive quantizer axes rather than
+relying on rejection or hoping the learned model ignores no-op coordinates.
+
 The MXFP8 frontend has three selection modes:
 
 - `off`: always use the built-in baseline unless an explicit config is passed.
 - `cache`: use a compatible saved winner, otherwise use the baseline. This is
   the default.
 - `coordinate`: run/resume coordinate descent on first use and then execute the
-  winner.
+  winner. Persistent inference states use the composable learned-global plus
+  local-search engine under the same public mode name.
 
 An explicit `MXFP8FwdConfig` or `MXFP8PrequantConfig` always wins over
 autotuning.
+
+Packed-state requests remain opaque through `torch.compile`; exact device,
+shape, operand-state, and physical-layout cache selection occurs inside the
+custom-op runtime on first execution rather than being frozen during tracing.
 
 ## Executable search space
 

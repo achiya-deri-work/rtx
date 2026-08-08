@@ -3,6 +3,16 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.4.0
+
+- Add distinct AOT-weight and fully-packed MXFP8 tuning families.
+- Remove inactive operand-quantizer coordinates from both inference spaces.
+- Add calibrated hot/rotating inference harnesses which exclude AOT packing
+  from authoritative timing.
+- Persist promoted winners in a device, shape, state, regime, and physical
+  layout-specific runtime cache.
+- Add a bounded cross-device inference pilot manifest.
+
 ## 0.3.0
 
 - Rename the distribution and public package identity to `rtx`.

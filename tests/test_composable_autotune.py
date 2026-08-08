@@ -18,14 +18,19 @@ from rtx.autotune import (
     JsonlTuningStore,
     KernelContext,
     RandomSearch,
+    RuntimeWinnerKey,
     SequentialScheduler,
     TrialOutcome,
     TuningBudget,
     UCB1Scheduler,
     import_legacy_json_database,
     make_mxfp8_bwd_adapter,
+    make_mxfp8_fully_prequant_adapter,
     make_mxfp8_fwd_adapter,
     make_mxfp8_prequant_adapter,
+    make_mxfp8_weight_prequant_adapter,
+    load_runtime_winner,
+    save_runtime_winner,
 )
 from rtx.autotune.core import Proposal, evaluate_proposal
 from rtx.kernels.mxfp8 import MXFP8Problem
@@ -319,11 +324,19 @@ class ComposableAutotuneTests(unittest.TestCase):
         adapters = (
             make_mxfp8_fwd_adapter(problem, evaluator),
             make_mxfp8_prequant_adapter(problem, evaluator),
+            make_mxfp8_weight_prequant_adapter(problem, evaluator),
+            make_mxfp8_fully_prequant_adapter(problem, evaluator),
             make_mxfp8_bwd_adapter(problem, evaluator),
         )
         self.assertEqual(
             {adapter.context.family for adapter in adapters},
-            {"mxfp8_fused_fwd", "mxfp8_prequant_fwd", "mxfp8_bwd"},
+            {
+                "mxfp8_fused_fwd",
+                "mxfp8_prequant_fwd",
+                "mxfp8_weight_prequant_fwd",
+                "mxfp8_fully_prequant_fwd",
+                "mxfp8_bwd",
+            },
         )
         for adapter in adapters:
             serialized = adapter.serialize(adapter.initial_config)
@@ -334,6 +347,71 @@ class ComposableAutotuneTests(unittest.TestCase):
             )
             self.assertTrue(adapter.features(restored))
             self.assertTrue(adapter.coordinates())
+
+    def test_inference_state_adapters_remove_inactive_quantizer_axes(self) -> None:
+        problem = MXFP8Problem(512, 1536, 1536)
+        evaluator = lambda _config: TrialOutcome("ok", median_ms=1.0)
+        weight = make_mxfp8_weight_prequant_adapter(problem, evaluator)
+        fully = make_mxfp8_fully_prequant_adapter(problem, evaluator)
+        self.assertEqual(weight.context.tags["operand_state"], "weight_prequantized")
+        self.assertEqual(fully.context.tags["operand_state"], "fully_prequantized")
+        self.assertTrue(any(name.startswith("x_") for name in weight.coordinates()))
+        self.assertFalse(any(name.startswith("w_") for name in weight.coordinates()))
+        self.assertFalse(any("quant_launch" in name for name in weight.coordinates()))
+        self.assertFalse(any(name.startswith("x_") for name in fully.coordinates()))
+        self.assertFalse(any(name.startswith("w_") for name in fully.coordinates()))
+        self.assertEqual(
+            weight.features(weight.initial_config)[
+                "derived.operand_state_weight_prequantized"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            fully.features(fully.initial_config)[
+                "derived.operand_state_fully_prequantized"
+            ],
+            1.0,
+        )
+        candidates = weight.sample(
+            random.Random(17), 12, (weight.initial_config,)
+        )
+        self.assertTrue(candidates)
+        self.assertTrue(all(weight.rejection(item) is None for item in candidates))
+
+    def test_runtime_winner_cache_is_state_layout_and_device_specific(self) -> None:
+        problem = MXFP8Problem(128, 128, 256)
+        adapter = make_mxfp8_fully_prequant_adapter(
+            problem, lambda _config: TrialOutcome("ok", median_ms=1.0)
+        )
+        key = RuntimeWinnerKey(
+            adapter.context.family,
+            problem,
+            "hot",
+            "synthetic-device",
+            "x-row_major_w-row_major",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = save_runtime_winner(
+                key,
+                adapter.serialize(adapter.initial_config),
+                config_id=adapter.config_id(adapter.initial_config),
+                root=directory,
+                median_ms=0.125,
+            )
+            self.assertTrue(path.exists())
+            restored = load_runtime_winner(
+                key,
+                adapter.deserialize,
+                root=directory,
+                rejection=lambda config: config.rejection(problem),
+            )
+            self.assertEqual(restored, adapter.initial_config)
+            wrong_layout = replace(key, variant="x-mma128_w-mma128")
+            self.assertIsNone(
+                load_runtime_winner(
+                    wrong_layout, adapter.deserialize, root=directory
+                )
+            )
 
     def test_fused_random_walk_preserves_legality_and_explores(self) -> None:
         adapter = make_mxfp8_fwd_adapter(

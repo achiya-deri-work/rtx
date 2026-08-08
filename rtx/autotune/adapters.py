@@ -416,6 +416,187 @@ def make_mxfp8_prequant_adapter(
     )
 
 
+def make_mxfp8_weight_prequant_adapter(
+    problem: MXFP8Problem,
+    evaluator: Callable[[object], TrialOutcome],
+    *,
+    initial: object | None = None,
+    axes: Mapping[str, Iterable[Mapping[str, object]]] | None = None,
+    device: DeviceFingerprint | Mapping[str, object] | None = None,
+    regime: str = "hot",
+    tags: Mapping[str, object] | None = None,
+) -> DiscreteKernelAdapter[object]:
+    """Tune only work executed per call for BF16 X and an AOT-packed W."""
+
+    from ..configs import MXFP8WeightPrequantConfig
+    from ..inference_autotune import (
+        INFERENCE_KERNEL_REVISION,
+        MXFP8_WEIGHT_PREQUANT_SEARCH_SPACE,
+        update_weight_prequant_config,
+        weight_prequant_config_from_dict,
+        weight_prequant_config_id,
+        weight_prequant_config_to_dict,
+    )
+
+    initial_config = MXFP8WeightPrequantConfig() if initial is None else initial
+    selected_axes = MXFP8_WEIGHT_PREQUANT_SEARCH_SPACE if axes is None else axes
+    axis_values = {name: tuple(values) for name, values in selected_axes.items()}
+    unknown = set(axis_values).difference(MXFP8_WEIGHT_PREQUANT_SEARCH_SPACE)
+    if unknown:
+        raise ValueError(f"unknown AOT-weight tuning axes: {sorted(unknown)}")
+
+    def rejection(config: object) -> tuple[str, str] | None:
+        reason = config.rejection(problem)  # type: ignore[attr-defined]
+        if reason is None:
+            profile = _device_dict(device)
+            smem_limit = int(
+                profile_value(profile, "shared_memory_per_block_optin", 0)
+                or profile_value(profile, "shared_memory_per_block", 0)
+                or 0
+            )
+            gemm = config.gemm  # type: ignore[attr-defined]
+            if smem_limit and _gemm_smem_bytes(gemm) > smem_limit:
+                reason = (
+                    f"GEMM requires {_gemm_smem_bytes(gemm)} bytes of CTA SMEM, "
+                    f"device limit is {smem_limit}"
+                )
+        return None if reason is None else ("implementation_rejected", reason)
+
+    def derived(config: object) -> Mapping[str, float]:
+        gemm = config.gemm  # type: ignore[attr-defined]
+        quant_x = config.quant_x  # type: ignore[attr-defined]
+        values = _gemm_features(problem, gemm, device, materialized_quant=True)
+        values.update(
+            _prefix(
+                _quant_features(problem.m, problem.k, quant_x, device),
+                "quant_x_",
+            )
+        )
+        x_bf16 = 2 * problem.m * problem.k
+        qx = problem.m * problem.k + problem.m * (problem.k // 32)
+        qw = problem.n * problem.k + problem.n * (problem.k // 32)
+        out = 2 * problem.m * problem.n
+        values.update(
+            operand_state_weight_prequantized=1.0,
+            quant_launch_count=1.0,
+            total_kernel_launches=2.0,
+            untimed_weight_packing=1.0,
+            estimated_total_memory_bytes=float(x_bf16 + qx + qx + qw + out),
+            quantized_materialization_bytes=float(qx),
+        )
+        return values
+
+    state_tags = {**dict(tags or {}), "operand_state": "weight_prequantized"}
+    return DiscreteKernelAdapter(
+        context=_context(
+            "mxfp8_weight_prequant_fwd",
+            INFERENCE_KERNEL_REVISION,
+            problem,
+            device,
+            regime,
+            state_tags,
+        ),
+        initial_config=initial_config,
+        axes=axis_values,
+        config_id_fn=weight_prequant_config_id,
+        serialize_fn=weight_prequant_config_to_dict,
+        deserialize_fn=weight_prequant_config_from_dict,
+        update_fn=lambda config, _coordinate, value: update_weight_prequant_config(
+            config, value
+        ),
+        evaluator=evaluator,
+        rejection_fn=rejection,
+        extra_features_fn=derived,
+    )
+
+
+def make_mxfp8_fully_prequant_adapter(
+    problem: MXFP8Problem,
+    evaluator: Callable[[object], TrialOutcome],
+    *,
+    initial: object | None = None,
+    axes: Mapping[str, Iterable[Mapping[str, object]]] | None = None,
+    device: DeviceFingerprint | Mapping[str, object] | None = None,
+    regime: str = "hot",
+    tags: Mapping[str, object] | None = None,
+) -> DiscreteKernelAdapter[object]:
+    """Tune GEMM-only execution when X and W are both already packed."""
+
+    from ..configs import MXFP8FullyPrequantConfig
+    from ..inference_autotune import (
+        INFERENCE_KERNEL_REVISION,
+        MXFP8_FULLY_PREQUANT_SEARCH_SPACE,
+        fully_prequant_config_from_dict,
+        fully_prequant_config_id,
+        fully_prequant_config_to_dict,
+        update_fully_prequant_config,
+    )
+
+    initial_config = MXFP8FullyPrequantConfig() if initial is None else initial
+    selected_axes = MXFP8_FULLY_PREQUANT_SEARCH_SPACE if axes is None else axes
+    axis_values = {name: tuple(values) for name, values in selected_axes.items()}
+    unknown = set(axis_values).difference(MXFP8_FULLY_PREQUANT_SEARCH_SPACE)
+    if unknown:
+        raise ValueError(f"unknown fully-packed tuning axes: {sorted(unknown)}")
+
+    def rejection(config: object) -> tuple[str, str] | None:
+        reason = config.rejection(problem)  # type: ignore[attr-defined]
+        if reason is None:
+            profile = _device_dict(device)
+            smem_limit = int(
+                profile_value(profile, "shared_memory_per_block_optin", 0)
+                or profile_value(profile, "shared_memory_per_block", 0)
+                or 0
+            )
+            gemm = config.gemm  # type: ignore[attr-defined]
+            if smem_limit and _gemm_smem_bytes(gemm) > smem_limit:
+                reason = (
+                    f"GEMM requires {_gemm_smem_bytes(gemm)} bytes of CTA SMEM, "
+                    f"device limit is {smem_limit}"
+                )
+        return None if reason is None else ("implementation_rejected", reason)
+
+    def derived(config: object) -> Mapping[str, float]:
+        gemm = config.gemm  # type: ignore[attr-defined]
+        values = _gemm_features(problem, gemm, device, materialized_quant=True)
+        qx = problem.m * problem.k + problem.m * (problem.k // 32)
+        qw = problem.n * problem.k + problem.n * (problem.k // 32)
+        out = 2 * problem.m * problem.n
+        values.update(
+            operand_state_fully_prequantized=1.0,
+            quant_launch_count=0.0,
+            total_kernel_launches=1.0,
+            untimed_activation_packing=1.0,
+            untimed_weight_packing=1.0,
+            estimated_total_memory_bytes=float(qx + qw + out),
+            quantized_materialization_bytes=0.0,
+        )
+        return values
+
+    state_tags = {**dict(tags or {}), "operand_state": "fully_prequantized"}
+    return DiscreteKernelAdapter(
+        context=_context(
+            "mxfp8_fully_prequant_fwd",
+            INFERENCE_KERNEL_REVISION,
+            problem,
+            device,
+            regime,
+            state_tags,
+        ),
+        initial_config=initial_config,
+        axes=axis_values,
+        config_id_fn=fully_prequant_config_id,
+        serialize_fn=fully_prequant_config_to_dict,
+        deserialize_fn=fully_prequant_config_from_dict,
+        update_fn=lambda config, _coordinate, value: update_fully_prequant_config(
+            config, value
+        ),
+        evaluator=evaluator,
+        rejection_fn=rejection,
+        extra_features_fn=derived,
+    )
+
+
 def make_mxfp8_bwd_adapter(
     problem: MXFP8Problem,
     evaluator: Callable[[object], TrialOutcome],
@@ -546,6 +727,8 @@ def make_mxfp8_bwd_adapter(
 
 __all__ = [
     "make_mxfp8_bwd_adapter",
+    "make_mxfp8_fully_prequant_adapter",
     "make_mxfp8_fwd_adapter",
     "make_mxfp8_prequant_adapter",
+    "make_mxfp8_weight_prequant_adapter",
 ]

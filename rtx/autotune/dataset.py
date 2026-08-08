@@ -28,8 +28,10 @@ import torch
 
 from .adapters import (
     make_mxfp8_bwd_adapter,
+    make_mxfp8_fully_prequant_adapter,
     make_mxfp8_fwd_adapter,
     make_mxfp8_prequant_adapter,
+    make_mxfp8_weight_prequant_adapter,
 )
 from .core import KernelAdapter, canonical_json, stable_id
 from .evaluators import CalibratedBwdEvaluator, CalibratedPrequantEvaluator
@@ -37,6 +39,7 @@ from .hardware import compiled_resource_metadata
 from .legacy import DeviceFingerprint
 from .recipes import HybridTuningPolicy, make_hybrid_autotuner
 from .store import JsonlTuningStore
+from .winners import runtime_winner_key, save_runtime_winner
 from ..bwd_experiments import BwdBenchmarkHarness
 from ..kernels.mxfp8 import (
     DEFAULT_MXFP8_FWD_CONFIG,
@@ -56,6 +59,10 @@ from ..prequant_experiments import (
     _reference_prequant_config,
     probe_device,
     robust_summary,
+)
+from ..inference_experiments import (
+    FullyPrequantBenchmarkHarness,
+    WeightPrequantBenchmarkHarness,
 )
 
 
@@ -573,6 +580,30 @@ def _bwd_harness(
     )
 
 
+def _weight_prequant_harness(
+    campaign: "DatasetCampaign", job: DatasetJob, shape: ShapeSpec, regime: CacheRegime
+):
+    return WeightPrequantBenchmarkHarness(
+        shape,
+        regime,
+        job.protocol,
+        device=campaign.device,
+        seed=_backend_seed(campaign, job, shape, regime),
+    )
+
+
+def _fully_prequant_harness(
+    campaign: "DatasetCampaign", job: DatasetJob, shape: ShapeSpec, regime: CacheRegime
+):
+    return FullyPrequantBenchmarkHarness(
+        shape,
+        regime,
+        job.protocol,
+        device=campaign.device,
+        seed=_backend_seed(campaign, job, shape, regime),
+    )
+
+
 def _fused_adapter(
     campaign: "DatasetCampaign",
     job: DatasetJob,
@@ -634,11 +665,59 @@ def _bwd_adapter(
     )
 
 
+def _weight_prequant_adapter(
+    campaign: "DatasetCampaign",
+    job: DatasetJob,
+    shape: ShapeSpec,
+    regime: CacheRegime,
+    harness,
+    tags: Mapping[str, object],
+) -> KernelAdapter:
+    evaluator = CalibratedPrequantEvaluator(
+        harness, samples=job.protocol.samples, seed=campaign.manifest.seed
+    )
+    return make_mxfp8_weight_prequant_adapter(
+        shape.problem,
+        evaluator,
+        device=campaign.hardware_profile,
+        regime=regime,
+        tags=tags,
+    )
+
+
+def _fully_prequant_adapter(
+    campaign: "DatasetCampaign",
+    job: DatasetJob,
+    shape: ShapeSpec,
+    regime: CacheRegime,
+    harness,
+    tags: Mapping[str, object],
+) -> KernelAdapter:
+    evaluator = CalibratedPrequantEvaluator(
+        harness, samples=job.protocol.samples, seed=campaign.manifest.seed
+    )
+    return make_mxfp8_fully_prequant_adapter(
+        shape.problem,
+        evaluator,
+        device=campaign.hardware_profile,
+        regime=regime,
+        tags=tags,
+    )
+
+
 register_dataset_backend(
     "mxfp8_fused_fwd", DatasetBackend(_fused_harness, _fused_adapter)
 )
 register_dataset_backend(
     "mxfp8_prequant_fwd", DatasetBackend(_prequant_harness, _prequant_adapter)
+)
+register_dataset_backend(
+    "mxfp8_weight_prequant_fwd",
+    DatasetBackend(_weight_prequant_harness, _weight_prequant_adapter),
+)
+register_dataset_backend(
+    "mxfp8_fully_prequant_fwd",
+    DatasetBackend(_fully_prequant_harness, _fully_prequant_adapter),
 )
 register_dataset_backend("mxfp8_bwd", DatasetBackend(_bwd_harness, _bwd_adapter))
 
@@ -872,12 +951,50 @@ class DatasetCampaign:
             completed.add(key)
             if outcome.get("decision") == "challenger":
                 incumbent = challenger
+        winner_id = adapter.config_id(incumbent)
+        winner_measurement = next(
+            (
+                record
+                for record in confirmed
+                if str(record.get("config_id")) == winner_id
+            ),
+            None,
+        )
+        winner_median = None
+        if winner_measurement is not None:
+            winner_median = float(
+                winner_measurement["outcome"]["summary_ms"]["median"]  # type: ignore[index]
+            )
+        cache_path = save_runtime_winner(
+            runtime_winner_key(
+                job.family,
+                shape.problem,
+                regime=regime,
+                fingerprint=self.fingerprint,
+                variant=(
+                    f"w-{incumbent.operand_scale_layouts[1]}"
+                    if job.family == "mxfp8_weight_prequant_fwd"
+                    else "x-{}_w-{}".format(*incumbent.operand_scale_layouts)
+                    if job.family == "mxfp8_fully_prequant_fwd"
+                    else "default"
+                ),
+            ),
+            adapter.serialize(incumbent),
+            config_id=winner_id,
+            root=self.bundle,
+            median_ms=winner_median,
+            metadata={
+                "context_id": adapter.context.identifier,
+                "manifest_digest": self.manifest.digest,
+            },
+        )
         return {
             "status": "ok",
             "screened": len(observations),
             "confirmed": len(confirmed),
-            "winner_id": adapter.config_id(incumbent),
+            "winner_id": winner_id,
             "winner_config": adapter.serialize(incumbent),
+            "runtime_cache": str(cache_path.relative_to(self.bundle)),
         }
 
     def _assigned_contexts(
@@ -896,7 +1013,9 @@ class DatasetCampaign:
         family_order = {
             "mxfp8_fused_fwd": 0,
             "mxfp8_prequant_fwd": 1,
-            "mxfp8_bwd": 2,
+            "mxfp8_weight_prequant_fwd": 2,
+            "mxfp8_fully_prequant_fwd": 3,
+            "mxfp8_bwd": 4,
         }
 
         def shape_priority(shape: ShapeSpec) -> int:

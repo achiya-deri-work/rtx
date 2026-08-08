@@ -3,8 +3,10 @@
 from . import legacy as _legacy
 from .adapters import (
     make_mxfp8_bwd_adapter,
+    make_mxfp8_fully_prequant_adapter,
     make_mxfp8_fwd_adapter,
     make_mxfp8_prequant_adapter,
+    make_mxfp8_weight_prequant_adapter,
 )
 from .calibration import calibrate_device
 from .core import (
@@ -53,6 +55,12 @@ from .orchestrator import (
 from .migration import import_legacy_json_database
 from .recipes import HybridTuningPolicy, make_hybrid_autotuner
 from .store import InMemoryTuningStore, JsonlTuningStore, TuningStore
+from .winners import (
+    RuntimeWinnerKey,
+    load_runtime_winner,
+    runtime_winner_key,
+    save_runtime_winner,
+)
 from .strategies import (
     CoordinateLocalSearch,
     CostModelGuidedSearch,
@@ -115,6 +123,7 @@ __all__ = [
     "Observation",
     "Proposal",
     "RandomSearch",
+    "RuntimeWinnerKey",
     "SearchHistory",
     "SearchStrategy",
     "SequentialScheduler",
@@ -133,13 +142,18 @@ __all__ = [
     "device_properties",
     "export_bundle",
     "load_cached_mxfp8_fwd_config",
+    "load_runtime_winner",
     "import_legacy_json_database",
     "make_mxfp8_bwd_adapter",
+    "make_mxfp8_fully_prequant_adapter",
     "make_mxfp8_fwd_adapter",
     "make_mxfp8_prequant_adapter",
+    "make_mxfp8_weight_prequant_adapter",
     "make_hybrid_autotuner",
     "normalized_rows",
     "register_dataset_backend",
+    "runtime_winner_key",
+    "save_runtime_winner",
     "static_device_profile",
     "tune_mxfp8_fwd",
 ]
