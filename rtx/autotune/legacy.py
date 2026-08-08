@@ -40,7 +40,11 @@ from ..kernels.mxfp8 import (
     fwd_search_space_digest,
     normalize_fwd_config,
 )
-from ..kernels.mxfp8_fwd import compile_mxfp8_fwd
+from ..runtime import load_kernel_symbol
+
+
+def compile_mxfp8_fwd(*args, **kwargs):
+    return load_kernel_symbol("mxfp8_fwd", "compile_mxfp8_fwd")(*args, **kwargs)
 
 try:
     import fcntl

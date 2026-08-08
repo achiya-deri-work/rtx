@@ -43,7 +43,7 @@ from ..kernels.mxfp8 import (
     MXFP8FwdConfig,
     MXFP8Problem,
 )
-from ..kernels.mxfp8_fwd import compile_mxfp8_fwd
+from ..runtime import load_kernel_symbol
 from ..prequant_experiments import (
     BenchmarkProtocol,
     CacheRegime,
@@ -62,6 +62,10 @@ from ..prequant_experiments import (
 DATASET_SCHEMA_VERSION = 2
 KernelFamily = str
 ExportFormat = Literal["csv", "parquet", "both", "none"]
+
+
+def compile_mxfp8_fwd(*args, **kwargs):
+    return load_kernel_symbol("mxfp8_fwd", "compile_mxfp8_fwd")(*args, **kwargs)
 
 
 @dataclass(frozen=True, slots=True)

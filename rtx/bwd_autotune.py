@@ -38,8 +38,7 @@ from .kernels.mxfp8_bwd import (
     MXFP8BwdConfig,
     MXFP8BwdMatmulConfig,
 )
-from .kernels.mxfp8_gemm import MXFP8GemmConfig
-from .kernels.mxfp8_quant import MXFP8QuantConfig
+from .configs import MXFP8GemmConfig, MXFP8QuantConfig
 
 try:
     import fcntl

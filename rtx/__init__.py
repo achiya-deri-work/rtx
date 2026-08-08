@@ -1,78 +1,65 @@
-"""RTX Blackwell low-precision linear layers."""
+"""RTX low-precision linear layers and architecture-aware autotuning."""
 
 from ._version import __version__
 
-from .fp8 import (
-    DEFAULT_MXFP8_PREQUANT_CONFIG,
-    MXFP8Linear,
-    MXFP8PrequantConfig,
-    mxfp8_linear,
-)
-from .fp8_bwd import (
-    DEFAULT_MXFP8_BWD_CONFIG,
-    MXFP8BwdConfig,
-    MXFP8BwdMatmulConfig,
-    mxfp8_linear_backward,
-)
-from .fp4 import NVFP4Linear, nvfp4_linear
 
-__all__ = [
-    "__version__",
-    "CoordinateDescentPolicy",
-    "BWD_COORDINATE_ORDER",
-    "BWD_SEARCH_SPACE",
-    "BwdTuningResult",
-    "DEFAULT_MXFP8_PREQUANT_CONFIG",
-    "DEFAULT_MXFP8_BWD_CONFIG",
-    "MXFP8Linear",
-    "NVFP4Linear",
-    "MXFP8BwdConfig",
-    "MXFP8BwdMatmulConfig",
-    "MXFP8PrequantConfig",
-    "PREQUANT_COORDINATE_ORDER",
-    "PREQUANT_SEARCH_SPACE",
-    "PrequantTuningResult",
-    "load_cached_mxfp8_fwd_config",
-    "load_cached_mxfp8_bwd_config",
-    "load_mxfp8_bwd_config",
-    "load_cached_mxfp8_prequant_config",
-    "mxfp8_linear",
-    "mxfp8_linear_backward",
-    "nvfp4_linear",
-    "tune_mxfp8_fwd",
-    "tune_mxfp8_backward",
-    "tune_mxfp8_prequant",
-]
+_LAZY_EXPORTS = {
+    # Stable public format and frontend API.
+    "MXFP8Tensor": ("formats", "MXFP8Tensor"),
+    "NVFP4Tensor": ("formats", "NVFP4Tensor"),
+    "LinearOperandState": ("formats", "LinearOperandState"),
+    "MXFP8Linear": ("fp8", "MXFP8Linear"),
+    "NVFP4Linear": ("fp4", "NVFP4Linear"),
+    "mxfp8_linear": ("fp8", "mxfp8_linear"),
+    "nvfp4_linear": ("fp4", "nvfp4_linear"),
+    "quantize_mxfp8": ("fp8", "quantize_mxfp8"),
+    "quantize_nvfp4": ("fp4", "quantize_nvfp4"),
+    "DEFAULT_MXFP8_INFERENCE_CONFIG": ("fp8", "DEFAULT_MXFP8_INFERENCE_CONFIG"),
+    "DEFAULT_MXFP8_PREQUANT_CONFIG": ("fp8", "DEFAULT_MXFP8_PREQUANT_CONFIG"),
+    "MXFP8PrequantConfig": ("fp8", "MXFP8PrequantConfig"),
+    "MXFP8QuantConfig": ("configs", "MXFP8QuantConfig"),
+    "MXFP8GemmConfig": ("configs", "MXFP8GemmConfig"),
+    "MXFP8FwdConfig": ("kernels.mxfp8", "MXFP8FwdConfig"),
+    "MXFP8Problem": ("kernels.mxfp8", "MXFP8Problem"),
+    "DEFAULT_MXFP8_BWD_CONFIG": ("fp8_bwd", "DEFAULT_MXFP8_BWD_CONFIG"),
+    "MXFP8BwdConfig": ("fp8_bwd", "MXFP8BwdConfig"),
+    "MXFP8BwdMatmulConfig": ("fp8_bwd", "MXFP8BwdMatmulConfig"),
+    "mxfp8_linear_backward": ("fp8_bwd", "mxfp8_linear_backward"),
+    # Compatibility exports for the legacy production tuners.
+    "CoordinateDescentPolicy": ("autotune", "CoordinateDescentPolicy"),
+    "load_cached_mxfp8_fwd_config": ("autotune", "load_cached_mxfp8_fwd_config"),
+    "tune_mxfp8_fwd": ("autotune", "tune_mxfp8_fwd"),
+    "BWD_COORDINATE_ORDER": ("bwd_autotune", "BWD_COORDINATE_ORDER"),
+    "BWD_SEARCH_SPACE": ("bwd_autotune", "BWD_SEARCH_SPACE"),
+    "BwdTuningResult": ("bwd_autotune", "BwdTuningResult"),
+    "load_cached_mxfp8_bwd_config": ("bwd_autotune", "load_cached_mxfp8_bwd_config"),
+    "load_mxfp8_bwd_config": ("bwd_autotune", "load_mxfp8_bwd_config"),
+    "tune_mxfp8_backward": ("bwd_autotune", "tune_mxfp8_backward"),
+    "PREQUANT_COORDINATE_ORDER": ("prequant_autotune", "PREQUANT_COORDINATE_ORDER"),
+    "PREQUANT_SEARCH_SPACE": ("prequant_autotune", "PREQUANT_SEARCH_SPACE"),
+    "PrequantTuningResult": ("prequant_autotune", "PrequantTuningResult"),
+    "load_cached_mxfp8_prequant_config": (
+        "prequant_autotune",
+        "load_cached_mxfp8_prequant_config",
+    ),
+    "tune_mxfp8_prequant": ("prequant_autotune", "tune_mxfp8_prequant"),
+}
 
 
 def __getattr__(name: str):
-    if name in {
-        "BWD_COORDINATE_ORDER",
-        "BWD_SEARCH_SPACE",
-        "BwdTuningResult",
-        "load_cached_mxfp8_bwd_config",
-        "load_mxfp8_bwd_config",
-        "tune_mxfp8_backward",
-    }:
-        from . import bwd_autotune
+    try:
+        module_name, attribute = _LAZY_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(name) from exc
+    from importlib import import_module
 
-        return getattr(bwd_autotune, name)
-    if name in {
-        "CoordinateDescentPolicy",
-        "load_cached_mxfp8_fwd_config",
-        "tune_mxfp8_fwd",
-    }:
-        from . import autotune
+    value = getattr(import_module(f".{module_name}", __name__), attribute)
+    globals()[name] = value
+    return value
 
-        return getattr(autotune, name)
-    if name in {
-        "PREQUANT_COORDINATE_ORDER",
-        "PREQUANT_SEARCH_SPACE",
-        "PrequantTuningResult",
-        "load_cached_mxfp8_prequant_config",
-        "tune_mxfp8_prequant",
-    }:
-        from . import prequant_autotune
 
-        return getattr(prequant_autotune, name)
-    raise AttributeError(name)
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))
+
+
+__all__ = ["__version__", *_LAZY_EXPORTS]

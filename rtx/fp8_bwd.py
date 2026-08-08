@@ -17,12 +17,27 @@ from .kernels.mxfp8_bwd import (
     MXFP8BwdConfig,
     MXFP8BwdMatmulConfig,
 )
-from .kernels.mxfp8_gemm import compile_mxfp8_gemm
-from .kernels.mxfp8_quant import (
-    compile_mxfp8_oriented_dual_quant,
-    compile_mxfp8_quant,
-    compile_mxfp8_transposed_quant,
-)
+from .runtime import load_kernel_symbol
+
+
+def compile_mxfp8_gemm(*args, **kwargs):
+    return load_kernel_symbol("mxfp8_gemm", "compile_mxfp8_gemm")(*args, **kwargs)
+
+
+def compile_mxfp8_quant(*args, **kwargs):
+    return load_kernel_symbol("mxfp8_quant", "compile_mxfp8_quant")(*args, **kwargs)
+
+
+def compile_mxfp8_transposed_quant(*args, **kwargs):
+    return load_kernel_symbol("mxfp8_quant", "compile_mxfp8_transposed_quant")(
+        *args, **kwargs
+    )
+
+
+def compile_mxfp8_oriented_dual_quant(*args, **kwargs):
+    return load_kernel_symbol("mxfp8_quant", "compile_mxfp8_oriented_dual_quant")(
+        *args, **kwargs
+    )
 
 if TYPE_CHECKING:
     from .autotune import CoordinateDescentPolicy

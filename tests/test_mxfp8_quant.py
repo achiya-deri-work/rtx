@@ -4,6 +4,8 @@ import unittest
 
 import torch
 
+import rtx
+
 from rtx.kernels.mxfp8_quant import (
     MXFP8QuantConfig,
     compile_mxfp8_dual_quant,
@@ -229,6 +231,34 @@ class MXFP8QuantCudaTests(unittest.TestCase):
                 self._assert_native_scales(native_sx, sx, tile_rows)
                 self._assert_native_scales(native_sw, sw, 128)
                 torch.testing.assert_close(native_out, row_out, rtol=0, atol=0)
+
+    def test_three_public_operand_states_are_numerically_identical(self) -> None:
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("native kernel requires SM120/SM121")
+        torch.manual_seed(1705)
+        x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        config = rtx.DEFAULT_MXFP8_INFERENCE_CONFIG
+        with torch.inference_mode():
+            dynamic = rtx.mxfp8_linear(
+                x,
+                weight,
+                backend="prequant",
+                prequant_config=config,
+            )
+            packed_weight = rtx.quantize_mxfp8(
+                weight, config=config.resolved_weight_quant()
+            )
+            aot_weight = rtx.mxfp8_linear(
+                x, packed_weight, prequant_config=config
+            )
+            packed_x = rtx.quantize_mxfp8(x, config=config.quant)
+            fully_packed = rtx.mxfp8_linear(
+                packed_x, packed_weight, prequant_config=config
+            )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(aot_weight, dynamic, rtol=0, atol=0)
+        torch.testing.assert_close(fully_packed, dynamic, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

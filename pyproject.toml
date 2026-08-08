@@ -1,4 +1,58 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "rtx"
+dynamic = ["version"]
+description = "Low-precision training and inference kernels for NVIDIA RTX Blackwell"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+  {name = "Achiya Deri @LATENT ADVANTAGE LTD", email = "achiya.work@gmail.com"},
+]
+dependencies = [
+  "numpy>=2.0,<3",
+  "torch>=2.9",
+  "cuda-python>=13.0,<14",
+  "nvidia-cutlass-dsl>=4.7,<4.8",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Repository = "https://github.com/achiya-deri-work/rtx"
+Issues = "https://github.com/achiya-deri-work/rtx/issues"
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=16"]
+dev = ["pytest>=8", "pyarrow>=16", "build>=1.2", "twine>=5"]
+
+[project.scripts]
+rtx-autotune = "rtx.autotune.dataset:main"
+rtx-autotune-legacy = "rtx.autotune.legacy:_cli"
+rtx-prequant-experiment = "rtx.prequant_experiments:_cli"
+
+[tool.setuptools.dynamic]
+version = {attr = "rtx._version.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["rtx", "rtx.*"]
+
+[tool.setuptools.package-data]
+rtx = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

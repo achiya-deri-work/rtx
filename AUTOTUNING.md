@@ -1,5 +1,12 @@
 # RTX kernel autotuning
 
+The legacy name `prequant` in APIs, cache keys, and v1/v2 datasets means a
+*materialized dynamic* pipeline: BF16 X and BF16 W are quantized every call,
+then consumed by a separate GEMM. It must not be confused with the persistent
+AOT-weight or fully packed inference states introduced by the public packed
+operand API. Historical family names remain frozen so active datasets resume
+without relabeling observations.
+
 The MXFP8 frontend has three selection modes:
 
 - `off`: always use the built-in baseline unless an explicit config is passed.

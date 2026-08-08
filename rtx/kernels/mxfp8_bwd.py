@@ -11,8 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 from .mxfp8 import MXFP8Problem
-from .mxfp8_gemm import MXFP8GemmConfig
-from .mxfp8_quant import MXFP8QuantConfig
+from ..configs import MXFP8GemmConfig, MXFP8QuantConfig
 
 
 @dataclass(frozen=True, slots=True)

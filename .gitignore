@@ -11,3 +11,4 @@ dist/
 *.egg-info/
 autotune_datasets/
 hardware_calibration*.json
+*.log

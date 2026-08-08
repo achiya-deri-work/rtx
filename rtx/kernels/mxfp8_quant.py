@@ -8,7 +8,7 @@ quantization across M tiles.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from functools import lru_cache
 import math
 import os
@@ -33,6 +33,8 @@ from cutlass import (
 )
 from cutlass.experimental.primitives import nvvm_wrapper as nvvm
 
+from ..configs.mxfp8 import MXFP8QuantConfig
+
 
 SF_VEC_SIZE = 32
 F32_MANTISSA_BITS = 23
@@ -44,67 +46,6 @@ E8M0_MAX_UNBIASED = 128
 
 def _native_scale_tile_rows(scale_layout: str) -> int:
     return {"row_major": 0, "mma64": 64, "mma128": 128}[scale_layout]
-
-
-@dataclass(frozen=True, slots=True)
-class MXFP8QuantConfig:
-    """One independently compilable dynamic quantizer schedule."""
-
-    quant_vec: int = 4
-    load_bits: int = 64
-    quant_math: str = "bf16x2"
-    quant_amax: str = "bf16_bits"
-    reduction: str = "shuffle"
-    num_warps: int = 8
-    persistent_waves: int = 4
-    maxrregcount: int = 128
-    scale_layout: str = "row_major"
-    native_scale_store: str = "scalar"
-    # Logical-transpose sources are staged once in their physical [K,row]
-    # order, then consumed through a [row,K] CuTe view of the same SMEM bytes.
-    transposed_tile_rows: int = 128
-    transposed_smem_padding: int = 1
-
-    def rejection(self, rows: int, k: int) -> str | None:
-        if rows <= 0 or k <= 0 or k % SF_VEC_SIZE:
-            return "rows must be positive and K must be divisible by 32"
-        if self.quant_vec not in (1, 2, 4, 8):
-            return "quant_vec must be one of 1, 2, 4, 8"
-        if self.load_bits not in (16, 32, 64, 128):
-            return "load_bits must be one of 16, 32, 64, 128"
-        if self.load_bits > self.quant_vec * BFloat16.width:
-            return "load width exceeds values owned by one lane"
-        if (self.quant_vec * BFloat16.width) % self.load_bits:
-            return "quant_vec must contain an integer number of vector loads"
-        if (k // SF_VEC_SIZE) % self.quant_vec:
-            return "K scale blocks must be divisible by quant_vec"
-        if self.quant_math not in ("fp32", "bf16x2"):
-            return "quant_math must be fp32 or bf16x2"
-        if self.quant_amax not in ("fp32", "bf16_bits"):
-            return "quant_amax must be fp32 or bf16_bits"
-        if self.reduction not in ("shuffle", "redux"):
-            return "reduction must be shuffle or redux"
-        if self.num_warps not in (4, 8, 16):
-            return "num_warps must be one of 4, 8, 16"
-        if self.persistent_waves not in (1, 2, 3, 4, 6, 8):
-            return "persistent_waves must be one of 1, 2, 3, 4, 6, 8"
-        if self.scale_layout not in ("row_major", "mma64", "mma128"):
-            return "scale_layout must be row_major, mma64, or mma128"
-        if self.scale_layout == "mma128" and (rows % 128 or k % 128):
-            return "mma128 scales require rows and K divisible by 128"
-        if self.scale_layout == "mma64" and (rows % 64 or k % 128):
-            return "mma64 scales require rows divisible by 64 and K by 128"
-        if self.native_scale_store not in ("scalar", "packed"):
-            return "native_scale_store must be scalar or packed"
-        if self.native_scale_store == "packed" and (
-            self.scale_layout != "mma128" or self.quant_vec != 4
-        ):
-            return "packed native scale stores require mma128 and quant_vec=4"
-        if self.transposed_tile_rows not in (32, 64, 128, 256):
-            return "transposed_tile_rows must be 32, 64, 128, or 256"
-        if self.transposed_smem_padding not in (0, 1, 2, 4, 8):
-            return "transposed_smem_padding must be 0, 1, 2, 4, or 8"
-        return None
 
 
 class MXFP8QuantKernel:

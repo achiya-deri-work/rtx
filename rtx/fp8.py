@@ -15,14 +15,11 @@ import torch
 from torch import nn
 from torch._library._out_variant import register_out_variant
 
+from .formats import MXFP8Tensor
+from .formats.common import SCALE_LAYOUT_CODES, reject_packed_dtype_conversion
+from .configs import MXFP8GemmConfig, MXFP8QuantConfig
 from .kernels.mxfp8 import DEFAULT_MXFP8_FWD_CONFIG, MXFP8FwdConfig, MXFP8Problem
-from .kernels.mxfp8_fwd import compile_mxfp8_fwd
-from .kernels.mxfp8_gemm import MXFP8GemmConfig, compile_mxfp8_gemm
-from .kernels.mxfp8_quant import (
-    MXFP8QuantConfig,
-    compile_mxfp8_dual_quant,
-    compile_mxfp8_quant,
-)
+from .runtime import load_kernel_symbol
 
 if TYPE_CHECKING:
     from .autotune import CoordinateDescentPolicy
@@ -30,6 +27,25 @@ if TYPE_CHECKING:
 
 AutotuneMode = Literal["off", "cache", "coordinate"]
 MXFP8Backend = Literal["auto", "fused", "prequant"]
+WeightMode = Literal["dynamic", "prequantized"]
+
+
+def compile_mxfp8_fwd(*args, **kwargs):
+    return load_kernel_symbol("mxfp8_fwd", "compile_mxfp8_fwd")(*args, **kwargs)
+
+
+def compile_mxfp8_gemm(*args, **kwargs):
+    return load_kernel_symbol("mxfp8_gemm", "compile_mxfp8_gemm")(*args, **kwargs)
+
+
+def compile_mxfp8_quant(*args, **kwargs):
+    return load_kernel_symbol("mxfp8_quant", "compile_mxfp8_quant")(*args, **kwargs)
+
+
+def compile_mxfp8_dual_quant(*args, **kwargs):
+    return load_kernel_symbol("mxfp8_quant", "compile_mxfp8_dual_quant")(
+        *args, **kwargs
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +141,10 @@ class MXFP8PrequantConfig:
 
 
 DEFAULT_MXFP8_PREQUANT_CONFIG = MXFP8PrequantConfig()
+DEFAULT_MXFP8_INFERENCE_CONFIG = MXFP8PrequantConfig(
+    quant=MXFP8QuantConfig(),
+    gemm=MXFP8GemmConfig(epilogue="direct", store_vec=1),
+)
 
 
 _CONFIGS: dict[str, MXFP8FwdConfig] = {}
@@ -135,6 +155,7 @@ _PREQUANT_RUNNERS: dict[
     tuple[object, ...],
     "_PrequantRunner",
 ] = {}
+_WEIGHT_PREQUANT_RUNNERS: dict[tuple[object, ...], "_WeightPrequantRunner"] = {}
 
 
 class _InductorPrequantLauncherRegistry(dict[str, object]):
@@ -205,6 +226,25 @@ class _PrequantRunner:
             assert self.quant_w is not None
             self.quant_w(weight, self.qw, self.sw)
         self.gemm(self.qx, self.qw, self.sx, self.sw, out)
+
+
+@dataclass(slots=True)
+class _WeightPrequantRunner:
+    quant_x: object
+    gemm: object
+    qx: torch.Tensor
+    sx: torch.Tensor
+    l2_fetch_granularity: int | None
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight: MXFP8Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        _ensure_l2_fetch_granularity(self.l2_fetch_granularity)
+        self.quant_x(x, self.qx, self.sx)
+        self.gemm(self.qx, weight.data, self.sx, weight.scales, out)
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,6 +402,55 @@ def _allocate_scales(
         512,
         dtype=torch.float8_e8m0fnu,
         device=device,
+    )
+
+
+def quantize_mxfp8(
+    tensor: torch.Tensor,
+    *,
+    config: MXFP8QuantConfig | None = None,
+) -> MXFP8Tensor:
+    """Prequantize a BF16 operand once for an MXFP8 inference path."""
+
+    if tensor.ndim < 1:
+        raise ValueError("MXFP8 quantization requires at least one dimension")
+    if tensor.device.type != "cuda":
+        raise ValueError("MXFP8 quantization requires a CUDA tensor")
+    if tensor.dtype is not torch.bfloat16:
+        raise TypeError(f"MXFP8 quantization requires BF16, got {tensor.dtype}")
+    leading_shape = tuple(int(value) for value in tensor.shape)
+    source = tensor.reshape(-1, tensor.shape[-1])
+    source = source if source.is_contiguous() else source.contiguous()
+    selected = config or MXFP8QuantConfig()
+    rejection = selected.rejection(int(source.shape[0]), int(source.shape[1]))
+    if rejection is not None:
+        raise RuntimeError(f"MXFP8 operand cannot be quantized: {rejection}")
+    major, minor = torch.cuda.get_device_capability(tensor.device)
+    if major != 12:
+        raise RuntimeError(
+            "native RTX MXFP8 quantization requires SM120/SM121; "
+            f"got {(major, minor)}"
+        )
+    data = torch.empty_like(source, dtype=torch.float8_e4m3fn)
+    scales = _allocate_scales(
+        int(source.shape[0]),
+        int(source.shape[1]),
+        selected.scale_layout,
+        source.device,
+    )
+    launcher = compile_mxfp8_quant(
+        int(source.shape[0]), int(source.shape[1]), selected
+    )
+    launcher(source, data, scales)
+    # CuTe/TVM-FFI launches asynchronously. Preserve the BF16 source until
+    # both materialized outputs have become ready on the launch stream.
+    data._base_inputs = (source,)
+    scales._base_inputs = (source,)
+    return MXFP8Tensor(
+        data=data,
+        scales=scales,
+        shape=leading_shape,
+        scale_layout=selected.scale_layout,
     )
 
 
@@ -633,6 +722,245 @@ def _run_prequant(
     return _mxfp8_linear_prequant_op(x, weight, config_key)
 
 
+def _packed_weight_from_tensors(
+    data: torch.Tensor,
+    scales: torch.Tensor,
+    n: int,
+    k: int,
+    scale_layout: str,
+) -> MXFP8Tensor:
+    return MXFP8Tensor(data, scales, (n, k), scale_layout)  # type: ignore[arg-type]
+
+
+def _validate_packed_linear_operands(
+    x: MXFP8Tensor,
+    weight: MXFP8Tensor,
+) -> MXFP8Problem:
+    if x.orientation != "row_major" or weight.orientation != "row_major":
+        raise ValueError("public packed linear operands must be row-major logical views")
+    m, k = x.matrix_shape
+    n, weight_k = weight.matrix_shape
+    if k != weight_k:
+        raise ValueError(f"packed linear K mismatch: X={k}, W={weight_k}")
+    if x.device != weight.device:
+        raise ValueError("packed X and W must be on one CUDA device")
+    if x.device.type != "cuda":
+        raise ValueError("packed MXFP8 execution requires CUDA operands")
+    return MXFP8Problem(m, n, k)
+
+
+def _packed_gemm_config(
+    problem: MXFP8Problem,
+    x_layout: str,
+    weight_layout: str,
+    config_key: str,
+) -> MXFP8PrequantConfig:
+    try:
+        config = _PREQUANT_CONFIGS[config_key]
+    except KeyError as exc:
+        raise RuntimeError("unknown MXFP8 inference configuration key") from exc
+    expected = {
+        "row_major": ("row_major", "row_major"),
+        "mma128": ("mma128", "mma128"),
+        "mma64x128": ("mma64", "mma128"),
+    }.get(config.gemm.scale_layout)
+    if expected != (x_layout, weight_layout):
+        raise RuntimeError(
+            f"packed layouts {(x_layout, weight_layout)} are incompatible with "
+            f"GEMM layout {config.gemm.scale_layout}"
+        )
+    rejection = config.gemm.rejection(problem)
+    if rejection is not None:
+        raise RuntimeError(f"packed MXFP8 GEMM cannot run: {rejection}")
+    return config
+
+
+def _launch_weight_prequant_out(
+    x: torch.Tensor,
+    weight: MXFP8Tensor,
+    config_key: str,
+    out: torch.Tensor,
+) -> None:
+    if x.ndim != 2:
+        raise ValueError("internal dynamic-X/prequant-W op expects 2D X")
+    if x.device.type != "cuda" or x.dtype is not torch.bfloat16:
+        raise TypeError("dynamic-X/prequant-W MXFP8 expects CUDA BF16 X")
+    n, k = weight.matrix_shape
+    if x.shape[1] != k or x.device != weight.device:
+        raise ValueError("dynamic X and packed W have incompatible shape/device")
+    x_c = x if x.is_contiguous() else x.contiguous()
+    problem = MXFP8Problem(int(x_c.shape[0]), n, k)
+    try:
+        requested = _PREQUANT_CONFIGS[config_key]
+    except KeyError as exc:
+        raise RuntimeError("unknown MXFP8 inference configuration key") from exc
+    config = _packed_gemm_config(
+        problem,
+        requested.quant.scale_layout,
+        weight.scale_layout,
+        config_key,
+    )
+    rejection = config.quant.rejection(problem.m, problem.k)
+    if rejection is not None:
+        raise RuntimeError(f"activation quantizer cannot run: {rejection}")
+    stream = torch.cuda.current_stream(x.device)
+    runner_key = (
+        x.device.index,
+        int(stream.cuda_stream),
+        problem.m,
+        problem.n,
+        problem.k,
+        weight.scale_layout,
+        config_key,
+    )
+    runner = _WEIGHT_PREQUANT_RUNNERS.get(runner_key)
+    if runner is None:
+        with _CONFIG_LOCK:
+            runner = _WEIGHT_PREQUANT_RUNNERS.get(runner_key)
+            if runner is None:
+                if config.l2_fetch_granularity is not None:
+                    _set_l2_fetch_granularity(config.l2_fetch_granularity)
+                qx = torch.empty_like(x_c, dtype=torch.float8_e4m3fn)
+                sx = _allocate_scales(
+                    problem.m,
+                    problem.k,
+                    config.quant.scale_layout,
+                    x.device,
+                )
+                runner = _WeightPrequantRunner(
+                    quant_x=compile_mxfp8_quant(
+                        problem.m, problem.k, config.quant
+                    ),
+                    gemm=compile_mxfp8_gemm(problem, config.gemm),
+                    qx=qx,
+                    sx=sx,
+                    l2_fetch_granularity=config.l2_fetch_granularity,
+                )
+                _WEIGHT_PREQUANT_RUNNERS[runner_key] = runner
+    runner(x_c, weight, out)
+
+
+@torch.library.custom_op(
+    "rtx::mxfp8_linear_dynamic_x_prequant_w",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _mxfp8_linear_dynamic_x_prequant_w_op(
+    x: torch.Tensor,
+    weight_data: torch.Tensor,
+    weight_scales: torch.Tensor,
+    n: int,
+    k: int,
+    weight_scale_layout: str,
+    config_key: str,
+) -> torch.Tensor:
+    weight = _packed_weight_from_tensors(
+        weight_data, weight_scales, n, k, weight_scale_layout
+    )
+    out = torch.empty((x.shape[0], n), dtype=torch.bfloat16, device=x.device)
+    _launch_weight_prequant_out(x, weight, config_key, out)
+    out._base_inputs = (x, weight_data, weight_scales)
+    return out
+
+
+@_mxfp8_linear_dynamic_x_prequant_w_op.register_fake
+def _mxfp8_linear_dynamic_x_prequant_w_fake(
+    x: torch.Tensor,
+    weight_data: torch.Tensor,
+    weight_scales: torch.Tensor,
+    n: int,
+    k: int,
+    weight_scale_layout: str,
+    config_key: str,
+) -> torch.Tensor:
+    return torch.empty((x.shape[0], n), dtype=torch.bfloat16, device=x.device)
+
+
+@torch.library.custom_op(
+    "rtx::mxfp8_linear_prequantized",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _mxfp8_linear_prequantized_op(
+    x_data: torch.Tensor,
+    weight_data: torch.Tensor,
+    x_scales: torch.Tensor,
+    weight_scales: torch.Tensor,
+    m: int,
+    n: int,
+    k: int,
+    x_scale_layout: str,
+    weight_scale_layout: str,
+    config_key: str,
+) -> torch.Tensor:
+    x = _packed_weight_from_tensors(x_data, x_scales, m, k, x_scale_layout)
+    weight = _packed_weight_from_tensors(
+        weight_data, weight_scales, n, k, weight_scale_layout
+    )
+    problem = _validate_packed_linear_operands(x, weight)
+    config = _packed_gemm_config(
+        problem, x.scale_layout, weight.scale_layout, config_key
+    )
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+    launcher = compile_mxfp8_gemm(problem, config.gemm)
+    launcher(x.data, weight.data, x.scales, weight.scales, out)
+    out._base_inputs = (x_data, weight_data, x_scales, weight_scales)
+    return out
+
+
+@_mxfp8_linear_prequantized_op.register_fake
+def _mxfp8_linear_prequantized_fake(
+    x_data: torch.Tensor,
+    weight_data: torch.Tensor,
+    x_scales: torch.Tensor,
+    weight_scales: torch.Tensor,
+    m: int,
+    n: int,
+    k: int,
+    x_scale_layout: str,
+    weight_scale_layout: str,
+    config_key: str,
+) -> torch.Tensor:
+    return torch.empty((m, n), dtype=torch.bfloat16, device=x_data.device)
+
+
+def _run_weight_prequantized(
+    x: torch.Tensor,
+    weight: MXFP8Tensor,
+    config_key: str,
+) -> torch.Tensor:
+    n, k = weight.matrix_shape
+    return _mxfp8_linear_dynamic_x_prequant_w_op(
+        x,
+        weight.data,
+        weight.scales,
+        n,
+        k,
+        weight.scale_layout,
+        config_key,
+    )
+
+
+def _run_fully_prequantized(
+    x: MXFP8Tensor,
+    weight: MXFP8Tensor,
+    config_key: str,
+) -> torch.Tensor:
+    problem = _validate_packed_linear_operands(x, weight)
+    return _mxfp8_linear_prequantized_op(
+        x.data,
+        weight.data,
+        x.scales,
+        weight.scales,
+        problem.m,
+        problem.n,
+        problem.k,
+        x.scale_layout,
+        weight.scale_layout,
+        config_key,
+    )
+
+
 def _launch_training_forward(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -650,8 +978,8 @@ def _launch_training_forward(
 
 
 def mxfp8_linear(
-    x: torch.Tensor,
-    weight: torch.Tensor,
+    x: torch.Tensor | MXFP8Tensor,
+    weight: torch.Tensor | MXFP8Tensor,
     *,
     config: MXFP8FwdConfig | None = None,
     autotune: AutotuneMode | bool | None = None,
@@ -661,11 +989,42 @@ def mxfp8_linear(
     prequant_config: MXFP8PrequantConfig | None = None,
     backward_config: "MXFP8BwdConfig | None" = None,
 ) -> torch.Tensor:
-    """Apply a no-bias linear transform with dynamic block-scaled MXFP8 operands.
+    """Apply MXFP8 linear in dynamic or prequantized inference states.
 
     Leading activation dimensions are flattened for the kernel and restored in
-    the BF16 result.  ``weight`` has the normal PyTorch ``[out, in]`` layout.
+    the BF16 result. A packed weight makes the operation inference-only; a
+    packed activation additionally skips all quantization in this invocation.
     """
+
+    if isinstance(weight, MXFP8Tensor):
+        selected = prequant_config or DEFAULT_MXFP8_INFERENCE_CONFIG
+        key = _intern_prequant_config(selected)
+        if isinstance(x, MXFP8Tensor):
+            if x.shape[-1] != weight.shape[-1]:
+                raise ValueError("packed activation and weight K must match")
+            out = _run_fully_prequantized(x, weight, key)
+            return out.reshape(*x.shape[:-1], weight.matrix_shape[0])
+        if x.ndim < 1 or x.shape[-1] != weight.shape[-1]:
+            raise ValueError(
+                f"expected activation [..., {weight.shape[-1]}], got {x.shape}"
+            )
+        if x.device.type != "cuda" or weight.device.type != "cuda":
+            raise ValueError("dynamic-X/prequant-W MXFP8 execution requires CUDA")
+        if x.device != weight.device:
+            raise ValueError("dynamic X and packed W must be on one CUDA device")
+        if x.dtype is not torch.bfloat16:
+            raise TypeError(f"dynamic MXFP8 activation must be BF16, got {x.dtype}")
+        if torch.is_grad_enabled() and x.requires_grad:
+            raise RuntimeError(
+                "prequantized MXFP8 weights are inference-only and cannot "
+                "participate in autograd"
+            )
+        leading_shape = x.shape[:-1]
+        x_2d = x.reshape(-1, x.shape[-1])
+        out = _run_weight_prequantized(x_2d, weight, key)
+        return out.reshape(*leading_shape, weight.matrix_shape[0])
+    if isinstance(x, MXFP8Tensor):
+        raise TypeError("a prequantized MXFP8 activation requires a prequantized weight")
 
     if x.ndim < 1:
         raise ValueError("activation must have at least one dimension")
@@ -806,9 +1165,9 @@ def _resolve_fwd_config(
 
 
 class MXFP8Linear(nn.Module):
-    """No-bias BF16 linear module whose two operands are MXFP8 in the kernel."""
+    """No-bias MXFP8 linear supporting dynamic and packed inference operands."""
 
-    __constants__ = ["in_features", "out_features", "backend"]
+    __constants__ = ["in_features", "out_features", "backend", "weight_mode"]
 
     def __init__(
         self,
@@ -825,6 +1184,7 @@ class MXFP8Linear(nn.Module):
         backend: MXFP8Backend = "auto",
         prequant_config: MXFP8PrequantConfig | None = None,
         backward_config: "MXFP8BwdConfig | None" = None,
+        packed_weight: MXFP8Tensor | None = None,
     ) -> None:
         super().__init__()
         if bias:
@@ -847,7 +1207,14 @@ class MXFP8Linear(nn.Module):
         self.backend = backend
         self.prequant_config = prequant_config
         self.backward_config = backward_config
-        selected_prequant = prequant_config or DEFAULT_MXFP8_PREQUANT_CONFIG
+        self.weight_mode: WeightMode = (
+            "prequantized" if packed_weight is not None else "dynamic"
+        )
+        selected_prequant = prequant_config or (
+            DEFAULT_MXFP8_INFERENCE_CONFIG
+            if packed_weight is not None
+            else DEFAULT_MXFP8_PREQUANT_CONFIG
+        )
         mode = _autotune_mode(autotune)
         if prequant_config is not None or mode == "off":
             self._prequant_config_key = _intern_prequant_config(
@@ -865,21 +1232,165 @@ class MXFP8Linear(nn.Module):
         self._backward_config_key = _intern_bwd_config(
             backward_config or DEFAULT_MXFP8_BWD_CONFIG
         )
-        self.weight = nn.Parameter(
-            torch.empty(
-                (out_features, in_features), device=device, dtype=torch.bfloat16
+        if packed_weight is None:
+            self.weight = nn.Parameter(
+                torch.empty(
+                    (out_features, in_features), device=device, dtype=torch.bfloat16
+                )
             )
-        )
-        self.reset_parameters()
+            self.reset_parameters()
+        else:
+            if packed_weight.shape != (out_features, in_features):
+                raise ValueError(
+                    "packed MXFP8 weight shape must equal "
+                    f"{(out_features, in_features)}, got {packed_weight.shape}"
+                )
+            if packed_weight.orientation != "row_major":
+                raise ValueError("packed linear weights must be row-major")
+            if device is not None:
+                packed_weight = packed_weight.to(device)
+            self.register_parameter("weight", None)
+            self.register_buffer("weight_data", packed_weight.data)
+            self.register_buffer("weight_scales", packed_weight.scales)
+            self.register_buffer(
+                "weight_packing_meta",
+                torch.tensor(
+                    [
+                        packed_weight.schema_version,
+                        SCALE_LAYOUT_CODES[packed_weight.scale_layout],
+                    ],
+                    dtype=torch.int64,
+                    device=packed_weight.device,
+                ),
+            )
+            self._weight_scale_layout = packed_weight.scale_layout
+            self._weight_packing_schema = packed_weight.schema_version
+            self.training = False
 
     @property
     def bias(self) -> None:
         return None
 
-    def reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+    def to(self, *args, **kwargs):
+        if self.weight_mode == "prequantized":
+            reject_packed_dtype_conversion(args, kwargs, format_name="MXFP8")
+        return super().to(*args, **kwargs)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def train(self, mode: bool = True):
+        if self.weight_mode == "prequantized" and mode:
+            raise RuntimeError(
+                "a prequantized MXFP8Linear is inference-only; keep a dynamic "
+                "BF16-master module for training"
+            )
+        return super().train(mode)
+
+    def half(self):
+        if self.weight_mode == "prequantized":
+            raise TypeError("a prequantized MXFP8 module cannot be dtype-cast")
+        return super().half()
+
+    def float(self):
+        if self.weight_mode == "prequantized":
+            raise TypeError("a prequantized MXFP8 module cannot be dtype-cast")
+        return super().float()
+
+    def bfloat16(self):
+        if self.weight_mode == "prequantized":
+            raise TypeError("a prequantized MXFP8 module cannot be dtype-cast")
+        return super().bfloat16()
+
+    def type(self, dst_type=None):
+        if self.weight_mode == "prequantized" and dst_type is not None:
+            raise TypeError("a prequantized MXFP8 module cannot be dtype-cast")
+        return super().type(dst_type)
+
+    def reset_parameters(self) -> None:
+        if self.weight is not None:
+            nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    @property
+    def packed_weight(self) -> MXFP8Tensor | None:
+        if self.weight_mode != "prequantized":
+            return None
+        return MXFP8Tensor(
+            self.weight_data,
+            self.weight_scales,
+            (self.out_features, self.in_features),
+            self._weight_scale_layout,
+            schema_version=self._weight_packing_schema,
+        )
+
+    @classmethod
+    def from_float(
+        cls,
+        module: nn.Linear,
+        *,
+        prequant_config: MXFP8PrequantConfig | None = None,
+    ) -> "MXFP8Linear":
+        """Create an inference module with its weight quantized exactly once."""
+
+        if module.bias is not None:
+            raise NotImplementedError("MXFP8Linear.from_float requires bias=False")
+        if module.weight.dtype is not torch.bfloat16:
+            raise TypeError("MXFP8Linear.from_float requires a BF16 weight")
+        selected = prequant_config or DEFAULT_MXFP8_INFERENCE_CONFIG
+        packed = quantize_mxfp8(
+            module.weight.detach(), config=selected.resolved_weight_quant()
+        )
+        return cls(
+            module.in_features,
+            module.out_features,
+            bias=False,
+            device=module.weight.device,
+            prequant_config=selected,
+            packed_weight=packed,
+        )
+
+    def to_quantized_weight(
+        self,
+        *,
+        prequant_config: MXFP8PrequantConfig | None = None,
+    ) -> "MXFP8Linear":
+        """Return an inference-only copy with a persistent packed weight."""
+
+        if self.weight_mode == "prequantized":
+            return self
+        assert self.weight is not None
+        selected = prequant_config or self.prequant_config or DEFAULT_MXFP8_INFERENCE_CONFIG
+        packed = quantize_mxfp8(
+            self.weight.detach(), config=selected.resolved_weight_quant()
+        )
+        return type(self)(
+            self.in_features,
+            self.out_features,
+            bias=False,
+            device=self.weight.device,
+            config=self.config,
+            autotune=self.autotune,
+            tuning_policy=self.tuning_policy,
+            autotune_cache_dir=self.autotune_cache_dir,
+            backend=self.backend,
+            prequant_config=selected,
+            backward_config=self.backward_config,
+            packed_weight=packed,
+        )
+
+    def forward(self, x: torch.Tensor | MXFP8Tensor) -> torch.Tensor:
+        if self.weight_mode == "prequantized":
+            packed_weight = self.packed_weight
+            assert packed_weight is not None
+            return mxfp8_linear(
+                x,
+                packed_weight,
+                prequant_config=(
+                    self.prequant_config or DEFAULT_MXFP8_INFERENCE_CONFIG
+                ),
+            )
+        if isinstance(x, MXFP8Tensor):
+            raise TypeError(
+                "a prequantized activation requires a prequantized module weight"
+            )
+        assert self.weight is not None
         use_prequant = self.backend == "prequant"
         if (
             self.backend == "auto"
@@ -933,13 +1444,16 @@ class MXFP8Linear(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias=False, format=E4M3xE8M0, backend={self.backend}"
+            f"bias=False, format=E4M3xE8M0, backend={self.backend}, "
+            f"weight_mode={self.weight_mode}"
         )
 
 
 __all__ = [
     "DEFAULT_MXFP8_PREQUANT_CONFIG",
+    "DEFAULT_MXFP8_INFERENCE_CONFIG",
     "MXFP8Linear",
     "MXFP8PrequantConfig",
     "mxfp8_linear",
+    "quantize_mxfp8",
 ]

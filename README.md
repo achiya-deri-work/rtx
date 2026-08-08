@@ -1,7 +1,8 @@
 # RTX low-precision linear layers
 
-`rtx-mxfp8` is an experimental Python library for trainable MXFP8 linear
-layers and empirical kernel autotuning on NVIDIA RTX Blackwell GPUs. The
+`rtx` is an experimental Python library for low-precision training and
+inference on NVIDIA RTX and Jetson Blackwell GPUs. Its two public linear
+frontends are `rtx.MXFP8Linear` and `rtx.NVFP4Linear`. The
 current implementation contains:
 
 - fused BF16 input/weight quantization and MXFP8 forward GEMM;
@@ -12,8 +13,11 @@ current implementation contains:
 - calibrated hot/rotating-cache measurements and paired finalist races; and
 - portable cross-device datasets exported as CSV or Parquet.
 
-The native kernels target SM120/SM121. This is research software: kernel and
-dataset schemas are versioned, but APIs may still change.
+The executable native kernels currently target SM120/SM121. Architecture
+discovery and lazy dispatch also recognize SM110/Jetson Thor, whose separate
+TCGen05/TMEM kernels remain under development. This is research software:
+kernel, packed-operand, and dataset schemas are versioned, but APIs may still
+change.
 
 ## Requirements
 
@@ -47,22 +51,59 @@ changing because every dataset bundle records a hash of the installed source.
 
 ```python
 import torch
-from rtx import MXFP8Linear, mxfp8_linear
+import rtx
 
 x = torch.randn(512, 1536, device="cuda", dtype=torch.bfloat16)
 w = torch.randn(1536, 1536, device="cuda", dtype=torch.bfloat16)
 
-y = mxfp8_linear(x, w)
-layer = MXFP8Linear(1536, 1536, bias=False, device="cuda", dtype=torch.bfloat16)
+y = rtx.mxfp8_linear(x, w)
+layer = rtx.MXFP8Linear(
+    1536, 1536, bias=False, device="cuda", dtype=torch.bfloat16
+)
 y2 = layer(x)
 ```
 
-The final public layer pair is `rtx.MXFP8Linear` and `rtx.NVFP4Linear`.
-Both accept BF16 activations and weights, return BF16, expose the usual
-`nn.Linear(in_features, out_features, bias=False, ...)` parameter layout, and
-use the registered MXFP8 backward kernels. `NVFP4Linear` has a registered
-forward/fake/autograd boundary, but its NVFP4 forward kernel is intentionally
-not implemented yet.
+Both modules return BF16 and expose the usual no-bias
+`nn.Linear(in_features, out_features, bias=False, ...)` shape convention.
+Quantization state is independent from training mode:
+
+| State | Activation | Weight | Training | Per-call work |
+| --- | --- | --- | --- | --- |
+| Dynamic | BF16 | BF16 | Yes | Quantize X and W, then GEMM |
+| AOT weight | BF16 | Packed | Inference only | Quantize X, then GEMM |
+| Prequantized | Packed | Packed | Inference only | GEMM only |
+
+Dynamic execution is equally valid under `torch.inference_mode()`; inference
+does not imply packed weights. Explicit conversion performs weight
+quantization exactly once:
+
+```python
+dynamic = rtx.MXFP8Linear(1536, 1536, device="cuda")
+
+with torch.inference_mode():
+    y_dynamic = dynamic(x)  # BF16 X and W are dynamically quantized
+
+    packed_weight = dynamic.to_quantized_weight()
+    y_weight_aot = packed_weight(x)  # only X is dynamically quantized
+
+    packed_x = rtx.quantize_mxfp8(x)
+    y_prequantized = packed_weight(packed_x)  # pure packed GEMM
+```
+
+`rtx.MXFP8Tensor` stores E4M3 values, E8M0 block scales, logical shape,
+orientation, physical scale layout, and packing schema version. The analogous
+`rtx.NVFP4Tensor` stores packed E2M1 values, E4M3 scales per 16 values, and its
+FP32 tensor scale. Packed module weights are persistent buffers and do not
+retain a BF16 master weight.
+
+MXFP8 implements all three state boundaries. `NVFP4Linear` and
+`NVFP4Tensor` expose the same dispatcher/fake/module contract, but execution
+still raises clearly until the NVFP4 quantizer and GEMM are implemented.
+
+The historical MXFP8 backend name `prequant` means *materialized dynamic*: it
+quantizes both BF16 operands into global memory on every call before launching
+the GEMM. It is an implementation strategy for the first row above, not an AOT
+weight state.
 
 See `rtx/fp8.py` and `rtx/fp8_bwd.py` for backend, configuration, and explicit
 backward controls.
