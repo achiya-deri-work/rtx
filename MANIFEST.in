@@ -1,0 +1,8 @@
+include README.md
+include AUTOTUNING.md
+include requirements.txt
+include requirements-dev.txt
+recursive-include autotune_manifests *.json
+recursive-include benchmarks *.py
+recursive-include tests *.py
+

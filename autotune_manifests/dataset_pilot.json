@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "name": "mxfp8_dataset_pilot_v1",
+  "seed": 20260808,
+  "jobs": [
+    {
+      "family": "mxfp8_fused_fwd",
+      "shapes": [
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"}
+      ],
+      "regimes": ["hot"],
+      "promote": 4,
+      "tuning": {
+        "max_trials": 96,
+        "time_budget_s": 1800.0,
+        "cost_model_trials": 64,
+        "model_warmup": 16,
+        "model_pool_size": 2048,
+        "confirmation_repeats": 1,
+        "confirmation_ratio": 0.01,
+        "confirm_initial": true,
+        "seed": 20260808
+      },
+      "protocol": {
+        "warmup_calls": 5,
+        "samples": 7,
+        "confirm_samples": 15,
+        "race_rounds": 15,
+        "target_batch_ms": 30.0,
+        "practical_threshold": 0.005,
+        "bootstrap_resamples": 1000,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "mxfp8_prequant_fwd",
+      "shapes": [
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 4,
+      "tuning": {
+        "max_trials": 96,
+        "time_budget_s": 1800.0,
+        "cost_model_trials": 64,
+        "model_warmup": 16,
+        "model_pool_size": 2048,
+        "confirmation_repeats": 1,
+        "confirmation_ratio": 0.01,
+        "confirm_initial": true,
+        "seed": 20260808
+      },
+      "protocol": {
+        "warmup_calls": 5,
+        "samples": 7,
+        "confirm_samples": 15,
+        "race_rounds": 15,
+        "target_batch_ms": 30.0,
+        "practical_threshold": 0.005,
+        "bootstrap_resamples": 1000,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "mxfp8_bwd",
+      "shapes": [
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"}
+      ],
+      "regimes": ["hot"],
+      "promote": 4,
+      "tuning": {
+        "max_trials": 128,
+        "time_budget_s": 2400.0,
+        "cost_model_trials": 88,
+        "model_warmup": 20,
+        "model_pool_size": 4096,
+        "model_max_features": 96,
+        "local_beam_width": 4,
+        "confirmation_repeats": 1,
+        "confirmation_ratio": 0.01,
+        "confirm_initial": true,
+        "seed": 20260808
+      },
+      "protocol": {
+        "warmup_calls": 8,
+        "samples": 7,
+        "confirm_samples": 15,
+        "race_rounds": 21,
+        "target_batch_ms": 30.0,
+        "correctness_rtol": 0.07,
+        "correctness_atol": 1.0,
+        "practical_threshold": 0.005,
+        "bootstrap_resamples": 1000,
+        "telemetry": true
+      }
+    }
+  ]
+}

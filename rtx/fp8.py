@@ -26,6 +26,7 @@ from .kernels.mxfp8_quant import (
 
 if TYPE_CHECKING:
     from .autotune import CoordinateDescentPolicy
+    from .kernels.mxfp8_bwd import MXFP8BwdConfig
 
 AutotuneMode = Literal["off", "cache", "coordinate"]
 MXFP8Backend = Literal["auto", "fused", "prequant"]
@@ -634,6 +635,7 @@ def mxfp8_linear(
     autotune_cache_dir: Path | str | None = None,
     backend: MXFP8Backend = "auto",
     prequant_config: MXFP8PrequantConfig | None = None,
+    backward_config: "MXFP8BwdConfig | None" = None,
 ) -> torch.Tensor:
     """Apply a no-bias linear transform with dynamic block-scaled MXFP8 operands.
 
@@ -683,7 +685,21 @@ def mxfp8_linear(
                 autotune_cache_dir,
                 selected_prequant,
             )
-        out = _run_prequant(x_2d, weight, key)
+        if torch.is_grad_enabled() and (
+            x_2d.requires_grad or weight.requires_grad
+        ):
+            from .fp8_bwd import (
+                DEFAULT_MXFP8_BWD_CONFIG,
+                _intern_bwd_config,
+                _mxfp8_linear_train_op,
+            )
+
+            bwd_key = _intern_bwd_config(
+                backward_config or DEFAULT_MXFP8_BWD_CONFIG
+            )
+            out = _mxfp8_linear_train_op(x_2d, weight, key, bwd_key)
+        else:
+            out = _run_prequant(x_2d, weight, key)
         return out.reshape(*leading_shape, weight.shape[0])
     selected_config = _resolve_fwd_config(
         x_2d,
@@ -771,6 +787,7 @@ class MXFP8Linear(nn.Module):
         autotune_cache_dir: Path | str | None = None,
         backend: MXFP8Backend = "auto",
         prequant_config: MXFP8PrequantConfig | None = None,
+        backward_config: "MXFP8BwdConfig | None" = None,
     ) -> None:
         super().__init__()
         if in_features % 32:
@@ -788,10 +805,13 @@ class MXFP8Linear(nn.Module):
         self.autotune_cache_dir = autotune_cache_dir
         self.backend = backend
         self.prequant_config = prequant_config
+        self.backward_config = backward_config
         selected_prequant = prequant_config or DEFAULT_MXFP8_PREQUANT_CONFIG
         mode = _autotune_mode(autotune)
         if prequant_config is not None or mode == "off":
-            self._prequant_config_key = _intern_prequant_config(selected_prequant)
+            self._prequant_config_key = _intern_prequant_config(
+                selected_prequant
+            )
         else:
             self._prequant_config_key = _intern_prequant_autotune_request(
                 mode,
@@ -799,6 +819,11 @@ class MXFP8Linear(nn.Module):
                 autotune_cache_dir,
                 selected_prequant,
             )
+        from .fp8_bwd import DEFAULT_MXFP8_BWD_CONFIG, _intern_bwd_config
+
+        self._backward_config_key = _intern_bwd_config(
+            backward_config or DEFAULT_MXFP8_BWD_CONFIG
+        )
         self.weight = nn.Parameter(
             torch.empty(
                 (out_features, in_features), device=device, dtype=torch.bfloat16
@@ -832,7 +857,21 @@ class MXFP8Linear(nn.Module):
             leading_shape = x.shape[:-1]
             x_2d = x.reshape(-1, self.in_features)
             _check_inputs(x_2d, self.weight)
-            out = _run_prequant(x_2d, self.weight, self._prequant_config_key)
+            if torch.is_grad_enabled() and (
+                x_2d.requires_grad or self.weight.requires_grad
+            ):
+                from .fp8_bwd import _mxfp8_linear_train_op
+
+                out = _mxfp8_linear_train_op(
+                    x_2d,
+                    self.weight,
+                    self._prequant_config_key,
+                    self._backward_config_key,
+                )
+            else:
+                out = _run_prequant(
+                    x_2d, self.weight, self._prequant_config_key
+                )
             return out.reshape(*leading_shape, self.out_features)
         return mxfp8_linear(
             x,
@@ -843,6 +882,7 @@ class MXFP8Linear(nn.Module):
             autotune_cache_dir=self.autotune_cache_dir,
             backend=self.backend,
             prequant_config=self.prequant_config,
+            backward_config=self.backward_config,
         )
 
     def extra_repr(self) -> str:

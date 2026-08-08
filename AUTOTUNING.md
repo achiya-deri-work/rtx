@@ -261,3 +261,265 @@ Use `benchmarks/benchmark_mxfp8_frontend.py` to measure the registered
 dynamic-weight op through `torch.compile(fullgraph=True, dynamic=False)`. Kernel
 timings and standalone compiled-op timings are deliberately reported separately:
 the latter also includes graph-output allocation and host submission gaps.
+
+## Rigorous multi-shape experiments
+
+`rtx.prequant_experiments` builds persistent datasets rather than selecting a
+first-use production configuration. It adds facilities which ordinary
+coordinate descent deliberately does not pay for:
+
+- a conditional legal catalogue with an interpretable one-factor structural
+  basis followed by coverage-guided compound schedules;
+- adaptive event batches targeting a fixed amount of GPU time;
+- explicit `hot` and rotating-input regimes, where the rotation ring targets
+  twice the device L2 size when memory permits;
+- low-fidelity screening, high-fidelity confirmation, and AB/BA paired races;
+- bootstrap confidence intervals and a practical-equivalence threshold;
+- separate quantizer and materialized-GEMM diagnostics for confirmed
+  candidates while end-to-end timing remains authoritative;
+- NVIDIA clock, power, temperature, P-state, and utilization snapshots;
+- derived CTA-wave, operand-reuse, tail, byte-size, and L2-fit features;
+- append-only JSONL observations, deterministic hash sharding, atomic summary
+  JSON, and flat CSV export.
+
+Run the bounded three-shape pilot:
+
+```bash
+.venv/bin/python -m rtx.prequant_experiments \
+  --manifest autotune_manifests/pilot_rigorous.json \
+  --output-dir autotune_results/experiments \
+  --export-csv autotune_results/experiments/pilot.csv
+```
+
+Probe each machine before distributing work:
+
+```bash
+.venv/bin/python -m rtx.prequant_experiments --probe
+```
+
+The probe records L2, SMEM, registers, SM count, memory, software fingerprint,
+and telemetry availability. The current native kernel campaign admits
+SM120/SM121 only. In particular, run this probe on Thor before assigning the
+RTX manifest; a different compute capability needs its own legal kernel family
+and must not silently contribute rows of compile failures to the RTX dataset.
+
+Inspect catalogue size and shard allocation without requiring CUDA:
+
+```bash
+.venv/bin/python -m rtx.prequant_experiments \
+  --manifest autotune_manifests/blackwell_cross_device_v1.json \
+  --dry-run
+```
+
+The cross-device manifest is an initial common anchor corpus. Copy the same
+repository revision and manifest to every machine. Device fingerprints place
+each machine in a separate result directory. To split one device's catalogue
+across processes or machines, give each copy a distinct `shard_index` in
+`[0, shard_count)`; configuration IDs are assigned by a deterministic hash.
+
+JSONL measurement records retain raw timing vectors, confidence summaries,
+configuration dictionaries, protocol, device environment, telemetry and
+features. Resume checks observation keys and never overwrites measurements.
+Completed paired-race decisions are replayed when rebuilding the atomic shard
+summary. Compilation and correctness failures are dataset rows rather than
+reasons to terminate a campaign.
+
+After copying device result directories to one machine, merge and flatten all
+shards with:
+
+```bash
+.venv/bin/python -m rtx.prequant_experiments \
+  --merge-root autotune_results/experiments/mxfp8_blackwell_cross_device_v1 \
+  --merged-jsonl autotune_results/experiments/cross_device.jsonl \
+  --export-csv autotune_results/experiments/cross_device.csv \
+  --analysis-json autotune_results/experiments/cross_device_analysis.json \
+  --portfolio-tolerance 0.01
+```
+
+The merger deduplicates by device and observation key, retains the source
+journal path, and preserves session records. CSV columns flatten configs,
+protocols, device properties, telemetry and derived features; raw sample
+vectors remain JSON-encoded in one column.
+
+The analysis report defines one context as `(device, shape, cache regime)`,
+uses confirmed measurements when available, and greedily finds the smallest
+observed configuration portfolio that covers contexts within the requested
+regret tolerance. This gives us an empirical selector baseline and a concrete
+top-k target before fitting a learned ranker.
+
+The cache regimes answer different questions. `hot` is the repeated-layer
+microbenchmark limit. `rotate` cycles equal-valued tensors at distinct
+addresses over a working set larger than L2, approximating newly produced
+activations and recently written dynamic weights. It is intentionally not
+called "cold": quantized scratch buffers and tensor-core execution still have
+their normal within-launch locality.
+
+## MXFP8 backward
+
+The initial backward is an explicitly decomposed end-to-end pipeline. For a
+forward problem `Y[M,N] = X[M,K] @ W[N,K].T`, it executes:
+
+- `dX = dY[M,N] @ W.T[K,N].T`, where `W.T` is a metadata-only view;
+- `dW = dY.T[N,M] @ X.T[K,M].T`, where both transposes are metadata-only views.
+
+CuTe layouts carry every source orientation. A logical transpose keeps the
+original row-major allocation and presents shape `[rows, K]`, stride
+`(1, rows)` to the compiled kernel. Its physical `[32, tile_rows]` bytes are
+loaded contiguously to SMEM once; a second CuTe layout views those same bytes
+as logical `[tile_rows, 32]`. There is no GMEM transpose allocation, transpose
+kernel, SMEM transpose copy, or BF16 orientation workspace.
+
+Each oriented operand is dynamically quantized to E4M3 with its own E8M0
+scales. Forward scales are not reused because the backward reduction axes are
+different. The baseline dW GEMM performs the entire token reduction in FP32
+accumulators and converts only its final result to BF16.
+
+The executable dual quantizer also accepts mixed source orientations with
+independent schedules. dX can therefore quantize row-major `dY` and logical
+`W.T` in one persistent launch without forcing the row and transpose paths to
+share vector width, arithmetic, tile, or register choices. dW similarly emits
+both logical-transpose operands in one launch. Separate launches remain an
+autotuned option because fusion can lose on some shapes.
+
+`rtx.bwd_autotune` times the whole backward, including logical-layout
+quantization, four quantized operands, dX, and dW. Its persistent device/shape database saves
+successful measurements, named legality/implementation rejections, raw timing
+samples, compilation time, correctness results, sessions, and the selected
+winner. The search keeps dX and dW schedules independent and includes:
+
+- logical-layout staging tiles and padding, vector widths, warps, persistence
+  depth, and register caps;
+- dual versus separate quantization, independent A/B vector arithmetic,
+  reductions, launch shapes, scale stores, and register caps;
+- native scale layout/transport, GEMM SMEM/RMEM geometry, stages, LDSM and S2R
+  widths, swizzles, cache controls, register partitions, epilogues and raster;
+- full FP32, split-workspace FP32, FP32 atomic and cluster reduction families;
+- persistent/multi-output tile scheduling, operand reuse/locality, dX/dW order,
+  and stream scheduling.
+
+Families that are represented but do not generate distinct code yet are saved
+as `implementation_rejected`; they are never benchmarked as no-op knobs. The
+current executable baseline uses row-major and logical-transpose quantizers
+plus the MXFP8 GEMM. Tune directly with:
+
+```python
+from rtx import CoordinateDescentPolicy, tune_mxfp8_backward
+
+result = tune_mxfp8_backward(
+    grad_output,
+    x,
+    weight,
+    policy=CoordinateDescentPolicy(time_budget_s=1800),
+)
+```
+
+Or let the public backward API load a cached result or tune on a cache miss:
+
+```python
+from rtx import mxfp8_linear_backward
+
+dx, dw = mxfp8_linear_backward(
+    grad_output,
+    x,
+    weight,
+    autotune="coordinate",
+)
+```
+
+The calibrated composable search is available as:
+
+```bash
+.venv/bin/python -m benchmarks.tune_composable_bwd \
+  --store autotune_results/composable_bwd \
+  --legacy-db path/to/legacy-backward.json \
+  --trials 400 --model-trials 220 --model-pool 8192
+```
+
+`BwdBenchmarkHarness` uses auto-sized multi-call batches, an FP32 normalized-L2
+accuracy gate, component diagnostics, and AB/BA paired races. Historical
+backward databases with nested outcome records are imported as transfer-only
+cost-model data.
+
+## Composable autotuning layer
+
+`rtx.autotune` is now an importable package shared by fused forward,
+prequantized forward, and backward. The original forward coordinate tuner is
+available through a compatibility module, while new searches use five
+independent interfaces:
+
+- kernel adapters own configuration identity, legality, features, mutation,
+  sampling, and evaluation;
+- strategies propose candidates, including random walks, a dependency-free
+  gradient-boosted cost model, and beam coordinate-local search;
+- schedulers compose strategies sequentially or allocate trials with UCB1;
+- the orchestrator owns budgets, deduplication, reward accounting, and session
+  lifecycle;
+- the append-only JSONL store durably records observations and orchestration
+  decisions after every trial.
+
+The default hybrid recipe runs learned global search and then coordinate-local
+search. It can instead expose random, learned, and local strategies as bandit
+arms:
+
+```python
+from rtx.autotune import (
+    HybridTuningPolicy,
+    JsonlTuningStore,
+    make_hybrid_autotuner,
+    make_mxfp8_bwd_adapter,
+)
+
+adapter = make_mxfp8_bwd_adapter(problem, evaluator, device=fingerprint)
+tuner = make_hybrid_autotuner(
+    adapter,
+    JsonlTuningStore("autotune_results/unified"),
+    HybridTuningPolicy(orchestration="bandit", max_trials=512),
+    progress=print,
+)
+result = tuner.tune()
+```
+
+Cross-device observations with the same family/revision are training data for
+the cost model. Incumbents and duplicate suppression remain device/workload/
+regime-local, so transferred predictions never replace actual measurement on
+the target. See `rtx/autotune/README.md` for the schema and extension contract.
+
+### New all-time 512×1536×1536 forward result
+
+The composable tuner imported the 1,646-trial legacy database, trained the GBT
+on those observations, performed legal global sampling, and then ranked full
+coordinate neighborhoods around its measured beam. It found a previously
+untested compound point that changes the best-ever schedule's GEMM producer
+register allocation from 64 to 40 while retaining the 232-register consumer,
+255-register compilation cap, `raster="m"`, and `grid_swizzle=1`.
+
+- previous best search median: 16.678080 µs;
+- new search median: 16.663946 µs;
+- first interleaved race, 51 rounds: 0.2622% median speedup, 95% bootstrap CI
+  0.2582%–0.2705%;
+- independent race, 75 rounds: 0.2738% median speedup, 95% bootstrap CI
+  0.2694%–0.2793%.
+
+Both races selected the challenger with a zero practical threshold. The saved
+winner and raw verification records are under
+`autotune_results/composable_fwd_best/`.
+
+### New 512×1536×1536 backward result
+
+Mixed-layout dual quantization plus two confirmation-aware composable search
+waves reduced the complete backward from the previous saved 42.059 µs search
+winner to the new configuration `08bd05f84afe8f34e7ba`. A fresh 31-sample
+measurement recorded 40.158 µs versus 42.145 µs for the legacy winner. The
+authoritative 75-round paired races found:
+
+- Wave 2 versus Wave 1: 0.1174% median speedup, 95% bootstrap CI
+  0.1103%–0.1220%;
+- Wave 2 versus the previous saved winner: 4.9987% median speedup, 95% CI
+  4.9957%–5.0031%.
+
+The two outputs have identical measured normalized-L2 error. The complete
+configuration, tuning journals, and raw verification samples are under
+`autotune_results/composable_bwd_wave1/`.
+
+Load a saved winner directly with `rtx.load_mxfp8_bwd_config(path)` and pass it
+as the `config=` argument to `mxfp8_linear_backward`.

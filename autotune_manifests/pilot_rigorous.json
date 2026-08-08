@@ -1,0 +1,52 @@
+{
+  "name": "mxfp8_rigorous_pilot_v3",
+  "shapes": [
+    {
+      "m": 512,
+      "n": 1536,
+      "k": 1536,
+      "name": "underfilled",
+      "weight": 1.0
+    },
+    {
+      "m": 1536,
+      "n": 1536,
+      "k": 1536,
+      "name": "balanced",
+      "weight": 1.0
+    },
+    {
+      "m": 8192,
+      "n": 1536,
+      "k": 1536,
+      "name": "tall_weight_reuse",
+      "weight": 1.0
+    }
+  ],
+  "regimes": [
+    "hot",
+    "rotate"
+  ],
+  "candidates_per_shape": 24,
+  "promote": 4,
+  "seed": 20260807,
+  "shard_index": 0,
+  "shard_count": 1,
+  "protocol": {
+    "warmup_calls": 3,
+    "samples": 5,
+    "confirm_samples": 11,
+    "race_rounds": 9,
+    "target_batch_ms": 20.0,
+    "min_calls_per_sample": 1,
+    "max_calls_per_sample": 4096,
+    "correctness_rtol": 0.05,
+    "correctness_atol": 0.5,
+    "practical_threshold": 0.005,
+    "bootstrap_resamples": 1000,
+    "rotation_l2_multiple": 2.0,
+    "max_rotation_buffers": 16,
+    "max_rotation_bytes": 1073741824,
+    "telemetry": true
+  }
+}

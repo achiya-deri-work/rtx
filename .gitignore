@@ -2,5 +2,11 @@
 __pycache__/
 *.py[cod]
 autotune_logs/
+autotune_results/
+dsls_docs/
 .pytest_cache/
 .mypy_cache/
+build/
+dist/
+*.egg-info/
+autotune_datasets/
