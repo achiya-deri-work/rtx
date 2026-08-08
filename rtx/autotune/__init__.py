@@ -46,6 +46,7 @@ from .legacy import (
     tune_mxfp8_fwd,
 )
 from .orchestrator import (
+    AdaptiveBanditScheduler,
     ArmStatistics,
     AutotuneOrchestrator,
     ConfirmationPolicy,
@@ -92,6 +93,7 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "AdaptiveBanditScheduler",
     "ArmStatistics",
     "ArchitectureProfile",
     "AnytimeRunPolicy",

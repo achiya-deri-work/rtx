@@ -8,10 +8,10 @@ from typing import Generic, Literal
 from .core import ConfigT, KernelAdapter, TuningBudget
 from .cost_model import GradientBoostedCostModel, GradientBoostedFeasibilityModel
 from .orchestrator import (
+    AdaptiveBanditScheduler,
     AutotuneOrchestrator,
     ConfirmationPolicy,
     SequentialScheduler,
-    UCB1Scheduler,
 )
 from .store import TuningStore
 from .strategies import CostModelGuidedSearch, CostModelLocalSearch, RandomSearch
@@ -105,7 +105,11 @@ def make_hybrid_autotuner(
         )
     else:
         strategies = [random_search, learned, local]
-        scheduler = UCB1Scheduler(exploration=policy.bandit_exploration)
+        scheduler = AdaptiveBanditScheduler(
+            exploration=policy.bandit_exploration,
+            warmup_trials=policy.model_warmup,
+            warmup_arm=random_search.name,
+        )
     return AutotuneOrchestrator(
         adapter,
         store,

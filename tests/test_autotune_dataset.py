@@ -66,6 +66,32 @@ class DatasetTests(unittest.TestCase):
         self.assertEqual(dataset_module._parse_milestones("8,32,96"), (8, 32, 96))
         with self.assertRaises(ValueError):
             AnytimeRunPolicy(10.0, trial_milestones=(32, 16))
+        with self.assertRaises(ValueError):
+            AnytimeRunPolicy(10.0, context_bandit_discount=0.0)
+
+    def test_context_bandit_uses_similarity_and_forces_real_samples(self) -> None:
+        shape_a = dataset_module.ShapeSpec(128, 1536, 1536, "a")
+        shape_b = dataset_module.ShapeSpec(256, 1536, 1536, "b")
+        shape_c = dataset_module.ShapeSpec(8192, 4096, 4096, "c")
+        descriptors = {
+            "a": ("mxfp8_fused_fwd", shape_a, "hot"),
+            "b": ("mxfp8_fused_fwd", shape_b, "hot"),
+            "c": ("mxfp8_bwd", shape_c, "rotate"),
+        }
+        arms = {
+            key: dataset_module._ContextArmStatistics() for key in descriptors
+        }
+        arms["a"].update(0.8, 1.0, True)
+        arms["c"].update(-0.2, 1.0, False)
+        scores = dataset_module._context_bandit_scores(
+            tuple(descriptors), arms, descriptors, 0.1
+        )
+        self.assertEqual(scores["b"], float("inf"))
+        arms["b"].update(0.0, 1.0, True)
+        scores = dataset_module._context_bandit_scores(
+            tuple(descriptors), arms, descriptors, 0.1
+        )
+        self.assertGreater(scores["b"], scores["c"])
 
     def test_anytime_context_order_is_breadth_first_across_families(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -114,6 +140,7 @@ class DatasetTests(unittest.TestCase):
             "dataset_pilot.json",
             "cross_device_dataset_v1.json",
             "cross_device_dataset_v2.json",
+            "cross_device_dataset_bandit_v1.json",
             "inference_states_pilot_v1.json",
         ):
             manifest = DatasetManifest.load(root / "autotune_manifests" / name)
@@ -207,9 +234,22 @@ class DatasetTests(unittest.TestCase):
                     },
                 }
             )
+            allocations = ExperimentJournal(root / "context_allocations.jsonl")
+            allocations.append(
+                {
+                    "record_type": "context_allocation",
+                    "observation_key": "allocation-one",
+                    "context_id": adapter.context.identifier,
+                    "family": "test_kernel",
+                    "machine_id": "machine-one",
+                    "shape": {"m": 128, "n": 256, "k": 512},
+                    "reward": 0.25,
+                    "success": True,
+                }
+            )
 
             rows = normalized_rows((root, root))
-            self.assertEqual(len(rows), 2)
+            self.assertEqual(len(rows), 3)
             measurement = next(row for row in rows if row["record_type"] == "measurement")
             self.assertEqual(measurement["context__workload__m"], 128)
             self.assertEqual(measurement["config__tile"], 128)
@@ -219,12 +259,17 @@ class DatasetTests(unittest.TestCase):
                 50_000_000,
             )
             self.assertEqual(measurement["strategy"], "cost_model")
+            allocation = next(
+                row for row in rows if row["record_type"] == "context_allocation"
+            )
+            self.assertEqual(allocation["allocation__reward"], 0.25)
 
             report = export_bundle((root,), root / "merged", export_format="csv")
-            self.assertEqual(report["rows"], 2)
+            self.assertEqual(report["rows"], 3)
+            self.assertEqual(report["context_allocations"], 1)
             with (root / "merged.csv").open(encoding="utf-8") as source:
                 exported = list(csv.DictReader(source))
-            self.assertEqual(len(exported), 2)
+            self.assertEqual(len(exported), 3)
             self.assertTrue((root / "merged.export.json").exists())
 
     def test_parquet_dependency_error_is_actionable(self) -> None:

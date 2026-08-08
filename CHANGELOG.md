@@ -3,6 +3,18 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.6.0
+
+- Add a resumable, nonstationary contextual bandit over random, learned-global,
+  and model-local search strategies with cost-aware rewards and capped
+  cross-context priors.
+- Add coverage-first contextual bandit allocation across dataset contexts with
+  milestone fairness, durable decision journals, and CSV/Parquet export.
+- Add CLI controls for composing both allocation levels and a dedicated
+  cross-device hierarchical-bandit manifest.
+- Preserve the v2 manifest and sequential/breadth-first behavior as compatible
+  control policies.
+
 ## 0.5.1
 
 - Prefer official PyTorch CUDA 13.2 wheels in `requirements.txt` and add a

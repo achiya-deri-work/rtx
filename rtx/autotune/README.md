@@ -9,8 +9,8 @@ kernel-specific coordinate tuner:
    cost-model search, coordinate/beam local search, and strategy pipelines are
    provided.
 3. `StrategyScheduler` assigns the next trial. `SequentialScheduler` implements
-   staged search and `UCB1Scheduler` treats strategies as multi-armed-bandit
-   arms.
+   staged search, `UCB1Scheduler` remains available as a small baseline, and
+   `AdaptiveBanditScheduler` is the production discounted contextual bandit.
 4. `AutotuneOrchestrator` owns budget, deduplication, evaluation, rewards,
    progress, and session lifecycle.
 5. `TuningStore` records sessions, orchestration decisions, and observations.
@@ -89,8 +89,36 @@ wins. Confirmation is disabled by default so existing integrations retain
 their measurement cost.
 
 For online strategy allocation, set `orchestration="bandit"`. Random, learned,
-and local strategies then become UCB1 arms; improvement, validity, and evaluator
-wall time determine allocation.
+and local strategies become discounted-UCB arms. The scheduler performs an
+explicit random/model warmup, forces a real active-context sample from every
+arm, then allocates by bounded incumbent improvement, validity, information
+gain, evaluator cost, and uncertainty. Similar workload/device observations
+are capped virtual pulls: they influence cold-start ordering but cannot replace
+a measurement on the current GPU and shape.
+
+Bandit state is reconstructed from append-only observations on every resume;
+it is not reset at process or context-slice boundaries. Every decision records
+scores, effective discounted counts, cumulative counts, rewards, cooldowns,
+and transfer priors in `events.jsonl`.
+
+Time-budgeted dataset campaigns can compose a second bandit over workload
+contexts. It first reaches a configurable coverage floor, then uses contextual
+discounted UCB to decide which shape/family/cache regime receives the next
+slice. A milestone-lead bound prevents starvation. Its decisions are durable
+in `context_allocations.jsonl` and are included in CSV/Parquet exports.
+
+```bash
+rtx-autotune run autotune_manifests/cross_device_dataset_bandit_v1.json \
+  --device cuda:0 --output-dir autotune_datasets --format both \
+  --wall-time 12h --context-slice 2m \
+  --context-orchestration bandit
+```
+
+To continue an existing manifest without changing its digest, add
+`--strategy-orchestration bandit --strategy-bandit-exploration 0.35`; the
+override is recorded in the run's anytime policy. Use
+`--adopt-existing-context-identity` only for a compatible runner-only upgrade
+as described in the repository README.
 
 ## Recorded schema
 
@@ -105,8 +133,9 @@ Every observation includes:
 - raw timing samples, median, compilation latency, and numerical error;
 - session sequence, timestamps, and full evaluator duration.
 
-Strategy-selection events store the state of every scheduler arm. This makes
-offline replay and counterfactual orchestration analysis possible.
+Strategy-selection events and context-allocation rows store the state and score
+of every scheduler arm. This makes offline replay and counterfactual
+orchestration analysis possible.
 
 When `transfer_history=True`, the cost model receives observations from other
 contexts with the same family and kernel revision. Deduplication and incumbent

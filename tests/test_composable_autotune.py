@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from rtx.autotune import (
+    AdaptiveBanditScheduler,
     AutotuneOrchestrator,
     ConfirmationPolicy,
     CoordinateLocalSearch,
@@ -74,6 +75,66 @@ def _toy_adapter() -> DiscreteKernelAdapter[_ToyConfig]:
 
 
 class ComposableAutotuneTests(unittest.TestCase):
+    def test_adaptive_bandit_replays_state_across_resume(self) -> None:
+        adapter = _toy_adapter()
+        with tempfile.TemporaryDirectory() as directory:
+            store = JsonlTuningStore(Path(directory), fsync=False)
+            strategies = [RandomSearch(), CoordinateLocalSearch()]
+            first = AutotuneOrchestrator(
+                adapter,
+                store,
+                strategies,
+                AdaptiveBanditScheduler(
+                    exploration=0.2,
+                    warmup_trials=2,
+                    warmup_arm="random",
+                ),
+                TuningBudget(max_trials=6, time_budget_s=10),
+                seed=11,
+                max_trials_includes_resumed=True,
+            ).tune()
+            self.assertEqual(first.evaluated_trials, 6)
+            events_before = len(store.events_path.read_text().splitlines())
+            second = AutotuneOrchestrator(
+                adapter,
+                store,
+                [RandomSearch(), CoordinateLocalSearch()],
+                AdaptiveBanditScheduler(
+                    exploration=0.2,
+                    warmup_trials=2,
+                    warmup_arm="random",
+                ),
+                TuningBudget(max_trials=8, time_budget_s=10),
+                seed=11,
+                max_trials_includes_resumed=True,
+            ).tune()
+            self.assertEqual(second.evaluated_trials, 2)
+            new_events = [
+                json.loads(line)
+                for line in store.events_path.read_text().splitlines()[events_before:]
+                if json.loads(line).get("kind") == "strategy_selected"
+            ]
+            self.assertTrue(new_events)
+            state = new_events[0]["payload"]["scheduler_state"]
+            self.assertEqual(state["scheduler"], "adaptive_contextual_bandit")
+            self.assertGreater(
+                sum(arm["pulls"] for arm in state["arms"].values()),
+                0,
+            )
+
+    def test_adaptive_bandit_reward_penalizes_expensive_failures(self) -> None:
+        scheduler = AdaptiveBanditScheduler(cost_scale_s=1.0)
+        fast = evaluate_proposal(
+            _toy_adapter(),
+            Proposal(_ToyConfig(), "random"),
+            session_id="session",
+            sequence=0,
+        )
+        fast.outcome = TrialOutcome("compile_error", error="bad")
+        fast.elapsed_s = 0.01
+        slow = replace(fast, elapsed_s=10.0)
+        self.assertLess(scheduler.reward(float("inf"), slow), scheduler.reward(float("inf"), fast))
+
     def test_gradient_boosted_model_learns_schedule_order(self) -> None:
         adapter = _toy_adapter()
         observations = []

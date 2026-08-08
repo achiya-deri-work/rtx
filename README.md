@@ -186,6 +186,28 @@ finalists, and fully searched contexts use the manifest's full confirmation
 policy. The global wall time and every context visit are checkpoints, and
 Ctrl-C preserves all observations already printed as `SAVE`.
 
+For new campaigns, the hierarchical bandit manifest makes random exploration,
+gradient-boosted global search, and model-guided local search competing,
+resumable arms. Adding the context allocator distributes wall time across
+shapes while retaining a 32-trial coverage floor and a bounded milestone lead:
+
+```bash
+rtx-autotune run autotune_manifests/cross_device_dataset_bandit_v1.json \
+  --device cuda:0 \
+  --output-dir autotune_datasets \
+  --format both \
+  --calibration hardware_calibration.json \
+  --wall-time 12h \
+  --context-slice 2m \
+  --context-orchestration bandit
+```
+
+Use `--strategy-orchestration bandit --strategy-bandit-exploration 0.35` with
+an existing manifest to override its per-context scheduler without changing
+that manifest's digest. Both levels replay their append-only history after
+interruption. Strategy decisions live in each store's `events.jsonl`; context
+decisions live in `context_allocations.jsonl` and are exported to CSV/Parquet.
+
 If this scheduler is pulled while a v2 run made by an older checkout already
 exists, explicitly adopt that bundle's context identity so the old observations
 count toward the same milestones:
@@ -226,6 +248,7 @@ autotune_datasets/<campaign>/<machine-id>/shard-000-of-001/
 ├── machine.json
 ├── summary.json
 ├── verification.jsonl
+├── context_allocations.jsonl
 ├── dataset.csv
 └── stores/
     └── <kernel>/<regime>/

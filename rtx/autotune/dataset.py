@@ -77,12 +77,19 @@ def compile_mxfp8_fwd(*args, **kwargs):
 
 @dataclass(frozen=True, slots=True)
 class AnytimeRunPolicy:
-    """Breadth-first campaign scheduling for useful preemptible runs."""
+    """Preemptible campaign scheduling with optional context-level bandits."""
 
     wall_time_s: float
     context_slice_s: float = 120.0
     trial_milestones: tuple[int, ...] = (32, 96, 192, 384, 512)
     initial_promote: int = 2
+    strategy_orchestration: Literal["manifest", "sequential", "bandit"] = "manifest"
+    strategy_bandit_exploration: float | None = None
+    context_orchestration: Literal["breadth_first", "bandit"] = "breadth_first"
+    bandit_min_trials: int = 32
+    context_bandit_exploration: float = 0.35
+    context_bandit_discount: float = 0.97
+    max_milestone_lead: int = 1
 
     def __post_init__(self) -> None:
         if self.wall_time_s <= 0 or self.context_slice_s <= 0:
@@ -93,6 +100,122 @@ class AnytimeRunPolicy:
             raise ValueError("anytime trial milestones must be unique and increasing")
         if self.initial_promote <= 0:
             raise ValueError("anytime initial promotion count must be positive")
+        if self.context_orchestration not in ("breadth_first", "bandit"):
+            raise ValueError("unknown anytime context orchestration")
+        if self.strategy_orchestration not in ("manifest", "sequential", "bandit"):
+            raise ValueError("unknown strategy orchestration override")
+        if (
+            self.strategy_bandit_exploration is not None
+            and self.strategy_bandit_exploration < 0
+        ):
+            raise ValueError("strategy-bandit exploration cannot be negative")
+        if self.bandit_min_trials <= 0:
+            raise ValueError("bandit minimum trials must be positive")
+        if self.context_bandit_exploration < 0:
+            raise ValueError("context-bandit exploration cannot be negative")
+        if not 0 < self.context_bandit_discount <= 1:
+            raise ValueError("context-bandit discount must be in (0, 1]")
+        if self.max_milestone_lead < 0:
+            raise ValueError("maximum milestone lead cannot be negative")
+
+
+@dataclass(slots=True)
+class _ContextArmStatistics:
+    pulls: int = 0
+    successes: int = 0
+    reward_sum: float = 0.0
+    elapsed_s: float = 0.0
+    effective_pulls: float = 0.0
+    effective_reward_sum: float = 0.0
+
+    @property
+    def mean(self) -> float:
+        if self.effective_pulls <= 0:
+            return 0.0
+        return self.effective_reward_sum / self.effective_pulls
+
+    def decay(self, discount: float) -> None:
+        self.effective_pulls *= discount
+        self.effective_reward_sum *= discount
+
+    def update(
+        self,
+        reward: float,
+        elapsed_s: float,
+        success: bool,
+    ) -> None:
+        self.pulls += 1
+        self.successes += int(success)
+        self.reward_sum += reward
+        self.elapsed_s += elapsed_s
+        self.effective_pulls += 1.0
+        self.effective_reward_sum += reward
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def _context_similarity(
+    left: tuple[str, ShapeSpec, CacheRegime],
+    right: tuple[str, ShapeSpec, CacheRegime],
+) -> float:
+    family_a, shape_a, regime_a = left
+    family_b, shape_b, regime_b = right
+    distance = sum(
+        abs(math.log2(float(a) / float(b)))
+        for a, b in (
+            (shape_a.m, shape_b.m),
+            (shape_a.n, shape_b.n),
+            (shape_a.k, shape_b.k),
+        )
+    ) / 3.0
+    family = 1.0 if family_a == family_b else 0.30
+    regime = 1.0 if regime_a == regime_b else 0.55
+    return max(0.01, family * regime * math.exp(-distance))
+
+
+def _context_bandit_scores(
+    keys: Sequence[str],
+    statistics_by_key: Mapping[str, _ContextArmStatistics],
+    descriptors: Mapping[str, tuple[str, ShapeSpec, CacheRegime]],
+    exploration: float,
+) -> dict[str, float]:
+    """Contextual discounted UCB scores with capped neighbor virtual pulls."""
+
+    total = max(
+        1.0,
+        sum(statistics_by_key[key].effective_pulls for key in keys),
+    )
+    result: dict[str, float] = {}
+    for key in keys:
+        arm = statistics_by_key[key]
+        if arm.pulls == 0:
+            result[key] = math.inf
+            continue
+        neighbor_weight = 0.0
+        neighbor_reward = 0.0
+        for other in keys:
+            if other == key:
+                continue
+            peer = statistics_by_key[other]
+            if peer.effective_pulls <= 0:
+                continue
+            similarity = _context_similarity(descriptors[key], descriptors[other])
+            weight = similarity * min(1.0, peer.effective_pulls)
+            neighbor_weight += weight
+            neighbor_reward += weight * peer.mean
+        prior_pulls = min(2.0, neighbor_weight / 4.0)
+        prior_reward = (
+            0.0
+            if neighbor_weight <= 0
+            else prior_pulls * neighbor_reward / neighbor_weight
+        )
+        pulls = arm.effective_pulls + prior_pulls
+        mean = (arm.effective_reward_sum + prior_reward) / max(pulls, 1e-9)
+        result[key] = mean + exploration * math.sqrt(
+            math.log(total + 1.0) / max(pulls, 1e-9)
+        )
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -760,6 +883,9 @@ class DatasetCampaign:
         if adopt_existing_context_identity:
             self.context_source = self._existing_context_source()
         self.verification = ExperimentJournal(self.bundle / "verification.jsonl")
+        self.context_allocations = ExperimentJournal(
+            self.bundle / "context_allocations.jsonl"
+        )
 
     def _existing_context_source(self) -> Mapping[str, object]:
         """Adopt v2 context tags after runner-only source changes.
@@ -1056,6 +1182,24 @@ class DatasetCampaign:
     def _context_trials(store: JsonlTuningStore, adapter: KernelAdapter) -> int:
         return sum(1 for _record in store.records(adapter.context))
 
+    @staticmethod
+    def _context_best_ms(
+        store: JsonlTuningStore, adapter: KernelAdapter
+    ) -> float:
+        best = math.inf
+        for record in store.records(adapter.context):
+            outcome = record.get("outcome", {})
+            if not isinstance(outcome, Mapping) or outcome.get("status") != "ok":
+                continue
+            value = outcome.get("median_ms")
+            try:
+                numeric = float(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(numeric):
+                best = min(best, numeric)
+        return best
+
     def _run_context(
         self,
         job: DatasetJob,
@@ -1072,6 +1216,26 @@ class DatasetCampaign:
         store = JsonlTuningStore(self.bundle / "stores" / job.family / regime)
         before = self._context_trials(store, adapter)
         effective_job = job
+        if self.anytime is not None and (
+            self.anytime.strategy_orchestration != "manifest"
+            or self.anytime.strategy_bandit_exploration is not None
+        ):
+            effective_job = replace(
+                effective_job,
+                tuning=replace(
+                    effective_job.tuning,
+                    orchestration=(
+                        effective_job.tuning.orchestration
+                        if self.anytime.strategy_orchestration == "manifest"
+                        else self.anytime.strategy_orchestration
+                    ),
+                    bandit_exploration=(
+                        effective_job.tuning.bandit_exploration
+                        if self.anytime.strategy_bandit_exploration is None
+                        else self.anytime.strategy_bandit_exploration
+                    ),
+                ),
+            )
         if target_trials is not None or time_budget_s is not None:
             effective_job = replace(
                 effective_job,
@@ -1129,7 +1293,295 @@ class DatasetCampaign:
             results.append(result)
         return "complete"
 
-    def _run_anytime(
+    def _run_anytime_bandit(
+        self,
+        results: list[dict[str, object]],
+        *,
+        started: float,
+    ) -> str:
+        """Coverage-first, then contextual discounted-UCB context allocation."""
+
+        assert self.anytime is not None
+        policy = self.anytime
+        deadline = started + policy.wall_time_s
+        assigned = self._assigned_contexts()
+        milestones = tuple(
+            sorted(
+                set(policy.trial_milestones)
+                | {policy.bandit_min_trials}
+                | {job.tuning.max_trials for job, _shape, _regime in assigned}
+            )
+        )
+        first_milestone = milestones[0]
+        items: dict[str, tuple[DatasetJob, ShapeSpec, CacheRegime]] = {}
+        descriptors: dict[str, tuple[str, ShapeSpec, CacheRegime]] = {}
+        trials: dict[str, int] = {}
+        best_ms: dict[str, float] = {}
+        blocked: set[str] = set()
+
+        self._log(
+            f"ANYTIME-BANDIT contexts={len(assigned)} wall={policy.wall_time_s:.0f}s "
+            f"slice={policy.context_slice_s:.0f}s min_trials={policy.bandit_min_trials} "
+            f"milestones={milestones}"
+        )
+        for job, shape, regime in assigned:
+            try:
+                harness = self._make_harness(job, shape, regime)
+                adapter = self._make_adapter(job, shape, regime, harness)
+                store = JsonlTuningStore(self.bundle / "stores" / job.family / regime)
+                key = adapter.context.identifier
+                items[key] = (job, shape, regime)
+                descriptors[key] = (job.family, shape, regime)
+                trials[key] = self._context_trials(store, adapter)
+                best_ms[key] = self._context_best_ms(store, adapter)
+                del harness, adapter, store
+            except Exception as exc:
+                self._log(
+                    f"SKIP    {job.family} {shape.key} {regime} setup_error "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                results.append(
+                    {
+                        "family": job.family,
+                        "shape": shape.key,
+                        "regime": regime,
+                        "status": "setup_error",
+                        "error": f"{type(exc).__name__}: {exc}"[:4000],
+                    }
+                )
+
+        statistics_by_key = {
+            key: _ContextArmStatistics() for key in items
+        }
+        allocation_records = self.context_allocations.records()
+        for record in allocation_records:
+            key = str(record.get("context_id", ""))
+            if key not in statistics_by_key:
+                continue
+            try:
+                reward = float(record["reward"])
+                elapsed_s = float(record.get("elapsed_s", 0.0))
+            except (KeyError, TypeError, ValueError):
+                continue
+            for arm in statistics_by_key.values():
+                arm.decay(policy.context_bandit_discount)
+            statistics_by_key[key].update(
+                reward,
+                elapsed_s,
+                bool(record.get("success", False)),
+            )
+
+        allocation_sequence = len(allocation_records)
+
+        def level(key: str) -> int:
+            return sum(trials[key] >= min(value, items[key][0].tuning.max_trials) for value in milestones)
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._log("DEADLINE global anytime wall-time exhausted")
+                return "time_budget_exhausted"
+            unfinished = [
+                key
+                for key, (job, _shape, _regime) in items.items()
+                if key not in blocked and trials[key] < job.tuning.max_trials
+            ]
+            if not unfinished:
+                return "complete"
+
+            coverage = [
+                key
+                for key in unfinished
+                if trials[key] < min(policy.bandit_min_trials, items[key][0].tuning.max_trials)
+            ]
+            all_scores = _context_bandit_scores(
+                tuple(items),
+                statistics_by_key,
+                descriptors,
+                policy.context_bandit_exploration,
+            )
+            if coverage:
+                # Preserve representative coverage under early interruption.
+                selected = min(
+                    coverage,
+                    key=lambda key: (trials[key], tuple(items).index(key)),
+                )
+                reason = "minimum_coverage"
+            else:
+                shallowest = min(level(key) for key in unfinished)
+                eligible = [
+                    key
+                    for key in unfinished
+                    if level(key) <= shallowest + policy.max_milestone_lead
+                ]
+                selected = max(
+                    eligible,
+                    key=lambda key: (all_scores[key], -tuple(items).index(key)),
+                )
+                reason = "contextual_discounted_ucb"
+
+            job, shape, regime = items[selected]
+            target = next(
+                (
+                    min(value, job.tuning.max_trials)
+                    for value in milestones
+                    if min(value, job.tuning.max_trials) > trials[selected]
+                ),
+                job.tuning.max_trials,
+            )
+            before = trials[selected]
+            before_best = best_ms[selected]
+            budget = min(policy.context_slice_s, remaining)
+            promote = (
+                job.promote
+                if target == job.tuning.max_trials
+                else policy.initial_promote
+            )
+            self._log(
+                f"ALLOC   {reason} {job.family} {shape.key} {regime} "
+                f"trials={before}->{target} score={all_scores[selected]:.5f}"
+            )
+            success = False
+            error: str | None = None
+            visit_started = time.monotonic()
+            tuning_elapsed_s: float | None = None
+            result: dict[str, object]
+            try:
+                result, _reported_before, after = self._run_context(
+                    job,
+                    shape,
+                    regime,
+                    target_trials=target,
+                    time_budget_s=budget,
+                    promote=promote,
+                    verify=False,
+                )
+                tuning_elapsed_s = float(result.get("elapsed_s", 0.0))
+                trials[selected] = after
+                candidate_best = result.get("tuning_best_ms")
+                if candidate_best is not None:
+                    best_ms[selected] = min(before_best, float(candidate_best))
+                success = after > before
+                if not success:
+                    blocked.add(selected)
+                reached_first = before < first_milestone <= after
+                reached_final = after >= job.tuning.max_trials
+                if reached_first or reached_final:
+                    harness = self._make_harness(job, shape, regime)
+                    adapter = self._make_adapter(job, shape, regime, harness)
+                    store = JsonlTuningStore(
+                        self.bundle / "stores" / job.family / regime
+                    )
+                    result["verification"] = self._verify(
+                        adapter,
+                        harness,
+                        replace(job, promote=promote),
+                        shape,
+                        regime,
+                        store,
+                    )
+                results.append(result)
+            except Exception as exc:
+                blocked.add(selected)
+                error = f"{type(exc).__name__}: {exc}"[:4000]
+                # A tuner may have durably saved observations before raising.
+                # Re-probe so the allocation journal never rolls trial counts
+                # back to their pre-visit value.
+                try:
+                    harness = self._make_harness(job, shape, regime)
+                    adapter = self._make_adapter(job, shape, regime, harness)
+                    store = JsonlTuningStore(
+                        self.bundle / "stores" / job.family / regime
+                    )
+                    trials[selected] = self._context_trials(store, adapter)
+                    best_ms[selected] = self._context_best_ms(store, adapter)
+                    del harness, adapter, store
+                except Exception:
+                    pass
+                self._log(
+                    f"SKIP    {job.family} {shape.key} {regime} tuning_error {error}"
+                )
+                result = {
+                    "family": job.family,
+                    "shape": shape.key,
+                    "regime": regime,
+                    "context_id": selected,
+                    "target_trials": target,
+                    "status": "tuning_error",
+                    "error": error,
+                }
+                results.append(result)
+
+            visit_elapsed_s = time.monotonic() - visit_started
+            elapsed_s = (
+                visit_elapsed_s if tuning_elapsed_s is None else tuning_elapsed_s
+            )
+            after = trials[selected]
+            after_best = best_ms[selected]
+            cost = 0.05 * math.tanh(elapsed_s / max(policy.context_slice_s, 1e-9))
+            if not success:
+                reward = -0.20 - cost
+            else:
+                improvement = 0.0
+                if math.isfinite(before_best) and math.isfinite(after_best) and after_best > 0:
+                    improvement = math.tanh(max(0.0, math.log(before_best / after_best)))
+                coverage_reward = 0.05 * math.tanh((after - before) / 32.0)
+                reward = 0.01 + improvement + coverage_reward - cost
+
+            for arm in statistics_by_key.values():
+                arm.decay(policy.context_bandit_discount)
+            statistics_by_key[selected].update(reward, elapsed_s, success)
+            recorded_at = _utc_now()
+            allocation_id = stable_id(
+                {
+                    "machine_id": self.machine["machine_id"],
+                    "context_id": selected,
+                    "sequence": allocation_sequence,
+                    "before": before,
+                    "after": after,
+                    "recorded_at": recorded_at,
+                }
+            )
+            self.context_allocations.append(
+                {
+                    "schema_version": DATASET_SCHEMA_VERSION,
+                    "record_type": "context_allocation",
+                    "observation_key": allocation_id,
+                    "allocation_id": allocation_id,
+                    "sequence": allocation_sequence,
+                    "recorded_at": recorded_at,
+                    "manifest_digest": self.manifest.digest,
+                    "machine_id": self.machine["machine_id"],
+                    "device_id": self.fingerprint.identifier,
+                    "context_id": selected,
+                    "family": job.family,
+                    "shape": asdict(shape),
+                    "shape_key": shape.key,
+                    "regime": regime,
+                    "reason": reason,
+                    "target_trials": target,
+                    "trials_before": before,
+                    "trials_after": after,
+                    "best_before_ms": None if not math.isfinite(before_best) else before_best,
+                    "best_after_ms": None if not math.isfinite(after_best) else after_best,
+                    "elapsed_s": elapsed_s,
+                    "visit_elapsed_s": visit_elapsed_s,
+                    "success": success,
+                    "reward": reward,
+                    "error": error,
+                    "scores": {
+                        key: (None if not math.isfinite(value) else value)
+                        for key, value in all_scores.items()
+                    },
+                    "arms": {
+                        key: arm.as_dict()
+                        for key, arm in statistics_by_key.items()
+                    },
+                }
+            )
+            allocation_sequence += 1
+
+    def _run_anytime_breadth_first(
         self,
         results: list[dict[str, object]],
         *,
@@ -1254,6 +1706,17 @@ class DatasetCampaign:
                     self._log(f"PHASE   target={milestone} stalled; advancing")
                     break
         return "complete"
+
+    def _run_anytime(
+        self,
+        results: list[dict[str, object]],
+        *,
+        started: float,
+    ) -> str:
+        assert self.anytime is not None
+        if self.anytime.context_orchestration == "bandit":
+            return self._run_anytime_bandit(results, started=started)
+        return self._run_anytime_breadth_first(results, started=started)
 
     def run(self, *, export_format: ExportFormat = "csv") -> Path:
         self.bundle.mkdir(parents=True, exist_ok=True)
@@ -1464,6 +1927,29 @@ def normalized_rows(paths: Iterable[Path | str]) -> list[dict[str, object]]:
             _flatten(prefix, value, row)
         identity = (record.get("record_type"), record.get("observation_key"))
         unique.setdefault(identity, row)
+
+    for path, record in _iter_jsonl(sources, "context_allocations.jsonl"):
+        row = {
+            "schema_version": DATASET_SCHEMA_VERSION,
+            "record_type": "context_allocation",
+            "source_path": str(path),
+            "observation_id": record.get("observation_key"),
+            "context_id": record.get("context_id"),
+            "family": record.get("family"),
+            "manifest_digest": record.get("manifest_digest"),
+            "machine_id": record.get("machine_id"),
+            "device_id": record.get("device_id"),
+            "recorded_at": record.get("recorded_at"),
+            "sequence": record.get("sequence"),
+        }
+        for prefix, value in (
+            ("machine", machines.get(str(record.get("machine_id")), {})),
+            ("shape", record.get("shape", {})),
+            ("allocation", record),
+        ):
+            _flatten(prefix, value, row)
+        identity = ("context_allocation", record.get("observation_key"))
+        unique.setdefault(identity, row)
     return [unique[key] for key in sorted(unique, key=lambda item: tuple(map(str, item)))]
 
 
@@ -1530,6 +2016,9 @@ def export_bundle(
             row.get("record_type") == "verification_measurement" for row in rows
         ),
         "races": sum(row.get("record_type") == "race" for row in rows),
+        "context_allocations": sum(
+            row.get("record_type") == "context_allocation" for row in rows
+        ),
         "successful_rows": sum(row.get("outcome__status") == "ok" for row in rows),
         "families": sorted(
             {str(row["family"]) for row in rows if row.get("family") is not None}
@@ -1626,6 +2115,47 @@ def _build_parser() -> argparse.ArgumentParser:
         help="finalists verified after the first coverage milestone (default: 2)",
     )
     run.add_argument(
+        "--strategy-orchestration",
+        choices=("manifest", "sequential", "bandit"),
+        default="manifest",
+        help="override each context's search-strategy allocator in anytime mode",
+    )
+    run.add_argument(
+        "--strategy-bandit-exploration",
+        type=float,
+        help="override the strategy discounted-UCB exploration coefficient",
+    )
+    run.add_argument(
+        "--context-orchestration",
+        choices=("breadth_first", "bandit"),
+        default="breadth_first",
+        help="anytime context allocator (default: breadth_first)",
+    )
+    run.add_argument(
+        "--bandit-min-trials",
+        type=int,
+        default=32,
+        help="coverage floor before context-bandit allocation (default: 32)",
+    )
+    run.add_argument(
+        "--context-bandit-exploration",
+        type=float,
+        default=0.35,
+        help="discounted-UCB exploration coefficient (default: 0.35)",
+    )
+    run.add_argument(
+        "--context-bandit-discount",
+        type=float,
+        default=0.97,
+        help="reward discount per context allocation (default: 0.97)",
+    )
+    run.add_argument(
+        "--max-milestone-lead",
+        type=int,
+        default=1,
+        help="maximum milestone lead over the shallowest context (default: 1)",
+    )
+    run.add_argument(
         "--adopt-existing-context-identity",
         action="store_true",
         help="resume a v2 bundle across runner-only source changes",
@@ -1715,6 +2245,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 context_slice_s=args.context_slice,
                 trial_milestones=args.trial_milestones,
                 initial_promote=args.initial_promote,
+                strategy_orchestration=args.strategy_orchestration,
+                strategy_bandit_exploration=args.strategy_bandit_exploration,
+                context_orchestration=args.context_orchestration,
+                bandit_min_trials=args.bandit_min_trials,
+                context_bandit_exploration=args.context_bandit_exploration,
+                context_bandit_discount=args.context_bandit_discount,
+                max_milestone_lead=args.max_milestone_lead,
             )
         ),
         adopt_existing_context_identity=args.adopt_existing_context_identity,

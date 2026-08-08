@@ -197,6 +197,30 @@ Because timings describe the current system load, do not promote a database
 created while the GPU is busy. Use `--force` during a quiet tuning run to replace
 those measurements.
 
+## Hierarchical bandit campaigns
+
+The composable tuner has two independent allocation levels. Inside one
+device/shape/regime context, `AdaptiveBanditScheduler` treats random search,
+gradient-boosted global search, and model-guided local search as arms. Its
+reward is dimensionless and bounded: incumbent improvement and model
+uncertainty are balanced against invalid candidates and actual evaluator wall
+time. Discounting makes the policy adapt as the cost model improves. A fixed
+warmup and one mandatory local pull per arm prevent transfer priors from
+short-circuiting direct evidence.
+
+Across contexts, anytime mode can use a second discounted contextual UCB. It
+completes broad minimum coverage first, limits how many milestones any context
+may lead the shallowest unfinished context, then allocates slices using recent
+improvement per visit and similarity across family, shape, and cache regime.
+This layer decides *where* to spend the next slice; the strategy bandit decides
+*how* to search inside that slice.
+
+Both layers are crash-resumable. Strategy state is replayed from
+`observations.jsonl`, context state from `context_allocations.jsonl`, and every
+selection stores all arm scores and sufficient statistics for offline replay.
+The original sequential and breadth-first schedulers remain selectable control
+policies.
+
 ## Native-scale prequant backend
 
 The production materialize-once backend has a joint end-to-end tuner. It times
