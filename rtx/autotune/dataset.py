@@ -33,6 +33,7 @@ from .adapters import (
 )
 from .core import KernelAdapter, canonical_json, stable_id
 from .evaluators import CalibratedBwdEvaluator, CalibratedPrequantEvaluator
+from .hardware import compiled_resource_metadata
 from .legacy import DeviceFingerprint
 from .recipes import HybridTuningPolicy, make_hybrid_autotuner
 from .store import JsonlTuningStore
@@ -58,7 +59,7 @@ from ..prequant_experiments import (
 )
 
 
-DATASET_SCHEMA_VERSION = 1
+DATASET_SCHEMA_VERSION = 2
 KernelFamily = str
 ExportFormat = Literal["csv", "parquet", "both", "none"]
 
@@ -161,7 +162,7 @@ class DatasetManifest:
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "DatasetManifest":
         version = int(value.get("schema_version", DATASET_SCHEMA_VERSION))
-        if version != DATASET_SCHEMA_VERSION:
+        if version not in (1, DATASET_SCHEMA_VERSION):
             raise ValueError(f"unsupported dataset manifest schema {version}")
         return cls(
             name=str(value["name"]),
@@ -197,6 +198,15 @@ class _PreparedFused:
     out: torch.Tensor
     compile_ms: float
     max_abs_error: float
+    compiled_resources: Mapping[str, object]
+
+
+class FusedCandidateCompileError(RuntimeError):
+    pass
+
+
+class FusedCandidateCorrectnessError(RuntimeError):
+    pass
 
 
 class FusedFwdBenchmarkHarness:
@@ -271,7 +281,10 @@ class FusedFwdBenchmarkHarness:
         if reason is not None:
             raise RuntimeError(reason)
         started = time.monotonic()
-        launcher = compile_mxfp8_fwd(self.problem, config)
+        try:
+            launcher = compile_mxfp8_fwd(self.problem, config)
+        except Exception as exc:
+            raise FusedCandidateCompileError(f"{type(exc).__name__}: {exc}") from exc
         compile_ms = (time.monotonic() - started) * 1000
         out = torch.empty_like(self._expected)
         launcher(self.x, self.weight, out)
@@ -284,8 +297,17 @@ class FusedFwdBenchmarkHarness:
             atol=self.protocol.correctness_atol,
             equal_nan=True,
         ):
-            raise RuntimeError(f"candidate differs from baseline (max abs {max_error})")
-        return _PreparedFused(config, launcher, out, compile_ms, max_error)
+            raise FusedCandidateCorrectnessError(
+                f"candidate differs from baseline (max abs {max_error})"
+            )
+        return _PreparedFused(
+            config,
+            launcher,
+            out,
+            compile_ms,
+            max_error,
+            compiled_resource_metadata(launcher),
+        )
 
     def _time_batch(self, prepared: _PreparedFused, calls: int, offset: int) -> float:
         start = torch.cuda.Event(enable_timing=True)
@@ -327,8 +349,14 @@ class FusedFwdBenchmarkHarness:
         try:
             prepared = self.prepare(config)
         except Exception as exc:
+            if isinstance(exc, FusedCandidateCompileError):
+                status = "compile_error"
+            elif isinstance(exc, FusedCandidateCorrectnessError):
+                status = "correctness_error"
+            else:
+                status = "runtime_error"
             return {
-                "status": "compile_error",
+                "status": status,
                 "error": f"{type(exc).__name__}: {exc}"[:4000],
                 "elapsed_s": time.monotonic() - started,
                 "telemetry_before": telemetry_before,
@@ -351,6 +379,7 @@ class FusedFwdBenchmarkHarness:
             "status": "ok",
             "compile_ms": prepared.compile_ms,
             "max_abs_error": prepared.max_abs_error,
+            "compiled_resources": prepared.compiled_resources,
             "calls_per_sample": calls,
             "pilot_ms_per_call": pilot,
             "rotation_buffers": len(self._inputs),
@@ -444,13 +473,19 @@ def _source_snapshot() -> dict[str, object]:
     return result
 
 
-def machine_snapshot(device: torch.device | str = "cuda") -> dict[str, object]:
-    device_report = probe_device(device)
+def machine_snapshot(
+    device: torch.device | str = "cuda",
+    *,
+    calibration: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    device_report = probe_device(device, calibration=calibration)
     source = _source_snapshot()
     identity = {
         "hostname": socket.gethostname(),
         "device_id": device_report["fingerprint_id"],
         "platform": platform.platform(),
+        "dataset_schema_version": DATASET_SCHEMA_VERSION,
+        "hardware_profile": device_report.get("hardware_profile"),
     }
     return {
         "schema_version": DATASET_SCHEMA_VERSION,
@@ -528,7 +563,7 @@ def _fused_adapter(
     return make_mxfp8_fwd_adapter(
         shape.problem,
         evaluator,
-        device=campaign.fingerprint,
+        device=campaign.hardware_profile,
         regime=regime,
         tags=tags,
     )
@@ -549,7 +584,7 @@ def _prequant_adapter(
         shape.problem,
         evaluator,
         initial=_reference_prequant_config(shape.problem),
-        device=campaign.fingerprint,
+        device=campaign.hardware_profile,
         regime=regime,
         tags=tags,
     )
@@ -569,7 +604,7 @@ def _bwd_adapter(
     return make_mxfp8_bwd_adapter(
         shape.problem,
         evaluator,
-        device=campaign.fingerprint,
+        device=campaign.hardware_profile,
         regime=regime,
         tags=tags,
     )
@@ -593,6 +628,7 @@ class DatasetCampaign:
         output_dir: Path | str,
         *,
         device: torch.device | str = "cuda",
+        calibration: Mapping[str, object] | None = None,
         progress=print,
     ) -> None:
         self.manifest = manifest
@@ -605,7 +641,8 @@ class DatasetCampaign:
                 "native RTX MXFP8 campaigns require SM120/SM121; got "
                 f"{self.fingerprint.capability} on {self.fingerprint.name}"
             )
-        self.machine = machine_snapshot(self.device)
+        self.machine = machine_snapshot(self.device, calibration=calibration)
+        self.hardware_profile = self.machine["device"]["hardware_profile"]  # type: ignore[index]
         self.bundle = (
             self.output_dir
             / manifest.name
@@ -1032,6 +1069,17 @@ def export_bundle(
     export_format: ExportFormat = "both",
 ) -> dict[str, object]:
     sources = tuple(paths)
+    machine_documents = [
+        document
+        for _path, document in _json_documents(sources, "machine.json")
+        if isinstance(document, dict)
+    ]
+    source_schema_versions = sorted(
+        {
+            int(document.get("schema_version", 1))
+            for document in machine_documents
+        }
+    )
     rows = normalized_rows(sources)
     prefix = Path(output_prefix)
     written: dict[str, str] = {}
@@ -1041,6 +1089,8 @@ def export_bundle(
         written["parquet"] = str(export_parquet(rows, prefix.with_suffix(".parquet")))
     report: dict[str, object] = {
         "schema_version": DATASET_SCHEMA_VERSION,
+        "source_dataset_schema_versions": source_schema_versions,
+        "mixed_dataset_schemas": len(source_schema_versions) > 1,
         "recorded_at": _utc_now(),
         "rows": len(rows),
         "measurements": sum(row.get("record_type") == "measurement" for row in rows),
@@ -1083,6 +1133,11 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--shard-index", type=int)
     run.add_argument("--shard-count", type=int)
     run.add_argument("--quiet", action="store_true")
+    run.add_argument(
+        "--calibration",
+        type=Path,
+        help="JSON emitted by 'rtx-autotune calibrate' on this machine",
+    )
 
     collect = subparsers.add_parser("collect", help="merge copied campaign bundles")
     collect.add_argument("paths", type=Path, nargs="+")
@@ -1093,6 +1148,15 @@ def _build_parser() -> argparse.ArgumentParser:
     validate.add_argument("manifest", type=Path)
     probe = subparsers.add_parser("probe", help="print machine and GPU capability metadata")
     probe.add_argument("--device", default="cuda")
+    probe.add_argument("--calibration", type=Path)
+    calibrate = subparsers.add_parser(
+        "calibrate", help="measure device rooflines for architecture-aware search"
+    )
+    calibrate.add_argument("--device", default="cuda")
+    calibrate.add_argument("--output", type=Path, required=True)
+    calibrate.add_argument("--samples", type=int, default=5)
+    calibrate.add_argument("--target-ms", type=float, default=30.0)
+    calibrate.add_argument("--skip-native-mxfp8", action="store_true")
     return parser
 
 
@@ -1107,7 +1171,30 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "probe":
         if not torch.cuda.is_available():
             parser.error("CUDA is not available")
-        print(json.dumps(machine_snapshot(args.device), indent=2, sort_keys=True))
+        calibration = None
+        if args.calibration is not None:
+            calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
+        print(
+            json.dumps(
+                machine_snapshot(args.device, calibration=calibration),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+    if args.command == "calibrate":
+        if not torch.cuda.is_available():
+            parser.error("CUDA is not available")
+        from .calibration import calibrate_device
+
+        result = calibrate_device(
+            args.device,
+            samples=args.samples,
+            target_ms=args.target_ms,
+            include_native_mxfp8=not args.skip_native_mxfp8,
+        )
+        _atomic_json(args.output, result)
+        print(json.dumps({"calibration": str(args.output)}, indent=2))
         return
     if args.command == "collect":
         report = export_bundle(args.paths, args.output, export_format=args.format)
@@ -1120,10 +1207,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--shard-index and --shard-count must be provided together")
     if args.shard_index is not None:
         manifest = manifest.with_shard(args.shard_index, args.shard_count)
+    calibration = None
+    if args.calibration is not None:
+        calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
     campaign = DatasetCampaign(
         manifest,
         args.output_dir,
         device=args.device,
+        calibration=calibration,
         progress=None if args.quiet else print,
     )
     bundle = campaign.run(export_format=args.format)

@@ -57,7 +57,11 @@ def _adapter() -> DiscreteKernelAdapter[_Config]:
 class DatasetTests(unittest.TestCase):
     def test_repository_manifests_validate_and_round_trip(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        for name in ("dataset_pilot.json", "cross_device_dataset_v1.json"):
+        for name in (
+            "dataset_pilot.json",
+            "cross_device_dataset_v1.json",
+            "cross_device_dataset_v2.json",
+        ):
             manifest = DatasetManifest.load(root / "autotune_manifests" / name)
             restored = DatasetManifest.from_dict(manifest.as_dict())
             self.assertEqual(restored, manifest)

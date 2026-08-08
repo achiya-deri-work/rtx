@@ -347,7 +347,13 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 started,
                 f"SAVE {proposal.strategy} {observation.config_id} "
                 f"{observation.outcome.status}"
-                + ("" if observation.outcome.median_ms is None else f" {observation.score * 1000:.3f}us"),
+                + ("" if observation.outcome.median_ms is None else f" {observation.score * 1000:.3f}us")
+                + (
+                    ""
+                    if observation.outcome.error is None
+                    else " "
+                    + " ".join(observation.outcome.error.splitlines())[:240]
+                ),
             )
             return observation
 

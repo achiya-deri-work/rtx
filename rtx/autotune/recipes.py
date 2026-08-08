@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Generic, Literal
 
 from .core import ConfigT, KernelAdapter, TuningBudget
-from .cost_model import GradientBoostedCostModel
+from .cost_model import GradientBoostedCostModel, GradientBoostedFeasibilityModel
 from .orchestrator import (
     AutotuneOrchestrator,
     ConfirmationPolicy,
@@ -33,6 +33,12 @@ class HybridTuningPolicy:
     model_min_leaf: int = 4
     model_max_features: int = 64
     model_max_thresholds: int = 10
+    feasibility_estimators: int = 16
+    feasibility_ensembles: int = 3
+    feasibility_max_depth: int = 3
+    feasibility_min_leaf: int = 3
+    feasibility_exploration: float = 0.5
+    minimum_optimistic_feasibility: float = 0.05
     local_beam_width: int = 3
     local_model_refit_interval: int = 32
     bandit_exploration: float = 1.25
@@ -55,6 +61,15 @@ def make_hybrid_autotuner(
     """Build GBT-guided global search followed by/bandited with local search."""
 
     random_search = RandomSearch[ConfigT]()
+    feasibility = GradientBoostedFeasibilityModel(
+        n_estimators=policy.feasibility_estimators,
+        ensembles=policy.feasibility_ensembles,
+        max_depth=policy.feasibility_max_depth,
+        min_leaf=policy.feasibility_min_leaf,
+        max_features=policy.model_max_features,
+        max_thresholds=policy.model_max_thresholds,
+        seed=policy.seed ^ 0x5EED,
+    )
     learned = CostModelGuidedSearch[ConfigT](
         model=GradientBoostedCostModel(
             n_estimators=policy.model_estimators,
@@ -70,12 +85,18 @@ def make_hybrid_autotuner(
         pool_size=policy.model_pool_size,
         refit_interval=policy.model_refit_interval,
         exploration=policy.model_exploration,
+        feasibility_model=feasibility,
+        feasibility_exploration=policy.feasibility_exploration,
+        minimum_optimistic_feasibility=policy.minimum_optimistic_feasibility,
     )
     local = CostModelLocalSearch[ConfigT](
         model=learned.model,
+        feasibility_model=feasibility,
         beam_width=policy.local_beam_width,
         exploration=policy.model_exploration * 0.25,
         refit_interval=policy.local_model_refit_interval,
+        feasibility_exploration=policy.feasibility_exploration,
+        minimum_optimistic_feasibility=policy.minimum_optimistic_feasibility,
     )
     if policy.orchestration == "sequential":
         strategies = [learned, local]

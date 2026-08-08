@@ -38,6 +38,11 @@ import uuid
 import torch
 
 from .autotune import DeviceFingerprint
+from .autotune.hardware import (
+    compiled_resource_metadata,
+    device_properties,
+    static_device_profile,
+)
 from .fp8 import (
     DEFAULT_MXFP8_PREQUANT_CONFIG,
     MXFP8PrequantConfig,
@@ -487,26 +492,14 @@ def _nvidia_smi_snapshot(device_index: int) -> dict[str, object]:
 
 
 def _device_properties(device: torch.device) -> dict[str, object]:
-    props = torch.cuda.get_device_properties(device)
-    l2 = getattr(props, "L2_cache_size", None)
-    if l2 is None:
-        l2 = getattr(props, "l2_cache_size", None)
-    return {
-        "name": props.name,
-        "major": props.major,
-        "minor": props.minor,
-        "multiprocessor_count": props.multi_processor_count,
-        "total_memory": props.total_memory,
-        "l2_cache_size": None if l2 is None else int(l2),
-        "shared_memory_per_multiprocessor": int(
-            getattr(props, "shared_memory_per_multiprocessor", 0)
-        ),
-        "regs_per_multiprocessor": int(getattr(props, "regs_per_multiprocessor", 0)),
-        "warp_size": int(getattr(props, "warp_size", 0)),
-    }
+    return device_properties(device)
 
 
-def probe_device(device: torch.device | str = "cuda") -> dict[str, object]:
+def probe_device(
+    device: torch.device | str = "cuda",
+    *,
+    calibration: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     """Report campaign-relevant capabilities without compiling a kernel."""
 
     resolved = torch.device(device)
@@ -515,10 +508,13 @@ def probe_device(device: torch.device | str = "cuda") -> dict[str, object]:
     index = resolved.index
     if index is None:
         index = torch.cuda.current_device()
+    hardware = static_device_profile(resolved, calibration=calibration)
+    hardware["software"] = fingerprint.as_dict()
     return {
         "fingerprint_id": fingerprint.identifier,
         "fingerprint": fingerprint.as_dict(),
-        "properties": _device_properties(resolved),
+        "properties": hardware["properties"],
+        "hardware_profile": hardware,
         "free_memory": int(free_memory),
         "total_memory": int(total_memory),
         "native_rtx_mxfp8_campaign_supported": fingerprint.capability[0] == 12,
@@ -587,6 +583,7 @@ class _PreparedCandidate:
     out: torch.Tensor
     compile_ms: float
     max_abs_error: float
+    compiled_resources: Mapping[str, object]
 
 
 class CandidateCompileError(RuntimeError):
@@ -719,7 +716,14 @@ class PrequantBenchmarkHarness:
                 raise CandidateCorrectnessError(
                     f"candidate differs from reference (max abs {max_abs_error})"
                 )
-            return _PreparedCandidate(config, runner, out, compile_ms, max_abs_error)
+            return _PreparedCandidate(
+                config,
+                runner,
+                out,
+                compile_ms,
+                max_abs_error,
+                compiled_resource_metadata(runner),
+            )
         finally:
             if previous_l2 is not None:
                 _set_l2_fetch_granularity(previous_l2)
@@ -885,6 +889,7 @@ class PrequantBenchmarkHarness:
             "status": "ok",
             "compile_ms": prepared.compile_ms,
             "max_abs_error": prepared.max_abs_error,
+            "compiled_resources": prepared.compiled_resources,
             "calls_per_sample": calls,
             "pilot_ms_per_call": pilot_ms,
             "rotation_buffers": len(self._inputs),

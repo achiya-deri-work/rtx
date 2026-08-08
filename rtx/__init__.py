@@ -14,6 +14,7 @@ from .fp8_bwd import (
     MXFP8BwdMatmulConfig,
     mxfp8_linear_backward,
 )
+from .fp4 import NVFP4Linear, nvfp4_linear
 
 __all__ = [
     "__version__",
@@ -24,6 +25,7 @@ __all__ = [
     "DEFAULT_MXFP8_PREQUANT_CONFIG",
     "DEFAULT_MXFP8_BWD_CONFIG",
     "MXFP8Linear",
+    "NVFP4Linear",
     "MXFP8BwdConfig",
     "MXFP8BwdMatmulConfig",
     "MXFP8PrequantConfig",
@@ -36,6 +38,7 @@ __all__ = [
     "load_cached_mxfp8_prequant_config",
     "mxfp8_linear",
     "mxfp8_linear_backward",
+    "nvfp4_linear",
     "tune_mxfp8_fwd",
     "tune_mxfp8_backward",
     "tune_mxfp8_prequant",

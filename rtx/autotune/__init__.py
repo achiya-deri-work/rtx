@@ -6,6 +6,7 @@ from .adapters import (
     make_mxfp8_fwd_adapter,
     make_mxfp8_prequant_adapter,
 )
+from .calibration import calibrate_device
 from .core import (
     ComposableTuningResult,
     DiscreteKernelAdapter,
@@ -16,7 +17,19 @@ from .core import (
     SearchHistory,
     TuningBudget,
 )
-from .cost_model import GradientBoostedCostModel, SparseFeatureVectorizer
+from .cost_model import (
+    GradientBoostedCostModel,
+    GradientBoostedFeasibilityModel,
+    SparseFeatureVectorizer,
+)
+from .hardware import (
+    ArchitectureProfile,
+    architecture_profile,
+    compiled_resource_metadata,
+    compiler_profile,
+    device_properties,
+    static_device_profile,
+)
 from .evaluators import CalibratedBwdEvaluator, CalibratedPrequantEvaluator
 from .legacy import (
     CoordinateDescentPolicy,
@@ -71,6 +84,7 @@ def __getattr__(name: str):
 
 __all__ = [
     "ArmStatistics",
+    "ArchitectureProfile",
     "AutotuneOrchestrator",
     "CalibratedBwdEvaluator",
     "CalibratedPrequantEvaluator",
@@ -88,6 +102,7 @@ __all__ = [
     "DatasetManifest",
     "DiscreteKernelAdapter",
     "GradientBoostedCostModel",
+    "GradientBoostedFeasibilityModel",
     "HybridTuningPolicy",
     "InMemoryTuningStore",
     "JsonTuningDatabase",
@@ -109,6 +124,11 @@ __all__ = [
     "TuningStore",
     "UCB1Scheduler",
     "default_cache_dir",
+    "architecture_profile",
+    "calibrate_device",
+    "compiled_resource_metadata",
+    "compiler_profile",
+    "device_properties",
     "export_bundle",
     "load_cached_mxfp8_fwd_config",
     "import_legacy_json_database",
@@ -118,5 +138,6 @@ __all__ = [
     "make_hybrid_autotuner",
     "normalized_rows",
     "register_dataset_backend",
+    "static_device_profile",
     "tune_mxfp8_fwd",
 ]

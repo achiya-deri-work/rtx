@@ -1,4 +1,4 @@
-# RTX MXFP8
+# RTX low-precision linear layers
 
 `rtx-mxfp8` is an experimental Python library for trainable MXFP8 linear
 layers and empirical kernel autotuning on NVIDIA RTX Blackwell GPUs. The
@@ -57,6 +57,13 @@ layer = MXFP8Linear(1536, 1536, bias=False, device="cuda", dtype=torch.bfloat16)
 y2 = layer(x)
 ```
 
+The final public layer pair is `rtx.MXFP8Linear` and `rtx.NVFP4Linear`.
+Both accept BF16 activations and weights, return BF16, expose the usual
+`nn.Linear(in_features, out_features, bias=False, ...)` parameter layout, and
+use the registered MXFP8 backward kernels. `NVFP4Linear` has a registered
+forward/fake/autograd boundary, but its NVFP4 forward kernel is intentionally
+not implemented yet.
+
 See `rtx/fp8.py` and `rtx/fp8_bwd.py` for backend, configuration, and explicit
 backward controls.
 
@@ -65,7 +72,7 @@ backward controls.
 Validate a manifest without a GPU launch:
 
 ```bash
-rtx-autotune validate autotune_manifests/cross_device_dataset_v1.json
+rtx-autotune validate autotune_manifests/cross_device_dataset_v2.json
 ```
 
 Probe a machine before a long run:
@@ -74,13 +81,23 @@ Probe a machine before a long run:
 rtx-autotune probe --device cuda:0
 ```
 
+Create a machine-local calibration once. It measures L2/DRAM copy bandwidth,
+BF16 tensor throughput, and the native MXFP8 quantization/GEMM pipeline while
+retaining the raw timing samples:
+
+```bash
+rtx-autotune calibrate --device cuda:0 \
+  --output hardware_calibration.json
+```
+
 Run or resume the complete assigned campaign:
 
 ```bash
-rtx-autotune run autotune_manifests/cross_device_dataset_v1.json \
+rtx-autotune run autotune_manifests/cross_device_dataset_v2.json \
   --device cuda:0 \
   --output-dir autotune_datasets \
-  --format csv
+  --format both \
+  --calibration hardware_calibration.json
 ```
 
 Use `--format parquet` or `--format both` when the Parquet extra is installed.
@@ -90,7 +107,7 @@ rerunning the same command resumes after interruption.
 For multiple processes on one machine, split whole workload contexts:
 
 ```bash
-rtx-autotune run autotune_manifests/cross_device_dataset_v1.json \
+rtx-autotune run autotune_manifests/cross_device_dataset_v2.json \
   --shard-index 0 --shard-count 2
 ```
 
@@ -120,16 +137,17 @@ deduplicate and export all copied bundles:
 
 ```bash
 rtx-autotune collect copied_datasets/ \
-  --output merged/mxfp8_blackwell_v1 \
+  --output merged/mxfp8_blackwell_v2 \
   --format both
 ```
 
-This writes `merged/mxfp8_blackwell_v1.csv`,
-`merged/mxfp8_blackwell_v1.parquet`, and an export report. Rows contain exact
-configs, derived features, raw timing arrays, compiler latency, correctness
-results, telemetry, proposal provenance, device/environment context,
-confirmation measurements, and paired-race decisions. The JSONL files remain
-the authoritative records.
+This writes `merged/mxfp8_blackwell_v2.csv`,
+`merged/mxfp8_blackwell_v2.parquet`, and an export report. Rows contain exact
+configs, resource/occupancy/wave estimates, traffic and L2 ratios, memory-bus
+and calibrated roofline data, raw timing arrays, compiler latency and available
+compiled-resource attributes, correctness results, telemetry, proposal
+provenance, device/environment context, confirmation measurements, and
+paired-race decisions. The JSONL files remain authoritative.
 
 ## Dataset manifest
 
@@ -139,7 +157,7 @@ count:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "name": "example",
   "seed": 20260808,
   "jobs": [

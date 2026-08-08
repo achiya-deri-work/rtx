@@ -320,8 +320,127 @@ class GradientBoostedCostModel:
         return model
 
 
+class GradientBoostedFeasibilityModel:
+    """Small bagged classifier for whether generated device IR will compile.
+
+    Only explicit ``ok`` and ``compile_error`` outcomes are labels. Correctness
+    and runtime failures are intentionally excluded because they do not provide
+    a reliable compile-boundary label across harness implementations.
+    """
+
+    def __init__(
+        self,
+        *,
+        n_estimators: int = 16,
+        max_depth: int = 3,
+        learning_rate: float = 0.1,
+        min_leaf: int = 3,
+        ensembles: int = 3,
+        row_subsample: float = 0.85,
+        max_training_rows: int = 50_000,
+        max_thresholds: int = 10,
+        max_features: int = 64,
+        seed: int = 0,
+    ) -> None:
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.learning_rate = learning_rate
+        self.min_leaf = min_leaf
+        self.ensembles = ensembles
+        self.row_subsample = row_subsample
+        self.max_training_rows = max_training_rows
+        self.max_thresholds = max_thresholds
+        self.max_features = max_features
+        self.seed = seed
+        self.vectorizer = SparseFeatureVectorizer()
+        self.models: list[_BoostedEnsemble] = []
+
+    @property
+    def fitted(self) -> bool:
+        return bool(self.models)
+
+    @property
+    def parameter_count(self) -> int:
+        return sum(
+            len(tree.nodes) * 5 + 1 for model in self.models for tree in model.trees
+        )
+
+    @staticmethod
+    def labeled_count(observations: Sequence[Observation[object]]) -> int:
+        return sum(
+            item.outcome.status in ("ok", "compile_error") for item in observations
+        )
+
+    def fit(self, observations: Sequence[Observation[object]]) -> None:
+        usable = [
+            item
+            for item in observations
+            if item.outcome.status in ("ok", "compile_error")
+        ]
+        labels = np.asarray(
+            [1.0 if item.outcome.status == "ok" else 0.0 for item in usable],
+            dtype=np.float64,
+        )
+        if (
+            len(usable) < max(8, self.min_leaf * 2)
+            or labels.size == 0
+            or float(np.min(labels)) == float(np.max(labels))
+        ):
+            self.models = []
+            return
+        rng = np.random.default_rng(self.seed)
+        if len(usable) > self.max_training_rows:
+            indices = rng.choice(len(usable), self.max_training_rows, replace=False)
+            usable = [usable[int(index)] for index in indices]
+            labels = labels[indices]
+        self.vectorizer.fit(item.features for item in usable)
+        x = self.vectorizer.transform([item.features for item in usable])
+        self.models = []
+        for ensemble_index in range(self.ensembles):
+            ensemble_rng = np.random.default_rng(self.seed + ensemble_index * 130363)
+            sample_count = max(self.min_leaf * 2, int(len(labels) * self.row_subsample))
+            sample_rows = ensemble_rng.choice(len(labels), sample_count, replace=True)
+            train_x = x[sample_rows]
+            train_y = labels[sample_rows]
+            base = float(np.mean(train_y))
+            prediction = np.full(train_y.shape, base, dtype=np.float64)
+            trees: list[_RegressionTree] = []
+            for tree_index in range(self.n_estimators):
+                residual = train_y - prediction
+                tree = _RegressionTree(
+                    max_depth=self.max_depth,
+                    min_leaf=self.min_leaf,
+                    max_thresholds=self.max_thresholds,
+                    max_features=min(self.max_features, max(1, x.shape[1])),
+                    seed=self.seed + ensemble_index * 2017 + tree_index,
+                )
+                tree.fit(train_x, residual)
+                prediction += self.learning_rate * tree.predict(train_x)
+                trees.append(tree)
+            self.models.append(_BoostedEnsemble(base, trees))
+
+    def _predict_one(self, model: _BoostedEnsemble, x: np.ndarray) -> np.ndarray:
+        result = np.full(x.shape[0], model.base, dtype=np.float64)
+        for tree in model.trees:
+            result += self.learning_rate * tree.predict(x)
+        return np.clip(result, 0.0, 1.0)
+
+    def predict(self, features: Sequence[FeatureMap]) -> tuple[np.ndarray, np.ndarray]:
+        if not self.models:
+            raise RuntimeError("feasibility model has not been fitted")
+        x = self.vectorizer.transform(features)
+        predictions = np.stack([self._predict_one(model, x) for model in self.models])
+        probability = np.clip(np.mean(predictions, axis=0), 0.0, 1.0)
+        uncertainty = np.sqrt(
+            np.var(predictions, axis=0)
+            + probability * (1.0 - probability) / max(1, len(self.models))
+        )
+        return probability, uncertainty
+
+
 __all__ = [
     "CostModel",
     "GradientBoostedCostModel",
+    "GradientBoostedFeasibilityModel",
     "SparseFeatureVectorizer",
 ]

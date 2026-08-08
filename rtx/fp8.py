@@ -292,6 +292,14 @@ def _mxfp8_linear_fwd_op(
     weight: torch.Tensor,
     config_key: str,
 ) -> torch.Tensor:
+    return _launch_fused(x, weight, config_key)
+
+
+def _launch_fused(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+) -> torch.Tensor:
     _check_inputs(x, weight)
     x_c = x if x.is_contiguous() else x.contiguous()
     weight_c = weight if weight.is_contiguous() else weight.contiguous()
@@ -625,6 +633,22 @@ def _run_prequant(
     return _mxfp8_linear_prequant_op(x, weight, config_key)
 
 
+def _launch_training_forward(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+) -> torch.Tensor:
+    """Launch either registered MXFP8 forward family for the autograd op."""
+
+    if config_key in _CONFIGS:
+        return _launch_fused(x, weight, config_key)
+    out = torch.empty(
+        (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
+    )
+    _launch_prequant_out(x, weight, config_key, out)
+    return out
+
+
 def mxfp8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -710,7 +734,19 @@ def mxfp8_linear(
         cache_dir=autotune_cache_dir,
     )
     key = _intern_config(selected_config)
-    out = _mxfp8_linear_fwd_op(x_2d, weight, key)
+    if torch.is_grad_enabled() and (x_2d.requires_grad or weight.requires_grad):
+        from .fp8_bwd import (
+            DEFAULT_MXFP8_BWD_CONFIG,
+            _intern_bwd_config,
+            _mxfp8_linear_train_op,
+        )
+
+        bwd_key = _intern_bwd_config(
+            backward_config or DEFAULT_MXFP8_BWD_CONFIG
+        )
+        out = _mxfp8_linear_train_op(x_2d, weight, key, bwd_key)
+    else:
+        out = _mxfp8_linear_fwd_op(x_2d, weight, key)
     return out.reshape(*leading_shape, weight.shape[0])
 
 
@@ -778,6 +814,7 @@ class MXFP8Linear(nn.Module):
         self,
         in_features: int,
         out_features: int,
+        bias: bool = False,
         *,
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.bfloat16,
@@ -790,6 +827,10 @@ class MXFP8Linear(nn.Module):
         backward_config: "MXFP8BwdConfig | None" = None,
     ) -> None:
         super().__init__()
+        if bias:
+            raise NotImplementedError(
+                "MXFP8Linear is a no-bias linear layer; pass bias=False"
+            )
         if in_features % 32:
             raise ValueError(
                 f"MXFP8 in_features must be divisible by scale-vector size 32, "
@@ -830,6 +871,10 @@ class MXFP8Linear(nn.Module):
             )
         )
         self.reset_parameters()
+
+    @property
+    def bias(self) -> None:
+        return None
 
     def reset_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))

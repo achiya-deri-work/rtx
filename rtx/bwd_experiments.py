@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import time
-from typing import Callable
+from typing import Callable, Mapping
 
 import torch
 
+from .autotune.hardware import compiled_resource_metadata
 from .fp8_bwd import _build_bwd_runner
 from .kernels.mxfp8_bwd import MXFP8BwdConfig
 from .prequant_experiments import (
@@ -37,6 +38,7 @@ class _PreparedBwdCandidate:
     compile_ms: float
     max_abs_error: float
     max_relative_l2_error: float
+    compiled_resources: Mapping[str, object]
 
 
 class BwdBenchmarkHarness:
@@ -170,6 +172,7 @@ class BwdBenchmarkHarness:
             compile_ms,
             max_abs_error,
             max_relative_l2_error,
+            compiled_resource_metadata(runner),
         )
 
     def _time_batch(
@@ -303,6 +306,7 @@ class BwdBenchmarkHarness:
             "compile_ms": prepared.compile_ms,
             "max_abs_error": prepared.max_abs_error,
             "max_relative_l2_error": prepared.max_relative_l2_error,
+            "compiled_resources": prepared.compiled_resources,
             "calls_per_sample": calls,
             "pilot_ms_per_call": pilot_ms,
             "rotation_buffers": len(self._inputs),

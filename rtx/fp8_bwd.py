@@ -410,13 +410,9 @@ def _mxfp8_linear_train_op(
     forward_config_key: str,
     backward_config_key: str,
 ) -> torch.Tensor:
-    from .fp8 import _launch_prequant_out
+    from .fp8 import _launch_training_forward
 
-    out = torch.empty(
-        (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
-    )
-    _launch_prequant_out(x, weight, forward_config_key, out)
-    return out
+    return _launch_training_forward(x, weight, forward_config_key)
 
 
 @_mxfp8_linear_train_op.register_fake

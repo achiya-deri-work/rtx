@@ -6,8 +6,10 @@ from dataclasses import dataclass, field
 import random
 from typing import Generic, Protocol, Sequence
 
+import numpy as np
+
 from .core import ConfigT, KernelAdapter, Observation, Proposal, SearchHistory
-from .cost_model import GradientBoostedCostModel
+from .cost_model import GradientBoostedCostModel, GradientBoostedFeasibilityModel
 
 
 class SearchStrategy(Protocol, Generic[ConfigT]):
@@ -107,14 +109,20 @@ class CostModelGuidedSearch(Generic[ConfigT]):
     """Train gradient boosting on measured trials and rank a broad legal pool."""
 
     model: GradientBoostedCostModel = field(default_factory=GradientBoostedCostModel)
+    feasibility_model: GradientBoostedFeasibilityModel = field(
+        default_factory=GradientBoostedFeasibilityModel
+    )
     warmup: SearchStrategy[ConfigT] = field(default_factory=RandomSearch)
     min_observations: int = 16
     pool_size: int = 2048
     refit_interval: int = 8
     exploration: float = 0.15
+    feasibility_exploration: float = 0.5
+    minimum_optimistic_feasibility: float = 0.05
     include_local_neighbors: int = 4
     name: str = "gradient_boosted"
     _fitted_count: int = field(default=0, init=False, repr=False)
+    _feasibility_fitted_count: int = field(default=0, init=False, repr=False)
     _queue: list[Proposal[ConfigT]] = field(default_factory=list, init=False, repr=False)
 
     def propose(
@@ -138,6 +146,16 @@ class CostModelGuidedSearch(Generic[ConfigT]):
         ):
             self.model.fit(history.observations)  # type: ignore[arg-type]
             self._fitted_count = len(training_successes)
+            self._queue.clear()
+        feasibility_count = self.feasibility_model.labeled_count(
+            history.observations  # type: ignore[arg-type]
+        )
+        if (
+            not self.feasibility_model.fitted
+            or feasibility_count - self._feasibility_fitted_count >= self.refit_interval
+        ):
+            self.feasibility_model.fit(history.observations)  # type: ignore[arg-type]
+            self._feasibility_fitted_count = feasibility_count
             self._queue.clear()
         if not self.model.fitted:
             return self.warmup.propose(adapter, history, rng, limit)
@@ -171,23 +189,47 @@ class CostModelGuidedSearch(Generic[ConfigT]):
         candidates = list(candidate_by_id.values())
         if not candidates:
             return []
-        mean, uncertainty = self.model.predict([adapter.features(item) for item in candidates])
+        feature_rows = [adapter.features(item) for item in candidates]
+        mean, uncertainty = self.model.predict(feature_rows)
         acquisition = mean - self.exploration * uncertainty
+        compile_probability = None
+        compile_uncertainty = None
+        if self.feasibility_model.fitted:
+            compile_probability, compile_uncertainty = self.feasibility_model.predict(
+                feature_rows
+            )
+            optimistic_probability = np.clip(
+                compile_probability
+                + self.feasibility_exploration * compile_uncertainty,
+                self.minimum_optimistic_feasibility,
+                1.0,
+            )
+            # Expected latency per successful trial. Uncertain regions retain
+            # an optimistic probability and are explored rather than pruned.
+            acquisition = mean / optimistic_probability - self.exploration * uncertainty
         order = sorted(range(len(candidates)), key=lambda index: float(acquisition[index]))
         queue_limit = min(len(order), max(256, self.refit_interval * 8))
         for index in order[:queue_limit]:
+            metadata = {
+                "predicted_ms": float(mean[index]),
+                "predicted_std_ms": float(uncertainty[index]),
+                "acquisition": float(acquisition[index]),
+                "training_successes": len(training_successes),
+                "current_successes": len(current_successes),
+                "model_parameters": self.model.parameter_count,
+                "compile_training_labels": feasibility_count,
+                "feasibility_model_parameters": self.feasibility_model.parameter_count,
+            }
+            if compile_probability is not None and compile_uncertainty is not None:
+                metadata.update(
+                    predicted_compile_probability=float(compile_probability[index]),
+                    predicted_compile_uncertainty=float(compile_uncertainty[index]),
+                )
             self._queue.append(
                 Proposal(
                     candidates[index],
                     self.name,
-                    metadata={
-                        "predicted_ms": float(mean[index]),
-                        "predicted_std_ms": float(uncertainty[index]),
-                        "acquisition": float(acquisition[index]),
-                        "training_successes": len(training_successes),
-                        "current_successes": len(current_successes),
-                        "model_parameters": self.model.parameter_count,
-                    },
+                    metadata=metadata,
                 )
             )
         while self._queue and len(queued) < limit:
@@ -205,14 +247,18 @@ class CostModelLocalSearch(Generic[ConfigT]):
     """Rank complete legal coordinate neighborhoods with a fitted cost model."""
 
     model: GradientBoostedCostModel
+    feasibility_model: GradientBoostedFeasibilityModel | None = None
     beam_width: int = 3
     exploration: float = 0.05
+    feasibility_exploration: float = 0.5
+    minimum_optimistic_feasibility: float = 0.05
     refresh_interval: int = 8
     refit_interval: int = 32
     name: str = "model_local"
     _queue: list[Proposal[ConfigT]] = field(default_factory=list, init=False, repr=False)
     _observed: int = field(default=0, init=False, repr=False)
     _fitted_count: int = field(default=0, init=False, repr=False)
+    _feasibility_fitted_count: int = field(default=0, init=False, repr=False)
 
     def propose(
         self,
@@ -229,6 +275,18 @@ class CostModelLocalSearch(Generic[ConfigT]):
             self.model.fit(history.observations)  # type: ignore[arg-type]
             self._fitted_count = training_count
             self._queue.clear()
+        if self.feasibility_model is not None:
+            feasibility_count = self.feasibility_model.labeled_count(
+                history.observations  # type: ignore[arg-type]
+            )
+            if (
+                not self.feasibility_model.fitted
+                or feasibility_count - self._feasibility_fitted_count
+                >= self.refit_interval
+            ):
+                self.feasibility_model.fit(history.observations)  # type: ignore[arg-type]
+                self._feasibility_fitted_count = feasibility_count
+                self._queue.clear()
         if not self.model.fitted:
             return CoordinateLocalSearch[ConfigT](
                 beam_width=self.beam_width, name=self.name
@@ -265,10 +323,22 @@ class CostModelLocalSearch(Generic[ConfigT]):
                 )
         if not candidates:
             return selected
-        mean, uncertainty = self.model.predict(
-            [adapter.features(item.config) for item in candidates]
-        )
+        feature_rows = [adapter.features(item.config) for item in candidates]
+        mean, uncertainty = self.model.predict(feature_rows)
         acquisition = mean - self.exploration * uncertainty
+        compile_probability = None
+        compile_uncertainty = None
+        if self.feasibility_model is not None and self.feasibility_model.fitted:
+            compile_probability, compile_uncertainty = self.feasibility_model.predict(
+                feature_rows
+            )
+            optimistic_probability = np.clip(
+                compile_probability
+                + self.feasibility_exploration * compile_uncertainty,
+                self.minimum_optimistic_feasibility,
+                1.0,
+            )
+            acquisition = mean / optimistic_probability - self.exploration * uncertainty
         order = sorted(range(len(candidates)), key=lambda index: float(acquisition[index]))
         for index in order:
             proposal = candidates[index]
@@ -277,6 +347,11 @@ class CostModelLocalSearch(Generic[ConfigT]):
                 predicted_std_ms=float(uncertainty[index]),
                 acquisition=float(acquisition[index]),
             )
+            if compile_probability is not None and compile_uncertainty is not None:
+                proposal.metadata.update(
+                    predicted_compile_probability=float(compile_probability[index]),
+                    predicted_compile_uncertainty=float(compile_uncertainty[index]),
+                )
             self._queue.append(proposal)
         while self._queue and len(selected) < limit:
             proposal = self._queue.pop(0)

@@ -54,9 +54,31 @@ result = tuner.tune()
 
 The learned stage uses random-walk warmup, then trains a small bagged
 gradient-boosted CART ensemble on log latency and ranks a broad candidate pool
-with a lower-confidence-bound acquisition. The local stage explores complete
-coordinate neighborhoods around the best measured configurations and refits
-the shared model as new local labels accumulate.
+with a lower-confidence-bound acquisition. A separate classifier learns from
+`compile_error` observations and estimates compilation feasibility. Its
+optimistic probability adjusts ranking but never hard-prunes an uncertain
+region. The local stage explores complete coordinate neighborhoods around the
+best measured configurations and refits both shared models as labels arrive.
+
+## Architecture and SKU features
+
+Dataset campaigns pass a complete hardware profile into every kernel context.
+It separates ISA architecture (SM110 versus SM120/SM121), physical SKU limits,
+and optional empirical calibration. Model features include actual/persistent
+grid CTAs, wave fullness at estimated multi-CTA residency, SMEM/register/thread
+occupancy limits, logical-transpose quantizer resources, instruction-work
+proxies, operand traffic, L2 fit/reuse, memory bus width, theoretical bandwidth,
+and measured rooflines. Requested register budgets are estimates; compiled
+resource attributes are attached to outcomes whenever the active CuTe wrapper
+exposes them.
+
+Generate and use a portable calibration with:
+
+```bash
+rtx-autotune calibrate --device cuda:0 --output hardware_calibration.json
+rtx-autotune run manifest.json --device cuda:0 \
+  --calibration hardware_calibration.json
+```
 
 Set `confirmation_repeats` to make apparent incumbents earn promotion through
 additional independent evaluator runs. Their raw samples are merged into one
