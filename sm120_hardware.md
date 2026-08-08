@@ -1,5 +1,12 @@
 # SM120 (RTX 5090 / GeForce Blackwell) Hardware Features
 
+## Attribution
+
+The SM120 hardware information summarized here was derived from
+[Quack](https://github.com/Dao-AILab/quack) by Tri Dao and Dao-AILab. Credit
+for the original SM120 hardware investigation and documentation belongs to
+the Quack authors and contributors.
+
 ## Hardware Specs
 - 170 SMs, 32 GB GDDR7, ~1.8 TB/s memory bandwidth
 - 99 KB shared memory per block (vs 228 KB on SM90 H100)
