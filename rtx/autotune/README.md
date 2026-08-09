@@ -82,9 +82,9 @@ best measured configurations and refits both shared models as labels arrive.
 
 ## Architecture and SKU features
 
-Dataset campaigns pass a complete hardware profile into every kernel context.
-It separates ISA architecture (SM110 versus SM120/SM121), physical SKU limits,
-and optional empirical calibration. Model features include actual/persistent
+Dataset campaigns pass a complete SM120/SM121 hardware profile into every
+kernel context. It separates ISA facts, physical SKU limits, and optional
+empirical calibration. Model features include actual/persistent
 grid CTAs, wave fullness at estimated multi-CTA residency, SMEM/register/thread
 occupancy limits, logical-transpose quantizer resources, instruction-work
 proxies, operand traffic, L2 fit/reuse, memory bus width, theoretical bandwidth,
@@ -160,7 +160,7 @@ orchestration analysis possible.
 When `transfer_history=True`, the cost model receives observations from other
 contexts with the same family and kernel revision. Deduplication and incumbent
 selection remain context-local, so a configuration measured on a 5090 is still
-benchmarked on a 5070 or Thor before it can win there.
+benchmarked on a 5070 before it can win there.
 
 ## Adding another kernel
 

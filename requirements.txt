@@ -1,6 +1,4 @@
 # Preferred discrete-Blackwell install: official PyTorch CUDA 13.2 wheels.
-# Jetson users should install NVIDIA's platform PyTorch build first, then use
-# `python -m pip install -e .` so that the existing torch satisfies metadata.
 --extra-index-url https://download.pytorch.org/whl/cu132
 torch==2.13.0+cu132
 torchao>=0.18.0

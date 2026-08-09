@@ -5,6 +5,8 @@ project follows semantic versioning while it is in active alpha development.
 
 ## 0.6.0
 
+- Narrow the supported hardware surface to SM120/SM121 RTX Blackwell; remove
+  planned SM110/Jetson Thor profiling and support claims.
 - Add a resumable, nonstationary contextual bandit over random, learned-global,
   and model-local search strategies with cost-aware rewards and capped
   cross-context priors.

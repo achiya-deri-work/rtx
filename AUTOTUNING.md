@@ -344,10 +344,8 @@ Probe each machine before distributing work:
 ```
 
 The probe records L2, SMEM, registers, SM count, memory, software fingerprint,
-and telemetry availability. The current native kernel campaign admits
-SM120/SM121 only. In particular, run this probe on Thor before assigning the
-RTX manifest; a different compute capability needs its own legal kernel family
-and must not silently contribute rows of compile failures to the RTX dataset.
+and telemetry availability. The native kernel campaign admits SM120/SM121
+only; other compute capabilities are rejected before dataset collection.
 
 Inspect catalogue size and shard allocation without requiring CUDA:
 

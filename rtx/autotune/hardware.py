@@ -37,18 +37,6 @@ class ArchitectureProfile:
 
 
 _ARCHITECTURES: dict[tuple[int, int], ArchitectureProfile] = {
-    # Thor uses tcgen05 async MMA and TMEM accumulators.  It is deliberately a
-    # different kernel family from the RTX warp-MMA/RMEM implementation.
-    (11, 0): ArchitectureProfile(
-        "sm110",
-        "tcgen05_async",
-        "tmem",
-        True,
-        True,
-        True,
-        register_allocation_unit_per_warp=256,
-        shared_memory_allocation_unit=256,
-    ),
     (12, 0): ArchitectureProfile(
         "sm120",
         "warp_mma_sync",
@@ -143,39 +131,6 @@ _SKU_SPECS: tuple[tuple[re.Pattern[str], dict[str, object]], ...] = (
             "theoretical_memory_bandwidth_gbps": 896.0,
             "cuda_core_count": 8_960,
             "spec_source": "nvidia_reference",
-        },
-    ),
-    (
-        re.compile(r"(?:Jetson.*T5000|T5000.*Jetson|Jetson AGX Thor)", re.IGNORECASE),
-        {
-            "sku_family": "jetson_t5000",
-            "memory_type": "LPDDR5X",
-            "memory_bus_width_bits": 256,
-            "theoretical_memory_bandwidth_gbps": 273.0,
-            "cuda_core_count": 2_560,
-            "tensor_core_count": 96,
-            "spec_source": "nvidia_module",
-        },
-    ),
-    (
-        re.compile(r"(?:Jetson.*T4000|T4000.*Jetson)", re.IGNORECASE),
-        {
-            "sku_family": "jetson_t4000",
-            "memory_type": "LPDDR5X",
-            "memory_bus_width_bits": 256,
-            "theoretical_memory_bandwidth_gbps": 273.0,
-            "cuda_core_count": 1_536,
-            "spec_source": "nvidia_module",
-        },
-    ),
-    (
-        re.compile(r"\bThor\b", re.IGNORECASE),
-        {
-            "sku_family": "thor_unknown_module",
-            "memory_type": "LPDDR5X",
-            "memory_bus_width_bits": 256,
-            "theoretical_memory_bandwidth_gbps": 273.0,
-            "spec_source": "nvidia_thor_family",
         },
     ),
 )

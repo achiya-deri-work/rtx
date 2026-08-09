@@ -28,7 +28,9 @@ class _CompileConfig:
 
 class HardwareAutotuneTests(unittest.TestCase):
     def test_architecture_and_sku_profiles_cover_target_devices(self) -> None:
-        self.assertEqual(architecture_profile((11, 0)).tensor_accumulator, "tmem")
+        unsupported = architecture_profile((11, 0))
+        self.assertEqual(unsupported.execution_model, "unknown")
+        self.assertFalse(unsupported.supports_mxfp8)
         self.assertEqual(architecture_profile((12, 0)).tensor_accumulator, "rmem")
         self.assertEqual(
             sku_spec("NVIDIA GeForce RTX 5090")["memory_bus_width_bits"], 512
@@ -36,9 +38,7 @@ class HardwareAutotuneTests(unittest.TestCase):
         laptop = sku_spec("NVIDIA GeForce RTX 5070 Laptop GPU")
         self.assertEqual(laptop["memory_bus_width_bits"], 128)
         self.assertEqual(laptop["theoretical_memory_bandwidth_gbps"], 384.0)
-        thor = sku_spec("NVIDIA Jetson T5000")
-        self.assertEqual(thor["memory_bus_width_bits"], 256)
-        self.assertEqual(thor["theoretical_memory_bandwidth_gbps"], 273.0)
+        self.assertEqual(sku_spec("NVIDIA Jetson T5000")["sku_family"], "unknown")
 
     def test_resource_features_compute_multi_residency_waves(self) -> None:
         profile = {

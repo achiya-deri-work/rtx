@@ -1,7 +1,7 @@
 # RTX low-precision linear layers
 
 `rtx` is an experimental Python library for low-precision training and
-inference on NVIDIA RTX and Jetson Blackwell GPUs. Its two public linear
+inference on NVIDIA RTX Blackwell GPUs. Its two public linear
 frontends are `rtx.MXFP8Linear` and `rtx.NVFP4Linear`. The
 current implementation contains:
 
@@ -13,9 +13,9 @@ current implementation contains:
 - calibrated hot/rotating-cache measurements and paired finalist races; and
 - portable cross-device datasets exported as CSV or Parquet.
 
-The executable native kernels currently target SM120/SM121. Architecture
-discovery and lazy dispatch also recognize SM110/Jetson Thor, whose separate
-TCGen05/TMEM kernels remain under development. This is research software:
+The executable native kernels target SM120/SM121. SM110/Jetson Thor is outside
+the project scope because its TCGen05/TMEM execution model requires a separate
+kernel family. This is research software:
 kernel, packed-operand, and dataset schemas are versioned, but APIs may still
 change.
 
@@ -48,9 +48,8 @@ python -m pip install -r requirements-cu130.txt
 python -m pip install -e .
 ```
 
-Jetson/SM110 users should install NVIDIA's platform-specific CUDA-enabled
-PyTorch build first and then install the project normally. PyArrow is a core
-dependency, so CSV and Parquet export are available in every supported install.
+PyArrow is a core dependency, so CSV and Parquet export are available in every
+supported install.
 For development tools:
 
 ```bash

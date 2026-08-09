@@ -146,8 +146,8 @@ def calibrate_device(
         try:
             calibration.update(_native_mxfp8(resolved, samples=samples))
         except Exception as exc:
-            # SM110 and partially configured machines can still contribute
-            # memory/BF16 rooflines before their native kernel family exists.
+            # Partially configured SM120/SM121 machines can still contribute
+            # memory/BF16 rooflines when native-kernel calibration is unavailable.
             calibration["native_mxfp8_outcome"] = {
                 "status": "unavailable",
                 "error": f"{type(exc).__name__}: {exc}"[:4000],

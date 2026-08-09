@@ -25,8 +25,7 @@ def load_kernel_symbol(module: str, symbol: str, *, family: str = "sm120"):
     except KeyError as exc:
         raise RuntimeError(
             f"RTX has no executable CuTe kernel family {family!r}; "
-            "SM110 contracts are recognized, but their kernels are still "
-            "under development"
+            "supported kernels require the SM120/SM121 instruction family"
         ) from exc
     requested = os.environ.get("CUTE_DSL_ARCH")
     if requested not in (None, target):
