@@ -8,6 +8,11 @@ on:
         required: false
         default: false
         type: boolean
+      backward_benchmark:
+        description: Run the fused-versus-decomposed backward benchmark
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   sm120:
@@ -30,3 +35,15 @@ jobs:
       - name: Run every CUDA-gated test
         if: ${{ inputs.full_suite }}
         run: python -m unittest discover -s tests -v
+      - name: Benchmark backward kernel families
+        if: ${{ inputs.backward_benchmark }}
+        run: |
+          python benchmarks/benchmark_mxfp8_bwd.py \
+            --m 512 --n 1536 --k 1536 \
+            --output autotune_reports/ci_mxfp8_backward.json
+      - name: Upload backward benchmark
+        if: ${{ inputs.backward_benchmark && always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mxfp8-backward-${{ runner.name }}
+          path: autotune_reports/ci_mxfp8_backward.json

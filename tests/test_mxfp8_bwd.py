@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import tempfile
@@ -19,7 +19,7 @@ from rtx.bwd_autotune import (
 )
 from rtx.bwd_experiments import BwdBenchmarkHarness
 from rtx.fp8_bwd import mxfp8_linear_backward
-from rtx.kernels.mxfp8 import MXFP8Problem
+from rtx.kernels.mxfp8 import MXFP8Problem, normalize_fwd_config
 from rtx.kernels.mxfp8_fwd import (
     compile_mxfp8_atomic_split_fwd,
     compile_mxfp8_fwd,
@@ -257,6 +257,27 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
 
 @unittest.skipUnless(_has_sm120(), "requires an SM120/SM121 CUDA GPU")
 class TestMXFP8BwdCuda(unittest.TestCase):
+    @staticmethod
+    def _assert_backward_close(
+        config, grad_output: torch.Tensor, x: torch.Tensor, weight: torch.Tensor
+    ) -> None:
+        grad_x, grad_weight = mxfp8_linear_backward(
+            grad_output, x, weight, config=config, autotune="off"
+        )
+        torch.cuda.synchronize()
+        expected_x = grad_output.float() @ weight.float()
+        expected_weight = grad_output.float().T @ x.float()
+        relative_x = (grad_x.float() - expected_x).norm() / expected_x.norm()
+        relative_weight = (
+            (grad_weight.float() - expected_weight).norm()
+            / expected_weight.norm()
+        )
+        if float(relative_x) >= 0.07 or float(relative_weight) >= 0.07:
+            raise AssertionError(
+                f"backward error exceeds 7%: dX={float(relative_x)} "
+                f"dW={float(relative_weight)} config={config}"
+            )
+
     def test_cute_logical_transpose_quant_matches_contiguous_reference(self) -> None:
         rows, k = 128, 256
         source = torch.randn(k, rows, device="cuda", dtype=torch.bfloat16)
@@ -356,6 +377,67 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         )
         self.assertLess(float(relative_x), 0.06)
         self.assertLess(float(relative_weight), 0.06)
+
+    def test_fused_tma_and_split_reduction_runtime_matrix(self) -> None:
+        torch.manual_seed(29)
+        m, n, k = 512, 128, 128
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        grad_output = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+        tma = normalize_fwd_config(
+            load_engine="tma",
+            schedule="three_role",
+            bf16_tile_k=32,
+            bf16_swizzle="none",
+            bf16_stages=2,
+            mxfp8_stages=2,
+            quantizer_warps=4,
+            quant_vec=8,
+            quant_math="bf16x2",
+            quant_amax="bf16_bits",
+            quant_load_bits=128,
+        )
+        fused_tma = update_bwd_config(
+            DEFAULT_MXFP8_BWD_CONFIG,
+            {
+                "dx": {"fused": asdict(tma)},
+                "dw": {"fused": asdict(tma)},
+            },
+        )
+        variants = {
+            "tma_full": fused_tma,
+            "tma_workspace": update_bwd_config(
+                fused_tma,
+                {
+                    "dw": {
+                        "reduction": "split_fp32_workspace",
+                        "split_reduction": 4,
+                        "reduction_tile": 128,
+                        "workspace_epilogue": "tree",
+                    }
+                },
+            ),
+            "tma_atomic": update_bwd_config(
+                fused_tma,
+                {
+                    "dw": {
+                        "reduction": "split_fp32_atomic",
+                        "split_reduction": 4,
+                        "reduction_tile": 128,
+                        "workspace_epilogue": "none",
+                    }
+                },
+            ),
+            "tma_dual_stream": update_bwd_config(
+                fused_tma, {"stream_schedule": "dual_stream"}
+            ),
+        }
+        for name, config in variants.items():
+            with self.subTest(name=name):
+                self.assertIsNone(
+                    config.implementation_rejection(MXFP8Problem(m, n, k))
+                )
+                self._assert_backward_close(config, grad_output, x, weight)
 
     def test_calibrated_harness_measures_and_races_backward(self) -> None:
         protocol = BenchmarkProtocol(
