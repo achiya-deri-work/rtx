@@ -28,6 +28,7 @@ from rtx.autotune import (
     TrialResponse,
     UCB1Scheduler,
 )
+from rtx.runtime import BoundedCache
 
 
 def _portable_space() -> ConditionalSearchSpace:
@@ -112,6 +113,25 @@ def _portable_adapter() -> StagedTaskAdapter[dict[str, object]]:
 
 
 class PortableAutotuneTests(unittest.TestCase):
+    def test_bounded_cache_is_lru_and_reports_evictions(self) -> None:
+        cache = BoundedCache[str, object](2)
+        first, second, third = object(), object(), object()
+        cache["first"] = first
+        cache["second"] = second
+        self.assertIs(cache.get("first"), first)
+        cache["third"] = third
+        self.assertIsNone(cache.get("second"))
+        self.assertIs(cache.get("first"), first)
+        self.assertIs(cache.get("third"), third)
+        self.assertEqual(cache.stats()["entries"], 2)
+        self.assertEqual(cache.stats()["evictions"], 1)
+
+    def test_zero_sized_cache_retains_nothing(self) -> None:
+        cache = BoundedCache[str, int](0)
+        cache["value"] = 3
+        self.assertEqual(len(cache), 0)
+        self.assertEqual(cache.stats()["evictions"], 1)
+
     def test_conditional_space_is_normalized_serializable_and_legal(self) -> None:
         space = _portable_space()
         self.assertEqual(

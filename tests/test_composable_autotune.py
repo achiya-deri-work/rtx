@@ -34,6 +34,7 @@ from rtx.autotune import (
     make_mxfp8_weight_prequant_adapter,
     load_runtime_winner,
     make_hybrid_autotuner,
+    make_hybrid_ask_tell_runner,
     save_runtime_winner,
 )
 from rtx.autotune.core import Proposal, evaluate_proposal
@@ -78,6 +79,35 @@ def _toy_adapter() -> DiscreteKernelAdapter[_ToyConfig]:
 
 
 class ComposableAutotuneTests(unittest.TestCase):
+    def test_durable_ask_tell_runner_uses_store_and_resumes(self) -> None:
+        adapter = _toy_adapter()
+        store = InMemoryTuningStore()
+        first = make_hybrid_ask_tell_runner(
+            adapter,
+            store,
+            HybridTuningPolicy(
+                portfolio="random",
+                max_trials=4,
+                time_budget_s=10,
+                seed=19,
+            ),
+        ).tune()
+        self.assertEqual(first.evaluated_trials, 4)
+        self.assertEqual(store.sessions[0]["engine"], "durable_local_ask_tell")
+        self.assertTrue(any(event["kind"] == "trial_issued" for event in store.events))
+        second = make_hybrid_ask_tell_runner(
+            adapter,
+            store,
+            HybridTuningPolicy(
+                portfolio="random",
+                max_trials=6,
+                time_budget_s=10,
+                seed=19,
+            ),
+        ).tune()
+        self.assertEqual(second.evaluated_trials, 2)
+        self.assertLessEqual(second.median_ms, first.median_ms)
+
     def test_sticky_device_fault_is_durable_then_aborts_worker(self) -> None:
         adapter = _toy_adapter()
         adapter.initial_config = _ToyConfig(1, 0)

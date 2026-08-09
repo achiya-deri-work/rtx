@@ -108,6 +108,16 @@ layer = rtx.MXFP8Linear(
 y2 = layer(x)
 ```
 
+Shape/stream-specific dynamic runners retain quantized workspaces for reuse.
+These caches are bounded to eight entries per execution family by default.
+Use `RTX_MXFP8_RUNNER_CACHE_ENTRIES`, or a family-specific variable such as
+`RTX_MXFP8_BACKWARD_CACHE_ENTRIES`, to change the bound. Applications which
+finish a variable-shape phase can release every retained workspace safely:
+
+```python
+released = rtx.clear_runtime_caches()  # synchronizes before releasing buffers
+```
+
 Both modules return BF16 and expose the usual no-bias
 `nn.Linear(in_features, out_features, bias=False, ...)` shape convention.
 Quantization state is independent from training mode:
@@ -191,6 +201,21 @@ rtx-autotune run autotune_manifests/cross_device_dataset_v2.json \
   --format both \
   --calibration hardware_calibration.json
 ```
+
+New campaigns can exercise the same portable lease/worker boundary used by
+external projects while retaining the existing residual stores and campaign
+verification:
+
+```bash
+rtx-autotune run manifest.json --device cuda:0 \
+  --execution-engine ask_tell --output-dir autotune_datasets
+```
+
+Long campaigns may also add `--reuse-deterministic-failures`. This writes an
+append-only ledger for exact architecture, compiler, kernel revision, workload,
+and configuration matches. It reuses only static/compile failures, never
+latencies, correctness failures, or runtime failures, and keeps prospective
+treatments and replicates isolated.
 
 Use `--format parquet` or `--format both` to emit Parquet datasets.
 Every accepted observation is fsync'd to JSONL before the next candidate, so
@@ -356,6 +381,13 @@ and calibrated roofline data, raw timing arrays, compiler latency and available
 compiled-resource attributes, correctness results, telemetry, proposal
 provenance, device/environment context, confirmation measurements, and
 paired-race decisions. The JSONL files remain authoritative.
+
+New machine snapshots expose independent `architecture_id`, `device_id`,
+`compiler_id`, `environment_id`, `calibration_id`, and `kernel_source_id`
+fields under `identities`. The compatibility `machine_id` still selects the
+bundle directory. Offline models should group by the narrowest identity needed
+for a claim instead of treating a compiler PATH or calibration change as a new
+physical GPU.
 
 Campaigns using `storage_mode: residual_context` place the same four journals
 under one directory per family/treatment/replicate/category/regime/shape/context

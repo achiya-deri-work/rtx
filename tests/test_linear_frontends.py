@@ -41,6 +41,19 @@ class LinearFrontendContractTests(unittest.TestCase):
         self.assertIs(rtx.MXFP8Tensor, MXTensor)
         self.assertIs(rtx.NVFP4Tensor, NVFP4Tensor)
 
+    def test_runtime_workspace_caches_have_an_explicit_release_boundary(self) -> None:
+        released = rtx.clear_runtime_caches(synchronize=False)
+        self.assertIn("fp8", released)
+        self.assertIn("fp8_bwd", released)
+        self.assertIn("prequant", released["fp8"])
+        self.assertIn("backward", released["fp8_bwd"])
+
+    def test_dynamic_module_defers_backward_cache_selection(self) -> None:
+        cached = rtx.MXFP8Linear(128, 64, device="cpu", autotune="cache")
+        self.assertTrue(cached._backward_config_key.startswith("bwd-autotune:"))
+        fixed = rtx.MXFP8Linear(128, 64, device="cpu", autotune="off")
+        self.assertFalse(fixed._backward_config_key.startswith("bwd-autotune:"))
+
     def test_external_torchao_mx_tensors_map_to_rtx_kernel_layouts(self) -> None:
         from torchao.prototype.mx_formats.mx_tensor import MXTensor
 

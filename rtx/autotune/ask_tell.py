@@ -11,6 +11,7 @@ import uuid
 
 from .bandit import ArmStatistics
 from .core import (
+    ComposableTuningResult,
     KernelAdapter,
     Observation,
     Proposal,
@@ -19,8 +20,9 @@ from .core import (
     stable_id,
     utc_now,
 )
-from .outcomes import TrialOutcome
+from .outcomes import TrialOutcome, raise_if_fatal_device_context_error
 from .orchestrator import StrategyScheduler
+from .store import TuningStore
 from .strategies import SearchStrategy
 
 
@@ -198,6 +200,7 @@ class AskTellSession(Generic[ConfigT]):
         *,
         seed: int = 0,
         observations: Sequence[Observation[ConfigT]] = (),
+        session_id: str = "ask-tell",
     ) -> None:
         if not strategies:
             raise ValueError("at least one strategy is required")
@@ -209,6 +212,7 @@ class AskTellSession(Generic[ConfigT]):
         self.scheduler = scheduler
         self.rng = random.Random(seed)
         self.seed = seed
+        self.session_id = session_id
         self.history = SearchHistory(
             list(observations), adapter.context.identifier
         )
@@ -431,7 +435,7 @@ class AskTellSession(Generic[ConfigT]):
                 },
                 32,
             ),
-            session_id="ask-tell",
+            session_id=self.session_id,
             sequence=request.sequence,
             context_id=request.context_id,
             family=request.family,
@@ -479,6 +483,7 @@ class AskTellSession(Generic[ConfigT]):
             "type": "rtx_autotune_ask_tell_session",
             "context": self.adapter.context.as_dict(),
             "seed": self.seed,
+            "session_id": self.session_id,
             "rng_state": self.rng.getstate(),
             "next_sequence": self._next_sequence,
             "scheduler": (
@@ -517,6 +522,7 @@ class AskTellSession(Generic[ConfigT]):
             scheduler,
             seed=int(state.get("seed", 0)),
             observations=observations,
+            session_id=str(state.get("session_id", "ask-tell")),
         )
         if state.get("rng_state") is not None:
             session.rng.setstate(_tuple_tree(state["rng_state"]))
@@ -537,8 +543,188 @@ class AskTellSession(Generic[ConfigT]):
         return session
 
 
+class DurableLocalAskTellRunner(Generic[ConfigT]):
+    """Run the portable optimizer locally with campaign-grade durability.
+
+    This is deliberately a thin deployment wrapper: optimization remains in
+    :class:`AskTellSession`, execution remains in ``LocalTrialWorker``, and all
+    accepted responses are written through the ordinary ``TuningStore``. The
+    same session can later be driven by remote workers without changing its
+    optimizer state machine.
+    """
+
+    def __init__(
+        self,
+        adapter: KernelAdapter[ConfigT],
+        store: TuningStore[ConfigT],
+        strategies: Sequence[SearchStrategy[ConfigT]],
+        scheduler: StrategyScheduler,
+        *,
+        max_trials: int = 256,
+        time_budget_s: float = 1800.0,
+        seed: int = 0,
+        resume: bool = True,
+        max_trials_includes_resumed: bool = True,
+        transfer_history: bool = True,
+        lease_s: float = 300.0,
+        worker_metadata: Mapping[str, object] | None = None,
+        progress=None,
+    ) -> None:
+        if max_trials <= 0 or time_budget_s <= 0 or lease_s <= 0:
+            raise ValueError("ask/tell budgets and leases must be positive")
+        self.adapter = adapter
+        self.store = store
+        self.strategies = tuple(strategies)
+        self.scheduler = scheduler
+        self.max_trials = int(max_trials)
+        self.time_budget_s = float(time_budget_s)
+        self.seed = int(seed)
+        self.resume = bool(resume)
+        self.max_trials_includes_resumed = bool(max_trials_includes_resumed)
+        self.transfer_history = bool(transfer_history)
+        self.lease_s = float(lease_s)
+        self.worker_metadata = dict(worker_metadata or {})
+        self.progress = progress
+
+    def _restored(self) -> list[Observation[ConfigT]]:
+        if not self.resume:
+            return []
+        source_context = None if self.transfer_history else self.adapter.context
+        restored: list[Observation[ConfigT]] = []
+        for record in self.store.records(source_context):
+            if (
+                record.get("family") != self.adapter.context.family
+                or int(record.get("kernel_revision", -1))
+                != self.adapter.context.kernel_revision
+            ):
+                continue
+            try:
+                restored.append(observation_from_dict(self.adapter, record))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return restored
+
+    def tune(self) -> ComposableTuningResult[ConfigT]:
+        started = time.monotonic()
+        restored = self._restored()
+        active_restored = sum(
+            item.context_id == self.adapter.context.identifier for item in restored
+        )
+        consumed = active_restored if self.max_trials_includes_resumed else 0
+        session_id = self.store.start_session(
+            self.adapter.context,
+            {
+                "engine": "durable_local_ask_tell",
+                "scheduler": self.scheduler.name,
+                "strategies": [strategy.name for strategy in self.strategies],
+                "budget": {
+                    "max_trials": self.max_trials,
+                    "time_budget_s": self.time_budget_s,
+                },
+                "seed": self.seed,
+                "resumed_observations": len(restored),
+                "resumed_active_budget": consumed,
+                "max_trials_includes_resumed": self.max_trials_includes_resumed,
+            },
+        )
+        optimizer = AskTellSession(
+            self.adapter,
+            self.strategies,
+            self.scheduler,
+            seed=self.seed,
+            observations=restored,
+            session_id=session_id,
+        )
+        worker = LocalTrialWorker(
+            self.adapter,
+            {"execution": "local", **self.worker_metadata},
+        )
+        evaluated = 0
+        status = "complete"
+        while consumed + evaluated < self.max_trials:
+            if time.monotonic() - started >= self.time_budget_s:
+                status = "budget_exhausted"
+                break
+            requests = optimizer.ask(1, lease_s=self.lease_s)
+            if not requests:
+                break
+            request = requests[0]
+            self.store.record_event(
+                session_id,
+                "trial_issued",
+                {
+                    "sequence": request.sequence,
+                    "request_id": request.request_id,
+                    "config_id": request.config_id,
+                    "strategy": request.strategy,
+                    "fidelity": request.fidelity,
+                },
+            )
+            response = worker.evaluate(request)
+            observation = optimizer.tell(response)
+            self.store.record_observation(observation)
+            evaluated += 1
+            if self.progress is not None:
+                suffix = (
+                    ""
+                    if observation.outcome.median_ms is None
+                    else f" {observation.score * 1000:.3f}us"
+                )
+                self.progress(
+                    f"[{time.monotonic() - started:8.2f}s] SAVE "
+                    f"{observation.strategy} {observation.config_id} "
+                    f"{observation.outcome.status}{suffix}"
+                )
+            if observation.outcome.error is not None:
+                raise_if_fatal_device_context_error(observation.outcome.error)
+            if request.strategy == "initial" and not observation.successful:
+                self.store.finish_session(
+                    session_id,
+                    {
+                        "status": "failed",
+                        "reason": "initial configuration failed",
+                    },
+                )
+                raise RuntimeError(
+                    "initial configuration failed: "
+                    f"{observation.outcome.status}: {observation.outcome.error}"
+                )
+        if consumed + evaluated >= self.max_trials:
+            status = "budget_exhausted"
+        best = optimizer.history.best
+        if best is None:
+            self.store.finish_session(
+                session_id, {"status": "failed", "reason": "no successful trials"}
+            )
+            raise RuntimeError("autotuning produced no successful configurations")
+        elapsed = time.monotonic() - started
+        self.store.finish_session(
+            session_id,
+            {
+                "status": status,
+                "best_config_id": best.config_id,
+                "best_median_ms": best.score,
+                "evaluated_trials": evaluated,
+                "elapsed_s": elapsed,
+            },
+        )
+        return ComposableTuningResult(
+            config=best.config,
+            median_ms=best.score,
+            session_id=session_id,
+            context_id=self.adapter.context.identifier,
+            evaluated_trials=evaluated,
+            elapsed_s=elapsed,
+            strategy_trials={
+                name: arm.pulls for name, arm in optimizer.statistics.items()
+            },
+            store_path=None if self.store.path is None else str(self.store.path),
+        )
+
+
 __all__ = [
     "AskTellSession",
+    "DurableLocalAskTellRunner",
     "LocalTrialWorker",
     "TrialRequest",
     "TrialResponse",

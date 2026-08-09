@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Literal, Mapping
 
 from .bandit import AdaptiveBanditScheduler
+from .ask_tell import DurableLocalAskTellRunner
 from .core import ConfigT, KernelAdapter, TuningBudget
 from .cost_model import GradientBoostedCostModel, GradientBoostedFeasibilityModel
 from .orchestrator import (
@@ -263,4 +264,42 @@ def make_hybrid_autotuner(
     )
 
 
-__all__ = ["HybridTuningPolicy", "make_hybrid_autotuner"]
+def make_hybrid_ask_tell_runner(
+    adapter: KernelAdapter[ConfigT],
+    store: TuningStore[ConfigT],
+    policy: HybridTuningPolicy = HybridTuningPolicy(),
+    *,
+    progress=None,
+) -> DurableLocalAskTellRunner[ConfigT]:
+    """Build the same hybrid policy on the portable ask/tell execution path."""
+
+    if (
+        policy.confirmation_repeats
+        or policy.confirmation_ratio
+        or policy.confirm_initial
+    ):
+        raise ValueError(
+            "ask/tell confirmation belongs in staged evaluation; use a task "
+            "with an explicit confirmation fidelity"
+        )
+    synchronous = make_hybrid_autotuner(adapter, store, policy, progress=progress)
+    return DurableLocalAskTellRunner(
+        adapter,
+        store,
+        tuple(synchronous.strategies.values()),
+        synchronous.scheduler,
+        max_trials=synchronous.budget.max_trials,
+        time_budget_s=synchronous.budget.time_budget_s,
+        seed=synchronous.seed,
+        resume=synchronous.resume,
+        max_trials_includes_resumed=synchronous.max_trials_includes_resumed,
+        transfer_history=synchronous.transfer_history,
+        progress=progress,
+    )
+
+
+__all__ = [
+    "HybridTuningPolicy",
+    "make_hybrid_ask_tell_runner",
+    "make_hybrid_autotuner",
+]

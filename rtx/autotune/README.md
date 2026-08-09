@@ -113,6 +113,15 @@ request = study.ask()[0]
 study.tell(worker.evaluate(request))
 ```
 
+For a single local GPU with campaign-grade append-only persistence, wrap the
+same policy in `DurableLocalAskTellRunner`, or use
+`make_hybrid_ask_tell_runner` for the standard random/model/local portfolio.
+The runner restores compatible observations from the normal `TuningStore`,
+records each issued lease and completed response, and enforces total resumed
+trial and wall-time budgets. It is the migration boundary between current
+synchronous campaigns and future queue/RPC workers; the optimizer itself does
+not change when execution becomes remote.
+
 `TrialRequest.as_dict()` and `TrialResponse.as_dict()` are the transport
 boundary for a queue, RPC service, or database. Requests include stable context
 and configuration identities, fidelity, strategy provenance, and a renewable
@@ -253,6 +262,12 @@ the responsible proposal, raises `FatalDeviceContextError`, and the CLI exits
 75. Supervisors may restart that code only; ordinary Python, manifest, and
 dependency failures remain terminal. This prevents one illegal kernel from
 turning all later contexts into correlated setup failures.
+
+For a new campaign, `--reuse-deterministic-failures` avoids recompiling exact
+known static/compiler failures across cache regimes. Its fsync'd JSONL ledger is
+scoped by architecture, compiler, kernel revision, workload, configuration,
+treatment, and replicate. The flag is deliberately opt-in so it cannot change
+the sampling distribution of an already-running prospective comparison.
 
 ## Recorded schema
 

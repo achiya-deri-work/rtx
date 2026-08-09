@@ -3,6 +3,27 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.8.0
+
+- Bound shape/stream-specific MXFP8 forward and backward runner caches with
+  configurable LRUs, cache statistics, and a synchronized public
+  `rtx.clear_runtime_caches()` release boundary.
+- Add a durable local ask/tell deployment which restores observations, issues
+  leaseable work, records every response through the ordinary tuning store,
+  and resumes against total trial and wall-time budgets.
+- Separate architecture, physical device, compiler, environment, calibration,
+  and kernel-source identities in new machine snapshots while preserving the
+  existing bundle-path `machine_id`.
+- Load dataset-promoted fused-forward, prequant-forward, and backward winners
+  through the runtime frontends, including opaque first-execution resolution
+  under `torch.compile`.
+- Reject GEMM candidates against the actual CuTe launch SMEM footprint and add
+  an opt-in, append-only exact deterministic-failure ledger isolated by
+  prospective treatment and replicate.
+- Expand CPU CI to Python 3.11 through 3.13 and the complete test suite, add
+  package metadata validation, and provide a manually triggered self-hosted
+  SM120 GPU workflow.
+
 ## 0.7.0
 
 - Add a backend-neutral conditional search-space schema with dependent

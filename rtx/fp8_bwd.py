@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ from .kernels.mxfp8_bwd import (
     MXFP8BwdConfig,
     MXFP8BwdMatmulConfig,
 )
-from .runtime import load_kernel_symbol
+from .runtime import BoundedCache, load_kernel_symbol, runner_cache_limit
 
 
 def compile_mxfp8_gemm(*args, **kwargs):
@@ -207,8 +208,19 @@ def _build_bwd_runner(
 
 
 _CONFIGS: dict[str, MXFP8BwdConfig] = {}
-_RUNNERS: dict[tuple[object, ...], _BwdRunner] = {}
+_AUTOTUNE_REQUESTS: dict[str, "_BwdAutotuneRequest"] = {}
+_AUTOTUNE_SELECTIONS: dict[tuple[object, ...], str] = {}
+_RUNNERS: BoundedCache[tuple[object, ...], _BwdRunner] = BoundedCache(
+    runner_cache_limit("backward", 8)
+)
 _LOCK = RLock()
+
+
+@dataclass(frozen=True, slots=True)
+class _BwdAutotuneRequest:
+    mode: AutotuneMode
+    policy: object | None
+    cache_dir: str | None
 
 
 @torch.compiler.assume_constant_result
@@ -217,6 +229,28 @@ def _intern_bwd_config(config: MXFP8BwdConfig) -> str:
     key = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
     with _LOCK:
         _CONFIGS[key] = config
+    return key
+
+
+@torch.compiler.assume_constant_result
+def _intern_bwd_autotune_request(
+    mode: AutotuneMode,
+    policy: object | None,
+    cache_dir: Path | str | None,
+) -> str:
+    payload = {
+        "mode": mode,
+        "policy": None if policy is None else asdict(policy),
+        "cache_dir": (
+            None if cache_dir is None else str(Path(cache_dir).expanduser())
+        ),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    key = "bwd-autotune:" + hashlib.sha256(encoded.encode()).hexdigest()[:24]
+    with _LOCK:
+        _AUTOTUNE_REQUESTS[key] = _BwdAutotuneRequest(
+            mode, policy, payload["cache_dir"]
+        )
     return key
 
 
@@ -278,6 +312,49 @@ def _resolve_bwd_runner(
     torch.Tensor,
 ]:
     problem = _check_bwd_inputs(grad_output, x, weight)
+    request = _AUTOTUNE_REQUESTS.get(config_key)
+    if request is not None:
+        selection_key = (
+            config_key,
+            x.device.index,
+            problem.m,
+            problem.n,
+            problem.k,
+        )
+        selected_key = _AUTOTUNE_SELECTIONS.get(selection_key)
+        if selected_key is None:
+            from .autotune.winners import load_runtime_winner, runtime_winner_key
+            from .bwd_autotune import (
+                bwd_config_from_dict,
+                load_cached_mxfp8_bwd_config,
+                tune_mxfp8_backward,
+            )
+
+            selected = load_runtime_winner(
+                runtime_winner_key("mxfp8_bwd", problem, device=x.device),
+                bwd_config_from_dict,
+                root=request.cache_dir,
+                rejection=lambda candidate: candidate.implementation_rejection(
+                    problem
+                ),
+            )
+            if selected is None:
+                selected = load_cached_mxfp8_bwd_config(
+                    problem, device=x.device, cache_dir=request.cache_dir
+                )
+            if selected is None and request.mode == "coordinate":
+                selected = tune_mxfp8_backward(
+                    grad_output,
+                    x,
+                    weight,
+                    policy=request.policy,
+                    cache_dir=request.cache_dir,
+                ).config
+            selected_key = _intern_bwd_config(
+                selected or DEFAULT_MXFP8_BWD_CONFIG
+            )
+            _AUTOTUNE_SELECTIONS[selection_key] = selected_key
+        config_key = selected_key
     config = _CONFIGS.get(config_key)
     if config is None:
         raise RuntimeError("unknown MXFP8 backward configuration key")
@@ -340,6 +417,13 @@ def _launch_dw(
     runner.dw(grad_output_c.T, x_c.T, grad_weight)
     grad_weight._base_inputs = (grad_output_c, x_c, weight_c)
     return grad_weight
+
+
+def _clear_runtime_caches() -> dict[str, object]:
+    before = {"backward": _RUNNERS.stats()}
+    _RUNNERS.clear()
+    _AUTOTUNE_SELECTIONS.clear()
+    return before
 
 
 @torch.library.custom_op(
@@ -521,18 +605,29 @@ def mxfp8_linear_backward(
             selected = DEFAULT_MXFP8_BWD_CONFIG
         else:
             from .bwd_autotune import (
+                bwd_config_from_dict,
                 load_cached_mxfp8_bwd_config,
                 tune_mxfp8_backward,
             )
+            from .autotune.winners import load_runtime_winner, runtime_winner_key
 
             problem = MXFP8Problem(
                 int(x_2d.shape[0]), int(weight.shape[0]), int(x_2d.shape[1])
             )
-            cached = load_cached_mxfp8_bwd_config(
-                problem,
-                device=x.device,
-                cache_dir=autotune_cache_dir,
+            cached = load_runtime_winner(
+                runtime_winner_key("mxfp8_bwd", problem, device=x.device),
+                bwd_config_from_dict,
+                root=autotune_cache_dir,
+                rejection=lambda candidate: candidate.implementation_rejection(
+                    problem
+                ),
             )
+            if cached is None:
+                cached = load_cached_mxfp8_bwd_config(
+                    problem,
+                    device=x.device,
+                    cache_dir=autotune_cache_dir,
+                )
             if cached is not None:
                 selected = cached
             elif mode == "coordinate":

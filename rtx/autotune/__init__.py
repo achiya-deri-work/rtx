@@ -15,7 +15,13 @@ from .bandit import (
     UCB1Scheduler,
     contextual_ucb_scores,
 )
-from .ask_tell import AskTellSession, LocalTrialWorker, TrialRequest, TrialResponse
+from .ask_tell import (
+    AskTellSession,
+    DurableLocalAskTellRunner,
+    LocalTrialWorker,
+    TrialRequest,
+    TrialResponse,
+)
 from .calibration import calibrate_device
 from .core import (
     ComposableTuningResult,
@@ -64,7 +70,11 @@ from .orchestrator import (
     SequentialScheduler,
 )
 from .migration import import_legacy_json_database
-from .recipes import HybridTuningPolicy, make_hybrid_autotuner
+from .recipes import (
+    HybridTuningPolicy,
+    make_hybrid_ask_tell_runner,
+    make_hybrid_autotuner,
+)
 from .pretrained import (
     ConditionalEffectRule,
     ConditionalRuleSet,
@@ -87,6 +97,7 @@ from .space import (
     SearchSpace,
     SpaceConstraint,
 )
+from .safety import JsonlFailureLedger, SafetyAwareAdapter, failure_scope
 from .task import (
     AdapterKernelTask,
     AdapterSearchSpace,
@@ -176,6 +187,7 @@ __all__ = [
     "DatasetTreatment",
     "DiscreteKernelAdapter",
     "DiscreteParameter",
+    "DurableLocalAskTellRunner",
     "EvaluationPlan",
     "EvaluationStage",
     "FunctionKernelTask",
@@ -186,6 +198,7 @@ __all__ = [
     "InMemoryTuningStore",
     "JsonTuningDatabase",
     "JsonlTuningStore",
+    "JsonlFailureLedger",
     "KernelAdapter",
     "KernelContext",
     "LocalTrialWorker",
@@ -198,6 +211,7 @@ __all__ = [
     "ResidualTuningStore",
     "RuntimeWinnerKey",
     "SearchHistory",
+    "SafetyAwareAdapter",
     "SearchSpace",
     "SearchStrategy",
     "SequentialScheduler",
@@ -223,6 +237,7 @@ __all__ = [
     "compiler_profile",
     "device_properties",
     "export_bundle",
+    "failure_scope",
     "load_cached_mxfp8_fwd_config",
     "load_offline_observations",
     "load_pretrained_family",
@@ -235,6 +250,7 @@ __all__ = [
     "make_mxfp8_prequant_adapter",
     "make_mxfp8_weight_prequant_adapter",
     "make_hybrid_autotuner",
+    "make_hybrid_ask_tell_runner",
     "normalized_rows",
     "optimizer_study_rows",
     "register_dataset_backend",

@@ -27,6 +27,7 @@ from rtx.autotune.dataset import (
     export_parquet,
     normalized_rows,
 )
+from rtx.autotune.dataset import decomposed_machine_identities
 from rtx.autotune import dataset as dataset_module
 from rtx.autotune.optimizer_benchmark import (
     optimizer_study_rows,
@@ -67,6 +68,54 @@ def _adapter() -> DiscreteKernelAdapter[_Config]:
 
 
 class DatasetTests(unittest.TestCase):
+    def test_machine_identities_separate_device_compiler_calibration_and_source(self) -> None:
+        device = {
+            "fingerprint": {
+                "uuid": "gpu-1",
+                "name": "RTX test",
+                "capability": [12, 0],
+                "total_memory": 16,
+                "multiprocessor_count": 70,
+            },
+            "hardware_profile": {
+                "architecture": {"key": "sm120"},
+                "sku": {"sku_family": "test", "memory_bus_width_bits": 256},
+                "properties": {"l2_cache_size": 1024},
+                "compiler": {"nvcc": "13.2"},
+                "calibration": {"dram": 1.0},
+                "software": {"torch": "2.13"},
+            },
+        }
+        base = decomposed_machine_identities(
+            device,
+            {"python_source_sha256": "one"},
+            hostname="host",
+            platform_name="linux",
+            python_version="3.13",
+        )
+        compiler_changed = json.loads(json.dumps(device))
+        compiler_changed["hardware_profile"]["compiler"]["nvcc"] = "13.3"
+        changed = decomposed_machine_identities(
+            compiler_changed,
+            {"python_source_sha256": "one"},
+            hostname="host",
+            platform_name="linux",
+            python_version="3.13",
+        )
+        self.assertNotEqual(base["compiler_id"], changed["compiler_id"])
+        for key in base.keys() - {"compiler_id"}:
+            self.assertEqual(base[key], changed[key])
+        source_changed = decomposed_machine_identities(
+            device,
+            {"python_source_sha256": "two"},
+            hostname="host",
+            platform_name="linux",
+            python_version="3.13",
+        )
+        self.assertNotEqual(base["kernel_source_id"], source_changed["kernel_source_id"])
+        for key in base.keys() - {"kernel_source_id"}:
+            self.assertEqual(base[key], source_changed[key])
+
     def test_anytime_policy_and_duration_parsing(self) -> None:
         self.assertEqual(dataset_module._parse_duration("2h"), 7200.0)
         self.assertEqual(dataset_module._parse_duration("90m"), 5400.0)

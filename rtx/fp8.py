@@ -30,8 +30,13 @@ from .formats.mxfp8 import (
     validate_mxfp8_tensor,
 )
 from .configs import MXFP8GemmConfig, MXFP8QuantConfig
-from .kernels.mxfp8 import DEFAULT_MXFP8_FWD_CONFIG, MXFP8FwdConfig, MXFP8Problem
-from .runtime import load_kernel_symbol
+from .kernels.mxfp8 import (
+    DEFAULT_MXFP8_FWD_CONFIG,
+    MXFP8FwdConfig,
+    MXFP8Problem,
+    fwd_config_from_dict,
+)
+from .runtime import BoundedCache, load_kernel_symbol, runner_cache_limit
 
 if TYPE_CHECKING:
     from .autotune import CoordinateDescentPolicy
@@ -160,17 +165,21 @@ DEFAULT_MXFP8_INFERENCE_CONFIG = MXFP8PrequantConfig(
 
 
 _CONFIGS: dict[str, MXFP8FwdConfig] = {}
+_FWD_AUTOTUNE_REQUESTS: dict[str, "_FwdAutotuneRequest"] = {}
+_FWD_AUTOTUNE_SELECTIONS: dict[tuple[object, ...], str] = {}
 _PREQUANT_CONFIGS: dict[str, MXFP8PrequantConfig] = {}
 _PREQUANT_AUTOTUNE_REQUESTS: dict[str, "_PrequantAutotuneRequest"] = {}
 _PACKED_INFERENCE_AUTOTUNE_REQUESTS: dict[
     str, "_PackedInferenceAutotuneRequest"
 ] = {}
 _PREQUANT_AUTOTUNE_SELECTIONS: dict[tuple[object, ...], str] = {}
-_PREQUANT_RUNNERS: dict[
+_PREQUANT_RUNNERS: BoundedCache[
     tuple[object, ...],
     "_PrequantRunner",
-] = {}
-_WEIGHT_PREQUANT_RUNNERS: dict[tuple[object, ...], "_WeightPrequantRunner"] = {}
+] = BoundedCache(runner_cache_limit("prequant", 8))
+_WEIGHT_PREQUANT_RUNNERS: BoundedCache[
+    tuple[object, ...], "_WeightPrequantRunner"
+] = BoundedCache(runner_cache_limit("weight_prequant", 8))
 _PACKED_INFERENCE_SELECTIONS: dict[tuple[object, ...], MXFP8PrequantConfig] = {}
 
 
@@ -278,6 +287,13 @@ class _PrequantAutotuneRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class _FwdAutotuneRequest:
+    mode: AutotuneMode
+    policy: object | None
+    cache_dir: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class _PackedInferenceAutotuneRequest:
     mode: AutotuneMode
     policy: object | None
@@ -288,6 +304,26 @@ def _intern_config(config: MXFP8FwdConfig) -> str:
     key = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
     with _CONFIG_LOCK:
         _CONFIGS[key] = config
+    return key
+
+
+@torch.compiler.assume_constant_result
+def _intern_fwd_autotune_request(
+    mode: AutotuneMode,
+    policy: object | None,
+    cache_dir: Path | str | None,
+) -> str:
+    payload = {
+        "mode": mode,
+        "policy": None if policy is None else asdict(policy),
+        "cache_dir": None if cache_dir is None else str(Path(cache_dir).expanduser()),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    key = "fwd-autotune:" + hashlib.sha256(encoded.encode()).hexdigest()[:24]
+    with _CONFIG_LOCK:
+        _FWD_AUTOTUNE_REQUESTS[key] = _FwdAutotuneRequest(
+            mode, policy, payload["cache_dir"]
+        )
     return key
 
 
@@ -402,6 +438,29 @@ def _launch_fused(
         n=int(weight_c.shape[0]),
         k=int(x_c.shape[1]),
     )
+    request = _FWD_AUTOTUNE_REQUESTS.get(config_key)
+    if request is not None:
+        selection_key = (
+            config_key,
+            x.device.index,
+            problem.m,
+            problem.n,
+            problem.k,
+        )
+        selected_key = _FWD_AUTOTUNE_SELECTIONS.get(selection_key)
+        if selected_key is None:
+            selected = _resolve_fwd_config(
+                x_c,
+                weight_c,
+                config=None,
+                autotune=request.mode,
+                tuning_policy=request.policy,
+                cache_dir=request.cache_dir,
+                defer_compiler_trace=False,
+            )
+            selected_key = _intern_config(selected)
+            _FWD_AUTOTUNE_SELECTIONS[selection_key] = selected_key
+        config_key = selected_key
     try:
         config = _CONFIGS[config_key]
     except KeyError as exc:
@@ -524,12 +583,24 @@ def _build_prequant_runner(
         )
         selected_key = _PREQUANT_AUTOTUNE_SELECTIONS.get(selection_key)
         if selected_key is None:
+            from .autotune.winners import load_runtime_winner, runtime_winner_key
             from .prequant_autotune import (
                 load_cached_mxfp8_prequant_config,
+                prequant_config_from_dict,
                 tune_mxfp8_prequant,
             )
 
-            if request.mode == "coordinate":
+            selected = load_runtime_winner(
+                runtime_winner_key(
+                    "mxfp8_prequant_fwd", problem, device=x.device
+                ),
+                prequant_config_from_dict,
+                root=request.cache_dir,
+                rejection=lambda candidate: candidate.rejection(problem),
+            )
+            if selected is not None:
+                pass
+            elif request.mode == "coordinate":
                 result = tune_mxfp8_prequant(
                     x,
                     weight,
@@ -631,7 +702,9 @@ class _InductorPrequantLauncher:
 
     def __init__(self, config_key: str) -> None:
         self.config_key = config_key
-        self.runners: dict[tuple[int | None, int, int, int, int], tuple] = {}
+        self.runners: BoundedCache[
+            tuple[int | None, int, int, int, int], tuple
+        ] = BoundedCache(runner_cache_limit("inductor_prequant", 8))
 
     def __call__(
         self,
@@ -1281,7 +1354,7 @@ def _launch_training_forward(
 ) -> torch.Tensor:
     """Launch either registered MXFP8 forward family for the autograd op."""
 
-    if config_key in _CONFIGS:
+    if config_key in _CONFIGS or config_key in _FWD_AUTOTUNE_REQUESTS:
         return _launch_fused(x, weight, config_key)
     out = torch.empty(
         (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
@@ -1405,36 +1478,48 @@ def mxfp8_linear(
             x_2d.requires_grad or weight.requires_grad
         ):
             from .fp8_bwd import (
-                DEFAULT_MXFP8_BWD_CONFIG,
                 _intern_bwd_config,
                 _mxfp8_linear_train_op,
             )
 
-            bwd_key = _intern_bwd_config(
-                backward_config or DEFAULT_MXFP8_BWD_CONFIG
+            bwd_key = (
+                _intern_bwd_config(backward_config)
+                if backward_config is not None
+                else _backward_config_key(
+                    mode, tuning_policy, autotune_cache_dir
+                )
             )
             out = _mxfp8_linear_train_op(x_2d, weight, key, bwd_key)
         else:
             out = _run_prequant(x_2d, weight, key)
         return out.reshape(*leading_shape, weight.shape[0])
-    selected_config = _resolve_fwd_config(
-        x_2d,
-        weight,
-        config=config,
-        autotune=autotune,
-        tuning_policy=tuning_policy,
-        cache_dir=autotune_cache_dir,
-    )
-    key = _intern_config(selected_config)
+    mode = _autotune_mode(autotune)
+    if config is None and mode != "off" and torch.compiler.is_compiling():
+        # Resolve the device/shape-specific runtime winner in the custom-op
+        # implementation, outside Dynamo's graph-capture side effects.
+        key = _intern_fwd_autotune_request(
+            mode, tuning_policy, autotune_cache_dir
+        )
+    else:
+        selected_config = _resolve_fwd_config(
+            x_2d,
+            weight,
+            config=config,
+            autotune=mode,
+            tuning_policy=tuning_policy,
+            cache_dir=autotune_cache_dir,
+        )
+        key = _intern_config(selected_config)
     if torch.is_grad_enabled() and (x_2d.requires_grad or weight.requires_grad):
         from .fp8_bwd import (
-            DEFAULT_MXFP8_BWD_CONFIG,
             _intern_bwd_config,
             _mxfp8_linear_train_op,
         )
 
-        bwd_key = _intern_bwd_config(
-            backward_config or DEFAULT_MXFP8_BWD_CONFIG
+        bwd_key = (
+            _intern_bwd_config(backward_config)
+            if backward_config is not None
+            else _backward_config_key(mode, tuning_policy, autotune_cache_dir)
         )
         out = _mxfp8_linear_train_op(x_2d, weight, key, bwd_key)
     else:
@@ -1454,6 +1539,47 @@ def _autotune_mode(value: AutotuneMode | bool | None) -> AutotuneMode:
     return selected
 
 
+def _backward_config_key(
+    mode: AutotuneMode,
+    policy: object | None,
+    cache_dir: Path | str | None,
+) -> str:
+    from .fp8_bwd import (
+        _DEFAULT_BWD_KEY,
+        _intern_bwd_autotune_request,
+    )
+
+    return (
+        _DEFAULT_BWD_KEY
+        if mode == "off"
+        else _intern_bwd_autotune_request(mode, policy, cache_dir)
+    )
+
+
+def _clear_runtime_caches() -> dict[str, object]:
+    """Internal half of :func:`rtx.clear_runtime_caches`."""
+
+    before = {
+        "prequant": _PREQUANT_RUNNERS.stats(),
+        "weight_prequant": _WEIGHT_PREQUANT_RUNNERS.stats(),
+        "inductor_launchers": len(_INDUCTOR_PREQUANT_LAUNCHERS),
+        "inductor_runners": sum(
+            len(launcher.runners)
+            for launcher in _INDUCTOR_PREQUANT_LAUNCHERS.values()
+            if isinstance(launcher, _InductorPrequantLauncher)
+        ),
+    }
+    _PREQUANT_RUNNERS.clear()
+    _WEIGHT_PREQUANT_RUNNERS.clear()
+    for launcher in _INDUCTOR_PREQUANT_LAUNCHERS.values():
+        if isinstance(launcher, _InductorPrequantLauncher):
+            launcher.runners.clear()
+    _PACKED_INFERENCE_SELECTIONS.clear()
+    _PREQUANT_AUTOTUNE_SELECTIONS.clear()
+    _FWD_AUTOTUNE_SELECTIONS.clear()
+    return before
+
+
 def _resolve_fwd_config(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1462,6 +1588,7 @@ def _resolve_fwd_config(
     autotune: AutotuneMode | bool | None,
     tuning_policy: "CoordinateDescentPolicy | None",
     cache_dir: Path | str | None,
+    defer_compiler_trace: bool = True,
 ) -> MXFP8FwdConfig:
     if config is not None:
         return config
@@ -1470,7 +1597,7 @@ def _resolve_fwd_config(
         return DEFAULT_MXFP8_FWD_CONFIG
     # Tuning launches and synchronizes kernels; never start it from a compiler
     # trace. Cache-only selection is also skipped to keep graph capture pure.
-    if torch.compiler.is_compiling():
+    if defer_compiler_trace and torch.compiler.is_compiling():
         return DEFAULT_MXFP8_FWD_CONFIG
 
     from .autotune import (
@@ -1478,11 +1605,19 @@ def _resolve_fwd_config(
         load_cached_mxfp8_fwd_config,
         tune_mxfp8_fwd,
     )
+    from .autotune.winners import load_runtime_winner, runtime_winner_key
 
     problem = MXFP8Problem(x.shape[0], weight.shape[0], x.shape[1])
-    cached = load_cached_mxfp8_fwd_config(
-        problem, device=x.device, cache_dir=cache_dir
+    cached = load_runtime_winner(
+        runtime_winner_key("mxfp8_fused_fwd", problem, device=x.device),
+        lambda value: fwd_config_from_dict(dict(value)),
+        root=cache_dir,
+        rejection=lambda candidate: candidate.implementation_rejection(problem),
     )
+    if cached is None:
+        cached = load_cached_mxfp8_fwd_config(
+            problem, device=x.device, cache_dir=cache_dir
+        )
     if cached is not None or mode == "cache":
         return cached or DEFAULT_MXFP8_FWD_CONFIG
 
@@ -1560,10 +1695,14 @@ class MXFP8Linear(nn.Module):
                 autotune_cache_dir,
                 selected_prequant,
             )
-        from .fp8_bwd import DEFAULT_MXFP8_BWD_CONFIG, _intern_bwd_config
+        from .fp8_bwd import _intern_bwd_config
 
-        self._backward_config_key = _intern_bwd_config(
-            backward_config or DEFAULT_MXFP8_BWD_CONFIG
+        self._backward_config_key = (
+            _intern_bwd_config(backward_config)
+            if backward_config is not None
+            else _backward_config_key(
+                mode, tuning_policy, autotune_cache_dir
+            )
         )
         if packed_weight is None:
             self.weight = nn.Parameter(

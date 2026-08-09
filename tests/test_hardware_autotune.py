@@ -9,7 +9,9 @@ from rtx.autotune import (
     KernelContext,
     TrialOutcome,
     make_mxfp8_fwd_adapter,
+    make_mxfp8_bwd_adapter,
 )
+from rtx.autotune.adapters import _gemm_launch_smem_bytes
 from rtx.autotune.core import Proposal, evaluate_proposal
 from rtx.autotune.hardware import (
     architecture_profile,
@@ -18,6 +20,7 @@ from rtx.autotune.hardware import (
     sku_spec,
 )
 from rtx.kernels.mxfp8 import DEFAULT_MXFP8_FWD_CONFIG, MXFP8Problem
+from rtx.kernels.mxfp8_bwd import DEFAULT_MXFP8_BWD_CONFIG
 
 
 @dataclass(frozen=True)
@@ -27,6 +30,23 @@ class _CompileConfig:
 
 
 class HardwareAutotuneTests(unittest.TestCase):
+    def test_backward_adapter_rejects_runtime_smem_overhead_before_launch(self) -> None:
+        raw_limit = _gemm_launch_smem_bytes(
+            DEFAULT_MXFP8_BWD_CONFIG.dx.gemm
+        ) - 1024
+        adapter = make_mxfp8_bwd_adapter(
+            MXFP8Problem(512, 1536, 1536),
+            lambda _config: TrialOutcome("ok", median_ms=1.0),
+            device={
+                "properties": {
+                    "shared_memory_per_block_optin": raw_limit,
+                }
+            },
+        )
+        rejection = adapter.rejection(DEFAULT_MXFP8_BWD_CONFIG)
+        self.assertIsNotNone(rejection)
+        self.assertIn("runtime overhead", rejection[1])
+
     def test_architecture_and_sku_profiles_cover_target_devices(self) -> None:
         unsupported = architecture_profile((11, 0))
         self.assertEqual(unsupported.execution_model, "unknown")

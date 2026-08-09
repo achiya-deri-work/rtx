@@ -49,7 +49,12 @@ from .outcomes import (
     FatalDeviceContextError,
     raise_if_fatal_device_context_error,
 )
-from .recipes import HybridTuningPolicy, make_hybrid_autotuner
+from .recipes import (
+    HybridTuningPolicy,
+    make_hybrid_ask_tell_runner,
+    make_hybrid_autotuner,
+)
+from .safety import JsonlFailureLedger, SafetyAwareAdapter
 from .store import JsonlTuningStore, ResidualTuningStore, TuningStore
 from .winners import runtime_winner_key, save_runtime_winner
 from ..bwd_experiments import BwdBenchmarkHarness
@@ -617,10 +622,22 @@ class FusedFwdBenchmarkHarness:
 def _source_snapshot() -> dict[str, object]:
     root = Path(__file__).resolve().parents[2]
     digest = hashlib.sha256()
+    kernel_digest = hashlib.sha256()
     for path in sorted((root / "rtx").rglob("*.py")):
-        digest.update(str(path.relative_to(root)).encode())
-        digest.update(path.read_bytes())
-    result: dict[str, object] = {"python_source_sha256": digest.hexdigest()}
+        relative = path.relative_to(root)
+        payload = path.read_bytes()
+        digest.update(str(relative).encode())
+        digest.update(payload)
+        if (
+            relative.parts[:2] in (("rtx", "kernels"), ("rtx", "configs"))
+            or relative == Path("rtx/runtime.py")
+        ):
+            kernel_digest.update(str(relative).encode())
+            kernel_digest.update(payload)
+    result: dict[str, object] = {
+        "python_source_sha256": digest.hexdigest(),
+        "kernel_source_sha256": kernel_digest.hexdigest(),
+    }
     try:
         completed = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -646,6 +663,81 @@ def _source_snapshot() -> dict[str, object]:
     return result
 
 
+def decomposed_machine_identities(
+    device_report: Mapping[str, object],
+    source: Mapping[str, object],
+    *,
+    hostname: str,
+    platform_name: str,
+    python_version: str,
+) -> dict[str, str]:
+    """Return orthogonal IDs for transfer, compilation, and provenance.
+
+    ``machine_id`` remains the bundle-path compatibility identity. These IDs
+    prevent offline models from treating a PATH change, new calibration, or
+    runner-only source edit as a different physical GPU.
+    """
+
+    fingerprint = device_report.get("fingerprint", {})
+    hardware = device_report.get("hardware_profile", {})
+    fingerprint = fingerprint if isinstance(fingerprint, Mapping) else {}
+    hardware = hardware if isinstance(hardware, Mapping) else {}
+    architecture = hardware.get("architecture", {})
+    sku = hardware.get("sku", {})
+    properties = hardware.get("properties", {})
+    compiler = hardware.get("compiler", {})
+    calibration = hardware.get("calibration", {})
+    software = hardware.get("software", fingerprint)
+    architecture = architecture if isinstance(architecture, Mapping) else {}
+    sku = sku if isinstance(sku, Mapping) else {}
+    properties = properties if isinstance(properties, Mapping) else {}
+    compiler = compiler if isinstance(compiler, Mapping) else {}
+    calibration = calibration if isinstance(calibration, Mapping) else {}
+    software = software if isinstance(software, Mapping) else {}
+
+    architecture_payload = {
+        "capability": fingerprint.get("capability", hardware.get("capability")),
+        "architecture": architecture,
+    }
+    # UUID identifies a board when available. Resource limits and the reference
+    # SKU keep the identity useful on runtimes which do not expose one.
+    device_payload = {
+        "uuid": fingerprint.get("uuid"),
+        "name": fingerprint.get("name", hardware.get("name")),
+        "capability": fingerprint.get("capability", hardware.get("capability")),
+        "total_memory": fingerprint.get("total_memory", hardware.get("total_memory")),
+        "multiprocessor_count": fingerprint.get(
+            "multiprocessor_count", hardware.get("multiprocessor_count")
+        ),
+        "l2_cache_size": properties.get("l2_cache_size"),
+        "memory_bus_width_bits": sku.get(
+            "memory_bus_width_bits", properties.get("memory_bus_width_bits")
+        ),
+        "sku_family": sku.get("sku_family"),
+    }
+    environment_payload = {
+        "hostname": hostname,
+        "platform": platform_name,
+        "python_version": python_version,
+        "driver_version": hardware.get("driver_version"),
+        "software": software,
+    }
+    return {
+        "architecture_id": _digest(architecture_payload),
+        "device_id": _digest(device_payload),
+        "compiler_id": _digest(compiler),
+        "environment_id": _digest(environment_payload),
+        "calibration_id": _digest(calibration),
+        "kernel_source_id": _digest(
+            {
+                "kernel_source_sha256": source.get(
+                    "kernel_source_sha256", source.get("python_source_sha256")
+                )
+            }
+        ),
+    }
+
+
 def machine_snapshot(
     device: torch.device | str = "cuda",
     *,
@@ -653,21 +745,32 @@ def machine_snapshot(
 ) -> dict[str, object]:
     device_report = probe_device(device, calibration=calibration)
     source = _source_snapshot()
+    hostname = socket.gethostname()
+    platform_name = platform.platform()
+    python_version = platform.python_version()
     identity = {
-        "hostname": socket.gethostname(),
+        "hostname": hostname,
         "device_id": device_report["fingerprint_id"],
-        "platform": platform.platform(),
+        "platform": platform_name,
         "dataset_schema_version": DATASET_SCHEMA_VERSION,
         "hardware_profile": device_report.get("hardware_profile"),
     }
+    identities = decomposed_machine_identities(
+        device_report,
+        source,
+        hostname=hostname,
+        platform_name=platform_name,
+        python_version=python_version,
+    )
     return {
         "schema_version": DATASET_SCHEMA_VERSION,
         "machine_id": _digest(identity),
         "recorded_at": _utc_now(),
-        "hostname": socket.gethostname(),
-        "platform": platform.platform(),
+        "identities": identities,
+        "hostname": hostname,
+        "platform": platform_name,
         "python_executable": sys.executable,
-        "python_version": platform.python_version(),
+        "python_version": python_version,
         "device": device_report,
         "source": source,
     }
@@ -878,6 +981,8 @@ class DatasetCampaign:
         adopt_existing_context_identity: bool = False,
         adopt_existing_context_identity_if_present: bool = False,
         pretrained_artifact: Path | str | None = None,
+        execution_engine: Literal["synchronous", "ask_tell"] = "synchronous",
+        reuse_deterministic_failures: bool = False,
         progress=print,
     ) -> None:
         self.manifest = manifest
@@ -885,6 +990,10 @@ class DatasetCampaign:
         self.device = torch.device(device)
         self.progress = progress
         self.anytime = anytime
+        if execution_engine not in ("synchronous", "ask_tell"):
+            raise ValueError(f"unknown tuning execution engine {execution_engine!r}")
+        self.execution_engine = execution_engine
+        self.reuse_deterministic_failures = reuse_deterministic_failures
         self.adopt_existing_context_identity = adopt_existing_context_identity
         self.pretrained_artifact = (
             None
@@ -968,9 +1077,21 @@ class DatasetCampaign:
         }
         if self.manifest.rotation_mode == "balanced_categories":
             tags["task_category"] = shape.name or "unnamed"
-        return _BACKENDS[job.family].make_adapter(
+        adapter = _BACKENDS[job.family].make_adapter(
             self, job, shape, regime, harness, tags
         )
+        if not self.reuse_deterministic_failures:
+            return adapter
+        treatment = self._safe_component(job.tags.get("treatment", "default"))
+        replicate = int(job.tags.get("replicate", 0))
+        ledger = JsonlFailureLedger(
+            self.bundle
+            / "failure_ledgers"
+            / treatment
+            / f"replicate-{replicate:03d}"
+            / "deterministic.jsonl"
+        )
+        return SafetyAwareAdapter(adapter, ledger)
 
     def _verification_base(
         self, adapter: KernelAdapter, job: DatasetJob, shape: ShapeSpec, regime: str
@@ -1465,7 +1586,12 @@ class DatasetCampaign:
             )
         if promote is not None:
             effective_job = replace(effective_job, promote=min(promote, job.promote))
-        tuner = make_hybrid_autotuner(
+        make_tuner = (
+            make_hybrid_ask_tell_runner
+            if self.execution_engine == "ask_tell"
+            else make_hybrid_autotuner
+        )
+        tuner = make_tuner(
             adapter,
             store,
             effective_job.tuning,
@@ -1985,6 +2111,10 @@ class DatasetCampaign:
                     "manifest_digest": self.manifest.digest,
                     "machine_id": self.machine["machine_id"],
                     "run_mode": "sequential" if self.anytime is None else "anytime",
+                    "execution_engine": self.execution_engine,
+                    "reuse_deterministic_failures": (
+                        self.reuse_deterministic_failures
+                    ),
                     "anytime_policy": (
                         None if self.anytime is None else asdict(self.anytime)
                     ),
@@ -2133,6 +2263,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pretrained-artifact",
         type=Path,
         help="offline model bundle produced by 'rtx-autotune pretrain'",
+    )
+    run.add_argument(
+        "--execution-engine",
+        choices=("synchronous", "ask_tell"),
+        default="synchronous",
+        help=(
+            "local campaign execution path; ask_tell uses the portable "
+            "lease/worker boundary (default: synchronous)"
+        ),
+    )
+    run.add_argument(
+        "--reuse-deterministic-failures",
+        action="store_true",
+        help=(
+            "reuse exact architecture/compiler/workload/config compile and "
+            "static failures within each treatment/replicate"
+        ),
     )
 
     collect = subparsers.add_parser("collect", help="merge copied campaign bundles")
@@ -2343,6 +2490,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.adopt_existing_context_identity_if_present
         ),
         pretrained_artifact=args.pretrained_artifact,
+        execution_engine=args.execution_engine,
+        reuse_deterministic_failures=args.reuse_deterministic_failures,
         progress=None if args.quiet else print,
     )
     try:

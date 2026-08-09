@@ -91,6 +91,33 @@ def _gemm_smem_bytes(config: object) -> int:
     return q_bytes + scale_bytes + out_bytes
 
 
+def _gemm_launch_smem_bytes(config: object) -> int:
+    # CuTe's generated wrapper reserves an additional 1 KiB for pipeline
+    # barriers/descriptors on the current SM120 GEMM. The raw operand estimate
+    # alone allowed a 101,376-byte candidate whose actual launch requested
+    # 102,400 bytes on a 101,376-byte device limit.
+    return _gemm_smem_bytes(config) + 1024
+
+
+def _gemm_smem_rejection(
+    config: object,
+    device: DeviceFingerprint | Mapping[str, object] | None,
+) -> str | None:
+    profile = _device_dict(device)
+    smem_limit = int(
+        profile_value(profile, "shared_memory_per_block_optin", 0)
+        or profile_value(profile, "shared_memory_per_block", 0)
+        or 0
+    )
+    required = _gemm_launch_smem_bytes(config)
+    if smem_limit and required > smem_limit:
+        return (
+            f"GEMM launch requires {required} bytes of CTA SMEM including "
+            f"runtime overhead, device limit is {smem_limit}"
+        )
+    return None
+
+
 def _specialized_register_budget(
     *,
     consumer_warps: int,
@@ -138,7 +165,7 @@ def _gemm_features(
             profile=profile,
             grid_ctas=grid_ctas,
             threads_per_cta=config.num_threads,
-            smem_bytes_per_cta=_gemm_smem_bytes(config),
+            smem_bytes_per_cta=_gemm_launch_smem_bytes(config),
             register_budget_per_cta=registers,
             register_limit_per_thread=config.maxrregcount,
         )
@@ -374,18 +401,8 @@ def make_mxfp8_prequant_adapter(
     def rejection(config: object) -> tuple[str, str] | None:
         reason = config.rejection(problem)  # type: ignore[attr-defined]
         if reason is None:
-            profile = _device_dict(device)
-            smem_limit = int(
-                profile_value(profile, "shared_memory_per_block_optin", 0)
-                or profile_value(profile, "shared_memory_per_block", 0)
-                or 0
-            )
             gemm = config.gemm  # type: ignore[attr-defined]
-            if smem_limit and _gemm_smem_bytes(gemm) > smem_limit:
-                reason = (
-                    f"GEMM requires {_gemm_smem_bytes(gemm)} bytes of CTA SMEM, "
-                    f"device limit is {smem_limit}"
-                )
+            reason = _gemm_smem_rejection(gemm, device)
         return None if reason is None else ("implementation_rejected", reason)
 
     def derived(config: object) -> Mapping[str, float]:
@@ -449,18 +466,8 @@ def make_mxfp8_weight_prequant_adapter(
     def rejection(config: object) -> tuple[str, str] | None:
         reason = config.rejection(problem)  # type: ignore[attr-defined]
         if reason is None:
-            profile = _device_dict(device)
-            smem_limit = int(
-                profile_value(profile, "shared_memory_per_block_optin", 0)
-                or profile_value(profile, "shared_memory_per_block", 0)
-                or 0
-            )
             gemm = config.gemm  # type: ignore[attr-defined]
-            if smem_limit and _gemm_smem_bytes(gemm) > smem_limit:
-                reason = (
-                    f"GEMM requires {_gemm_smem_bytes(gemm)} bytes of CTA SMEM, "
-                    f"device limit is {smem_limit}"
-                )
+            reason = _gemm_smem_rejection(gemm, device)
         return None if reason is None else ("implementation_rejected", reason)
 
     def derived(config: object) -> Mapping[str, float]:
@@ -543,18 +550,8 @@ def make_mxfp8_fully_prequant_adapter(
     def rejection(config: object) -> tuple[str, str] | None:
         reason = config.rejection(problem)  # type: ignore[attr-defined]
         if reason is None:
-            profile = _device_dict(device)
-            smem_limit = int(
-                profile_value(profile, "shared_memory_per_block_optin", 0)
-                or profile_value(profile, "shared_memory_per_block", 0)
-                or 0
-            )
             gemm = config.gemm  # type: ignore[attr-defined]
-            if smem_limit and _gemm_smem_bytes(gemm) > smem_limit:
-                reason = (
-                    f"GEMM requires {_gemm_smem_bytes(gemm)} bytes of CTA SMEM, "
-                    f"device limit is {smem_limit}"
-                )
+            reason = _gemm_smem_rejection(gemm, device)
         return None if reason is None else ("implementation_rejected", reason)
 
     def derived(config: object) -> Mapping[str, float]:
@@ -641,6 +638,12 @@ def make_mxfp8_bwd_adapter(
 
     def rejection(config: object) -> tuple[str, str] | None:
         reason = config.implementation_rejection(problem)  # type: ignore[attr-defined]
+        if reason is None:
+            for name, matmul in (("dX", config.dx), ("dW", config.dw)):  # type: ignore[attr-defined]
+                reason = _gemm_smem_rejection(matmul.gemm, device)
+                if reason is not None:
+                    reason = f"{name}: {reason}"
+                    break
         return None if reason is None else ("implementation_rejected", reason)
 
     def derived(config: object) -> Mapping[str, float]:
