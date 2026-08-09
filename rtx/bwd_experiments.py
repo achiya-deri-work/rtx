@@ -225,10 +225,11 @@ class BwdBenchmarkHarness:
         component_calls = max(1, min(calls, 1024))
         component_samples = max(3, min(samples, 5))
         operations: dict[str, Callable[[], None]] = {}
-        if prepared.config.quant_schedule == "quad":
+        is_quad = prepared.config.quant_schedule in ("quad", "shared_g_quad")
+        if is_quad:
             operations.update(
                 {
-                    "quad_quant": lambda: runner.quantize_quad(
+                    f"{prepared.config.quant_schedule}_quant": lambda: runner.quantize_quad(
                         self.grad_output, self.x, self.weight
                     ),
                     "dx_gemm_hot_materialized": lambda: runner.dx.matmul(
@@ -254,7 +255,7 @@ class BwdBenchmarkHarness:
                     ),
                 }
             )
-        if prepared.config.quant_schedule == "quad":
+        if is_quad:
             pass
         elif prepared.config.dw.backend == "fused":
             operations["dw_fused_quant_mma"] = lambda: runner.dw(

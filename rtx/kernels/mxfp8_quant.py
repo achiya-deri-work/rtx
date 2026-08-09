@@ -832,6 +832,67 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
                     for vec in cutlass.range_constexpr(values_per_load):
                         physical_smem[k_local, row_local + vec] = loaded[vec]
         cute.arch.sync_threads()
+        self._quantize_loaded_smem_tile(
+            logical_smem,
+            quantized,
+            scales,
+            packed_scale_smem,
+            row_base,
+            k_tile,
+            scale_tile_rows,
+        )
+
+    @cute.jit
+    def _quantize_loaded_smem_tile(
+        self,
+        logical_smem: cute.Tensor,
+        quantized: cute.Tensor,
+        scales: cute.Tensor,
+        packed_scale_smem: cute.Tensor,
+        row_base: Int32,
+        k_tile: Int32,
+        scale_tile_rows: cutlass.Constexpr,
+    ):
+        """Emit one already-resident logical SMEM tile and its native scales."""
+
+        self._quantize_loaded_smem_tile_group(
+            logical_smem,
+            quantized,
+            scales,
+            packed_scale_smem,
+            row_base,
+            k_tile,
+            scale_tile_rows,
+            0,
+            self.config.num_warps,
+        )
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def _quantize_loaded_smem_tile_group(
+        self,
+        logical_smem: cute.Tensor,
+        quantized: cute.Tensor,
+        scales: cute.Tensor,
+        packed_scale_smem: cute.Tensor,
+        row_base: Int32,
+        k_tile: Int32,
+        scale_tile_rows: cutlass.Constexpr,
+        warp_base: cutlass.Constexpr,
+        warp_count: cutlass.Constexpr,
+    ):
+        """Emit a tile with one warp subset; the caller owns synchronization."""
+
+        cfg = self.config
+        lane_idx = cute.arch.lane_idx()
+        warp_idx = (
+            cute.arch.make_warp_uniform(cute.arch.warp_idx()) - warp_base
+        )
+        blocks_per_tile = cfg.transposed_tile_k // SF_VEC_SIZE
+        threads_per_scale = 32 // cfg.quant_vec
+        scale_in_warp = lane_idx // threads_per_scale
+        lane_in_scale = lane_idx % threads_per_scale
+        rows_per_phase = warp_count * cfg.quant_vec
         for phase in cutlass.range_constexpr(
             cfg.transposed_tile_rows // rows_per_phase
         ):
@@ -902,7 +963,6 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
                             packed_scale_smem[local_row, local_block],
                             scale_tile_rows,
                         )
-        cute.arch.sync_threads()
 
 
 class MXFP8OrientedDualQuantKernel(MXFP8TransposedQuantKernel):
@@ -1328,6 +1388,290 @@ class MXFP8BackwardQuadQuantKernel(MXFP8OrientedDualQuantKernel):
                 )
 
 
+class MXFP8SharedGBackwardQuadQuantKernel(MXFP8BackwardQuadQuantKernel):
+    """Quad quantization with one BF16 load for both orientations of G.
+
+    A square physical ``G[row, column]`` tile is staged once.  ``qa`` is
+    emitted through the row-major SMEM layout and ``qc`` through a CuTe
+    transposed layout over the same allocation.  The two MXFP8 encodings are
+    necessarily distinct because their 32-value scale groups run along
+    different axes, but the BF16 global load is shared.
+    """
+
+    def __init__(
+        self,
+        a_rows: int,
+        b_rows: int,
+        k_ab: int,
+        c_rows: int,
+        d_rows: int,
+        k_cd: int,
+        row_config: MXFP8QuantConfig,
+        transposed_config: MXFP8QuantConfig,
+    ):
+        super().__init__(
+            a_rows,
+            b_rows,
+            k_ab,
+            c_rows,
+            d_rows,
+            k_cd,
+            row_config,
+            transposed_config,
+        )
+        if a_rows != k_cd or c_rows != k_ab:
+            raise ValueError("shared-G quad operands must be exact logical transposes")
+        if row_config != transposed_config:
+            raise ValueError("shared-G quad requires one quantization schedule")
+        if (
+            transposed_config.transposed_tile_rows
+            != transposed_config.transposed_tile_k
+        ):
+            raise ValueError("shared-G quad requires a square SMEM tile")
+        self.g_row_tiles = a_rows // transposed_config.transposed_tile_rows
+        self.g_column_tiles = k_ab // transposed_config.transposed_tile_k
+        self.g_task_groups = self.g_row_tiles * self.g_column_tiles
+        self.task_groups = (
+            self.g_task_groups + self.b_task_groups + self.d_task_groups
+        )
+        sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
+        self.grid_ctas = min(
+            self.task_groups,
+            sm_count * transposed_config.persistent_waves,
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        c: cute.Tensor,
+        d: cute.Tensor,
+        qa: cute.Tensor,
+        qb: cute.Tensor,
+        qc: cute.Tensor,
+        qd: cute.Tensor,
+        sa: cute.Tensor,
+        sb: cute.Tensor,
+        sc: cute.Tensor,
+        sd: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.shared_g_kernel(
+            a, b, c, d, qa, qb, qc, qd, sa, sb, sc, sd
+        ).launch(
+            grid=(self.grid_ctas, 1, 1),
+            block=(self.config.num_warps * 32, 1, 1),
+            stream=stream,
+        )
+
+    @cute.jit
+    def _quantize_shared_g_cta(
+        self,
+        src: cute.Tensor,
+        quantized_row: cute.Tensor,
+        quantized_transpose: cute.Tensor,
+        scales_row: cute.Tensor,
+        scales_transpose: cute.Tensor,
+        physical_smem: cute.Tensor,
+        logical_smem: cute.Tensor,
+        row_scale_smem: cute.Tensor,
+        transpose_scale_smem: cute.Tensor,
+        task_group: Int32,
+    ):
+        cfg = self.config
+        tidx, _, _ = cute.arch.thread_idx()
+        tile = cfg.transposed_tile_rows
+        row_tile = task_group // self.g_column_tiles
+        column_tile = task_group - row_tile * self.g_column_tiles
+        row_base = row_tile * tile
+        column_base = column_tile * tile
+        values_per_load = cfg.load_bits // BFloat16.width
+
+        if cutlass.const_expr(cfg.transposed_load_engine == "cp_async"):
+            cp_atom = cute.make_copy_atom(
+                cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
+                BFloat16,
+                num_bits_per_copy=128,
+            )
+            copy_threads = 16
+            partition_values = values_per_load * 4
+            row_threads = tile // partition_values
+            cp_thread_layout = cute.make_layout(
+                (copy_threads // row_threads, row_threads),
+                stride=(row_threads, 1),
+            )
+            cp_value_layout = cute.make_layout((1, partition_values))
+            cp_tiled_copy = cute.make_tiled_copy_tv(
+                cp_atom, cp_thread_layout, cp_value_layout
+            )
+            src_tile = cute.make_tensor(
+                (src.iterator + src.layout((row_base, column_base))).align(16),
+                cute.make_layout(
+                    (tile, tile),
+                    stride=(src.layout.stride[0], 1),
+                ),
+            )
+            if tidx < copy_threads:
+                cp_thread = cp_tiled_copy.get_slice(tidx)
+                cute.copy(
+                    cp_tiled_copy,
+                    cp_thread.partition_S(src_tile),
+                    cp_thread.partition_D(physical_smem),
+                )
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+        else:
+            load_tasks = tile * tile // values_per_load
+            for load_task in cutlass.range(
+                tidx, load_tasks, cfg.num_warps * 32, unroll=1
+            ):
+                linear = load_task * values_per_load
+                local_row = linear // tile
+                local_column = linear - local_row * tile
+                src_ptr = src.iterator + src.layout(
+                    (row_base + local_row, column_base + local_column)
+                )
+                if cutlass.const_expr(values_per_load == 1):
+                    physical_smem[local_row, local_column] = src[
+                        row_base + local_row, column_base + local_column
+                    ]
+                else:
+                    loaded = nvvm.load_ext(
+                        src_ptr,
+                        dtype=Uint16,
+                        count=values_per_load,
+                    ).bitcast(BFloat16)
+                    for vec in cutlass.range_constexpr(values_per_load):
+                        physical_smem[local_row, local_column + vec] = loaded[vec]
+        cute.arch.sync_threads()
+
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        half_warps = cfg.num_warps // 2
+        if warp_idx < half_warps:
+            self._quantize_loaded_smem_tile_group(
+                physical_smem,
+                quantized_row,
+                scales_row,
+                row_scale_smem,
+                row_base,
+                column_tile,
+                self.a_scale_tile_rows,
+                0,
+                half_warps,
+            )
+        else:
+            self._quantize_loaded_smem_tile_group(
+                logical_smem,
+                quantized_transpose,
+                scales_transpose,
+                transpose_scale_smem,
+                column_base,
+                row_tile,
+                self.c_scale_tile_rows,
+                half_warps,
+                half_warps,
+            )
+        cute.arch.sync_threads()
+
+    @cute.kernel
+    def shared_g_kernel(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        c: cute.Tensor,
+        d: cute.Tensor,
+        qa: cute.Tensor,
+        qb: cute.Tensor,
+        qc: cute.Tensor,
+        qd: cute.Tensor,
+        sa: cute.Tensor,
+        sb: cute.Tensor,
+        sc: cute.Tensor,
+        sd: cute.Tensor,
+    ):
+        # ``c`` is the metadata-only transpose of ``a``. It remains in the
+        # signature so both quad launchers share one Torch-side call contract;
+        # the shared-G implementation deliberately never loads it.
+        cfg = self.config
+        physical_stride = cfg.transposed_tile_rows + cfg.transposed_smem_padding
+        smem_allocator = cutlass.utils.SmemAllocator()
+        physical_smem = smem_allocator.allocate_tensor(
+            BFloat16,
+            cute.make_layout(
+                (cfg.transposed_tile_k, physical_stride),
+                stride=(physical_stride, 1),
+            ),
+            byte_alignment=16,
+        )
+        packed_scale_smem = smem_allocator.allocate_tensor(
+            Float8E8M0FNU,
+            cute.make_layout(
+                (cfg.transposed_tile_rows, cfg.transposed_tile_k // SF_VEC_SIZE),
+                stride=(cfg.transposed_tile_k // SF_VEC_SIZE, 1),
+            ),
+            byte_alignment=16,
+        )
+        transpose_scale_smem = smem_allocator.allocate_tensor(
+            Float8E8M0FNU,
+            cute.make_layout(
+                (cfg.transposed_tile_rows, cfg.transposed_tile_k // SF_VEC_SIZE),
+                stride=(cfg.transposed_tile_k // SF_VEC_SIZE, 1),
+            ),
+            byte_alignment=16,
+        )
+        logical_smem = cute.make_tensor(
+            physical_smem.iterator,
+            cute.make_layout(
+                (cfg.transposed_tile_rows, cfg.transposed_tile_k),
+                stride=(1, physical_stride),
+            ),
+        )
+        block_idx, _, _ = cute.arch.block_idx()
+        for task_group in cutlass.range(
+            block_idx, self.task_groups, self.grid_ctas, unroll=1
+        ):
+            if task_group < self.g_task_groups:
+                self._quantize_shared_g_cta(
+                    a,
+                    qa,
+                    qc,
+                    sa,
+                    sc,
+                    physical_smem,
+                    logical_smem,
+                    packed_scale_smem,
+                    transpose_scale_smem,
+                    task_group,
+                )
+            elif task_group < self.g_task_groups + self.b_task_groups:
+                local_task = task_group - self.g_task_groups
+                self._quantize_transposed_cta(
+                    b,
+                    qb,
+                    sb,
+                    physical_smem,
+                    logical_smem,
+                    packed_scale_smem,
+                    local_task,
+                    self.b_scale_tile_rows,
+                    self.k,
+                )
+            else:
+                local_task = task_group - self.g_task_groups - self.b_task_groups
+                self._quantize_transposed_cta(
+                    d,
+                    qd,
+                    sd,
+                    physical_smem,
+                    logical_smem,
+                    packed_scale_smem,
+                    local_task,
+                    self.d_scale_tile_rows,
+                    self.k_cd,
+                )
+
+
 @lru_cache(maxsize=None)
 def compile_mxfp8_quant(
     rows: int,
@@ -1572,10 +1916,20 @@ def compile_mxfp8_backward_quad_quant(
     k_cd: int,
     row_config: MXFP8QuantConfig,
     transposed_config: MXFP8QuantConfig,
+    shared_g: bool = False,
 ):
-    """Compile one launch for all dX/dW dynamic quantized operands."""
+    """Compile one launch for all dX/dW dynamic quantized operands.
 
-    kernel = MXFP8BackwardQuadQuantKernel(
+    With ``shared_g``, each BF16 grad-output tile is loaded once and emitted
+    through row and transposed SMEM layouts for the two GEMMs.
+    """
+
+    kernel_type = (
+        MXFP8SharedGBackwardQuadQuantKernel
+        if shared_g
+        else MXFP8BackwardQuadQuantKernel
+    )
+    kernel = kernel_type(
         a_rows,
         b_rows,
         k_ab,
@@ -1641,6 +1995,7 @@ def compile_mxfp8_backward_quad_quant(
 
 __all__ = [
     "MXFP8BackwardQuadQuantKernel",
+    "MXFP8SharedGBackwardQuadQuantKernel",
     "MXFP8DualQuantKernel",
     "MXFP8QuantConfig",
     "MXFP8QuantKernel",

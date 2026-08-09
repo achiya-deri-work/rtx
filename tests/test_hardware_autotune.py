@@ -31,6 +31,7 @@ from rtx.kernels.mxfp8 import (
 from rtx.kernels.mxfp8_bwd import DEFAULT_MXFP8_BWD_CONFIG
 from rtx.kernels.mxfp8_bwd import DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG
 from rtx.configs import MXFP8GemmConfig
+from rtx.bwd_autotune import BWD_SEARCH_SPACE, update_bwd_config
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,37 @@ class HardwareAutotuneTests(unittest.TestCase):
         rejection = adapter.rejection(DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG)
         self.assertIsNotNone(rejection)
         self.assertIn("runtime overhead", rejection[1])
+
+    def test_backward_features_model_shared_grad_output_traffic(self) -> None:
+        problem = MXFP8Problem(4096, 4096, 4096)
+        adapter = make_mxfp8_bwd_adapter(
+            problem,
+            lambda _config: TrialOutcome("ok", median_ms=1.0),
+        )
+        shared_value = next(
+            value
+            for value in BWD_SEARCH_SPACE["shared_g_quad"]
+            if value["dx"]["quant_a"]["transposed_tile_rows"] == 128
+            and value["dx"]["quant_a"]["transposed_load_engine"] == "cp_async"
+            and value["dx"]["quant_a"]["native_scale_store"] == "packed"
+        )
+        shared = update_bwd_config(DEFAULT_MXFP8_BWD_CONFIG, shared_value)
+        baseline_features = adapter.features(DEFAULT_MXFP8_BWD_CONFIG)
+        shared_features = adapter.features(shared)
+        self.assertEqual(
+            shared_features["derived.backward_shared_g_bf16_bytes_saved"],
+            4096 * 4096 * 2,
+        )
+        self.assertEqual(
+            baseline_features["derived.backward_grad_output_bf16_read_bytes"],
+            2 * shared_features["derived.backward_grad_output_bf16_read_bytes"],
+        )
+        self.assertEqual(
+            shared_features["derived.backward_shared_g_tile_count"], 32 * 32
+        )
+        self.assertEqual(
+            shared_features["derived.backward_total_kernel_launches"], 3
+        )
 
     def test_prequant_config_rejects_runtime_smem_reserve_statically(self) -> None:
         from rtx.configs import MXFP8GemmConfig

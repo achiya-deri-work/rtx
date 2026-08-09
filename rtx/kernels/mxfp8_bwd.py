@@ -379,8 +379,8 @@ class MXFP8BwdConfig:
             return "execution_order must be dx_first, dw_first, or interleaved"
         if self.stream_schedule not in ("single", "dual_stream", "graph"):
             return "stream_schedule must be single, dual_stream, or graph"
-        if self.quant_schedule not in ("per_matmul", "quad"):
-            return "quant_schedule must be per_matmul or quad"
+        if self.quant_schedule not in ("per_matmul", "quad", "shared_g_quad"):
+            return "quant_schedule must be per_matmul, quad, or shared_g_quad"
         if (self.dx.a_orientation, self.dx.b_orientation) != ("row", "transpose"):
             return "dX requires logical layouts A=row and B=transpose"
         if (self.dw.a_orientation, self.dw.b_orientation) != (
@@ -407,7 +407,7 @@ class MXFP8BwdConfig:
                 return "interleaved execution requires two decomposed matmuls"
         if self.stream_schedule == "graph":
             return f"stream schedule {self.stream_schedule!r} is not implemented yet"
-        if self.quant_schedule == "quad":
+        if self.quant_schedule in ("quad", "shared_g_quad"):
             if self.dx.backend != "decomposed" or self.dw.backend != "decomposed":
                 return "quad quantization requires two decomposed matmuls"
             if self.dx.quant_launches != "dual" or self.dw.quant_launches != "dual":
@@ -417,6 +417,44 @@ class MXFP8BwdConfig:
                 return "quad quantization requires one shared transposed schedule"
             if self.dx.quant_a.num_warps != transposed.num_warps:
                 return "quad quantization requires one CTA warp count"
+            if self.quant_schedule == "shared_g_quad":
+                if self.dx.quant_a != transposed:
+                    return "shared-G quad requires one quantization schedule"
+                if (
+                    transposed.transposed_tile_rows
+                    != transposed.transposed_tile_k
+                ):
+                    return "shared-G quad requires a square SMEM tile"
+                rows_per_phase = (
+                    transposed.num_warps // 2 * transposed.quant_vec
+                )
+                if transposed.transposed_tile_rows % rows_per_phase:
+                    return "shared-G tile rows must divide the two warp groups"
+                if transposed.transposed_load_engine == "cp_async":
+                    values_per_load = transposed.load_bits // 16
+                    partition_values = values_per_load * 4
+                    row_threads = (
+                        transposed.transposed_tile_rows // partition_values
+                    )
+                    if (
+                        transposed.transposed_tile_rows % partition_values
+                        or row_threads > 16
+                        or 16 % row_threads
+                    ):
+                        return "shared-G cp.async tile has no aligned copy partition"
+                shared_smem = (
+                    transposed.transposed_tile_rows
+                    * (
+                        transposed.transposed_tile_k
+                        + transposed.transposed_smem_padding
+                    )
+                    * 2
+                    + 2
+                    * transposed.transposed_tile_rows
+                    * (transposed.transposed_tile_k // 32)
+                )
+                if shared_smem > SM120_SMEM_CAPACITY_BYTES:
+                    return "shared-G quantizer exceeds SM120 shared-memory capacity"
         reason = self.dx.implementation_rejection(
             MXFP8Problem(forward.m, forward.k, forward.n)
         )

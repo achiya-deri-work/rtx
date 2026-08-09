@@ -11,7 +11,12 @@ import time
 
 import torch
 
-from rtx.bwd_autotune import bwd_config_id, bwd_config_to_dict, update_bwd_config
+from rtx.bwd_autotune import (
+    BWD_SEARCH_SPACE,
+    bwd_config_id,
+    bwd_config_to_dict,
+    update_bwd_config,
+)
 from rtx.bwd_experiments import BwdBenchmarkHarness
 from rtx.kernels.mxfp8 import MXFP8Problem, normalize_fwd_config
 from rtx.kernels.mxfp8_bwd import (
@@ -229,6 +234,18 @@ def _configs(shape: ShapeSpec, *, reuse_sweep: bool = False) -> dict[str, object
             },
         )
     problem = MXFP8Problem(shape.m, shape.n, shape.k)
+    for value in BWD_SEARCH_SPACE["shared_g_quad"]:
+        candidate = update_bwd_config(
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG, value
+        )
+        if candidate.implementation_rejection(problem) is None:
+            schedule = candidate.dx.quant_a
+            configs[
+                "decomposed_shared_g_"
+                f"t{schedule.transposed_tile_rows}_"
+                f"{schedule.transposed_load_engine}_"
+                f"{schedule.native_scale_store}"
+            ] = candidate
     for operand in ("a", "b"):
         for cluster_size in (2, 4):
             clustered = normalize_fwd_config(

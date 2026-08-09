@@ -35,6 +35,7 @@ from rtx.kernels.mxfp8_bwd import (
 )
 from rtx.kernels.mxfp8_quant import (
     MXFP8QuantConfig,
+    compile_mxfp8_backward_quad_quant,
     compile_mxfp8_quant,
     compile_mxfp8_transposed_quant,
 )
@@ -335,6 +336,28 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
         )
         self.assertIn("decomposed", fused.implementation_rejection(problem))
 
+    def test_shared_g_quad_is_a_reachable_square_tile_family(self) -> None:
+        problem = MXFP8Problem(512, 1536, 1536)
+        candidates = [
+            update_bwd_config(DEFAULT_MXFP8_BWD_CONFIG, value)
+            for value in BWD_SEARCH_SPACE["shared_g_quad"]
+        ]
+        self.assertTrue(candidates)
+        self.assertTrue(
+            all(candidate.quant_schedule == "shared_g_quad" for candidate in candidates)
+        )
+        self.assertTrue(
+            all(candidate.implementation_rejection(problem) is None for candidate in candidates)
+        )
+        for candidate in candidates:
+            shared = candidate.dx.quant_a
+            self.assertEqual(shared, candidate.dx.resolved_quant_b())
+            self.assertEqual(shared, candidate.dw.quant_a)
+            self.assertEqual(shared, candidate.dw.resolved_quant_b())
+            self.assertEqual(
+                shared.transposed_tile_rows, shared.transposed_tile_k
+            )
+
     def test_oriented_fused_kernels_compile_without_materialized_transposes(self) -> None:
         problem = MXFP8Problem(128, 128, 128)
         compile_mxfp8_fwd(
@@ -626,6 +649,96 @@ class TestMXFP8BwdCuda(unittest.TestCase):
             {"quant_schedule": "quad"},
         )
         self._assert_backward_close(config, grad_output, x, weight)
+
+    def test_shared_g_quad_loads_one_tile_for_both_orientations(self) -> None:
+        torch.manual_seed(133)
+        m = n = k = 256
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        grad_output = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+        variants = [
+            value
+            for value in BWD_SEARCH_SPACE["shared_g_quad"]
+            if value["dx"]["quant_a"]["transposed_tile_rows"] == 128
+        ]
+        for value in variants:
+            config = update_bwd_config(DEFAULT_MXFP8_BWD_CONFIG, value)
+            engine = config.dx.quant_a.transposed_load_engine
+            scale_store = config.dx.quant_a.native_scale_store
+            with self.subTest(engine=engine, scale_store=scale_store):
+                self.assertIsNone(
+                    config.implementation_rejection(MXFP8Problem(m, n, k))
+                )
+                self._assert_backward_close(config, grad_output, x, weight)
+
+    def test_shared_g_quad_never_reads_the_duplicate_transpose_argument(self) -> None:
+        torch.manual_seed(134)
+        rows = 128
+        value = next(
+            candidate
+            for candidate in BWD_SEARCH_SPACE["shared_g_quad"]
+            if candidate["dx"]["quant_a"]["transposed_tile_rows"] == 128
+            and candidate["dx"]["quant_a"]["transposed_load_engine"] == "cp_async"
+            and candidate["dx"]["quant_a"]["native_scale_store"] == "packed"
+        )
+        config = update_bwd_config(DEFAULT_MXFP8_BWD_CONFIG, value)
+        schedule = config.dx.quant_a
+        grad_output = torch.randn(
+            rows, rows, device="cuda", dtype=torch.bfloat16
+        )
+        unrelated = torch.zeros_like(grad_output).T
+        weight_t = torch.randn_like(grad_output).T
+        x_t = torch.randn_like(grad_output).T
+
+        def q_buffer() -> torch.Tensor:
+            return torch.empty(
+                rows, rows, device="cuda", dtype=torch.float8_e4m3fn
+            )
+
+        def s_buffer() -> torch.Tensor:
+            return torch.zeros(
+                1, 1, 512, device="cuda", dtype=torch.float8_e8m0fnu
+            )
+
+        qa, qb, qc, qd = (q_buffer() for _ in range(4))
+        sa, sb, sc, sd = (s_buffer() for _ in range(4))
+        compile_mxfp8_backward_quad_quant(
+            rows,
+            rows,
+            rows,
+            rows,
+            rows,
+            rows,
+            schedule,
+            schedule,
+            shared_g=True,
+        )(
+            grad_output,
+            weight_t,
+            unrelated,
+            x_t,
+            qa,
+            qb,
+            qc,
+            qd,
+            sa,
+            sb,
+            sc,
+            sd,
+        )
+        expected_qa, expected_qc = q_buffer(), q_buffer()
+        expected_sa, expected_sc = s_buffer(), s_buffer()
+        compile_mxfp8_quant(rows, rows, schedule)(
+            grad_output, expected_qa, expected_sa
+        )
+        compile_mxfp8_transposed_quant(rows, rows, schedule)(
+            grad_output.T, expected_qc, expected_sc
+        )
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(qa.view(torch.uint8), expected_qa.view(torch.uint8)))
+        self.assertTrue(torch.equal(qc.view(torch.uint8), expected_qc.view(torch.uint8)))
+        self.assertTrue(torch.equal(sa.view(torch.uint8), expected_sa.view(torch.uint8)))
+        self.assertTrue(torch.equal(sc.view(torch.uint8), expected_sc.view(torch.uint8)))
 
     def test_persistent_prequantized_backward_matches_reference(self) -> None:
         torch.manual_seed(34)

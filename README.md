@@ -13,7 +13,9 @@ current implementation contains:
   eight output tiles per persistent CTA;
 - fused dynamic MXFP8 backward for `dX` and the FP32-accumulating `dW`,
   including logical-transpose TMA transport and split-FP32 workspace reduction;
-- a one-launch four-operand backward quantizer with concurrent dX/dW GEMMs,
+- one-launch four-operand backward quantizers, including a shared-G family
+  that emits row and transposed MXFP8 encodings from one BF16 SMEM tile, with
+  concurrent dX/dW GEMMs,
   plus autotunable fused and quantize-once FP32 workspace/atomic split-K,
   fused and prequantized generation-counted cluster-local DSMEM FP32 split
   reduction,

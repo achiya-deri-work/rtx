@@ -510,7 +510,7 @@ def _build_bwd_runner(
     reason = config.implementation_rejection(problem)
     if reason is not None:
         raise RuntimeError(f"MXFP8 backward cannot run this configuration: {reason}")
-    use_quad = config.quant_schedule == "quad"
+    use_quad = config.quant_schedule in ("quad", "shared_g_quad")
     dx = _build_matmul_runner(
         problem=MXFP8Problem(problem.m, problem.k, problem.n),
         config=config.dx,
@@ -533,9 +533,10 @@ def _build_bwd_runner(
             problem.n,
             problem.k,
             problem.m,
-            config.dx.quant_a,
-            config.dx.resolved_quant_b(),
-        )
+        config.dx.quant_a,
+        config.dx.resolved_quant_b(),
+        shared_g=config.quant_schedule == "shared_g_quad",
+    )
     dx_stream = dw_stream = None
     if config.stream_schedule == "dual_stream":
         dx_stream = torch.cuda.Stream(device=device)

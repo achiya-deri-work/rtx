@@ -1020,6 +1020,44 @@ def make_mxfp8_bwd_adapter(
             values[f"{name}_reduction_waves"] = float(
                 matmul.reduction_waves
             )
+        quant_schedule = config.quant_schedule  # type: ignore[attr-defined]
+        is_quad = quant_schedule in ("quad", "shared_g_quad")
+        is_shared_g = quant_schedule == "shared_g_quad"
+        values["backward_quad_quant"] = float(is_quad)
+        values["backward_shared_g_quant"] = float(is_shared_g)
+        values["backward_standalone_quant_launches"] = float(
+            1
+            if is_quad
+            else sum(
+                0
+                if matmul.backend == "fused"
+                else (1 if matmul.quant_launches == "dual" else 2)
+                for matmul in (dx_matmul, dw_matmul)
+            )
+        )
+        values["backward_total_kernel_launches"] = float(
+            values["dx_total_kernel_launches"]
+            + values["dw_total_kernel_launches"]
+            - (1 if is_quad else 0)
+        )
+        values["backward_grad_output_bf16_read_bytes"] = float(
+            problem.m * problem.n * 2 * (1 if is_shared_g else 2)
+        )
+        values["backward_shared_g_bf16_bytes_saved"] = float(
+            problem.m * problem.n * 2 if is_shared_g else 0
+        )
+        shared_tile = (
+            dx_matmul.quant_a.transposed_tile_rows if is_shared_g else 0
+        )
+        values["backward_shared_g_tile"] = float(shared_tile)
+        values["backward_shared_g_tile_bytes"] = float(
+            shared_tile * shared_tile * 2
+        )
+        values["backward_shared_g_tile_count"] = float(
+            (problem.m // shared_tile) * (problem.n // shared_tile)
+            if shared_tile
+            else 0
+        )
         values["dw_reduction_length"] = problem.m
         values["dx_reduction_length"] = problem.n
         values["combined_nominal_flops"] = float(

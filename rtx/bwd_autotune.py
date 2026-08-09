@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 15
+KERNEL_REVISION = 16
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -88,6 +88,62 @@ def _quant_launch_variants() -> tuple[dict[str, object], ...]:
         {"num_warps": warps, "persistent_waves": waves}
         for warps in (4, 8, 16)
         for waves in (1, 2, 3, 4, 6, 8)
+    )
+
+
+def _shared_g_quad_variants() -> tuple[dict[str, object], ...]:
+    """Compound moves into legal one-load/two-orientation G schedules."""
+
+    variants: list[dict[str, object]] = []
+    for tile in (32, 64, 128):
+        for engine in ("register", "cp_async"):
+            stores = ("scalar", "packed") if tile == 128 else ("scalar",)
+            for scale_store in stores:
+                schedule = asdict(DEFAULT_MXFP8_BWD_CONFIG.dx.quant_a)
+                schedule.update(
+                    transposed_tile_rows=tile,
+                    transposed_tile_k=tile,
+                    transposed_load_engine=engine,
+                    transposed_smem_padding=0 if engine == "cp_async" else 1,
+                    native_scale_store=scale_store,
+                )
+                variants.append(
+                    {
+                        "quant_schedule": "shared_g_quad",
+                        "dx": {
+                            "backend": "decomposed",
+                            "quant_launches": "dual",
+                            "quant_a": dict(schedule),
+                            "quant_b": dict(schedule),
+                        },
+                        "dw": {
+                            "backend": "decomposed",
+                            "quant_launches": "dual",
+                            "quant_a": dict(schedule),
+                            "quant_b": dict(schedule),
+                        },
+                    }
+                )
+    return tuple(variants)
+
+
+def _shared_g_schedule_variants(
+    schedules: Iterable[Mapping[str, object]],
+) -> tuple[dict[str, object], ...]:
+    """Apply a quantizer coordinate to all four shared-quad logical operands."""
+
+    return tuple(
+        {
+            "dx": {
+                "quant_a": dict(schedule),
+                "quant_b": dict(schedule),
+            },
+            "dw": {
+                "quant_a": dict(schedule),
+                "quant_b": dict(schedule),
+            },
+        }
+        for schedule in schedules
     )
 
 
@@ -533,7 +589,27 @@ BWD_SEARCH_SPACE: dict[str, tuple[dict[str, object], ...]] = {
         {"stream_schedule": value} for value in ("single", "dual_stream")
     ),
     "quant_schedule": tuple(
-        {"quant_schedule": value} for value in ("per_matmul", "quad")
+        {"quant_schedule": value}
+        for value in ("per_matmul", "quad", "shared_g_quad")
+    ),
+    "shared_g_quad": _shared_g_quad_variants(),
+    "shared_g_vector": _shared_g_schedule_variants(_quant_vector_variants()),
+    "shared_g_arithmetic": _shared_g_schedule_variants(
+        _quant_arithmetic_variants()
+    ),
+    "shared_g_launch": _shared_g_schedule_variants(_quant_launch_variants()),
+    "shared_g_transport": _shared_g_schedule_variants(
+        {
+            "transposed_tile_rows": tile,
+            "transposed_tile_k": tile,
+            "transposed_load_engine": engine,
+            "transposed_smem_padding": 0 if engine == "cp_async" else padding,
+            "native_scale_store": scale_store,
+        }
+        for tile in (32, 64, 128)
+        for engine in ("register", "cp_async")
+        for padding in ((0, 1, 2, 4, 8) if engine == "register" else (0,))
+        for scale_store in (("scalar", "packed") if tile == 128 else ("scalar",))
     ),
     # Quad quantization shares one transposed schedule across dX.B, dW.A and
     # dW.B. This compound coordinate lets local search cross that legality
@@ -587,6 +663,7 @@ _EARLY_BWD_COORDINATES = (
     "execution_order",
     "stream_schedule",
     "quant_schedule",
+    "shared_g_quad",
     "dx_backend",
     "dw_backend",
     "dw_reduction",
