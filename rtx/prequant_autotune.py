@@ -49,15 +49,22 @@ except ImportError:  # pragma: no cover - Linux/CUDA is the supported target.
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_prequant_e2e"
-KERNEL_REVISION = 1
+KERNEL_REVISION = 2
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
     return tuple(
-        {"quant_vec": vector, "load_bits": bits}
+        {
+            "quant_vec": vector,
+            "load_bits": bits,
+            "quant_store_bits": store_bits,
+        }
         for vector in (1, 2, 4, 8)
         for bits in (16, 32, 64, 128)
+        for store_bits in (8, 16, 32)
         if bits <= vector * 16 and (vector * 16) % bits == 0
+        and store_bits <= vector * 8
+        and (vector * 8) % store_bits == 0
     )
 
 

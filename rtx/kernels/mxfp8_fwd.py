@@ -498,7 +498,7 @@ class MXFP8LinearFwdKernel:
         m_tiles = (self.problem.m + cfg.tile_m - 1) // cfg.tile_m
         n_tiles = (self.problem.n + cfg.tile_n - 1) // cfg.tile_n
         grid = (self.grid_ctas, 1, 1)
-        self.kernel(
+        kernel = self.kernel(
             x,
             weight,
             out,
@@ -517,11 +517,20 @@ class MXFP8LinearFwdKernel:
             self.bf16_b_smem_layout,
             self.out_smem_layout,
             cp_async_tiled_copy,
-        ).launch(
-            grid=grid,
-            block=[self.threads_per_cta, 1, 1],
-            stream=stream,
         )
+        if cutlass.const_expr(cfg.cluster_reuse != "none"):
+            kernel.launch(
+                grid=grid,
+                block=[self.threads_per_cta, 1, 1],
+                cluster=[cfg.cluster_size, 1, 1],
+                stream=stream,
+            )
+        else:
+            kernel.launch(
+                grid=grid,
+                block=[self.threads_per_cta, 1, 1],
+                stream=stream,
+            )
 
     @cute.jit
     def _scale_from_amax(self, amax: Float32):
@@ -716,6 +725,30 @@ class MXFP8LinearFwdKernel:
                 pipeline.PipelineUserType.Consumer, cfg.mxfp8_stages
             )
 
+        if cutlass.const_expr(cfg.cluster_reuse != "none"):
+            if cutlass.const_expr(cfg.cluster_reuse == "a"):
+                cluster_q_items = cfg.tile_m * cfg.tile_k * cfg.mxfp8_stages
+                cluster_sf_items = (
+                    ((cfg.tile_m + 127) // 128)
+                    * 128
+                    * (cfg.tile_k // SF_VEC_SIZE)
+                    * cfg.mxfp8_stages
+                )
+                cluster_local_sf = cute.make_tensor(
+                    s_sfa.iterator, cute.make_layout(cluster_sf_items)
+                )
+            else:
+                cluster_q_items = cfg.tile_n * cfg.tile_k * cfg.mxfp8_stages
+                cluster_sf_items = (
+                    ((cfg.tile_n + 127) // 128)
+                    * 128
+                    * (cfg.tile_k // SF_VEC_SIZE)
+                    * cfg.mxfp8_stages
+                )
+                cluster_local_sf = cute.make_tensor(
+                    s_sfb.iterator, cute.make_layout(cluster_sf_items)
+                )
+
         # MMA/register views are invariant across K tiles because shared memory
         # is reused after a CTA barrier.
         thr_mma = tiled_mma.get_slice(tidx)
@@ -775,6 +808,13 @@ class MXFP8LinearFwdKernel:
         t_cs_sfb_copy = thr_copy_sfb.partition_S(s_sfb)
         t_cr_sfa_copy = thr_copy_sfa.retile(t_cr_sfa)
         t_cr_sfb_copy = thr_copy_sfb.retile(t_cr_sfb)
+
+        if cutlass.const_expr(cfg.cluster_reuse != "none"):
+            # Establish every peer's dynamic-SMEM allocation once. Subsequent
+            # K stages need only publication and release barriers; repeating
+            # this rendezvous before every remote store is pure overhead.
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
 
         total_tiles = m_tiles * n_tiles
         for work_slot in cutlass.range_constexpr(self.work_tiles_per_cta):
@@ -1038,9 +1078,19 @@ class MXFP8LinearFwdKernel:
                     else:
                         quant_warp_idx = Int32(scale_groups)
                     quant_warp_count = cfg.quantizer_warps
+                first_task_group = quant_warp_idx
+                final_task_group = Int32(scale_groups)
+                if cutlass.const_expr(cfg.cluster_reuse != "none"):
+                    cluster_rank = cute.arch.block_idx_in_cluster()
+                    if cluster_rank != 0:
+                        a_task_groups = Int32(a_scale_blocks // cfg.quant_vec)
+                        if cutlass.const_expr(cfg.cluster_reuse == "a"):
+                            first_task_group = a_task_groups + quant_warp_idx
+                        else:
+                            final_task_group = a_task_groups
                 for task_group in cutlass.range(
-                    quant_warp_idx,
-                    scale_groups,
+                    first_task_group,
+                    final_task_group,
                     quant_warp_count,
                     unroll=1,
                 ):
@@ -1399,7 +1449,119 @@ class MXFP8LinearFwdKernel:
                         self.mma_sync_barrier.arrive_and_wait()
                 else:
                     cute.arch.sync_threads()
-    
+
+                if cutlass.const_expr(cfg.cluster_reuse != "none"):
+                    # Every role reaches the cluster barrier before CTA 0
+                    # publishes the shared native tile. SM120 supports remote
+                    # DSMEM stores but remote loads fault, and ldmatrix accepts
+                    # local shared addresses only. The owner therefore pushes
+                    # E4M3/E8M0 bytes directly into each peer's local stage;
+                    # peers perform no BF16 reload, amax, scaling, or convert.
+                    # This rendezvous cannot be folded into the previous
+                    # release: without it, independent role progress permits
+                    # the owner to publish while a peer still owns the stage,
+                    # producing sparse but repeatable corruption on SM120.
+                    cute.arch.cluster_arrive()
+                    cute.arch.cluster_wait()
+                    cluster_rank = cute.arch.block_idx_in_cluster()
+                    if cluster_rank == 0:
+                        for peer in cutlass.range_constexpr(1, cfg.cluster_size):
+                            if cutlass.const_expr(cfg.cluster_reuse == "a"):
+                                peer_q_ptr = cute.arch.map_dsmem_ptr(
+                                    s_a.iterator, Int32(peer)
+                                )
+                                peer_sf_ptr = cute.arch.map_dsmem_ptr(
+                                    s_sfa.iterator, Int32(peer)
+                                )
+                            else:
+                                peer_q_ptr = cute.arch.map_dsmem_ptr(
+                                    s_b.iterator, Int32(peer)
+                                )
+                                peer_sf_ptr = cute.arch.map_dsmem_ptr(
+                                    s_sfb.iterator, Int32(peer)
+                                )
+                            for item in cutlass.range(
+                                tidx,
+                                cluster_q_items // 4,
+                                cfg.num_threads,
+                                unroll=1,
+                            ):
+                                q_base = item * 4
+                                q_row = q_base // cfg.tile_k
+                                q_k = q_base % cfg.tile_k
+                                if cutlass.const_expr(cfg.cluster_reuse == "a"):
+                                    q_offset = s_a.layout((q_row, q_k, 0))
+                                    q0 = s_a[q_row, q_k, 0]
+                                    q1 = s_a[q_row, q_k + 1, 0]
+                                    q2 = s_a[q_row, q_k + 2, 0]
+                                    q3 = s_a[q_row, q_k + 3, 0]
+                                else:
+                                    q_offset = s_b.layout((q_row, q_k, 0))
+                                    q0 = s_b[q_row, q_k, 0]
+                                    q1 = s_b[q_row, q_k + 1, 0]
+                                    q2 = s_b[q_row, q_k + 2, 0]
+                                    q3 = s_b[q_row, q_k + 3, 0]
+                                q_word = (
+                                    Uint32(q0.bitcast(Uint8))
+                                    | (Uint32(q1.bitcast(Uint8)) << 8)
+                                    | (Uint32(q2.bitcast(Uint8)) << 16)
+                                    | (Uint32(q3.bitcast(Uint8)) << 24)
+                                )
+                                nvvm.inline_ptx_hl(
+                                    "st.shared::cluster.u32 [{$r0}], {$r1};",
+                                    write_only_types=[],
+                                    read_only_args=[
+                                        Uint32((peer_q_ptr + q_offset).toint()),
+                                        q_word,
+                                    ],
+                                )
+                            for item in cutlass.range(
+                                tidx,
+                                cluster_sf_items // 4,
+                                cfg.num_threads,
+                                unroll=1,
+                            ):
+                                sf_base = item * 4
+                                sf_word = (
+                                    Uint32(
+                                        cluster_local_sf[sf_base].bitcast(Uint8)
+                                    )
+                                    | (
+                                        Uint32(
+                                            cluster_local_sf[
+                                                sf_base + 1
+                                            ].bitcast(Uint8)
+                                        )
+                                        << 8
+                                    )
+                                    | (
+                                        Uint32(
+                                            cluster_local_sf[
+                                                sf_base + 2
+                                            ].bitcast(Uint8)
+                                        )
+                                        << 16
+                                    )
+                                    | (
+                                        Uint32(
+                                            cluster_local_sf[
+                                                sf_base + 3
+                                            ].bitcast(Uint8)
+                                        )
+                                        << 24
+                                    )
+                                )
+                                nvvm.inline_ptx_hl(
+                                    "st.shared::cluster.u32 [{$r0}], {$r1};",
+                                    write_only_types=[],
+                                    read_only_args=[
+                                        Uint32((peer_sf_ptr + sf_base).toint()),
+                                        sf_word,
+                                    ],
+                                )
+                    cute.arch.cluster_arrive()
+                    cute.arch.cluster_wait()
+
                 num_k_blocks = cute.size(t_cr_a, mode=[2])
                 if warp_idx < self.num_mma_warps:
                     for k_block in cutlass.range_constexpr(num_k_blocks):
@@ -1444,7 +1606,13 @@ class MXFP8LinearFwdKernel:
                                 ],
                                 accumulators,
                             )
-    
+
+                if cutlass.const_expr(cfg.cluster_reuse != "none"):
+                    # CTA 0 must not recycle the shared stage until every peer
+                    # has completed its remote ldmatrix/scale-fragment reads.
+                    cute.arch.cluster_arrive()
+                    cute.arch.cluster_wait()
+
                 if cutlass.const_expr(cfg.schedule == "three_role"):
                     if warp_idx < self.num_mma_warps:
                         quant_pipeline.consumer_release(quant_consumer_state)

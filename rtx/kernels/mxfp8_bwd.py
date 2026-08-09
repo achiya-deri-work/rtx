@@ -241,9 +241,10 @@ def _default_dx_config() -> MXFP8BwdMatmulConfig:
     )
     transposed = replace(
         base.quant_a,
-        quant_vec=2,
+        quant_vec=4,
         load_bits=32,
-        transposed_tile_rows=64,
+        quant_store_bits=32,
+        transposed_tile_rows=128,
     )
     return replace(base, quant_b=transposed)
 
@@ -254,9 +255,10 @@ def _default_dw_config() -> MXFP8BwdMatmulConfig:
     )
     transposed = replace(
         base.quant_a,
-        quant_vec=2,
+        quant_vec=4,
         load_bits=32,
-        transposed_tile_rows=64,
+        quant_store_bits=32,
+        transposed_tile_rows=128,
     )
     return replace(base, quant_a=transposed)
 

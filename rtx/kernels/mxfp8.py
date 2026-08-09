@@ -28,6 +28,7 @@ QuantAmax = Literal["fp32", "bf16_bits"]
 Swizzle = Literal["none", "32b", "64b", "128b"]
 Raster = Literal["m", "n"]
 Reuse = Literal["none", "x", "weight"]
+ClusterReuse = Literal["none", "a", "b"]
 Epilogue = Literal["direct", "smem", "tma"]
 SM120_SMEM_CAPACITY_BYTES = 101_376
 # CuTe's prequantized GEMM wrapper adds pipeline barriers/descriptors outside
@@ -129,6 +130,11 @@ class MXFP8FwdConfig:
     raster: Raster = "n"
     grid_swizzle: int = 1
     reuse: Reuse = "none"
+    # SM120 has CTA clusters and DSMEM even though it lacks TMA multicast.
+    # A clustered fused kernel can therefore quantize one native operand tile
+    # in CTA 0 and publish that E4M3/E8M0 tile into each peer's local SMEM.
+    cluster_reuse: ClusterReuse = "none"
+    cluster_size: int = 1
 
     @property
     def smem_rmem_tile(self) -> tuple[int, int, int, int, int]:
@@ -274,6 +280,10 @@ class MXFP8FwdConfig:
             return "grid_swizzle must be one of 1, 2, 4, 8"
         if self.persistent_waves not in (1, 2, 3, 4):
             return "persistent_waves must be one of 1, 2, 3, 4"
+        if self.cluster_size not in (1, 2, 4, 8):
+            return "cluster_size must be one of 1, 2, 4, 8"
+        if self.cluster_reuse not in ("none", "a", "b"):
+            return "cluster_reuse must be none, a, or b"
         return None
 
     def implementation_rejection(self, problem: MXFP8Problem) -> str | None:
@@ -356,6 +366,35 @@ class MXFP8FwdConfig:
             return "operand-locality scheduling requires a persistent CTA"
         if not self.persistent and self.persistent_waves != 1:
             return "persistent_waves only applies to a persistent CTA"
+        if self.cluster_reuse == "none" and self.cluster_size != 1:
+            return "cluster_size only applies to clustered operand reuse"
+        if self.cluster_reuse != "none":
+            if self.cluster_size == 1:
+                return "clustered operand reuse requires at least two CTAs"
+            if self.persistent:
+                return "clustered operand reuse is not combined with persistence yet"
+            if self.load_engine != "tma" or self.schedule != "three_role":
+                return "clustered operand reuse requires the three-role TMA schedule"
+            if self.mxfp8_stages != 1:
+                return "clustered operand reuse currently requires one MXFP8 stage"
+            m_tiles = (problem.m + self.tile_m - 1) // self.tile_m
+            n_tiles = (problem.n + self.tile_n - 1) // self.tile_n
+            if self.grid_swizzle != 1:
+                return "clustered operand reuse currently requires grid_swizzle=1"
+            if self.cluster_reuse == "a":
+                if self.raster != "n":
+                    return "clustered A reuse requires N-major rasterization"
+                if self.a_swizzle != "none":
+                    return "clustered A publication requires unswizzled A SMEM"
+                if n_tiles % self.cluster_size:
+                    return "N tile count must be divisible by the A-reuse cluster"
+            else:
+                if self.raster != "m":
+                    return "clustered B reuse requires M-major rasterization"
+                if self.b_swizzle != "none":
+                    return "clustered B publication requires unswizzled B SMEM"
+                if m_tiles % self.cluster_size:
+                    return "M tile count must be divisible by the B-reuse cluster"
         baseline = MXFP8FwdConfig()
         if self.schedule == "cooperative" and (
             self.producer_registers != baseline.producer_registers
@@ -411,6 +450,8 @@ class MXFP8FwdConfig:
             "raster",
             "grid_swizzle",
             "reuse",
+            "cluster_reuse",
+            "cluster_size",
         }
         unsupported = [
             field.name
@@ -465,7 +506,7 @@ class MXFP8FwdConfig:
 
 
 DEFAULT_MXFP8_FWD_CONFIG = MXFP8FwdConfig()
-MXFP8_FWD_KERNEL_REVISION = 15
+MXFP8_FWD_KERNEL_REVISION = 16
 
 
 # Block coordinates supplement, rather than replace, their primitive fields.
@@ -492,6 +533,17 @@ CTA_REUSE_TILE_COORDINATES: tuple[tuple[int, int, int, int, int, int], ...] = (
         for bf16_stages in (1, 2)
         for consumer_registers in (96,)
     ),
+)
+
+# This compound move enters a legal DSMEM-sharing basin atomically. Individual
+# cluster fields remain exposed as well, but ordinary coordinate descent must
+# not be forced through an invalid cluster_size/reuse intermediate.
+CLUSTER_REUSE_COORDINATES: tuple[tuple[str, int], ...] = (
+    ("none", 1),
+    ("a", 2),
+    ("b", 2),
+    ("a", 4),
+    ("b", 4),
 )
 
 BF16_PIPELINE_COORDINATES: tuple[tuple[str, str, int, str, int], ...] = (
@@ -524,6 +576,7 @@ BF16_PIPELINE_COORDINATES: tuple[tuple[str, str, int, str, int], ...] = (
 FWD_SEARCH_SPACE: dict[str, tuple[object, ...]] = {
     "smem_rmem_tile": SMEM_RMEM_TILE_COORDINATES,
     "cta_reuse_tile": CTA_REUSE_TILE_COORDINATES,
+    "cluster_reuse_tile": CLUSTER_REUSE_COORDINATES,
     "bf16_pipeline": BF16_PIPELINE_COORDINATES,
     "tile_m": (64, 128, 256),
     "tile_n": (128, 256),
@@ -561,6 +614,8 @@ FWD_SEARCH_SPACE: dict[str, tuple[object, ...]] = {
     "raster": ("m", "n"),
     "grid_swizzle": (1, 2, 4, 8),
     "reuse": ("none", "x", "weight"),
+    "cluster_reuse": ("none", "a", "b"),
+    "cluster_size": (1, 2, 4, 8),
 }
 
 # Start with coordinates that usually dominate the schedule, then refine data
@@ -570,6 +625,7 @@ FWD_COORDINATE_ORDER: tuple[str, ...] = (
     # requiring every slower one-field intermediate to win.
     "smem_rmem_tile",
     "cta_reuse_tile",
+    "cluster_reuse_tile",
     "bf16_pipeline",
     # Probe the data path before growing the CTA.  A 128x128 TMA tile fits in
     # SMEM, while a 256-row/column scalar winner can make every neighboring
@@ -610,6 +666,8 @@ FWD_COORDINATE_ORDER: tuple[str, ...] = (
     "raster",
     "grid_swizzle",
     "reuse",
+    "cluster_reuse",
+    "cluster_size",
 )
 
 
@@ -622,7 +680,12 @@ def normalize_fwd_config(
 
     values = asdict(base or DEFAULT_MXFP8_FWD_CONFIG)
     updates = dict(updates)
-    compound_names = {"smem_rmem_tile", "cta_reuse_tile", "bf16_pipeline"}
+    compound_names = {
+        "smem_rmem_tile",
+        "cta_reuse_tile",
+        "cluster_reuse_tile",
+        "bf16_pipeline",
+    }
     unknown = set(updates).difference(values).difference(compound_names)
     if unknown:
         raise ValueError(f"unknown MXFP8 forward coordinates: {sorted(unknown)}")
@@ -668,6 +731,29 @@ def normalize_fwd_config(
             quant_amax="bf16_bits",
             consumer_registers=consumer_registers,
             maxrregcount=maxrregcount,
+        )
+
+    cluster_reuse_tile = updates.pop("cluster_reuse_tile", None)
+    if cluster_reuse_tile is not None:
+        cluster_reuse, cluster_size = cluster_reuse_tile
+        updates.update(
+            cluster_reuse=cluster_reuse,
+            cluster_size=cluster_size,
+            load_engine="tma",
+            schedule="three_role",
+            bf16_tile_k=32,
+            bf16_swizzle="none",
+            bf16_stages=2,
+            mxfp8_stages=1,
+            quantizer_warps=4,
+            quant_vec=8,
+            quant_load_bits=128,
+            quant_math="bf16x2",
+            quant_amax="bf16_bits",
+            a_swizzle="none" if cluster_reuse == "a" else "128b",
+            b_swizzle="none" if cluster_reuse == "b" else "128b",
+            raster="n" if cluster_reuse == "a" else "m",
+            grid_swizzle=1,
         )
 
     bf16_pipeline = updates.pop("bf16_pipeline", None)

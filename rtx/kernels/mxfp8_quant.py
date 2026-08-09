@@ -32,6 +32,7 @@ from cutlass import (
     Uint8,
 )
 from cutlass.experimental.primitives import nvvm_wrapper as nvvm
+from cutlass.cute.nvgpu import cpasync
 
 from ..configs.mxfp8 import MXFP8QuantConfig
 
@@ -151,7 +152,11 @@ class MXFP8QuantKernel:
         threads_per_scale = 32 // cfg.quant_vec
         scale_in_warp = lane_idx // threads_per_scale
         bf16_values = [BFloat16(0.0)] * cfg.quant_vec
-        values_per_load = cfg.load_bits // BFloat16.width
+        values_per_load = (
+            128 // BFloat16.width
+            if cutlass.const_expr(cfg.transposed_load_engine == "cp_async")
+            else cfg.load_bits // BFloat16.width
+        )
         loads_per_lane = cfg.quant_vec // values_per_load
         src_row = src[row, None]
         for load_idx in cutlass.range_constexpr(loads_per_lane):
@@ -196,6 +201,7 @@ class MXFP8QuantKernel:
             local_maximum, threads_per_scale, lane_idx, row_schedule
         )
         scale_e8m0, inv_scale_fp32 = self._scale_from_amax(amax)
+        quantized_values = [Float8E4M3FN(0.0)] * cfg.quant_vec
         for pair in cutlass.range_constexpr((cfg.quant_vec + 1) // 2):
             vec0 = pair * 2
             vec1 = cutlass.min(vec0 + 1, cfg.quant_vec - 1)
@@ -227,9 +233,63 @@ class MXFP8QuantKernel:
                     (packed >> Int16(8)) & Int16(0xFF)
                 ).bitcast(Float8E4M3FN)
                 q1 = Uint8(packed & Int16(0xFF)).bitcast(Float8E4M3FN)
-            quantized[row, k_base + vec0] = q0
+            quantized_values[vec0] = q0
             if vec1 != vec0:
-                quantized[row, k_base + vec1] = q1
+                quantized_values[vec1] = q1
+
+        q_values_per_store = cfg.quant_store_bits // 8
+        q_store_count = cfg.quant_vec // q_values_per_store
+        quantized_row = quantized[row, None]
+        for store_idx in cutlass.range_constexpr(q_store_count):
+            vec_base = store_idx * q_values_per_store
+            if cutlass.const_expr(cfg.quant_store_bits == 8):
+                quantized_row[k_base + vec_base] = quantized_values[vec_base]
+            elif cutlass.const_expr(cfg.quant_store_bits == 16):
+                packed_q = Uint16(
+                    quantized_values[vec_base].bitcast(Uint8)
+                ) | (
+                    Uint16(quantized_values[vec_base + 1].bitcast(Uint8)) << 8
+                )
+                nvvm.inline_ptx_hl(
+                    "st.global.u16 [{$r0}], {$r1};",
+                    write_only_types=[],
+                    read_only_args=[
+                        quantized_row.iterator
+                        + quantized_row.layout(k_base + vec_base),
+                        packed_q,
+                    ],
+                )
+            else:
+                packed_q = (
+                    Int32(quantized_values[vec_base].bitcast(Uint8))
+                    | (
+                        Int32(
+                            quantized_values[vec_base + 1].bitcast(Uint8)
+                        )
+                        << 8
+                    )
+                    | (
+                        Int32(
+                            quantized_values[vec_base + 2].bitcast(Uint8)
+                        )
+                        << 16
+                    )
+                    | (
+                        Int32(
+                            quantized_values[vec_base + 3].bitcast(Uint8)
+                        )
+                        << 24
+                    )
+                )
+                nvvm.inline_ptx_hl(
+                    "st.global.u32 [{$r0}], {$r1};",
+                    write_only_types=[],
+                    read_only_args=[
+                        quantized_row.iterator
+                        + quantized_row.layout(k_base + vec_base),
+                        packed_q,
+                    ],
+                )
 
         if cutlass.const_expr(
             scale_tile_rows == 128
@@ -555,8 +615,59 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
             quantized_values[vec0] = q0
             if vec1 != vec0:
                 quantized_values[vec1] = q1
-        for vec in cutlass.range_constexpr(cfg.quant_vec):
-            quantized[global_row, global_k + vec] = quantized_values[vec]
+        q_values_per_store = cfg.quant_store_bits // 8
+        q_store_count = cfg.quant_vec // q_values_per_store
+        quantized_row = quantized[global_row, None]
+        for store_idx in cutlass.range_constexpr(q_store_count):
+            vec_base = store_idx * q_values_per_store
+            if cutlass.const_expr(cfg.quant_store_bits == 8):
+                quantized_row[global_k + vec_base] = quantized_values[vec_base]
+            elif cutlass.const_expr(cfg.quant_store_bits == 16):
+                packed_q = Uint16(
+                    quantized_values[vec_base].bitcast(Uint8)
+                ) | (
+                    Uint16(quantized_values[vec_base + 1].bitcast(Uint8)) << 8
+                )
+                nvvm.inline_ptx_hl(
+                    "st.global.u16 [{$r0}], {$r1};",
+                    write_only_types=[],
+                    read_only_args=[
+                        quantized_row.iterator
+                        + quantized_row.layout(global_k + vec_base),
+                        packed_q,
+                    ],
+                )
+            else:
+                packed_q = (
+                    Int32(quantized_values[vec_base].bitcast(Uint8))
+                    | (
+                        Int32(
+                            quantized_values[vec_base + 1].bitcast(Uint8)
+                        )
+                        << 8
+                    )
+                    | (
+                        Int32(
+                            quantized_values[vec_base + 2].bitcast(Uint8)
+                        )
+                        << 16
+                    )
+                    | (
+                        Int32(
+                            quantized_values[vec_base + 3].bitcast(Uint8)
+                        )
+                        << 24
+                    )
+                )
+                nvvm.inline_ptx_hl(
+                    "st.global.u32 [{$r0}], {$r1};",
+                    write_only_types=[],
+                    read_only_args=[
+                        quantized_row.iterator
+                        + quantized_row.layout(global_k + vec_base),
+                        packed_q,
+                    ],
+                )
         if lane_in_scale == 0:
             self._store_transposed_scale(
                 scales, global_row, scale_block, scale_e8m0, scale_tile_rows
@@ -639,27 +750,75 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
         # directly to contiguous physical [K, row] addresses. SMEM is written
         # in that same physical order; logical_smem is only another CuTe layout
         # over the identical pointer, never a transpose copy.
-        for load_task in cutlass.range(
-            tidx, load_tasks, cfg.num_warps * 32, unroll=1
-        ):
-            linear = load_task * values_per_load
-            k_local = linear // cfg.transposed_tile_rows
-            row_local = linear - k_local * cfg.transposed_tile_rows
-            if cutlass.const_expr(values_per_load == 1):
-                physical_smem[k_local, row_local] = src[
-                    row_base + row_local, k_base + k_local
-                ]
-            else:
-                loaded = nvvm.load_ext(
-                    src.iterator
-                    + src.layout(
-                        (row_base + row_local, k_base + k_local)
-                    ),
-                    dtype=Uint16,
-                    count=values_per_load,
-                ).bitcast(BFloat16)
-                for vec in cutlass.range_constexpr(values_per_load):
-                    physical_smem[k_local, row_local + vec] = loaded[vec]
+        if cutlass.const_expr(cfg.transposed_load_engine == "cp_async"):
+            # Present the tile in its physical [K, row] order. This is only a
+            # second CuTe layout over the source pointer: no transpose or copy
+            # is materialized. It makes the contiguous mode identical to the
+            # proven forward CopyG2SOp partition.
+            cp_atom = cute.make_copy_atom(
+                cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
+                BFloat16,
+                num_bits_per_copy=128,
+            )
+            # Half a producer warp is sufficient for this 2--16 KiB staging
+            # tile and gives the TV algebra a simple, provably aligned map.
+            # Remaining lanes proceed to quantization after the CTA barrier.
+            copy_threads = 16
+            partition_values = values_per_load * 4
+            row_threads = cfg.transposed_tile_rows // partition_values
+            cp_thread_layout = cute.make_layout(
+                (copy_threads // row_threads, row_threads),
+                stride=(row_threads, 1),
+            )
+            cp_value_layout = cute.make_layout((1, partition_values))
+            cp_tiled_copy = cute.make_tiled_copy_tv(
+                cp_atom, cp_thread_layout, cp_value_layout
+            )
+            src_tile = cute.local_tile(
+                src,
+                (cfg.transposed_tile_rows, SF_VEC_SIZE),
+                (row_tile, scale_block),
+            )
+            src_physical = cute.make_tensor(
+                (src.iterator + src.layout((row_base, k_base))).align(16),
+                cute.make_layout(
+                    (SF_VEC_SIZE, cfg.transposed_tile_rows),
+                    stride=(src.layout.stride[1], 1),
+                ),
+            )
+            if tidx < copy_threads:
+                cp_thread = cp_tiled_copy.get_slice(tidx)
+                thread_src = cp_thread.partition_S(src_physical)
+                thread_dst = cp_thread.partition_D(physical_smem)
+                cute.copy(
+                    cp_tiled_copy,
+                    thread_src,
+                    thread_dst,
+                )
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+        else:
+            for load_task in cutlass.range(
+                tidx, load_tasks, cfg.num_warps * 32, unroll=1
+            ):
+                linear = load_task * values_per_load
+                k_local = linear // cfg.transposed_tile_rows
+                row_local = linear - k_local * cfg.transposed_tile_rows
+                src_ptr = src.iterator + src.layout(
+                    (row_base + row_local, k_base + k_local)
+                )
+                if cutlass.const_expr(values_per_load == 1):
+                    physical_smem[k_local, row_local] = src[
+                        row_base + row_local, k_base + k_local
+                    ]
+                else:
+                    loaded = nvvm.load_ext(
+                        src_ptr,
+                        dtype=Uint16,
+                        count=values_per_load,
+                    ).bitcast(BFloat16)
+                    for vec in cutlass.range_constexpr(values_per_load):
+                        physical_smem[k_local, row_local + vec] = loaded[vec]
         cute.arch.sync_threads()
         for phase in cutlass.range_constexpr(
             cfg.transposed_tile_rows // rows_per_phase

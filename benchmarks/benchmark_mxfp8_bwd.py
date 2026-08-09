@@ -13,7 +13,7 @@ import torch
 
 from rtx.bwd_autotune import bwd_config_id, bwd_config_to_dict, update_bwd_config
 from rtx.bwd_experiments import BwdBenchmarkHarness
-from rtx.kernels.mxfp8 import normalize_fwd_config
+from rtx.kernels.mxfp8 import MXFP8Problem, normalize_fwd_config
 from rtx.kernels.mxfp8_bwd import (
     DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
     DEFAULT_DUAL_DECOMPOSED_MXFP8_BWD_CONFIG,
@@ -122,6 +122,87 @@ def _configs(shape: ShapeSpec, *, reuse_sweep: bool = False) -> dict[str, object
             fused_tma, {"stream_schedule": "dual_stream"}
         ),
     }
+    for store_bits in (8, 16, 32):
+        configs[f"decomposed_quad_cpasync_store{store_bits}"] = update_bwd_config(
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            {
+                "dx": {
+                    "quant_b": {
+                        "transposed_load_engine": "cp_async",
+                        "transposed_smem_padding": 0,
+                        "transposed_tile_rows": 128,
+                        "quant_store_bits": store_bits,
+                        "quant_vec": 4 if store_bits == 32 else 2,
+                    }
+                },
+                "dw": {
+                    "quant_a": {
+                        "transposed_load_engine": "cp_async",
+                        "transposed_smem_padding": 0,
+                        "transposed_tile_rows": 128,
+                        "quant_store_bits": store_bits,
+                        "quant_vec": 4 if store_bits == 32 else 2,
+                    },
+                    "quant_b": {
+                        "transposed_load_engine": "cp_async",
+                        "transposed_smem_padding": 0,
+                        "transposed_tile_rows": 128,
+                        "quant_store_bits": store_bits,
+                        "quant_vec": 4 if store_bits == 32 else 2,
+                    },
+                },
+            },
+        )
+    for store_bits in (8, 32):
+        configs[f"decomposed_quad_register_tile128_store{store_bits}"] = update_bwd_config(
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            {
+                "dx": {
+                    "quant_b": {
+                        "transposed_load_engine": "register",
+                        "transposed_smem_padding": 1,
+                        "transposed_tile_rows": 128,
+                        "quant_store_bits": store_bits,
+                        "quant_vec": 4 if store_bits == 32 else 2,
+                    }
+                },
+                "dw": {
+                    "quant_a": {
+                        "transposed_load_engine": "register",
+                        "transposed_smem_padding": 1,
+                        "transposed_tile_rows": 128,
+                        "quant_store_bits": store_bits,
+                        "quant_vec": 4 if store_bits == 32 else 2,
+                    },
+                    "quant_b": {
+                        "transposed_load_engine": "register",
+                        "transposed_smem_padding": 1,
+                        "transposed_tile_rows": 128,
+                        "quant_store_bits": store_bits,
+                        "quant_vec": 4 if store_bits == 32 else 2,
+                    },
+                },
+            },
+        )
+    problem = MXFP8Problem(shape.m, shape.n, shape.k)
+    for operand in ("a", "b"):
+        for cluster_size in (2, 4):
+            clustered = normalize_fwd_config(
+                tma_three_role,
+                cluster_reuse_tile=(operand, cluster_size),
+            )
+            candidate = update_bwd_config(
+                DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+                {
+                    "dx": {"fused": asdict(clustered)},
+                    "dw": {"fused": asdict(clustered)},
+                    "stream_schedule": "dual_stream",
+                },
+            )
+            if candidate.implementation_rejection(problem) is None:
+                configs[
+                    f"fused_tma_cluster_reuse_{operand}{cluster_size}_dual_stream"
+                ] = candidate
     split = _split_for(shape.m)
     if split is not None:
         parts, tile = split
@@ -206,6 +287,10 @@ def main() -> None:
     parser.add_argument("--target-batch-ms", type=float, default=30.0)
     parser.add_argument("--seed", type=int, default=20260809)
     parser.add_argument(
+        "--only",
+        help="comma-separated configuration names to benchmark",
+    )
+    parser.add_argument(
         "--reuse-sweep",
         action="store_true",
         help="sweep legal wide-CTA dW register/stage reuse basins",
@@ -230,6 +315,12 @@ def main() -> None:
         shape, protocol, regime=args.regime, seed=args.seed
     )
     configs = _configs(shape, reuse_sweep=args.reuse_sweep)
+    if args.only:
+        requested = tuple(part.strip() for part in args.only.split(",") if part.strip())
+        missing = tuple(name for name in requested if name not in configs)
+        if missing:
+            parser.error(f"unknown --only configurations: {', '.join(missing)}")
+        configs = {name: configs[name] for name in requested}
     measurements: dict[str, object] = {}
     for index, (name, config) in enumerate(configs.items()):
         print(f"START {name} {bwd_config_id(config)}", flush=True)
@@ -252,7 +343,10 @@ def main() -> None:
         )
 
     races: dict[str, object] = {}
-    reference_name = "decomposed_dual"
+    reference_name = next(
+        (name for name in ("decomposed_quad_quant_dual_stream", "decomposed_dual") if name in configs),
+        next(iter(configs)),
+    )
     reference = configs[reference_name]
     for index, (name, config) in enumerate(configs.items()):
         if name == reference_name or measurements[name].get("status") != "ok":
@@ -264,19 +358,20 @@ def main() -> None:
 
     fused_races: dict[str, object] = {}
     fused_reference_name = "fused_tma_dual_stream"
-    fused_reference = configs[fused_reference_name]
-    for index, (name, config) in enumerate(configs.items()):
-        if (
-            name == fused_reference_name
-            or "reuse_" not in name
-            or "dual_stream" not in name
-            or measurements[name].get("status") != "ok"
-        ):
-            continue
-        print(f"RACE  {fused_reference_name} vs {name}", flush=True)
-        fused_races[name] = harness.race(
-            fused_reference, config, seed=args.seed + 1000 + index
-        )
+    if fused_reference_name in configs:
+        fused_reference = configs[fused_reference_name]
+        for index, (name, config) in enumerate(configs.items()):
+            if (
+                name == fused_reference_name
+                or "reuse_" not in name
+                or "dual_stream" not in name
+                or measurements[name].get("status") != "ok"
+            ):
+                continue
+            print(f"RACE  {fused_reference_name} vs {name}", flush=True)
+            fused_races[name] = harness.race(
+                fused_reference, config, seed=args.seed + 1000 + index
+            )
 
     payload = {
         "schema_version": 1,

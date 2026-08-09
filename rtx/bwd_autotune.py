@@ -55,15 +55,22 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 8
+KERNEL_REVISION = 9
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
     return tuple(
-        {"quant_vec": vector, "load_bits": bits}
+        {
+            "quant_vec": vector,
+            "load_bits": bits,
+            "quant_store_bits": store_bits,
+        }
         for vector in (1, 2, 4, 8)
         for bits in (16, 32, 64, 128)
+        for store_bits in (8, 16, 32)
         if bits <= vector * 16 and (vector * 16) % bits == 0
+        and store_bits <= vector * 8
+        and (vector * 8) % store_bits == 0
     )
 
 
@@ -343,6 +350,41 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
         axes["dw_b_logical_tile"] = tuple(
             wrap({"quant_b": value}) for value in transposed_tiles
         )
+    if prefix == "dx":
+        axes["dx_b_logical_transport"] = tuple(
+            wrap(
+                {
+                    "quant_b": {
+                        "transposed_load_engine": value,
+                        "transposed_smem_padding": 0 if value == "cp_async" else 1,
+                    }
+                }
+            )
+            for value in ("register", "cp_async")
+        )
+    else:
+        axes["dw_a_logical_transport"] = tuple(
+            wrap(
+                {
+                    "quant_a": {
+                        "transposed_load_engine": value,
+                        "transposed_smem_padding": 0 if value == "cp_async" else 1,
+                    }
+                }
+            )
+            for value in ("register", "cp_async")
+        )
+        axes["dw_b_logical_transport"] = tuple(
+            wrap(
+                {
+                    "quant_b": {
+                        "transposed_load_engine": value,
+                        "transposed_smem_padding": 0 if value == "cp_async" else 1,
+                    }
+                }
+            )
+            for value in ("register", "cp_async")
+        )
     return axes
 
 
@@ -357,6 +399,30 @@ BWD_SEARCH_SPACE: dict[str, tuple[dict[str, object], ...]] = {
     ),
     "quant_schedule": tuple(
         {"quant_schedule": value} for value in ("per_matmul", "quad")
+    ),
+    # Quad quantization shares one transposed schedule across dX.B, dW.A and
+    # dW.B. This compound coordinate lets local search cross that legality
+    # boundary atomically instead of rejecting every single-leaf mutation.
+    "quad_logical_transport": tuple(
+        {
+            "dx": {
+                "quant_b": {
+                    "transposed_load_engine": value,
+                    "transposed_smem_padding": 0 if value == "cp_async" else 1,
+                }
+            },
+            "dw": {
+                "quant_a": {
+                    "transposed_load_engine": value,
+                    "transposed_smem_padding": 0 if value == "cp_async" else 1,
+                },
+                "quant_b": {
+                    "transposed_load_engine": value,
+                    "transposed_smem_padding": 0 if value == "cp_async" else 1,
+                },
+            },
+        }
+        for value in ("register", "cp_async")
     ),
     **_matmul_axes("dx"),
     **_matmul_axes("dw"),

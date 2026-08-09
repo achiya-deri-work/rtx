@@ -50,6 +50,30 @@ class MXFP8QuantConfigTests(unittest.TestCase):
             MXFP8QuantConfig(quant_vec=2, load_bits=128).rejection(128, 256),
         )
         self.assertIsNone(
+            MXFP8QuantConfig(quant_vec=4, quant_store_bits=32).rejection(
+                128, 256
+            )
+        )
+        self.assertIn(
+            "quantized store width exceeds",
+            MXFP8QuantConfig(
+                quant_vec=2, load_bits=32, quant_store_bits=32
+            ).rejection(128, 256),
+        )
+        self.assertIsNone(
+            MXFP8QuantConfig(
+                transposed_load_engine="cp_async",
+                transposed_smem_padding=0,
+            ).rejection(128, 256)
+        )
+        self.assertIn(
+            "copy alignment",
+            MXFP8QuantConfig(
+                transposed_load_engine="cp_async",
+                transposed_smem_padding=1,
+            ).rejection(128, 256),
+        )
+        self.assertIsNone(
             MXFP8GemmConfig().rejection(MXFP8Problem(128, 128, 256))
         )
 
@@ -111,6 +135,8 @@ class MXFP8QuantCudaTests(unittest.TestCase):
             MXFP8QuantConfig(load_bits=16),
             MXFP8QuantConfig(load_bits=32),
             MXFP8QuantConfig(load_bits=64),
+            MXFP8QuantConfig(quant_store_bits=16),
+            MXFP8QuantConfig(quant_store_bits=32),
             MXFP8QuantConfig(quant_math="fp32"),
             MXFP8QuantConfig(quant_amax="fp32"),
             MXFP8QuantConfig(reduction="redux"),

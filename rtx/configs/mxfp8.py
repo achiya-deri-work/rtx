@@ -18,6 +18,7 @@ SF_VEC_SIZE = 32
 class MXFP8QuantConfig:
     quant_vec: int = 4
     load_bits: int = 64
+    quant_store_bits: int = 8
     quant_math: str = "bf16x2"
     quant_amax: str = "bf16_bits"
     reduction: str = "shuffle"
@@ -26,6 +27,7 @@ class MXFP8QuantConfig:
     maxrregcount: int = 128
     scale_layout: str = "row_major"
     native_scale_store: str = "scalar"
+    transposed_load_engine: str = "register"
     transposed_tile_rows: int = 128
     transposed_smem_padding: int = 1
 
@@ -40,6 +42,12 @@ class MXFP8QuantConfig:
             return "load width exceeds values owned by one lane"
         if (self.quant_vec * 16) % self.load_bits:
             return "quant_vec must contain an integer number of vector loads"
+        if self.quant_store_bits not in (8, 16, 32):
+            return "quant_store_bits must be one of 8, 16, 32"
+        if self.quant_store_bits > self.quant_vec * 8:
+            return "quantized store width exceeds values owned by one lane"
+        if (self.quant_vec * 8) % self.quant_store_bits:
+            return "quant_vec must contain an integer number of quantized stores"
         if (k // SF_VEC_SIZE) % self.quant_vec:
             return "K scale blocks must be divisible by quant_vec"
         if self.quant_math not in ("fp32", "bf16x2"):
@@ -64,10 +72,18 @@ class MXFP8QuantConfig:
             self.scale_layout != "mma128" or self.quant_vec != 4
         ):
             return "packed native scale stores require mma128 and quant_vec=4"
+        if self.transposed_load_engine not in ("register", "cp_async"):
+            return "transposed_load_engine must be register or cp_async"
         if self.transposed_tile_rows not in (32, 64, 128, 256):
             return "transposed_tile_rows must be 32, 64, 128, or 256"
         if self.transposed_smem_padding not in (0, 1, 2, 4, 8):
             return "transposed_smem_padding must be 0, 1, 2, 4, or 8"
+        if (
+            self.transposed_load_engine == "cp_async"
+            and (self.transposed_tile_rows + self.transposed_smem_padding) * 2
+            % 16
+        ):
+            return "cp_async transposed SMEM rows must match the copy alignment"
         return None
 
 

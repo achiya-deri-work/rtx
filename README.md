@@ -10,7 +10,8 @@ current implementation contains:
 - fused dynamic MXFP8 backward for `dX` and the FP32-accumulating `dW`,
   including logical-transpose TMA transport and split-FP32 workspace reduction;
 - a one-launch four-operand backward quantizer with concurrent dX/dW GEMMs,
-  plus autotunable fused, per-matmul, interleaved, and wide-CTA reuse families;
+  plus autotunable fused, per-matmul, interleaved, asynchronous logical-
+  transpose transport, wide-store, wide-CTA, and CTA-cluster reuse families;
 - PyTorch custom-op and `nn.Module` frontends;
 - persistent random, gradient-boosted cost-model, bandit, and local search;
 - backend-neutral conditional spaces, staged tasks, and resumable ask/tell

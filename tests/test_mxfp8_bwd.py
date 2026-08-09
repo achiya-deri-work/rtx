@@ -355,6 +355,53 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         )
         self.assertTrue(torch.equal(scales.view(torch.uint8), reference_s.view(torch.uint8)))
 
+    def test_cpasync_logical_transpose_and_packed_stores_match_reference(self) -> None:
+        rows, k = 256, 256
+        source = torch.randn(k, rows, device="cuda", dtype=torch.bfloat16)
+        logical = source.T
+        baseline = MXFP8QuantConfig(
+            quant_vec=4,
+            load_bits=64,
+            quant_store_bits=8,
+            quant_math="bf16x2",
+            quant_amax="bf16_bits",
+            scale_layout="row_major",
+            transposed_load_engine="register",
+        )
+        expected_q = torch.empty(
+            rows, k, device="cuda", dtype=torch.float8_e4m3fn
+        )
+        expected_s = torch.empty(
+            rows, k // 32, device="cuda", dtype=torch.float8_e8m0fnu
+        )
+        compile_mxfp8_transposed_quant(rows, k, baseline)(
+            logical, expected_q, expected_s
+        )
+        for store_bits in (8, 16, 32):
+            config = replace(
+                baseline,
+                quant_store_bits=store_bits,
+                transposed_load_engine="cp_async",
+                transposed_smem_padding=0,
+            )
+            actual_q = torch.empty_like(expected_q)
+            actual_s = torch.empty_like(expected_s)
+            compile_mxfp8_transposed_quant(rows, k, config)(
+                logical, actual_q, actual_s
+            )
+            torch.cuda.synchronize()
+            with self.subTest(store_bits=store_bits):
+                self.assertTrue(
+                    torch.equal(
+                        actual_q.view(torch.uint8), expected_q.view(torch.uint8)
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        actual_s.view(torch.uint8), expected_s.view(torch.uint8)
+                    )
+                )
+
     def test_dual_dw_quantization_uses_two_logical_views(self) -> None:
         torch.manual_seed(11)
         x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
@@ -440,6 +487,28 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         )
         self._assert_backward_close(config, grad_output, x, weight)
 
+    def test_quad_cpasync_logical_transport_feeds_both_matmuls(self) -> None:
+        torch.manual_seed(35)
+        m = n = k = 256
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        grad_output = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+        transport = {
+            "transposed_load_engine": "cp_async",
+            "transposed_smem_padding": 0,
+            "transposed_tile_rows": 128,
+            "quant_store_bits": 16,
+        }
+        config = update_bwd_config(
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            {
+                "dx": {"quant_b": transport},
+                "dw": {"quant_a": transport, "quant_b": transport},
+            },
+        )
+        self.assertIsNone(config.implementation_rejection(MXFP8Problem(m, n, k)))
+        self._assert_backward_close(config, grad_output, x, weight)
+
     def test_wide_dw_cta_reuses_quantized_a_without_global_round_trip(self) -> None:
         torch.manual_seed(37)
         m, n, k = 512, 256, 256
@@ -457,6 +526,24 @@ class TestMXFP8BwdCuda(unittest.TestCase):
             {
                 "dx": {"fused": asdict(base)},
                 "dw": {"fused": asdict(wide_dw)},
+                "stream_schedule": "dual_stream",
+            },
+        )
+        self.assertIsNone(config.implementation_rejection(MXFP8Problem(m, n, k)))
+        self._assert_backward_close(config, grad_output, x, weight)
+
+    def test_clustered_fused_backward_shares_native_tiles(self) -> None:
+        torch.manual_seed(41)
+        m = n = k = 256
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        grad_output = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+        clustered = normalize_fwd_config(cluster_reuse_tile=("a", 2))
+        config = update_bwd_config(
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+            {
+                "dx": {"fused": asdict(clustered)},
+                "dw": {"fused": asdict(clustered)},
                 "stream_schedule": "dual_stream",
             },
         )

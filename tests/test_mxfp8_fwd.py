@@ -114,6 +114,30 @@ class MXFP8ConfigTests(unittest.TestCase):
             unsupported_n_atoms.implementation_rejection(problem),
         )
 
+    def test_cluster_reuse_compound_enters_real_dsmem_basins(self) -> None:
+        problem = MXFP8Problem(512, 512, 256)
+        for operand, raster in (("a", "n"), ("b", "m")):
+            with self.subTest(operand=operand):
+                config = normalize_fwd_config(
+                    cluster_reuse_tile=(operand, 2)
+                )
+                self.assertEqual(config.cluster_size, 2)
+                self.assertEqual(config.raster, raster)
+                self.assertEqual(config.mxfp8_stages, 1)
+                self.assertEqual(
+                    config.a_swizzle if operand == "a" else config.b_swizzle,
+                    "none",
+                )
+                self.assertIsNone(config.implementation_rejection(problem))
+        illegal = normalize_fwd_config(
+            normalize_fwd_config(cluster_reuse_tile=("a", 2)),
+            a_swizzle="128b",
+        )
+        self.assertIn(
+            "unswizzled A",
+            illegal.implementation_rejection(problem),
+        )
+
     def test_tma_epilogue_rejects_ragged_output_tiles(self) -> None:
         config = normalize_fwd_config(
             tile_m=64, epilogue="tma", store_vec=4
@@ -472,6 +496,37 @@ class MXFP8CudaTests(unittest.TestCase):
         torch.cuda.synchronize()
         expected = _reference_linear(x, weight)
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_clustered_native_operand_reuse_matches_unclustered(self) -> None:
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("native kernel requires SM120/SM121")
+        problem = MXFP8Problem(512, 512, 256)
+        torch.manual_seed(191)
+        x = torch.randn(problem.m, problem.k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(
+            problem.n, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        for operand, cluster_size in (("a", 2), ("b", 2), ("a", 4), ("b", 4)):
+            with self.subTest(operand=operand, cluster_size=cluster_size):
+                config = normalize_fwd_config(
+                    cluster_reuse_tile=(operand, cluster_size)
+                )
+                actual = torch.empty(
+                    problem.m,
+                    problem.n,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                expected = torch.empty_like(actual)
+                compile_mxfp8_fwd(problem, config)(x, weight, actual)
+                compile_mxfp8_fwd(
+                    problem,
+                    normalize_fwd_config(
+                        config, cluster_reuse="none", cluster_size=1
+                    ),
+                )(x, weight, expected)
+                torch.cuda.synchronize()
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

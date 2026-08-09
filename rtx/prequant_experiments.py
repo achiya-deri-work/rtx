@@ -416,8 +416,24 @@ def _coverage_tokens(config: MXFP8PrequantConfig) -> tuple[str, ...]:
     values: tuple[tuple[str, object], ...] = (
         ("family", (qx.scale_layout, qw.scale_layout, gemm.scale_layout, gemm.scale_role)),
         ("launches", config.quant_launches),
-        ("x_io", (qx.quant_vec, qx.load_bits, qx.native_scale_store)),
-        ("w_io", (qw.quant_vec, qw.load_bits, qw.native_scale_store)),
+        (
+            "x_io",
+            (
+                qx.quant_vec,
+                qx.load_bits,
+                qx.quant_store_bits,
+                qx.native_scale_store,
+            ),
+        ),
+        (
+            "w_io",
+            (
+                qw.quant_vec,
+                qw.load_bits,
+                qw.quant_store_bits,
+                qw.native_scale_store,
+            ),
+        ),
         ("x_math", (qx.quant_math, qx.quant_amax, qx.reduction)),
         ("w_math", (qw.quant_math, qw.quant_amax, qw.reduction)),
         ("x_launch", (qx.num_warps, qx.persistent_waves, qx.maxrregcount)),

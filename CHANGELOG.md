@@ -41,6 +41,17 @@ project follows semantic versioning while it is in active alpha development.
 - Encode SM120 SFA/SFB atom-layout, complete-quantizer-warpgroup, and wide-CTA
   register constraints before compilation, and benchmark wide-CTA reuse with
   paired confidence intervals and a dedicated register/stage sweep.
+- Add executable CTA-cluster operand reuse for fused forward/backward. The
+  cluster owner quantizes once and publishes packed native E4M3/E8M0 tiles to
+  peer-local SMEM with DSMEM stores; keep it searchable after representative
+  5070 Ti measurements showed the synchronization cost loses at M512.
+- Add 8/16/32-bit quantized GMEM store schedules and a CuTe `CopyG2SOp`
+  logical-transpose transport family. Promote the 128-row, four-value,
+  32-bit-store register schedule for backward after paired races improved
+  M512/M1536/M8192 and wide-N cases by about 6.2/10.6/1.5/2.3 percent while
+  remaining neutral at M128. Keep asynchronous transport independently
+  autotunable: it beats the old seed in one representative case but loses to
+  the matched register schedule.
 
 ## 0.9.0
 
