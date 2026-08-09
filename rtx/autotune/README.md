@@ -1,19 +1,25 @@
 # RTX composable autotuning
 
-This package separates five concerns that were previously fused inside each
+This package separates eight concerns that were previously fused inside each
 kernel-specific coordinate tuner:
 
-1. `KernelAdapter` describes configuration identity, serialization, legality,
-   features, mutation, sampling, and evaluation.
-2. `SearchStrategy` proposes candidates. Random exploration, gradient-boosted
+1. `ConditionalSearchSpace` describes dependent parameters, normalization,
+   legality, mutation, and sampling in a backend-neutral schema.
+2. `PortableKernelTask` describes workload context, analytical features, and a
+   multi-fidelity evaluation plan.
+3. `KernelAdapter` remains the compatibility contract consumed by existing
+   strategies and synchronous campaigns.
+4. `SearchStrategy` proposes candidates. Random exploration, gradient-boosted
    cost-model search, coordinate/beam local search, and strategy pipelines are
    provided.
-3. `StrategyScheduler` assigns the next trial. `SequentialScheduler` implements
+5. `StrategyScheduler` assigns the next trial. `SequentialScheduler` implements
    staged search, `UCB1Scheduler` remains available as a small baseline, and
    `AdaptiveBanditScheduler` is the production discounted contextual bandit.
-4. `AutotuneOrchestrator` owns budget, deduplication, evaluation, rewards,
-   progress, and session lifecycle.
-5. `TuningStore` records sessions, orchestration decisions, and observations.
+6. `AskTellSession` issues serializable leases and accepts out-of-order worker
+   responses; its complete optimizer state can be moved between processes.
+7. `AutotuneOrchestrator` owns the compatibility synchronous evaluation loop,
+   budget, rewards, progress, and session lifecycle.
+8. `TuningStore` records sessions, orchestration decisions, and observations.
    The JSONL backend is append-only, locked, flushed after every observation,
    and resumable after interruption.
 
@@ -24,7 +30,11 @@ package compatibility module.
 
 | Module | Responsibility |
 | --- | --- |
+| `outcomes.py` | Backend-neutral result and failure records |
 | `core.py` | Context, proposal, observation, budget, and adapter contracts |
+| `space.py` | Declarative conditional parameter spaces and constraints |
+| `task.py` | Portable staged tasks, fidelities, and adapter bridges |
+| `ask_tell.py` | Serializable requests/responses, leases, promotion, and resume |
 | `bandit.py` | Reusable arm state, UCB policies, rewards, and contextual scoring |
 | `strategies.py` | Random, learned-global, coordinate, and model-local proposals |
 | `cost_model.py` | Small latency and feasibility gradient-boosted models |
@@ -39,6 +49,80 @@ package compatibility module.
 Policy mathematics must not import dataset harnesses or kernel implementations.
 Campaign code composes public policies and adapters rather than embedding a
 second private tuner.
+
+## Portable project plugin
+
+The smallest external integration uses dictionaries as configurations. A
+project may instead implement `SearchSpace[YourConfig]` to retain its own
+immutable configuration type.
+
+```python
+from rtx.autotune import (
+    AskTellSession,
+    Condition,
+    ConditionalSearchSpace,
+    DiscreteParameter,
+    EvaluationPlan,
+    EvaluationStage,
+    FunctionKernelTask,
+    KernelContext,
+    LocalTrialWorker,
+    RandomSearch,
+    StageKind,
+    StageResult,
+    StagedTaskAdapter,
+    UCB1Scheduler,
+)
+
+space = ConditionalSearchSpace((
+    DiscreteParameter("tile", (32, 64, 128), default=64),
+    DiscreteParameter("load", ("vector", "tma")),
+    DiscreteParameter(
+        "stages",
+        (1, 2, 3, 4),
+        default=2,
+        active_if=(Condition("load", "eq", "tma"),),
+    ),
+))
+plan = EvaluationPlan((
+    EvaluationStage("compile", StageKind.COMPILE, 0.2),
+    EvaluationStage("correctness", StageKind.CORRECTNESS, 0.5),
+    EvaluationStage("benchmark", StageKind.BENCHMARK, 1.0),
+))
+
+def run_stage(config, stage):
+    # Invoke CuTe, Triton, CUDA C++, ROCm, or a project-specific generator.
+    # Results and artifact references must be serializable.
+    if stage.kind == StageKind.BENCHMARK:
+        return StageResult("ok", {"latency_ms": benchmark(config)})
+    return StageResult("ok")
+
+task = FunctionKernelTask(
+    KernelContext("custom_attention", 1, {"sequence": 8192}),
+    space,
+    plan,
+    run_stage,
+)
+adapter = StagedTaskAdapter(task)
+study = AskTellSession(
+    adapter, [RandomSearch()], UCB1Scheduler(), seed=17,
+)
+worker = LocalTrialWorker(adapter, {"worker_id": "gpu-0"})
+
+request = study.ask()[0]
+study.tell(worker.evaluate(request))
+```
+
+`TrialRequest.as_dict()` and `TrialResponse.as_dict()` are the transport
+boundary for a queue, RPC service, or database. Requests include stable context
+and configuration identities, fidelity, strategy provenance, and a renewable
+lease. `AskTellSession.state_dict()` includes observations, pending work, RNG,
+and arm statistics; `from_state_dict()` restores it after interruption.
+
+Compile or correctness-only work can be requested with `ask(fidelity=0.5)` and
+later advanced through `promote(config_id, 1.0)`. A partial successful trial is
+retained as such and is not mistaken for either a latency result or a runtime
+failure.
 
 ## Default learned-global then local composition
 

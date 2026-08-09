@@ -3,6 +3,17 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.7.0
+
+- Add a backend-neutral conditional search-space schema with dependent
+  parameters, normalization, named constraints, mutation, and sampling.
+- Add portable staged kernel tasks spanning static, compile, correctness,
+  benchmark, and application fidelities, including typed failure provenance.
+- Add serializable, resumable asynchronous ask/tell sessions, worker leases,
+  out-of-order completion, partial evaluation, and explicit promotion.
+- Wrap existing kernel adapters as portable tasks without changing RTX kernel
+  integrations, and move trial outcomes out of the legacy MXFP8 module.
+
 ## 0.6.0
 
 - Add CPU-only cross-device pretraining with revision-scoped latency, ranking,

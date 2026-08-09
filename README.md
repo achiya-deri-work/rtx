@@ -10,6 +10,8 @@ current implementation contains:
 - MXFP8 backward for `dX` and the FP32-accumulating long-reduction `dW`;
 - PyTorch custom-op and `nn.Module` frontends;
 - persistent random, gradient-boosted cost-model, bandit, and local search;
+- backend-neutral conditional spaces, staged tasks, and resumable ask/tell
+  workers suitable for MoE and attention kernel projects;
 - calibrated hot/rotating-cache measurements and paired finalist races; and
 - portable cross-device datasets exported as CSV or Parquet.
 
@@ -79,6 +81,13 @@ functional forms, and packed tensor types. Kernel modules remain lazy so
 importing `rtx` on a non-Blackwell or CPU-only machine does not initialize
 CuTe. Legacy coordinate tuners remain as compatibility modules; new search
 policy work belongs under `rtx.autotune`.
+
+The portable boundary is independent from CuTe and MXFP8: external projects
+define a `ConditionalSearchSpace` and `FunctionKernelTask`, then use
+`StagedTaskAdapter` with either the synchronous orchestrator or an
+`AskTellSession`. Existing project-specific `KernelAdapter` implementations can
+be exposed through `AdapterKernelTask` without being rewritten. See
+[`rtx/autotune/README.md`](rtx/autotune/README.md) for a complete example.
 
 See [`autotune_manifests/README.md`](autotune_manifests/README.md) for campaign
 status and [`benchmarks/README.md`](benchmarks/README.md) for focused tools.

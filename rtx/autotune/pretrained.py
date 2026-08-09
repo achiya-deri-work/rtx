@@ -24,7 +24,7 @@ import numpy as np
 
 from .core import FeatureMap, Observation, canonical_json
 from .cost_model import GradientBoostedCostModel, GradientBoostedFeasibilityModel
-from .legacy import TrialOutcome
+from .outcomes import TrialOutcome
 
 
 PRETRAINED_SCHEMA_VERSION = 1

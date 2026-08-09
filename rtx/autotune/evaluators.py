@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .legacy import TrialOutcome
+from .outcomes import TrialOutcome
 
 
 class CalibratedPrequantEvaluator:

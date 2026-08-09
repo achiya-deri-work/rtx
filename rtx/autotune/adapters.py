@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Callable, Iterable, Mapping
 
 from .core import DiscreteKernelAdapter, KernelContext
-from .legacy import DeviceFingerprint, TrialOutcome
+from .legacy import DeviceFingerprint
+from .outcomes import TrialOutcome
 from .hardware import (
     geometry_features,
     launch_resource_features,

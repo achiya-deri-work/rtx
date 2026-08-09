@@ -19,9 +19,10 @@ from .core import (
     SearchHistory,
     TuningBudget,
     evaluate_proposal,
+    observation_from_dict,
     utc_now,
 )
-from .legacy import TrialOutcome
+from .outcomes import TrialOutcome
 from .store import TuningStore
 from .strategies import SearchStrategy
 
@@ -77,41 +78,6 @@ class SequentialScheduler:
                 )
             consumed += budget
         return self.stages[-1][0] if self.stages else None
-
-
-def _restore_observation(
-    adapter: KernelAdapter[ConfigT],
-    record: Mapping[str, object],
-) -> Observation[ConfigT] | None:
-    try:
-        serialized = dict(record["config"])  # type: ignore[arg-type]
-        config = adapter.deserialize(serialized)
-        outcome = TrialOutcome.from_dict(record["outcome"])  # type: ignore[arg-type]
-        return Observation(
-            observation_id=str(record["observation_id"]),
-            session_id=str(record["session_id"]),
-            sequence=int(record["sequence"]),
-            context_id=str(record["context_id"]),
-            family=str(record["family"]),
-            kernel_revision=int(record["kernel_revision"]),
-            config_id=str(record["config_id"]),
-            config=config,
-            serialized_config=serialized,
-            features={str(key): float(value) for key, value in dict(record["features"]).items()},  # type: ignore[arg-type]
-            strategy=str(record["strategy"]),
-            outcome=outcome,
-            started_at=str(record["started_at"]),
-            finished_at=str(record["finished_at"]),
-            elapsed_s=float(record["elapsed_s"]),
-            parent_config_id=(
-                None if record.get("parent_config_id") is None else str(record["parent_config_id"])
-            ),
-            coordinate=None if record.get("coordinate") is None else str(record["coordinate"]),
-            coordinate_value=record.get("coordinate_value"),
-            metadata=dict(record.get("metadata", {})),  # type: ignore[arg-type]
-        )
-    except (KeyError, TypeError, ValueError):
-        return None
 
 
 class AutotuneOrchestrator(Generic[ConfigT]):
@@ -175,9 +141,10 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                     != self.adapter.context.kernel_revision
                 ):
                     continue
-                observation = _restore_observation(self.adapter, record)
-                if observation is not None:
-                    restored.append(observation)
+                try:
+                    restored.append(observation_from_dict(self.adapter, record))
+                except (KeyError, TypeError, ValueError):
+                    continue
         history = SearchHistory(restored, self.adapter.context.identifier)
         resumed_active = (
             len(history.current) if self.max_trials_includes_resumed else 0

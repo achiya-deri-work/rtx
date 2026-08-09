@@ -22,7 +22,7 @@ import random
 import statistics
 import tempfile
 import time
-from typing import Callable, Iterable, Iterator, Literal, Mapping, TextIO
+from typing import Callable, Iterable, Iterator, Mapping, TextIO
 import uuid
 
 import torch
@@ -41,6 +41,7 @@ from ..kernels.mxfp8 import (
     normalize_fwd_config,
 )
 from ..runtime import load_kernel_symbol
+from .outcomes import TrialOutcome, TrialStatus
 
 
 def compile_mxfp8_fwd(*args, **kwargs):
@@ -54,16 +55,6 @@ except ImportError:  # pragma: no cover - this project targets Linux/CUDA.
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_fwd"
-TrialStatus = Literal[
-    "ok",
-    "architecture_rejected",
-    "implementation_rejected",
-    "compile_error",
-    "correctness_error",
-    "runtime_error",
-]
-
-
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -168,43 +159,6 @@ class CoordinateDescentPolicy:
             raise ValueError("warmup must be nonnegative and timing counts positive")
         if not 0 <= self.min_improvement < 1:
             raise ValueError("min_improvement must be in [0, 1)")
-
-
-@dataclass(slots=True)
-class TrialOutcome:
-    status: TrialStatus
-    median_ms: float | None = None
-    timings_ms: list[float] = field(default_factory=list)
-    compile_ms: float | None = None
-    max_abs_error: float | None = None
-    error: str | None = None
-    # Kernel-specific diagnostics (telemetry, calibrated batch size, relative
-    # error, component timings, and so on). Keeping them attached to the
-    # outcome makes generic tuning observations useful as an offline dataset.
-    metadata: dict[str, object] = field(default_factory=dict)
-
-    @property
-    def successful(self) -> bool:
-        return self.status == "ok" and self.median_ms is not None
-
-    def as_dict(self) -> dict[str, object]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, values: Mapping[str, object]) -> "TrialOutcome":
-        return cls(
-            status=str(values["status"]),  # type: ignore[arg-type]
-            median_ms=None if values.get("median_ms") is None else float(values["median_ms"]),
-            timings_ms=[float(x) for x in values.get("timings_ms", [])],  # type: ignore[arg-type]
-            compile_ms=None if values.get("compile_ms") is None else float(values["compile_ms"]),
-            max_abs_error=(
-                None
-                if values.get("max_abs_error") is None
-                else float(values["max_abs_error"])
-            ),
-            error=None if values.get("error") is None else str(values["error"]),
-            metadata=dict(values.get("metadata", {})),  # type: ignore[arg-type]
-        )
 
 
 @dataclass(frozen=True, slots=True)

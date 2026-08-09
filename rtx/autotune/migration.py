@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .core import KernelAdapter, Observation, stable_id
-from .legacy import TrialOutcome
+from .outcomes import TrialOutcome
 from .store import TuningStore
 
 

@@ -557,6 +557,30 @@ the cost model. Incumbents and duplicate suppression remain device/workload/
 regime-local, so transferred predictions never replace actual measurement on
 the target. See `rtx/autotune/README.md` for the schema and extension contract.
 
+### Cross-project portability boundary
+
+Version 0.7 adds a kernel-generator-neutral layer above the existing adapters:
+
+- declarative conditional parameter spaces with named hard constraints;
+- staged static, compile, correctness, benchmark, and application evaluation;
+- partial-fidelity observations and explicit promotion;
+- serializable trial leases and worker responses;
+- out-of-order `ask`/`tell` completion; and
+- optimizer snapshots containing observations, pending requests, RNG, and arm
+  statistics.
+
+Existing RTX adapters can be wrapped with `AdapterKernelTask`; MoE, attention,
+and unrelated projects can define `FunctionKernelTask` or implement the
+`PortableKernelTask` protocol. Transport is intentionally not prescribed: the
+same request/response dictionaries can travel through multiprocessing, an RPC
+service, or a database queue.
+
+This is the portability foundation, not the final optimizer portfolio. The
+next framework milestones are a durable distributed coordinator, separate
+failure-type models, a learned multi-fidelity promotion policy, TPE/SMAC-style
+conditional-space search, and prospective regret-versus-wall-time evaluation
+across RTX linear, bidirectional MoE, and custom attention reference tasks.
+
 ### New all-time 512×1536×1536 forward result
 
 The composable tuner imported the 1,646-trial legacy database, trained the GBT

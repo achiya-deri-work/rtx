@@ -11,7 +11,7 @@ import random
 import time
 from typing import Callable, Generic, Iterable, Mapping, Protocol, Sequence, TypeVar
 
-from .legacy import TrialOutcome
+from .outcomes import TrialOutcome
 
 
 ConfigT = TypeVar("ConfigT")
@@ -389,6 +389,44 @@ def evaluate_proposal(
     )
 
 
+def observation_from_dict(
+    adapter: KernelAdapter[ConfigT], record: Mapping[str, object]
+) -> Observation[ConfigT]:
+    """Restore a durable observation using a project's configuration codec."""
+
+    serialized = dict(record["config"])  # type: ignore[arg-type]
+    return Observation(
+        observation_id=str(record["observation_id"]),
+        session_id=str(record["session_id"]),
+        sequence=int(record["sequence"]),
+        context_id=str(record["context_id"]),
+        family=str(record["family"]),
+        kernel_revision=int(record["kernel_revision"]),
+        config_id=str(record["config_id"]),
+        config=adapter.deserialize(serialized),
+        serialized_config=serialized,
+        features={
+            str(key): float(value)
+            for key, value in dict(record["features"]).items()  # type: ignore[arg-type]
+        },
+        strategy=str(record["strategy"]),
+        outcome=TrialOutcome.from_dict(record["outcome"]),  # type: ignore[arg-type]
+        started_at=str(record["started_at"]),
+        finished_at=str(record["finished_at"]),
+        elapsed_s=float(record["elapsed_s"]),
+        parent_config_id=(
+            None
+            if record.get("parent_config_id") is None
+            else str(record["parent_config_id"])
+        ),
+        coordinate=(
+            None if record.get("coordinate") is None else str(record["coordinate"])
+        ),
+        coordinate_value=record.get("coordinate_value"),
+        metadata=dict(record.get("metadata", {})),  # type: ignore[arg-type]
+    )
+
+
 __all__ = [
     "ComposableTuningResult",
     "ConfigT",
@@ -403,6 +441,7 @@ __all__ = [
     "canonical_json",
     "evaluate_proposal",
     "flatten_features",
+    "observation_from_dict",
     "stable_id",
     "utc_now",
 ]

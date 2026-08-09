@@ -15,6 +15,7 @@ from .bandit import (
     UCB1Scheduler,
     contextual_ucb_scores,
 )
+from .ask_tell import AskTellSession, LocalTrialWorker, TrialRequest, TrialResponse
 from .calibration import calibrate_device
 from .core import (
     ComposableTuningResult,
@@ -46,12 +47,12 @@ from .legacy import (
     DeviceFingerprint,
     JsonTuningDatabase,
     MXFP8ForwardEvaluator,
-    TrialOutcome,
     TuningResult,
     default_cache_dir,
     load_cached_mxfp8_fwd_config,
     tune_mxfp8_fwd,
 )
+from .outcomes import TrialOutcome, TrialStatus
 from .orchestrator import (
     AutotuneOrchestrator,
     ConfirmationPolicy,
@@ -69,6 +70,24 @@ from .pretrained import (
     train_pretrained_bundle,
 )
 from .store import InMemoryTuningStore, JsonlTuningStore, TuningStore
+from .space import (
+    Condition,
+    ConditionalSearchSpace,
+    DiscreteParameter,
+    SearchSpace,
+    SpaceConstraint,
+)
+from .task import (
+    AdapterKernelTask,
+    AdapterSearchSpace,
+    EvaluationPlan,
+    EvaluationStage,
+    FunctionKernelTask,
+    PortableKernelTask,
+    StageKind,
+    StageResult,
+    StagedTaskAdapter,
+)
 from .winners import (
     RuntimeWinnerKey,
     load_runtime_winner,
@@ -112,8 +131,11 @@ def __getattr__(name: str):
 
 __all__ = [
     "AdaptiveBanditScheduler",
+    "AdapterKernelTask",
+    "AdapterSearchSpace",
     "ArmStatistics",
     "ArchitectureProfile",
+    "AskTellSession",
     "AnytimeRunPolicy",
     "AutotuneOrchestrator",
     "CalibratedBwdEvaluator",
@@ -122,6 +144,8 @@ __all__ = [
     "ConfirmationPolicy",
     "ConditionalEffectRule",
     "ConditionalRuleSet",
+    "ConditionalSearchSpace",
+    "Condition",
     "ContextRankingModel",
     "CoordinateDescentPolicy",
     "CoordinateDescentTuner",
@@ -135,6 +159,10 @@ __all__ = [
     "DatasetJob",
     "DatasetManifest",
     "DiscreteKernelAdapter",
+    "DiscreteParameter",
+    "EvaluationPlan",
+    "EvaluationStage",
+    "FunctionKernelTask",
     "GradientBoostedCostModel",
     "GradientBoostedFeasibilityModel",
     "HybridTuningPolicy",
@@ -143,18 +171,28 @@ __all__ = [
     "JsonlTuningStore",
     "KernelAdapter",
     "KernelContext",
+    "LocalTrialWorker",
     "MXFP8ForwardEvaluator",
     "NormalizedCostModel",
     "Observation",
     "Proposal",
+    "PortableKernelTask",
     "RandomSearch",
     "RuntimeWinnerKey",
     "SearchHistory",
+    "SearchSpace",
     "SearchStrategy",
     "SequentialScheduler",
     "SparseFeatureVectorizer",
+    "SpaceConstraint",
+    "StageKind",
+    "StageResult",
+    "StagedTaskAdapter",
     "StrategyPipeline",
     "TrialOutcome",
+    "TrialStatus",
+    "TrialRequest",
+    "TrialResponse",
     "TuningBudget",
     "TuningResult",
     "TuningStore",
