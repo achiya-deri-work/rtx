@@ -95,18 +95,31 @@ class MXFP8ConfigTests(unittest.TestCase):
             config.implementation_rejection(MXFP8Problem(65, 129, 128)),
         )
 
-    def test_logical_transpose_requires_layout_aware_smem_loads(self) -> None:
+    def test_logical_transpose_exposes_proven_ldmatrix_vector_path(self) -> None:
         problem = MXFP8Problem(128, 128, 128)
         vector = normalize_fwd_config(
             load_engine="tma",
             schedule="three_role",
+            bf16_tile_k=32,
             bf16_swizzle="none",
             quant_vec=8,
             quant_load_bits=128,
         )
-        self.assertIn(
-            "layout-aware 16-bit loads",
+        self.assertIsNone(
             vector.oriented_implementation_rejection(
+                problem, "row", "transpose"
+            )
+        )
+        unsupported = normalize_fwd_config(
+            load_engine="tma",
+            schedule="three_role",
+            bf16_swizzle="none",
+            quant_vec=4,
+            quant_load_bits=64,
+        )
+        self.assertIn(
+            "TMA/ldmatrix x4 path",
+            unsupported.oriented_implementation_rejection(
                 problem, "row", "transpose"
             ),
         )

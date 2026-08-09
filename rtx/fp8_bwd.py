@@ -218,6 +218,20 @@ class _BwdRunner:
             caller.wait_stream(self.dx_stream)
             caller.wait_stream(self.dw_stream)
             return
+        if self.execution_order == "interleaved":
+            # Interleave the two decomposed matmuls at launch granularity:
+            # produce every quantized operand while the BF16 sources are hot,
+            # then consume both pairs.  This is intentionally a real schedule
+            # rather than an alias for dx_first/dw_first.  Fused runners cannot
+            # expose their internal quantization boundary and are rejected by
+            # MXFP8BwdConfig.implementation_rejection.
+            assert isinstance(self.dx, _MatmulRunner)
+            assert isinstance(self.dw, _MatmulRunner)
+            self.dx.quantize(grad_output, weight.T)
+            self.dw.quantize(grad_output.T, x.T)
+            self.dx.matmul(grad_x)
+            self.dw.matmul(grad_weight)
+            return
         if self.execution_order == "dx_first":
             self.dx(grad_output, weight.T, grad_x)
             self.dw(grad_output.T, x.T, grad_weight)

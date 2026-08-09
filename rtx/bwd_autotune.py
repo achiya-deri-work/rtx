@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 5
+KERNEL_REVISION = 7
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -294,7 +294,7 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
                         "reduction_tile": tile,
                         "workspace_epilogue": "none",
                     }
-                    for family in ("split_fp32_atomic", "cluster_fp32")
+                    for family in ("split_fp32_atomic",)
                     for split in (2, 4, 8, 16)
                     for tile in (128, 256, 512, 1024, 2048)
                 ),
@@ -311,37 +311,6 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
             for threads in (64, 128, 256, 512, 1024)
             for vector in (1, 2, 4, 8)
             for waves in (1, 2, 3, 4, 6, 8)
-        ),
-        f"{prefix}_tile_scheduler": tuple(
-            wrap(value)
-            for value in (
-                {
-                    "tile_scheduler": "static",
-                    "persistent_waves": 1,
-                    "tiles_per_cta": 1,
-                    "reuse_operand": "none",
-                    "tile_locality": "raster",
-                },
-                *(
-                    {
-                        "tile_scheduler": "persistent",
-                        "persistent_waves": waves,
-                        "tiles_per_cta": tiles,
-                        "reuse_operand": reuse,
-                        "tile_locality": locality,
-                    }
-                    for waves in (1, 2, 3, 4, 6, 8)
-                    for tiles in (1, 2, 3, 4, 8)
-                    for reuse in ("none", "a", "b", "both")
-                    for locality in (
-                        "raster",
-                        "same_a",
-                        "same_b",
-                        "serpentine",
-                        "l2_wave",
-                    )
-                ),
-            )
         ),
     }
     # Backward's fused family is the dynamic-forward implementation itself,
@@ -384,7 +353,7 @@ BWD_SEARCH_SPACE: dict[str, tuple[dict[str, object], ...]] = {
         {"execution_order": "interleaved"},
     ),
     "stream_schedule": tuple(
-        {"stream_schedule": value} for value in ("single", "dual_stream", "graph")
+        {"stream_schedule": value} for value in ("single", "dual_stream")
     ),
     **_matmul_axes("dx"),
     **_matmul_axes("dw"),

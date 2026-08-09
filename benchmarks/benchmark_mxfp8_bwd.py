@@ -17,6 +17,7 @@ from rtx.kernels.mxfp8 import normalize_fwd_config
 from rtx.kernels.mxfp8_bwd import (
     DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
     DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+    DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG,
 )
 from rtx.prequant_experiments import BenchmarkProtocol, ShapeSpec
 
@@ -46,16 +47,23 @@ def _configs(shape: ShapeSpec) -> dict[str, object]:
         quant_vec=8,
         quant_math="bf16x2",
         quant_amax="bf16_bits",
-        # Logical-transpose inputs are contiguous along MN, not K.  TMA stages
-        # them in an MN-major CuTe layout and the quantizer uses layout-aware
-        # scalar loads before emitting K-major FP8 MMA tiles.
-        quant_load_bits=16,
+        # One transposing x4 ldmatrix loads an 8-row x 32-K logical tile from
+        # MN-major TMA staging and delivers eight BF16 values per lane.
+        quant_load_bits=128,
     )
     fused_tma = update_bwd_config(
         DEFAULT_FUSED_MXFP8_BWD_CONFIG,
         {
             "dx": {"fused": asdict(tma_three_role)},
             "dw": {"fused": asdict(tma_three_role)},
+        },
+    )
+    tma_m64 = normalize_fwd_config(tma_three_role, tile_m=64)
+    fused_tma_m64 = update_bwd_config(
+        DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+        {
+            "dx": {"fused": asdict(tma_m64)},
+            "dw": {"fused": asdict(tma_m64)},
         },
     )
     parts, tile = _split_for(shape.m)
@@ -82,9 +90,18 @@ def _configs(shape: ShapeSpec) -> dict[str, object]:
         },
     )
     return {
-        "decomposed": DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+        "decomposed_separate": DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG,
+        "decomposed_dual": DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+        "decomposed_dual_interleaved": update_bwd_config(
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            {"execution_order": "interleaved"},
+        ),
         "fused_scalar": DEFAULT_FUSED_MXFP8_BWD_CONFIG,
         "fused_tma_three_role": fused_tma,
+        "fused_tma_m64": fused_tma_m64,
+        "fused_tma_m64_dual_stream": update_bwd_config(
+            fused_tma_m64, {"stream_schedule": "dual_stream"}
+        ),
         "fused_tma_workspace": workspace,
         "fused_tma_atomic": atomic,
         "fused_tma_dual_stream": update_bwd_config(
@@ -146,11 +163,12 @@ def main() -> None:
         )
 
     races: dict[str, object] = {}
-    reference = configs["decomposed"]
+    reference_name = "decomposed_dual"
+    reference = configs[reference_name]
     for index, (name, config) in enumerate(configs.items()):
-        if name == "decomposed" or measurements[name].get("status") != "ok":
+        if name == reference_name or measurements[name].get("status") != "ok":
             continue
-        print(f"RACE  decomposed vs {name}", flush=True)
+        print(f"RACE  {reference_name} vs {name}", flush=True)
         races[name] = harness.race(
             reference, config, seed=args.seed + 100 + index
         )
@@ -173,7 +191,8 @@ def main() -> None:
             "seed": args.seed,
         },
         "measurements": measurements,
-        "races_vs_decomposed": races,
+        "race_reference": reference_name,
+        "races_vs_reference": races,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

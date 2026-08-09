@@ -14,8 +14,9 @@ project follows semantic versioning while it is in active alpha development.
   persistent-tree FP32 epilogues, an FP32 atomic alternative, and dual-stream
   dX/dW execution.
 - Stage logical-transpose TMA operands in CuTe MN-major shared-memory layouts,
-  use layout-aware SMEM loads before emitting K-major MXFP8 MMA tiles, and
-  validate all backward families on SM120 through the production matrix.
+  add a native `ldmatrix.m8n8.x4.trans.b16` 128-bit SMEM-to-register path with
+  its measured lane/register-to-K mapping, and emit K-major MXFP8 MMA tiles.
+  Validate all backward families on SM120 through the production matrix.
 - Keep config interning opaque to Dynamo so eager and
   `torch.compile(fullgraph=True)` share the same registered forward/backward
   kernels.
@@ -23,6 +24,12 @@ project follows semantic versioning while it is in active alpha development.
   selectable family and measured untuned runtime seed; fused families remain
   fully autotunable while cross-CTA quantization reuse is developed. Advance
   the backward kernel revision.
+- Use the persistent dual-operand quantizer for each decomposed backward GEMM
+  by default after paired races showed gains across representative shapes;
+  retain independent quantizer launches as a separate search family.
+- Implement launch-level interleaved decomposed backward execution and remove
+  unimplemented graph, cluster-reduction, and legacy persistent-GEMM choices
+  from the active backward search space instead of spending trials on rejects.
 
 ## 0.9.0
 

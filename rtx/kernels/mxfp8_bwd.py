@@ -304,7 +304,10 @@ class MXFP8BwdConfig:
         if reason is not None:
             return reason
         if self.execution_order == "interleaved":
-            return "interleaved dX/dW execution is not implemented yet"
+            if self.stream_schedule != "single":
+                return "interleaved execution requires the single-stream schedule"
+            if self.dx.backend != "decomposed" or self.dw.backend != "decomposed":
+                return "interleaved execution requires two decomposed matmuls"
         if self.stream_schedule == "graph":
             return f"stream schedule {self.stream_schedule!r} is not implemented yet"
         reason = self.dx.implementation_rejection(
@@ -321,10 +324,22 @@ class MXFP8BwdConfig:
 DEFAULT_FUSED_MXFP8_BWD_CONFIG = MXFP8BwdConfig()
 
 
-DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG = replace(
+DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG = replace(
     DEFAULT_FUSED_MXFP8_BWD_CONFIG,
     dx=replace(DEFAULT_FUSED_MXFP8_BWD_CONFIG.dx, backend="decomposed"),
     dw=replace(DEFAULT_FUSED_MXFP8_BWD_CONFIG.dw, backend="decomposed"),
+)
+
+DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG = replace(
+    DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG,
+    dx=replace(
+        DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG.dx,
+        quant_launches="dual",
+    ),
+    dw=replace(
+        DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG.dw,
+        quant_launches="dual",
+    ),
 )
 
 # The fused families are searchable, but until their CTAs share quantized
@@ -336,6 +351,7 @@ __all__ = [
     "DEFAULT_MXFP8_BWD_CONFIG",
     "DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG",
     "DEFAULT_FUSED_MXFP8_BWD_CONFIG",
+    "DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG",
     "MXFP8BwdConfig",
     "MXFP8BwdMatmulConfig",
 ]

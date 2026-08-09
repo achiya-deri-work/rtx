@@ -30,6 +30,7 @@ from rtx.kernels.mxfp8_bwd import (
     DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
     DEFAULT_FUSED_MXFP8_BWD_CONFIG,
     DEFAULT_MXFP8_BWD_CONFIG,
+    DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG,
 )
 from rtx.kernels.mxfp8_quant import (
     MXFP8QuantConfig,
@@ -52,6 +53,8 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
         )
         self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.dx.backend, "decomposed")
         self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.dw.backend, "decomposed")
+        self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.dx.quant_launches, "dual")
+        self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.dw.quant_launches, "dual")
         self.assertEqual(DEFAULT_FUSED_MXFP8_BWD_CONFIG.dx.backend, "fused")
         self.assertEqual(DEFAULT_FUSED_MXFP8_BWD_CONFIG.dw.backend, "fused")
 
@@ -139,7 +142,7 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
     def test_b_only_coordinate_crosses_to_independent_quantizers(self) -> None:
         tuner = object.__new__(BwdCoordinateDescentTuner)
         candidate = tuner._candidate(
-            DEFAULT_MXFP8_BWD_CONFIG,
+            DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG,
             "dx_b_vector",
             {"dx": {"quant_b": {"quant_vec": 2, "load_bits": 32}}},
         )
@@ -149,7 +152,7 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
 
     def test_mixed_dual_coordinate_preserves_specialized_schedules(self) -> None:
         candidate = update_bwd_config(
-            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG,
             {"dx": {"quant_launches": "dual"}},
         )
         self.assertEqual(candidate.dx.quant_launches, "dual")
@@ -161,7 +164,7 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
     def test_mixed_dual_b_coordinate_remains_fused(self) -> None:
         tuner = object.__new__(BwdCoordinateDescentTuner)
         dual = update_bwd_config(
-            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG,
             {"dx": {"quant_launches": "dual"}},
         )
         candidate = tuner._candidate(
@@ -216,6 +219,24 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
         self.assertIsNone(
             candidate.implementation_rejection(MXFP8Problem(512, 1536, 1536))
         )
+
+    def test_interleaved_is_a_real_decomposed_only_schedule(self) -> None:
+        problem = MXFP8Problem(512, 1536, 1536)
+        candidate = update_bwd_config(
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            {"execution_order": "interleaved"},
+        )
+        self.assertIsNone(candidate.implementation_rejection(problem))
+        fused = update_bwd_config(
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+            {"execution_order": "interleaved"},
+        )
+        self.assertIn("requires two decomposed", fused.implementation_rejection(problem))
+        dual_stream = update_bwd_config(
+            candidate,
+            {"stream_schedule": "dual_stream"},
+        )
+        self.assertIn("single-stream", dual_stream.implementation_rejection(problem))
 
     def test_oriented_fused_kernels_compile_without_materialized_transposes(self) -> None:
         problem = MXFP8Problem(128, 128, 128)
@@ -324,9 +345,9 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         weight = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         grad_output = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         config = replace(
-            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG,
             dw=replace(
-                DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG.dw,
+                DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG.dw,
                 quant_launches="dual",
             ),
         )
@@ -350,7 +371,7 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         weight = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         grad_output = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         config = update_bwd_config(
-            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG,
             {"dx": {"quant_launches": "dual"}},
         )
         self.assertIsNone(
@@ -381,6 +402,17 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         self.assertLess(float(relative_x), 0.06)
         self.assertLess(float(relative_weight), 0.06)
 
+    def test_interleaved_decomposed_backward_matches_reference(self) -> None:
+        torch.manual_seed(31)
+        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        grad_output = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        config = update_bwd_config(
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            {"execution_order": "interleaved"},
+        )
+        self._assert_backward_close(config, grad_output, x, weight)
+
     def test_fused_tma_and_split_reduction_runtime_matrix(self) -> None:
         torch.manual_seed(29)
         m, n, k = 512, 128, 128
@@ -398,7 +430,7 @@ class TestMXFP8BwdCuda(unittest.TestCase):
             quant_vec=8,
             quant_math="bf16x2",
             quant_amax="bf16_bits",
-            quant_load_bits=16,
+            quant_load_bits=128,
         )
         fused_tma = update_bwd_config(
             DEFAULT_FUSED_MXFP8_BWD_CONFIG,
@@ -407,8 +439,16 @@ class TestMXFP8BwdCuda(unittest.TestCase):
                 "dw": {"fused": asdict(tma)},
             },
         )
+        tma_m64 = normalize_fwd_config(tma, tile_m=64)
         variants = {
             "tma_full": fused_tma,
+            "tma_m64": update_bwd_config(
+                DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+                {
+                    "dx": {"fused": asdict(tma_m64)},
+                    "dw": {"fused": asdict(tma_m64)},
+                },
+            ),
             "tma_workspace": update_bwd_config(
                 fused_tma,
                 {
@@ -460,7 +500,7 @@ class TestMXFP8BwdCuda(unittest.TestCase):
             ShapeSpec(128, 128, 128), protocol, seed=17
         )
         dual = update_bwd_config(
-            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG,
             {
                 "dx": {"quant_launches": "dual"},
                 "dw": {"quant_launches": "dual"},
@@ -472,7 +512,9 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         self.assertEqual(measurement["status"], "ok")
         self.assertEqual(len(measurement["timings_ms"]), 3)
         self.assertIn("dx_quant", measurement["components"])
-        race = harness.race(DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG, dual, seed=18)
+        race = harness.race(
+            DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG, dual, seed=18
+        )
         self.assertEqual(race["status"], "ok")
         self.assertEqual(len(race["incumbent_timings_ms"]), 3)
 

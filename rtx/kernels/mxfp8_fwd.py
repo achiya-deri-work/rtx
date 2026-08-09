@@ -35,6 +35,7 @@ from cutlass import (
     Int16,
     Int32,
     Uint16,
+    Uint32,
     Uint8,
 )
 from cutlass.cute.nvgpu import cpasync, warp
@@ -285,16 +286,36 @@ class MXFP8LinearFwdKernel:
             ),
             BFloat16,
         )
-        self.bf16_a_smem_layout = cute.tile_to_shape(
-            bf16_a_atom,
-            (cfg.tile_m, cfg.bf16_tile_k, cfg.bf16_stages),
-            order=(0, 1, 2),
-        )
-        self.bf16_b_smem_layout = cute.tile_to_shape(
-            bf16_b_atom,
-            (cfg.tile_n, cfg.bf16_tile_k, cfg.bf16_stages),
-            order=(0, 1, 2),
-        )
+        if self.a_orientation == "transpose" and cfg.bf16_swizzle == "none":
+            self.bf16_a_smem_layout = cute.make_composed_layout(
+                cute.make_swizzle(0, 0, 0),
+                0,
+                cute.make_ordered_layout(
+                    (cfg.tile_m, cfg.bf16_tile_k, cfg.bf16_stages),
+                    order=(0, 1, 2),
+                ),
+            )
+        else:
+            self.bf16_a_smem_layout = cute.tile_to_shape(
+                bf16_a_atom,
+                (cfg.tile_m, cfg.bf16_tile_k, cfg.bf16_stages),
+                order=(0, 1, 2),
+            )
+        if self.b_orientation == "transpose" and cfg.bf16_swizzle == "none":
+            self.bf16_b_smem_layout = cute.make_composed_layout(
+                cute.make_swizzle(0, 0, 0),
+                0,
+                cute.make_ordered_layout(
+                    (cfg.tile_n, cfg.bf16_tile_k, cfg.bf16_stages),
+                    order=(0, 1, 2),
+                ),
+            )
+        else:
+            self.bf16_b_smem_layout = cute.tile_to_shape(
+                bf16_b_atom,
+                (cfg.tile_n, cfg.bf16_tile_k, cfg.bf16_stages),
+                order=(0, 1, 2),
+            )
         out_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
             swizzle_kinds["128b"],
             self.c_dtype,
@@ -1024,7 +1045,10 @@ class MXFP8LinearFwdKernel:
                     unroll=1,
                 ):
                     task = task_group * cfg.quant_vec + scale_in_warp
-                    is_a = task < a_scale_blocks
+                    # A's task count is a multiple of every represented
+                    # quant_vec, making this branch warp-uniform.  That is
+                    # required by the transposing ldmatrix collective.
+                    is_a = task_group * cfg.quant_vec < a_scale_blocks
                     local_task = task if is_a else task - a_scale_blocks
                     row = local_task // blocks_per_load
                     scale_block = local_task % blocks_per_load
@@ -1051,39 +1075,106 @@ class MXFP8LinearFwdKernel:
                                 + lane_in_scale * cfg.quant_vec
                                 + vec_base
                             )
+                            loaded_values = [BFloat16(0.0)] * values_per_load
                             if cutlass.const_expr(cfg.load_engine != "scalar"):
                                 if is_a:
-                                    src_row_a = s_bf16_a[
-                                        row, None, bf16_stage
-                                    ]
-                                    loaded = nvvm.load_ext(
-                                        src_row_a.iterator
-                                        + src_row_a.layout(bf16_k_base),
-                                        dtype=Uint16,
-                                        count=values_per_load,
-                                    ).bitcast(BFloat16)
-                                    for load_vec in cutlass.range_constexpr(
-                                        values_per_load
+                                    if cutlass.const_expr(
+                                        self.a_orientation == "transpose"
                                     ):
-                                        bf16_values[vec_base + load_vec] = loaded[
-                                            load_vec
+                                        row_base = row - scale_in_warp
+                                        source_stage = s_bf16_a[
+                                            None, None, bf16_stage
                                         ]
+                                        source_ptr = (
+                                            source_stage.iterator
+                                            + source_stage.layout(
+                                                (row_base, lane_idx)
+                                            )
+                                        )
+                                        packed_rows = nvvm.inline_ptx_hl(
+                                            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+                                            "{{$w0}, {$w1}, {$w2}, {$w3}}, "
+                                            "[{$r0}];",
+                                            write_only_types=[Int32] * 4,
+                                            read_only_args=[
+                                                Uint32(source_ptr.toint())
+                                            ],
+                                        )
+                                        for register in cutlass.range_constexpr(4):
+                                            packed_pair = packed_rows[register]
+                                            loaded_values[register * 2] = Uint16(
+                                                packed_pair & Int32(0xFFFF)
+                                            ).bitcast(BFloat16)
+                                            loaded_values[register * 2 + 1] = Uint16(
+                                                (packed_pair >> Int32(16))
+                                                & Int32(0xFFFF)
+                                            ).bitcast(BFloat16)
+                                    else:
+                                        src_row_a = s_bf16_a[
+                                            row, None, bf16_stage
+                                        ]
+                                        loaded = nvvm.load_ext(
+                                            src_row_a.iterator
+                                            + src_row_a.layout(bf16_k_base),
+                                            dtype=Uint16,
+                                            count=values_per_load,
+                                        ).bitcast(BFloat16)
+                                        for load_vec in cutlass.range_constexpr(
+                                            values_per_load
+                                        ):
+                                            loaded_values[load_vec] = loaded[load_vec]
                                 else:
-                                    src_row_b = s_bf16_b[
-                                        row, None, bf16_stage
-                                    ]
-                                    loaded = nvvm.load_ext(
-                                        src_row_b.iterator
-                                        + src_row_b.layout(bf16_k_base),
-                                        dtype=Uint16,
-                                        count=values_per_load,
-                                    ).bitcast(BFloat16)
-                                    for load_vec in cutlass.range_constexpr(
-                                        values_per_load
+                                    if cutlass.const_expr(
+                                        self.b_orientation == "transpose"
                                     ):
-                                        bf16_values[vec_base + load_vec] = loaded[
-                                            load_vec
+                                        row_base = row - scale_in_warp
+                                        source_stage = s_bf16_b[
+                                            None, None, bf16_stage
                                         ]
+                                        source_ptr = (
+                                            source_stage.iterator
+                                            + source_stage.layout(
+                                                (row_base, lane_idx)
+                                            )
+                                        )
+                                        packed_rows = nvvm.inline_ptx_hl(
+                                            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+                                            "{{$w0}, {$w1}, {$w2}, {$w3}}, "
+                                            "[{$r0}];",
+                                            write_only_types=[Int32] * 4,
+                                            read_only_args=[
+                                                Uint32(source_ptr.toint())
+                                            ],
+                                        )
+                                        for register in cutlass.range_constexpr(4):
+                                            packed_pair = packed_rows[register]
+                                            loaded_values[register * 2] = Uint16(
+                                                packed_pair & Int32(0xFFFF)
+                                            ).bitcast(BFloat16)
+                                            loaded_values[register * 2 + 1] = Uint16(
+                                                (packed_pair >> Int32(16))
+                                                & Int32(0xFFFF)
+                                            ).bitcast(BFloat16)
+                                    else:
+                                        src_row_b = s_bf16_b[
+                                            row, None, bf16_stage
+                                        ]
+                                        loaded = nvvm.load_ext(
+                                            src_row_b.iterator
+                                            + src_row_b.layout(bf16_k_base),
+                                            dtype=Uint16,
+                                            count=values_per_load,
+                                        ).bitcast(BFloat16)
+                                        for load_vec in cutlass.range_constexpr(
+                                            values_per_load
+                                        ):
+                                            loaded_values[load_vec] = loaded[load_vec]
+                                for load_vec in cutlass.range_constexpr(
+                                    values_per_load
+                                ):
+                                    bf16_values[vec_base + load_vec] = loaded_values[
+                                        load_vec
+                                    ]
                             else:
                                 global_k_base = (
                                     k_tile * cfg.bf16_tile_k + bf16_k_base
@@ -1122,6 +1213,35 @@ class MXFP8LinearFwdKernel:
                             + lane_in_scale * cfg.quant_vec
                             + vec
                         )
+                        # ldmatrix.x4.trans distributes one two-BF16 pair from
+                        # each 8-K matrix to a lane: register r owns
+                        # K=8*r+2*lane_in_scale+{0,1}. Preserve that measured
+                        # delivery rather than pretending each lane received
+                        # eight consecutive K values.
+                        ldmatrix_k = (
+                            scale_block * SF_VEC_SIZE
+                            + (vec // 2) * 8
+                            + lane_in_scale * 2
+                            + vec % 2
+                        )
+                        if cutlass.const_expr(
+                            self.a_orientation == "transpose"
+                            and self.b_orientation == "transpose"
+                            and cfg.quant_load_bits == 128
+                        ):
+                            bf16_k = ldmatrix_k
+                        elif cutlass.const_expr(
+                            self.a_orientation == "transpose"
+                            and cfg.quant_load_bits == 128
+                        ):
+                            if is_a:
+                                bf16_k = ldmatrix_k
+                        elif cutlass.const_expr(
+                            self.b_orientation == "transpose"
+                            and cfg.quant_load_bits == 128
+                        ):
+                            if not is_a:
+                                bf16_k = ldmatrix_k
                         local_k = k_block_base * SF_VEC_SIZE + bf16_k
                         bf16_ks[vec] = bf16_k
                         local_ks[vec] = local_k

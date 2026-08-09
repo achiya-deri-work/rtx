@@ -430,12 +430,24 @@ class MXFP8FwdConfig:
         if transposed and self.load_engine == "cpasync":
             return "logical-transpose operands require scalar or TMA transport"
         if transposed and self.quant_load_bits != 16:
-            return "logical-transpose quantization requires layout-aware 16-bit loads"
+            transposed_ldmatrix = (
+                self.load_engine == "tma"
+                and self.quant_load_bits == 128
+                and self.quant_vec == 8
+                and self.bf16_tile_k == 32
+                and self.bf16_swizzle == "none"
+            )
+            if not transposed_ldmatrix:
+                return (
+                    "logical-transpose vector quantization requires the "
+                    "TMA/ldmatrix x4 path (128-bit, quant_vec=8, "
+                    "bf16_tile_k=32, unswizzled)"
+                )
         return None
 
 
 DEFAULT_MXFP8_FWD_CONFIG = MXFP8FwdConfig()
-MXFP8_FWD_KERNEL_REVISION = 14
+MXFP8_FWD_KERNEL_REVISION = 15
 
 
 # Block coordinates supplement, rather than replace, their primitive fields.
