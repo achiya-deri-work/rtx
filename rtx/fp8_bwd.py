@@ -42,6 +42,12 @@ def compile_mxfp8_atomic_split_fwd(*args, **kwargs):
     )
 
 
+def compile_mxfp8_cluster_split_fwd(*args, **kwargs):
+    return load_kernel_symbol("mxfp8_fwd", "compile_mxfp8_cluster_split_fwd")(
+        *args, **kwargs
+    )
+
+
 def compile_mxfp8_workspace_reduce(*args, **kwargs):
     return load_kernel_symbol("mxfp8_reduce", "compile_mxfp8_workspace_reduce")(
         *args, **kwargs
@@ -366,6 +372,17 @@ def _build_matmul_runner(
                     persistent_waves=config.reduction_waves,
                 ),
                 accumulator,
+            )
+        if config.reduction == "cluster_fp32":
+            return _FusedMatmulRunner(
+                compile_mxfp8_cluster_split_fwd(
+                    problem,
+                    config.fused,
+                    a_orientation=config.a_orientation,
+                    b_orientation=config.b_orientation,
+                    split_reduction=config.split_reduction,
+                    reduction_tile=config.reduction_tile,
+                )
             )
         return _FusedMatmulRunner(
             compile_mxfp8_fwd(

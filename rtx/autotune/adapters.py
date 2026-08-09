@@ -783,9 +783,14 @@ def make_mxfp8_bwd_adapter(
             if matmul.backend == "fused":
                 fused = matmul.fused
                 profile = _device_dict(device)
-                natural_ctas = (
+                natural_output_ctas = (
                     (matmul_problem.m + fused.tile_m - 1) // fused.tile_m
                 ) * ((matmul_problem.n + fused.tile_n - 1) // fused.tile_n)
+                natural_ctas = natural_output_ctas * (
+                    matmul.split_reduction
+                    if matmul.reduction != "full_fp32"
+                    else 1
+                )
                 grid_ctas = natural_ctas
                 if fused.persistent:
                     sm_count = max(
@@ -858,6 +863,38 @@ def make_mxfp8_bwd_adapter(
                 values[f"{name}_cluster_dsmem_reduction"] = float(
                     matmul.reduction == "cluster_fp32"
                 )
+                if matmul.reduction == "cluster_fp32":
+                    mma_threads = fused.num_mma_warps * 32
+                    accum_per_thread = (
+                        fused.tile_m * fused.tile_n // mma_threads
+                    )
+                    scratch_per_thread = (
+                        fused.tile_m
+                        * fused.tile_k
+                        * fused.mxfp8_stages
+                        // 4
+                        // mma_threads
+                    )
+                    chunk_elems = max(
+                        1, min(accum_per_thread, scratch_per_thread)
+                    )
+                    chunks = (
+                        accum_per_thread + chunk_elems - 1
+                    ) // chunk_elems
+                    values[f"{name}_cluster_reduction_chunks"] = float(chunks)
+                    values[f"{name}_cluster_barrier_phases"] = float(
+                        3 * chunks
+                    )
+                    values[f"{name}_cluster_dsmem_atomic_bytes"] = float(
+                        matmul_problem.m
+                        * matmul_problem.n
+                        * matmul.split_reduction
+                        * 4
+                    )
+                else:
+                    values[f"{name}_cluster_reduction_chunks"] = 0.0
+                    values[f"{name}_cluster_barrier_phases"] = 0.0
+                    values[f"{name}_cluster_dsmem_atomic_bytes"] = 0.0
                 values[f"{name}_reduction_threads"] = float(
                     matmul.reduction_threads
                 )

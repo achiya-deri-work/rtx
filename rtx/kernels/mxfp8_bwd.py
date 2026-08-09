@@ -10,7 +10,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
-from .mxfp8 import DEFAULT_MXFP8_FWD_CONFIG, MXFP8FwdConfig, MXFP8Problem
+from .mxfp8 import (
+    DEFAULT_MXFP8_FWD_CONFIG,
+    MXFP8FwdConfig,
+    MXFP8Problem,
+    SM120_FUSED_RUNTIME_SMEM_RESERVE_BYTES,
+    SM120_SMEM_CAPACITY_BYTES,
+)
 from ..configs import MXFP8GemmConfig, MXFP8QuantConfig
 
 
@@ -100,7 +106,13 @@ class MXFP8BwdMatmulConfig:
                 or self.workspace_epilogue != "none"
             ):
                 return "full reduction has no split/workspace coordinates"
-            if self.reduction in ("split_fp32_workspace", "split_fp32_atomic"):
+            if self.reduction != "full_fp32" and self.split_reduction == 1:
+                return "split/cluster reductions require more than one partition"
+            if self.reduction in (
+                "split_fp32_workspace",
+                "split_fp32_atomic",
+                "cluster_fp32",
+            ):
                 if (
                     self.reduction == "split_fp32_workspace"
                     and self.workspace_epilogue == "none"
@@ -111,6 +123,49 @@ class MXFP8BwdMatmulConfig:
                     and self.workspace_epilogue != "none"
                 ):
                     return "atomic split reduction does not use a workspace epilogue"
+                if self.reduction == "cluster_fp32":
+                    if self.split_reduction not in (2, 4, 8):
+                        return "cluster reduction requires 2, 4, or 8 CTAs"
+                    if self.workspace_epilogue != "none":
+                        return "cluster reduction does not use a workspace epilogue"
+                    if self.fused.cluster_reuse != "none":
+                        return "cluster reduction cannot also cluster operand reuse"
+                    fused = self.fused
+                    staged_bytes = (
+                        fused.mxfp8_stages
+                        * (fused.tile_m + fused.tile_n)
+                        * fused.tile_k
+                    )
+                    scale_bytes = (
+                        fused.mxfp8_stages
+                        * (
+                            ((fused.tile_m + 127) // 128) * 128
+                            + ((fused.tile_n + 127) // 128) * 128
+                        )
+                        * (fused.tile_k // 32)
+                    )
+                    bf16_bytes = (
+                        fused.bf16_stages
+                        * (fused.tile_m + fused.tile_n)
+                        * fused.bf16_tile_k
+                        * 2
+                        if fused.load_engine in ("cpasync", "tma")
+                        else 0
+                    )
+                    runtime_reserve = (
+                        SM120_FUSED_RUNTIME_SMEM_RESERVE_BYTES
+                        if fused.load_engine != "scalar"
+                        else 0
+                    )
+                    if (
+                        staged_bytes
+                        + scale_bytes
+                        + bf16_bytes
+                        + runtime_reserve
+                        + 16
+                        > SM120_SMEM_CAPACITY_BYTES
+                    ):
+                        return "cluster reduction exceeds SM120 shared-memory capacity"
                 if not (
                     (self.split_reduction - 1) * self.reduction_tile < problem.k
                     <= self.split_reduction * self.reduction_tile
@@ -127,8 +182,6 @@ class MXFP8BwdMatmulConfig:
             )
             if reason is not None:
                 return f"fused kernel: {reason}"
-            if self.reduction == "cluster_fp32":
-                return f"fused {self.reduction!r} reduction is not implemented yet"
             if self.tile_scheduler != "static":
                 return (
                     "use fused.persistent/reuse for fused backward scheduling; "

@@ -141,6 +141,39 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
             MXFP8Problem(512, 1536, 1536)
         )
         self.assertIsNone(reason)
+        fused_update = next(
+            value
+            for value in BWD_SEARCH_SPACE["dw_reduction"]
+            if value["dw"].get("backend") == "fused"
+            and value["dw"]["reduction"] == "cluster_fp32"
+            and value["dw"]["split_reduction"] == 4
+            and value["dw"]["reduction_tile"] == 128
+        )
+        fused = update_bwd_config(DEFAULT_FUSED_MXFP8_BWD_CONFIG, fused_update)
+        self.assertIsNone(
+            fused.implementation_rejection(MXFP8Problem(512, 1536, 1536))
+        )
+        overfull = update_bwd_config(
+            fused,
+            {
+                "dw": {
+                    "fused": {
+                        "load_engine": "tma",
+                        "schedule": "three_role",
+                        "bf16_tile_k": 32,
+                        "bf16_swizzle": "none",
+                        "bf16_stages": 2,
+                        "mxfp8_stages": 2,
+                        "quantizer_warps": 4,
+                        "quant_load_bits": 128,
+                    }
+                }
+            },
+        )
+        self.assertIn(
+            "cluster reduction exceeds SM120 shared-memory capacity",
+            overfull.implementation_rejection(MXFP8Problem(512, 1536, 1536)),
+        )
 
     def test_decomposed_workspace_and_atomic_reductions_are_executable(self) -> None:
         problem = MXFP8Problem(512, 1536, 1536)
@@ -732,6 +765,7 @@ class TestMXFP8BwdCuda(unittest.TestCase):
             },
         )
         tma_m64 = normalize_fwd_config(tma, tile_m=64)
+        tma_cluster = normalize_fwd_config(tma, mxfp8_stages=1)
         variants = {
             "tma_full": fused_tma,
             "tma_m64": update_bwd_config(
@@ -763,6 +797,18 @@ class TestMXFP8BwdCuda(unittest.TestCase):
                     }
                 },
             ),
+            "tma_cluster": update_bwd_config(
+                fused_tma,
+                {
+                    "dw": {
+                        "fused": asdict(tma_cluster),
+                        "reduction": "cluster_fp32",
+                        "split_reduction": 4,
+                        "reduction_tile": 128,
+                        "workspace_epilogue": "none",
+                    }
+                },
+            ),
             "tma_dual_stream": update_bwd_config(
                 fused_tma, {"stream_schedule": "dual_stream"}
             ),
@@ -772,7 +818,10 @@ class TestMXFP8BwdCuda(unittest.TestCase):
                 self.assertIsNone(
                     config.implementation_rejection(MXFP8Problem(m, n, k))
                 )
-                self._assert_backward_close(config, grad_output, x, weight)
+                for _ in range(8 if name == "tma_cluster" else 1):
+                    self._assert_backward_close(
+                        config, grad_output, x, weight
+                    )
 
     def test_calibrated_harness_measures_and_races_backward(self) -> None:
         protocol = BenchmarkProtocol(

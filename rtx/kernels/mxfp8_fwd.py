@@ -126,6 +126,7 @@ class MXFP8LinearFwdKernel:
         split_reduction: int = 1,
         reduction_tile: int = 0,
         atomic_output: bool = False,
+        cluster_output: bool = False,
     ):
         rejection = config.oriented_implementation_rejection(
             problem, a_orientation, b_orientation
@@ -139,15 +140,26 @@ class MXFP8LinearFwdKernel:
         self.split_reduction = split_reduction
         self.reduction_tile = reduction_tile
         self.atomic_output = atomic_output
+        self.cluster_output = cluster_output
         if split_reduction < 1:
             raise ValueError("split_reduction must be positive")
-        if split_reduction == 1 and (reduction_tile != 0 or atomic_output):
+        if split_reduction == 1 and (
+            reduction_tile != 0 or atomic_output or cluster_output
+        ):
             raise ValueError("an unsplit kernel must use reduction_tile=0")
+        if atomic_output and cluster_output:
+            raise ValueError("atomic and cluster outputs are mutually exclusive")
         if split_reduction > 1:
             if config.epilogue != "direct":
                 raise ValueError("split reduction requires the FP32 direct epilogue")
             if config.persistent:
                 raise ValueError("split reduction persistence is tuned in its epilogue")
+            if cluster_output and split_reduction not in (2, 4, 8):
+                raise ValueError("SM120 CTA clusters support split counts 2, 4, or 8")
+            if cluster_output and config.cluster_reuse != "none":
+                raise ValueError(
+                    "split reduction and operand reuse require separate CTA clusters"
+                )
             if reduction_tile <= 0 or reduction_tile % config.bf16_tile_k:
                 raise ValueError(
                     "split reduction tile must be a positive BF16-tile multiple"
@@ -187,9 +199,64 @@ class MXFP8LinearFwdKernel:
         self.b_dtype = Float8E4M3FN
         self.sf_dtype = Float8E8M0FNU
         self.acc_dtype = Float32
-        self.c_dtype = Float32 if split_reduction > 1 else BFloat16
+        self.c_dtype = (
+            Float32 if split_reduction > 1 and not cluster_output else BFloat16
+        )
         self.a_layout = utils.LayoutEnum.ROW_MAJOR
         self.b_layout = utils.LayoutEnum.ROW_MAJOR
+
+    @cute.jit
+    def _cluster_broadcast(
+        self,
+        barriers: cute.Tensor,
+        barrier_index: cutlass.Constexpr,
+        phase: Int32,
+        cluster_rank: Int32,
+    ) -> None:
+        """Rank 0 publishes one generation to every CTA in the cluster."""
+        cute.arch.sync_threads()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        if warp_idx == 0:
+            with cute.arch.elect_one():
+                if cluster_rank == 0:
+                    for peer in cutlass.range_constexpr(self.split_reduction):
+                        peer_barrier = cute.arch.map_dsmem_ptr(
+                            barriers.iterator + barrier_index, Int32(peer)
+                        )
+                        nvvm.mbarrier_arrive(
+                            peer_barrier,
+                            scope=nvvm.MemScope.CLUSTER,
+                        )
+                cute.arch.mbarrier_wait(
+                    barriers.iterator + barrier_index, phase
+                )
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def _cluster_gather(
+        self,
+        barriers: cute.Tensor,
+        barrier_index: cutlass.Constexpr,
+        phase: Int32,
+        cluster_rank: Int32,
+    ) -> None:
+        """Every CTA publishes a contribution; rank 0 waits for all peers."""
+        cute.arch.sync_threads()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        if warp_idx == 0:
+            with cute.arch.elect_one():
+                leader_barrier = cute.arch.map_dsmem_ptr(
+                    barriers.iterator + barrier_index, Int32(0)
+                )
+                nvvm.mbarrier_arrive(
+                    leader_barrier,
+                    scope=nvvm.MemScope.CLUSTER,
+                )
+                if cluster_rank == 0:
+                    cute.arch.mbarrier_wait(
+                        barriers.iterator + barrier_index, phase
+                    )
+        cute.arch.sync_threads()
 
     def _setup_static_layouts(self) -> None:
         cfg = self.config
@@ -452,6 +519,12 @@ class MXFP8LinearFwdKernel:
                     ],
                     1024,
                 ]
+                cluster_barrier: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Int64, 2 if self.cluster_output else 0
+                    ],
+                    8,
+                ]
         @cute.struct
         class SharedStorageScalar:
                 q_a: cute.struct.Align[
@@ -489,6 +562,12 @@ class MXFP8LinearFwdKernel:
                     ],
                     1024,
                 ]
+                cluster_barrier: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Int64, 2 if self.cluster_output else 0
+                    ],
+                    8,
+                ]
 
         self.shared_storage = SharedStorageScalar
         if cutlass.const_expr(cfg.load_engine != "scalar"):
@@ -518,7 +597,14 @@ class MXFP8LinearFwdKernel:
             self.out_smem_layout,
             cp_async_tiled_copy,
         )
-        if cutlass.const_expr(cfg.cluster_reuse != "none"):
+        if cutlass.const_expr(self.cluster_output):
+            kernel.launch(
+                grid=grid,
+                block=[self.threads_per_cta, 1, 1],
+                cluster=[self.split_reduction, 1, 1],
+                stream=stream,
+            )
+        elif cutlass.const_expr(cfg.cluster_reuse != "none"):
             kernel.launch(
                 grid=grid,
                 block=[self.threads_per_cta, 1, 1],
@@ -642,6 +728,23 @@ class MXFP8LinearFwdKernel:
         )
         s_sfa = storage.scale_a.get_tensor(sfa_smem_layout)
         s_sfb = storage.scale_b.get_tensor(sfb_smem_layout)
+        if cutlass.const_expr(self.cluster_output):
+            s_cluster_barrier = storage.cluster_barrier.get_tensor(
+                cute.make_layout((2,), stride=(1,))
+            )
+            if warp_idx == 0:
+                with cute.arch.elect_one():
+                    nvvm.mbarrier_init(
+                        s_cluster_barrier.iterator,
+                        1,
+                    )
+                    nvvm.mbarrier_init(
+                        s_cluster_barrier.iterator + 1,
+                        self.split_reduction,
+                    )
+            cute.arch.mbarrier_init_fence()
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
         if cutlass.const_expr(cfg.epilogue == "tma"):
             s_out = storage.out.get_tensor(
                 out_smem_layout.outer,
@@ -851,7 +954,10 @@ class MXFP8LinearFwdKernel:
                     linear_tile * self.work_tiles_per_cta + work_slot
                 )
             split_id = Int32(0)
-            if cutlass.const_expr(self.split_reduction > 1):
+            if cutlass.const_expr(self.cluster_output):
+                split_id = cute.arch.block_idx_in_cluster()
+                work_linear = linear_tile // self.split_reduction
+            elif cutlass.const_expr(self.split_reduction > 1):
                 split_id = work_linear // total_tiles
                 work_linear = work_linear % total_tiles
             # Grouped rasterization is bijective even for a partial final
@@ -891,7 +997,9 @@ class MXFP8LinearFwdKernel:
             # predicates for non-multiple M/N dimensions.
             out_matrix = out
             if cutlass.const_expr(
-                self.split_reduction > 1 and not self.atomic_output
+                self.split_reduction > 1
+                and not self.atomic_output
+                and not self.cluster_output
             ):
                 out_matrix = cute.make_tensor(
                     out.iterator
@@ -1666,7 +1774,93 @@ class MXFP8LinearFwdKernel:
                         quant_pipeline.producer_tail(quant_producer_state)
     
             if cutlass.const_expr(cfg.epilogue == "direct"):
-                if warp_idx < self.num_mma_warps:
+                if cutlass.const_expr(self.cluster_output):
+                    # The quantized A stages are dead after the mainloop. Reuse
+                    # them as a chunked FP32 DSMEM reduction window so fused
+                    # dynamic quantization never materializes partials in GMEM.
+                    scratch_elements = cute.cosize(a_smem_layout) // 4
+                    mma_threads = self.num_mma_warps * 32
+                    accum_elements = cute.size(accumulators)
+                    chunk_elements = cutlass.min(
+                        accum_elements,
+                        scratch_elements // mma_threads,
+                    )
+                    scratch = cute.make_tensor(
+                        cute.recast_ptr(s_a.iterator, dtype=Float32),
+                        cute.make_layout((scratch_elements,), stride=(1,)),
+                    )
+                    cluster_rank = cute.arch.block_idx_in_cluster()
+                    leader_ptr = cute.arch.map_dsmem_ptr(
+                        scratch.iterator, Int32(0)
+                    )
+                    chunk_count = cute.ceil_div(
+                        accum_elements, chunk_elements
+                    )
+                    # Producer and quantizer tails are warp-local. Publish their
+                    # completion CTA-wide before overlaying the operand stages.
+                    cute.arch.sync_threads()
+                    for chunk in cutlass.range_constexpr(chunk_count):
+                        first_elem = chunk * chunk_elements
+                        final_elem = cutlass.min(
+                            first_elem + chunk_elements, accum_elements
+                        )
+                        if cluster_rank == 0 and warp_idx < self.num_mma_warps:
+                            for elem in cutlass.range(
+                                first_elem, final_elem, unroll_full=True
+                            ):
+                                scratch[
+                                    tidx * chunk_elements + elem - first_elem
+                                ] = Float32(0.0)
+                        self._cluster_broadcast(
+                            s_cluster_barrier,
+                            0,
+                            Int32((chunk * 2) & 1),
+                            cluster_rank,
+                        )
+                        if warp_idx < self.num_mma_warps:
+                            for elem in cutlass.range(
+                                first_elem, final_elem, unroll_full=True
+                            ):
+                                nvvm.red(
+                                    nvvm.ReductionOp.ADD,
+                                    nvvm.ReductionType.F32,
+                                    leader_ptr
+                                    + tidx * chunk_elements
+                                    + elem
+                                    - first_elem,
+                                    accumulators[elem],
+                                    mem_order="relaxed",
+                                    mem_scope="cluster",
+                                )
+                        self._cluster_gather(
+                            s_cluster_barrier,
+                            1,
+                            Int32(chunk & 1),
+                            cluster_rank,
+                        )
+                        if cluster_rank == 0 and warp_idx < self.num_mma_warps:
+                            for elem in cutlass.range(
+                                first_elem, final_elem, unroll_full=True
+                            ):
+                                coord = t_cc_out[elem]
+                                if (
+                                    coord[0] < self.problem.m
+                                    and coord[1] < self.problem.n
+                                ):
+                                    t_cg_out[elem] = BFloat16(
+                                        scratch[
+                                            tidx * chunk_elements
+                                            + elem
+                                            - first_elem
+                                        ]
+                                    )
+                        self._cluster_broadcast(
+                            s_cluster_barrier,
+                            0,
+                            Int32((chunk * 2 + 1) & 1),
+                            cluster_rank,
+                        )
+                elif warp_idx < self.num_mma_warps:
                     for elem in cutlass.range(
                         cute.size(accumulators), unroll_full=True
                     ):
@@ -1953,9 +2147,66 @@ def compile_mxfp8_atomic_split_fwd(
     )
 
 
+@lru_cache(maxsize=None)
+def compile_mxfp8_cluster_split_fwd(
+    problem: MXFP8Problem,
+    config: MXFP8FwdConfig,
+    *,
+    a_orientation: str,
+    b_orientation: str,
+    split_reduction: int,
+    reduction_tile: int,
+):
+    """Compile fused split-K with cluster-local FP32 reduction to BF16."""
+
+    problem.validate()
+    kernel = MXFP8LinearFwdKernel(
+        problem,
+        config,
+        a_orientation=a_orientation,
+        b_orientation=b_orientation,
+        split_reduction=split_reduction,
+        reduction_tile=reduction_tile,
+        cluster_output=True,
+    )
+    a_stride = (problem.k, 1) if a_orientation == "row" else (1, problem.m)
+    b_stride = (problem.k, 1) if b_orientation == "row" else (1, problem.n)
+    x = cute.runtime.make_fake_tensor(
+        BFloat16,
+        (problem.m, problem.k),
+        stride=a_stride,
+        assumed_align=16,
+    )
+    weight = cute.runtime.make_fake_tensor(
+        BFloat16,
+        (problem.n, problem.k),
+        stride=b_stride,
+        assumed_align=16,
+    )
+    out = cute.runtime.make_fake_tensor(
+        BFloat16,
+        (problem.m, problem.n),
+        stride=(problem.n, 1),
+        assumed_align=16,
+    )
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        kernel,
+        x,
+        weight,
+        out,
+        stream,
+        options=(
+            "--enable-tvm-ffi --opt-level 3 "
+            f"--ptxas-options '-O3 -v --maxrregcount={config.maxrregcount}'"
+        ),
+    )
+
+
 __all__ = [
     "MXFP8LinearFwdKernel",
     "compile_mxfp8_fwd",
     "compile_mxfp8_atomic_split_fwd",
+    "compile_mxfp8_cluster_split_fwd",
     "compile_mxfp8_split_fwd",
 ]

@@ -59,6 +59,16 @@ def _configs(shape: ShapeSpec, *, reuse_sweep: bool = False) -> dict[str, object
             "dw": {"fused": asdict(tma_three_role)},
         },
     )
+    fused_tma_cluster = update_bwd_config(
+        fused_tma,
+        {
+            "dw": {
+                "fused": asdict(
+                    normalize_fwd_config(tma_three_role, mxfp8_stages=1)
+                )
+            }
+        },
+    )
     tma_m64 = normalize_fwd_config(tma_three_role, tile_m=64)
     fused_tma_m64 = update_bwd_config(
         DEFAULT_FUSED_MXFP8_BWD_CONFIG,
@@ -282,6 +292,17 @@ def _configs(shape: ShapeSpec, *, reuse_sweep: bool = False) -> dict[str, object
                     }
                 },
             )
+            configs["fused_tma_cluster"] = update_bwd_config(
+                fused_tma_cluster,
+                {
+                    "dw": {
+                        "reduction": "cluster_fp32",
+                        "split_reduction": parts,
+                        "reduction_tile": tile,
+                        "workspace_epilogue": "none",
+                    }
+                },
+            )
         for cluster_parts in (2, 4, 8):
             cluster_tiles = tuple(
                 candidate
@@ -302,6 +323,19 @@ def _configs(shape: ShapeSpec, *, reuse_sweep: bool = False) -> dict[str, object
                     {
                         "dw": {
                             **decomposed_split_base,
+                            "reduction": "cluster_fp32",
+                            "split_reduction": cluster_parts,
+                            "reduction_tile": cluster_tile,
+                            "workspace_epilogue": "none",
+                        }
+                    },
+                )
+            )
+            configs[f"fused_cluster_s{cluster_parts}_t{cluster_tile}"] = (
+                update_bwd_config(
+                    fused_tma_cluster,
+                    {
+                        "dw": {
                             "reduction": "cluster_fp32",
                             "split_reduction": cluster_parts,
                             "reduction_tile": cluster_tile,

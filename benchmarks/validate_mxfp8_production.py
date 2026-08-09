@@ -240,6 +240,10 @@ def main() -> None:
             1024 if args.quick else args.long_m,
             reduction="split_fp32_atomic",
         ),
+        "long_sequence_dw_cluster": lambda: _long_reduction_case(
+            1024 if args.quick else args.long_m,
+            reduction="cluster_fp32",
+        ),
         "long_sequence_dw_decomposed_workspace": lambda: _long_reduction_case(
             1024 if args.quick else args.long_m,
             reduction="split_fp32_workspace",

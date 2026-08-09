@@ -15,7 +15,8 @@ current implementation contains:
   including logical-transpose TMA transport and split-FP32 workspace reduction;
 - a one-launch four-operand backward quantizer with concurrent dX/dW GEMMs,
   plus autotunable fused and quantize-once FP32 workspace/atomic split-K,
-  generation-counted cluster-local DSMEM FP32 split reduction,
+  fused and prequantized generation-counted cluster-local DSMEM FP32 split
+  reduction,
   per-matmul, interleaved, asynchronous logical-transpose transport,
   wide-store, wide-CTA, and CTA-cluster reuse families;
 - PyTorch custom-op and `nn.Module` frontends;

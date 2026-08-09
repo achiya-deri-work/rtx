@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 14
+KERNEL_REVISION = 15
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -387,6 +387,27 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
                             "store_vec": 1,
                             "tiles_per_cta": 1,
                             "tile_locality": "raster",
+                        },
+                    }
+                    for split in (2, 4, 8)
+                    for tile in (128, 256, 512, 1024, 2048, 4096)
+                ),
+                *(
+                    {
+                        "backend": "fused",
+                        "reduction": "cluster_fp32",
+                        "split_reduction": split,
+                        "reduction_tile": tile,
+                        "workspace_epilogue": "none",
+                        "fused": {
+                            "epilogue": "direct",
+                            "epilogue_stages": 1,
+                            "store_vec": 1,
+                            "persistent": False,
+                            "persistent_waves": 1,
+                            "reuse": "none",
+                            "cluster_reuse": "none",
+                            "cluster_size": 1,
                         },
                     }
                     for split in (2, 4, 8)
