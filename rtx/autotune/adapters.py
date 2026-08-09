@@ -19,6 +19,7 @@ from ..kernels.mxfp8 import (
     MXFP8_FWD_KERNEL_REVISION,
     MXFP8FwdConfig,
     MXFP8Problem,
+    SM120_FUSED_RUNTIME_SMEM_RESERVE_BYTES,
     SM120_GEMM_RUNTIME_SMEM_RESERVE_BYTES,
     fwd_config_from_dict,
     fwd_config_id,
@@ -80,7 +81,12 @@ def _fused_smem_bytes(config: MXFP8FwdConfig) -> int:
         if config.epilogue != "direct"
         else 0
     )
-    return operands + scales + bf16 + epilogue
+    reserve = (
+        SM120_FUSED_RUNTIME_SMEM_RESERVE_BYTES
+        if config.load_engine != "scalar"
+        else 0
+    )
+    return operands + scales + bf16 + epilogue + reserve
 
 
 def _gemm_smem_bytes(config: object) -> int:

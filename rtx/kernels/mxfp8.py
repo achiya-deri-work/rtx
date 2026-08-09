@@ -34,6 +34,10 @@ SM120_SMEM_CAPACITY_BYTES = 101_376
 # the explicitly modeled operand storage. This reserve is part of legality,
 # not an autotuner heuristic: a 101,376-byte raw tile launches as 102,400 B.
 SM120_GEMM_RUNTIME_SMEM_RESERVE_BYTES = 1_024
+# Staged fused kernels add TMA/quant pipeline state to ``SharedStorageStaged``.
+# The struct is 1 KiB aligned, so reserve one complete alignment quantum beyond
+# the explicitly modeled BF16/E4M3/E8M0/output arrays.
+SM120_FUSED_RUNTIME_SMEM_RESERVE_BYTES = 1_024
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,11 +252,17 @@ class MXFP8FwdConfig:
             epilogue_bytes = (
                 self.epilogue_stages * self.tile_m * self.tile_n * 2
             )
+        runtime_reserve = (
+            SM120_FUSED_RUNTIME_SMEM_RESERVE_BYTES
+            if self.load_engine != "scalar"
+            else 0
+        )
         if (
             staged_operand_bytes
             + staged_scale_bytes
             + bf16_stage_bytes
             + epilogue_bytes
+            + runtime_reserve
             > SM120_SMEM_CAPACITY_BYTES
         ):
             return "MXFP8 operand stages exceed the SM120 shared-memory capacity"

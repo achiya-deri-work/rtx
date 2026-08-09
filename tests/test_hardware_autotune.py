@@ -11,7 +11,7 @@ from rtx.autotune import (
     make_mxfp8_fwd_adapter,
     make_mxfp8_bwd_adapter,
 )
-from rtx.autotune.adapters import _gemm_launch_smem_bytes
+from rtx.autotune.adapters import _fused_smem_bytes, _gemm_launch_smem_bytes
 from rtx.autotune.core import Proposal, evaluate_proposal
 from rtx.autotune.hardware import (
     architecture_profile,
@@ -19,7 +19,11 @@ from rtx.autotune.hardware import (
     launch_resource_features,
     sku_spec,
 )
-from rtx.kernels.mxfp8 import DEFAULT_MXFP8_FWD_CONFIG, MXFP8Problem
+from rtx.kernels.mxfp8 import (
+    DEFAULT_MXFP8_FWD_CONFIG,
+    MXFP8Problem,
+    normalize_fwd_config,
+)
 from rtx.kernels.mxfp8_bwd import DEFAULT_MXFP8_BWD_CONFIG
 from rtx.kernels.mxfp8_bwd import DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG
 
@@ -31,6 +35,20 @@ class _CompileConfig:
 
 
 class HardwareAutotuneTests(unittest.TestCase):
+    def test_staged_fused_smem_includes_pipeline_alignment_reserve(self) -> None:
+        candidate = normalize_fwd_config(
+            load_engine="tma",
+            schedule="three_role",
+            bf16_tile_k=32,
+            bf16_swizzle="none",
+            bf16_stages=2,
+            mxfp8_stages=2,
+            quantizer_warps=4,
+        )
+        # Explicit arrays consume 100,352 bytes. The staged CuTe struct adds
+        # one complete 1-KiB alignment quantum for its pipeline state.
+        self.assertEqual(_fused_smem_bytes(candidate), 101_376)
+
     def test_backward_adapter_rejects_runtime_smem_overhead_before_launch(self) -> None:
         raw_limit = _gemm_launch_smem_bytes(
             DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG.dx.gemm
