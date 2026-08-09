@@ -95,6 +95,30 @@ class MXFP8ConfigTests(unittest.TestCase):
             config.implementation_rejection(MXFP8Problem(65, 129, 128)),
         )
 
+    def test_logical_transpose_requires_layout_aware_smem_loads(self) -> None:
+        problem = MXFP8Problem(128, 128, 128)
+        vector = normalize_fwd_config(
+            load_engine="tma",
+            schedule="three_role",
+            bf16_swizzle="none",
+            quant_vec=8,
+            quant_load_bits=128,
+        )
+        self.assertIn(
+            "layout-aware 16-bit loads",
+            vector.oriented_implementation_rejection(
+                problem, "row", "transpose"
+            ),
+        )
+        scalar = normalize_fwd_config(
+            load_engine="tma", schedule="three_role", quant_load_bits=16
+        )
+        self.assertIsNone(
+            scalar.oriented_implementation_rejection(
+                problem, "transpose", "transpose"
+            )
+        )
+
     def test_baseline_compiles_without_a_visible_gpu(self) -> None:
         compiled = compile_mxfp8_fwd(
             MXFP8Problem(128, 128, 128), MXFP8FwdConfig()

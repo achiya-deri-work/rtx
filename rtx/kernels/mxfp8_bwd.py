@@ -318,19 +318,24 @@ class MXFP8BwdConfig:
         return None if reason is None else f"dW: {reason}"
 
 
-DEFAULT_MXFP8_BWD_CONFIG = MXFP8BwdConfig()
+DEFAULT_FUSED_MXFP8_BWD_CONFIG = MXFP8BwdConfig()
 
 
 DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG = replace(
-    DEFAULT_MXFP8_BWD_CONFIG,
-    dx=replace(DEFAULT_MXFP8_BWD_CONFIG.dx, backend="decomposed"),
-    dw=replace(DEFAULT_MXFP8_BWD_CONFIG.dw, backend="decomposed"),
+    DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+    dx=replace(DEFAULT_FUSED_MXFP8_BWD_CONFIG.dx, backend="decomposed"),
+    dw=replace(DEFAULT_FUSED_MXFP8_BWD_CONFIG.dw, backend="decomposed"),
 )
+
+# The fused families are searchable, but until their CTAs share quantized
+# operands the measured quantize-once implementation is the safe runtime seed.
+DEFAULT_MXFP8_BWD_CONFIG = DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG
 
 
 __all__ = [
     "DEFAULT_MXFP8_BWD_CONFIG",
     "DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG",
+    "DEFAULT_FUSED_MXFP8_BWD_CONFIG",
     "MXFP8BwdConfig",
     "MXFP8BwdMatmulConfig",
 ]

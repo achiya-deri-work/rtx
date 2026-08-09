@@ -413,10 +413,10 @@ class MXFP8FwdConfig:
         """Validate the fused kernel for physical row or logical-transpose views.
 
         A transpose is represented only by the GMEM tensor layout ``(1, rows)``.
-        TMA can move that physical layout into the ordinary row/K SMEM tile, so
-        quantization and MMA remain identical to forward.  ``cp.async`` and
-        vector scalar loads, on the other hand, require adjacent logical-K
-        values and therefore are not legal for a transposed source.
+        TMA moves that physical layout into an MN-major staging tile and the
+        quantizer emits the ordinary K-major FP8 MMA tile. ``cp.async`` and
+        vector SMEM/register loads require adjacent logical-K values and are not
+        legal for a transposed source; the layout-aware 16-bit path is.
         """
 
         reason = self.implementation_rejection(problem)
@@ -429,17 +429,13 @@ class MXFP8FwdConfig:
         transposed = a_orientation == "transpose" or b_orientation == "transpose"
         if transposed and self.load_engine == "cpasync":
             return "logical-transpose operands require scalar or TMA transport"
-        if (
-            transposed
-            and self.load_engine == "scalar"
-            and self.quant_load_bits != 16
-        ):
-            return "logical-transpose scalar transport requires 16-bit loads"
+        if transposed and self.quant_load_bits != 16:
+            return "logical-transpose quantization requires layout-aware 16-bit loads"
         return None
 
 
 DEFAULT_MXFP8_FWD_CONFIG = MXFP8FwdConfig()
-MXFP8_FWD_KERNEL_REVISION = 13
+MXFP8_FWD_KERNEL_REVISION = 14
 
 
 # Block coordinates supplement, rather than replace, their primitive fields.

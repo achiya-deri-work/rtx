@@ -25,6 +25,10 @@ _LAZY_EXPORTS = {
     "MXFP8FwdConfig": ("kernels.mxfp8", "MXFP8FwdConfig"),
     "MXFP8Problem": ("kernels.mxfp8", "MXFP8Problem"),
     "DEFAULT_MXFP8_BWD_CONFIG": ("fp8_bwd", "DEFAULT_MXFP8_BWD_CONFIG"),
+    "DEFAULT_FUSED_MXFP8_BWD_CONFIG": (
+        "fp8_bwd",
+        "DEFAULT_FUSED_MXFP8_BWD_CONFIG",
+    ),
     "MXFP8BwdConfig": ("fp8_bwd", "MXFP8BwdConfig"),
     "MXFP8BwdMatmulConfig": ("fp8_bwd", "MXFP8BwdMatmulConfig"),
     "mxfp8_linear_backward": ("fp8_bwd", "mxfp8_linear_backward"),

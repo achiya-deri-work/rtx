@@ -97,7 +97,9 @@ def _long_reduction_case(m: int, *, reduction: str) -> dict[str, object]:
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
     grad_output = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
-    config = rtx.DEFAULT_MXFP8_BWD_CONFIG
+    # Exercise fused backward explicitly. The public untuned seed remains the
+    # measured quantize-once family until cross-CTA quantization reuse lands.
+    config = rtx.DEFAULT_FUSED_MXFP8_BWD_CONFIG
     if reduction != "full_fp32":
         choices = tuple(
             (parts, reduction_tile)

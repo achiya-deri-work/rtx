@@ -209,6 +209,12 @@ class MXFP8LinearFwdKernel:
             "64b": cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW64,
             "128b": cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128,
         }
+        mn_swizzle_kinds = {
+            "none": cute.nvgpu.warpgroup.SmemLayoutAtomKind.MN_INTER,
+            "32b": cute.nvgpu.warpgroup.SmemLayoutAtomKind.MN_SW32,
+            "64b": cute.nvgpu.warpgroup.SmemLayoutAtomKind.MN_SW64,
+            "128b": cute.nvgpu.warpgroup.SmemLayoutAtomKind.MN_SW128,
+        }
         # Every choice is a legal K-major ldmatrix atom; unlike the previous
         # heuristic-only path, the bank-conflict swizzle is part of generated
         # shared-memory addressing and therefore a real tuning coordinate.
@@ -258,17 +264,34 @@ class MXFP8LinearFwdKernel:
             SF_VEC_SIZE,
             cfg.mxfp8_stages,
         )
-        bf16_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            swizzle_kinds[cfg.bf16_swizzle],
+        # TMA follows the contiguous basis of each GMEM tensor.  A metadata-only
+        # transpose has stride (1, rows), so its staging tile must be MN-major;
+        # using a K-major staging atom would reinterpret rather than transpose
+        # the tile.  The quantizer indexes either layout logically and still
+        # emits the final FP8 MMA operands in their required K-major layouts.
+        bf16_a_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+            (
+                mn_swizzle_kinds[cfg.bf16_swizzle]
+                if self.a_orientation == "transpose"
+                else swizzle_kinds[cfg.bf16_swizzle]
+            ),
+            BFloat16,
+        )
+        bf16_b_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+            (
+                mn_swizzle_kinds[cfg.bf16_swizzle]
+                if self.b_orientation == "transpose"
+                else swizzle_kinds[cfg.bf16_swizzle]
+            ),
             BFloat16,
         )
         self.bf16_a_smem_layout = cute.tile_to_shape(
-            bf16_atom,
+            bf16_a_atom,
             (cfg.tile_m, cfg.bf16_tile_k, cfg.bf16_stages),
             order=(0, 1, 2),
         )
         self.bf16_b_smem_layout = cute.tile_to_shape(
-            bf16_atom,
+            bf16_b_atom,
             (cfg.tile_n, cfg.bf16_tile_k, cfg.bf16_stages),
             order=(0, 1, 2),
         )
@@ -742,9 +765,7 @@ class MXFP8LinearFwdKernel:
                     linear_tile * self.work_tiles_per_cta + work_slot
                 )
             split_id = Int32(0)
-            if cutlass.const_expr(
-                self.split_reduction > 1 and not self.atomic_output
-            ):
+            if cutlass.const_expr(self.split_reduction > 1):
                 split_id = work_linear // total_tiles
                 work_linear = work_linear % total_tiles
             # Grouped rasterization is bijective even for a partial final
@@ -783,7 +804,9 @@ class MXFP8LinearFwdKernel:
             # same per-thread coordinate order.  The identity tensor supplies tail
             # predicates for non-multiple M/N dimensions.
             out_matrix = out
-            if cutlass.const_expr(self.split_reduction > 1):
+            if cutlass.const_expr(
+                self.split_reduction > 1 and not self.atomic_output
+            ):
                 out_matrix = cute.make_tensor(
                     out.iterator
                     + split_id * self.problem.m * self.problem.n,

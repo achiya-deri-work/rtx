@@ -28,6 +28,7 @@ from rtx.kernels.mxfp8_fwd import (
 from rtx.kernels.mxfp8_reduce import compile_mxfp8_workspace_reduce
 from rtx.kernels.mxfp8_bwd import (
     DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+    DEFAULT_FUSED_MXFP8_BWD_CONFIG,
     DEFAULT_MXFP8_BWD_CONFIG,
 )
 from rtx.kernels.mxfp8_quant import (
@@ -43,14 +44,16 @@ def _has_sm120() -> bool:
 
 
 class TestMXFP8BwdConfiguration(unittest.TestCase):
-    def test_default_maps_forward_axes_to_both_backward_gemms(self) -> None:
+    def test_default_is_measured_safe_seed_and_fused_family_is_exposed(self) -> None:
         problem = MXFP8Problem(512, 1536, 1536)
         self.assertIsNone(DEFAULT_MXFP8_BWD_CONFIG.rejection(problem))
         self.assertIsNone(
             DEFAULT_MXFP8_BWD_CONFIG.implementation_rejection(problem)
         )
-        self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.dx.backend, "fused")
-        self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.dw.backend, "fused")
+        self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.dx.backend, "decomposed")
+        self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.dw.backend, "decomposed")
+        self.assertEqual(DEFAULT_FUSED_MXFP8_BWD_CONFIG.dx.backend, "fused")
+        self.assertEqual(DEFAULT_FUSED_MXFP8_BWD_CONFIG.dw.backend, "fused")
 
     def test_forward_scales_are_not_admitted_as_backward_scales(self) -> None:
         problem = MXFP8Problem(510, 1536, 1536)
@@ -184,7 +187,7 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
 
     def test_fused_workspace_reduction_is_executable(self) -> None:
         candidate = update_bwd_config(
-            DEFAULT_MXFP8_BWD_CONFIG,
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG,
             {
                 "dw": {
                     "reduction": "split_fp32_workspace",
@@ -200,7 +203,7 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
 
     def test_fused_atomic_reduction_is_executable(self) -> None:
         candidate = update_bwd_config(
-            DEFAULT_MXFP8_BWD_CONFIG,
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG,
             {
                 "dw": {
                     "reduction": "split_fp32_atomic",
@@ -218,19 +221,19 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
         problem = MXFP8Problem(128, 128, 128)
         compile_mxfp8_fwd(
             problem,
-            DEFAULT_MXFP8_BWD_CONFIG.dx.fused,
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG.dx.fused,
             a_orientation="row",
             b_orientation="transpose",
         )
         compile_mxfp8_fwd(
             problem,
-            DEFAULT_MXFP8_BWD_CONFIG.dw.fused,
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG.dw.fused,
             a_orientation="transpose",
             b_orientation="transpose",
         )
         compile_mxfp8_split_fwd(
             MXFP8Problem(128, 128, 512),
-            DEFAULT_MXFP8_BWD_CONFIG.dw.fused,
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG.dw.fused,
             a_orientation="transpose",
             b_orientation="transpose",
             split_reduction=4,
@@ -238,7 +241,7 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
         )
         compile_mxfp8_atomic_split_fwd(
             MXFP8Problem(128, 128, 512),
-            DEFAULT_MXFP8_BWD_CONFIG.dw.fused,
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG.dw.fused,
             a_orientation="transpose",
             b_orientation="transpose",
             split_reduction=4,
@@ -395,10 +398,10 @@ class TestMXFP8BwdCuda(unittest.TestCase):
             quant_vec=8,
             quant_math="bf16x2",
             quant_amax="bf16_bits",
-            quant_load_bits=128,
+            quant_load_bits=16,
         )
         fused_tma = update_bwd_config(
-            DEFAULT_MXFP8_BWD_CONFIG,
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG,
             {
                 "dx": {"fused": asdict(tma)},
                 "dw": {"fused": asdict(tma)},

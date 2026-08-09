@@ -300,6 +300,7 @@ class _PackedInferenceAutotuneRequest:
     cache_dir: str | None
 
 
+@torch.compiler.assume_constant_result
 def _intern_config(config: MXFP8FwdConfig) -> str:
     key = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
     with _CONFIG_LOCK:

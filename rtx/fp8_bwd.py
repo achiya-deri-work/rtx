@@ -14,6 +14,7 @@ import torch
 
 from .kernels.mxfp8 import MXFP8Problem
 from .kernels.mxfp8_bwd import (
+    DEFAULT_FUSED_MXFP8_BWD_CONFIG,
     DEFAULT_MXFP8_BWD_CONFIG,
     MXFP8BwdConfig,
     MXFP8BwdMatmulConfig,
@@ -182,7 +183,10 @@ class _AtomicSplitFusedMatmulRunner:
     ) -> None:
         self.accumulator.zero_()
         self.partial(source_a, source_b, self.accumulator)
-        self.converter(self.accumulator, out)
+        # The atomic partial kernel needs a matrix view, while the shared
+        # workspace reducer deliberately exposes its input as one contiguous
+        # vector.  This is a metadata-only view; no transpose or copy occurs.
+        self.converter(self.accumulator.reshape(-1), out)
 
 
 @dataclass(slots=True)
@@ -813,6 +817,7 @@ def mxfp8_linear_backward(
 
 __all__ = [
     "DEFAULT_MXFP8_BWD_CONFIG",
+    "DEFAULT_FUSED_MXFP8_BWD_CONFIG",
     "MXFP8BwdConfig",
     "MXFP8BwdMatmulConfig",
     "mxfp8_linear_backward",

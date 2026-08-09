@@ -5,16 +5,24 @@ project follows semantic versioning while it is in active alpha development.
 
 ## 0.10.0
 
-- Make fused dynamic quantization/MMA the default MXFP8 backward backend by
-  compiling the forward-class CuTe kernel over row-major or metadata-only
-  logical-transpose tensor layouts. dX and dW now expose the complete dynamic
-  forward schedule independently without materializing E4M3 operands or E8M0
-  scales in global memory.
+- Add fused dynamic quantization/MMA MXFP8 backward by compiling the
+  forward-class CuTe kernel over row-major or metadata-only logical-transpose
+  tensor layouts. dX and dW expose the complete dynamic forward schedule
+  independently without materializing E4M3 operands or E8M0 scales in global
+  memory.
 - Add executable split-K dW with FP32 partial workspaces and serial, tree, or
   persistent-tree FP32 epilogues, an FP32 atomic alternative, and dual-stream
   dX/dW execution.
+- Stage logical-transpose TMA operands in CuTe MN-major shared-memory layouts,
+  use layout-aware SMEM loads before emitting K-major MXFP8 MMA tiles, and
+  validate all backward families on SM120 through the production matrix.
+- Keep config interning opaque to Dynamo so eager and
+  `torch.compile(fullgraph=True)` share the same registered forward/backward
+  kernels.
 - Preserve the decomposed quantize-plus-GEMM implementation as an explicitly
-  selectable benchmark baseline and advance the backward kernel revision.
+  selectable family and measured untuned runtime seed; fused families remain
+  fully autotunable while cross-CTA quantization reuse is developed. Advance
+  the backward kernel revision.
 
 ## 0.9.0
 

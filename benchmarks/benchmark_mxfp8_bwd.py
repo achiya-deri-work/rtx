@@ -16,7 +16,7 @@ from rtx.bwd_experiments import BwdBenchmarkHarness
 from rtx.kernels.mxfp8 import normalize_fwd_config
 from rtx.kernels.mxfp8_bwd import (
     DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
-    DEFAULT_MXFP8_BWD_CONFIG,
+    DEFAULT_FUSED_MXFP8_BWD_CONFIG,
 )
 from rtx.prequant_experiments import BenchmarkProtocol, ShapeSpec
 
@@ -46,10 +46,13 @@ def _configs(shape: ShapeSpec) -> dict[str, object]:
         quant_vec=8,
         quant_math="bf16x2",
         quant_amax="bf16_bits",
-        quant_load_bits=128,
+        # Logical-transpose inputs are contiguous along MN, not K.  TMA stages
+        # them in an MN-major CuTe layout and the quantizer uses layout-aware
+        # scalar loads before emitting K-major FP8 MMA tiles.
+        quant_load_bits=16,
     )
     fused_tma = update_bwd_config(
-        DEFAULT_MXFP8_BWD_CONFIG,
+        DEFAULT_FUSED_MXFP8_BWD_CONFIG,
         {
             "dx": {"fused": asdict(tma_three_role)},
             "dw": {"fused": asdict(tma_three_role)},
@@ -80,7 +83,7 @@ def _configs(shape: ShapeSpec) -> dict[str, object]:
     )
     return {
         "decomposed": DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
-        "fused_scalar": DEFAULT_MXFP8_BWD_CONFIG,
+        "fused_scalar": DEFAULT_FUSED_MXFP8_BWD_CONFIG,
         "fused_tma_three_role": fused_tma,
         "fused_tma_workspace": workspace,
         "fused_tma_atomic": atomic,
