@@ -460,6 +460,14 @@ def _build_matmul_runner(
             vector=config.reduction_vector,
             persistent_waves=config.reduction_waves,
         )
+    elif config.reduction == "cluster_fp32":
+        gemm = compile_mxfp8_gemm(
+            problem,
+            config.gemm,
+            split_reduction=config.split_reduction,
+            reduction_tile=config.reduction_tile,
+            cluster_output=True,
+        )
     else:
         gemm = compile_mxfp8_gemm(problem, config.gemm)
     return _MatmulRunner(

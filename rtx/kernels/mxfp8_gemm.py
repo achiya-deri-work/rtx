@@ -21,6 +21,7 @@ from cutlass import (
     Float8E8M0FNU,
     Float32,
     Int32,
+    Int64,
     Uint8,
 )
 from cutlass.cute.nvgpu import cpasync, warp
@@ -45,6 +46,7 @@ class MXFP8GemmKernel:
         split_reduction: int = 1,
         reduction_tile: int = 0,
         atomic_output: bool = False,
+        cluster_output: bool = False,
     ):
         rejection = config.rejection(problem)
         if rejection is not None:
@@ -54,15 +56,22 @@ class MXFP8GemmKernel:
         self.split_reduction = split_reduction
         self.reduction_tile = reduction_tile
         self.atomic_output = atomic_output
+        self.cluster_output = cluster_output
         if split_reduction < 1:
             raise ValueError("split_reduction must be positive")
-        if split_reduction == 1 and (reduction_tile != 0 or atomic_output):
+        if split_reduction == 1 and (
+            reduction_tile != 0 or atomic_output or cluster_output
+        ):
             raise ValueError("an unsplit GEMM must use reduction_tile=0")
+        if atomic_output and cluster_output:
+            raise ValueError("atomic and cluster outputs are mutually exclusive")
         if split_reduction > 1:
             if config.epilogue != "direct":
                 raise ValueError("split-K prequant GEMM requires direct FP32 output")
             if config.tiles_per_cta != 1:
                 raise ValueError("split-K and multi-output persistence are independent")
+            if cluster_output and split_reduction not in (2, 4, 8):
+                raise ValueError("SM120 CTA clusters support split counts 2, 4, or 8")
             if reduction_tile <= 0 or reduction_tile % config.tile_k:
                 raise ValueError("reduction_tile must be a positive tile-K multiple")
             if not (
@@ -88,6 +97,59 @@ class MXFP8GemmKernel:
         self.epilogue_barrier = pipeline.NamedBarrier(
             barrier_id=2, num_threads=config.num_mma_warps * 32
         )
+
+    @cute.jit
+    def _cluster_broadcast(
+        self,
+        barriers: cute.Tensor,
+        barrier_index: cutlass.Constexpr,
+        phase: Int32,
+        cluster_rank: Int32,
+    ) -> None:
+        """Rank 0 publishes a phase to one local mbarrier in every CTA."""
+        cute.arch.sync_threads()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        if warp_idx == 0:
+            with cute.arch.elect_one():
+                if cluster_rank == 0:
+                    for peer in cutlass.range_constexpr(self.split_reduction):
+                        peer_barrier = cute.arch.map_dsmem_ptr(
+                            barriers.iterator + barrier_index, Int32(peer)
+                        )
+                        nvvm.mbarrier_arrive(
+                            peer_barrier,
+                            scope=nvvm.MemScope.CLUSTER,
+                        )
+                cute.arch.mbarrier_wait(
+                    barriers.iterator + barrier_index, phase
+                )
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def _cluster_gather(
+        self,
+        barriers: cute.Tensor,
+        barrier_index: cutlass.Constexpr,
+        phase: Int32,
+        cluster_rank: Int32,
+    ) -> None:
+        """Every CTA publishes to rank 0; only rank 0 waits for completion."""
+        cute.arch.sync_threads()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        if warp_idx == 0:
+            with cute.arch.elect_one():
+                leader_barrier = cute.arch.map_dsmem_ptr(
+                    barriers.iterator + barrier_index, Int32(0)
+                )
+                nvvm.mbarrier_arrive(
+                    leader_barrier,
+                    scope=nvvm.MemScope.CLUSTER,
+                )
+                if cluster_rank == 0:
+                    cute.arch.mbarrier_wait(
+                        barriers.iterator + barrier_index, phase
+                    )
+        cute.arch.sync_threads()
 
     def _setup_static_layouts(self) -> None:
         cfg = self.config
@@ -354,6 +416,10 @@ class MXFP8GemmKernel:
                 ],
                 1024,
             ]
+            cluster_barrier: cute.struct.Align[
+                cute.struct.MemRange[Int64, 2 if self.cluster_output else 0],
+                8,
+            ]
 
         self.shared_storage = SharedStorage
         m_tiles = cute.ceil_div(self.problem.m, cfg.tile_m)
@@ -379,7 +445,7 @@ class MXFP8GemmKernel:
                 cute.slice_(scale_b_flat_layout, (None, 0)),
                 (scale_b_tile_elems,),
             )
-            self.kernel(
+            launch = self.kernel(
                 qx, qw, sx, sw, out,
                 tma_x, tma_x_tensor, tma_w, tma_w_tensor,
                 tma_sx, tma_sx_tensor, tma_sw, tma_sw_tensor,
@@ -387,13 +453,22 @@ class MXFP8GemmKernel:
                 self.a_layout, self.b_layout,
                 self.sfa_layout, self.sfb_layout,
                 scale_a_flat_layout, scale_b_flat_layout, self.out_layout,
-            ).launch(
-                grid=(self.grid_ctas, 1, 1),
-                block=(cfg.num_threads, 1, 1),
-                stream=stream,
             )
+            if cutlass.const_expr(self.cluster_output):
+                launch.launch(
+                    grid=(self.grid_ctas, 1, 1),
+                    block=(cfg.num_threads, 1, 1),
+                    cluster=(self.split_reduction, 1, 1),
+                    stream=stream,
+                )
+            else:
+                launch.launch(
+                    grid=(self.grid_ctas, 1, 1),
+                    block=(cfg.num_threads, 1, 1),
+                    stream=stream,
+                )
         else:
-            self.kernel(
+            launch = self.kernel(
                 qx, qw, sx, sw, out,
                 tma_x, tma_x_tensor, tma_w, tma_w_tensor,
                 tma_x, tma_x_tensor, tma_w, tma_w_tensor,
@@ -401,11 +476,20 @@ class MXFP8GemmKernel:
                 self.a_layout, self.b_layout,
                 self.sfa_layout, self.sfb_layout,
                 scale_a_flat_layout, scale_b_flat_layout, self.out_layout,
-            ).launch(
-                grid=(self.grid_ctas, 1, 1),
-                block=(cfg.num_threads, 1, 1),
-                stream=stream,
             )
+            if cutlass.const_expr(self.cluster_output):
+                launch.launch(
+                    grid=(self.grid_ctas, 1, 1),
+                    block=(cfg.num_threads, 1, 1),
+                    cluster=(self.split_reduction, 1, 1),
+                    stream=stream,
+                )
+            else:
+                launch.launch(
+                    grid=(self.grid_ctas, 1, 1),
+                    block=(cfg.num_threads, 1, 1),
+                    stream=stream,
+                )
 
     @cute.kernel
     def kernel(
@@ -481,6 +565,26 @@ class MXFP8GemmKernel:
         s_sfb = storage.sfb.get_tensor(sfb_layout)
         s_sfa_flat = cute.make_tensor(s_sfa.iterator, scale_a_flat_layout)
         s_sfb_flat = cute.make_tensor(s_sfb.iterator, scale_b_flat_layout)
+        if cutlass.const_expr(self.cluster_output):
+            s_cluster_barrier = storage.cluster_barrier.get_tensor(
+                cute.make_layout((2,), stride=(1,))
+            )
+            if warp_idx == 0:
+                with cute.arch.elect_one():
+                    nvvm.mbarrier_init(
+                        s_cluster_barrier.iterator,
+                        1,
+                    )
+                    nvvm.mbarrier_init(
+                        s_cluster_barrier.iterator + 1,
+                        self.split_reduction,
+                    )
+            cute.arch.mbarrier_init_fence()
+            # One launch-time rendezvous publishes every CTA's initialized
+            # mbarrier. Repeated epilogue phases use the generation-counted
+            # barriers below rather than barrier.cluster phase reuse.
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
         if cutlass.const_expr(cfg.epilogue == "tma"):
             s_out = storage.out.get_tensor(
                 out_layout.outer, swizzle=out_layout.inner
@@ -616,7 +720,11 @@ class MXFP8GemmKernel:
             # Only its epilogue is predicated, avoiding duplicate output stores.
             work_linear = cutlass.min(raw_work_linear, total_work_tiles - 1)
             split_id = Int32(0)
-            if cutlass.const_expr(self.split_reduction > 1):
+            if cutlass.const_expr(self.cluster_output):
+                split_id = cute.arch.block_idx_in_cluster()
+                work_linear = cta_idx // self.split_reduction
+                active_tile = work_linear < total_tiles
+            elif cutlass.const_expr(self.split_reduction > 1):
                 split_id = work_linear // total_tiles
                 work_linear = work_linear % total_tiles
             if cutlass.const_expr(cfg.tile_locality == "same_a"):
@@ -691,7 +799,9 @@ class MXFP8GemmKernel:
                 out.iterator
                 + (
                     split_id * self.problem.m * self.problem.n
-                    if self.split_reduction > 1 and not self.atomic_output
+                    if self.split_reduction > 1
+                    and not self.atomic_output
+                    and not self.cluster_output
                     else 0
                 ),
                 cute.make_layout(
@@ -977,7 +1087,98 @@ class MXFP8GemmKernel:
                 tma_pipeline.producer_tail(producer_state)
 
             if cutlass.const_expr(cfg.epilogue == "direct"):
-                if active_tile:
+                if cutlass.const_expr(self.cluster_output):
+                    # Reuse the now-dead A pipeline storage as a contiguous
+                    # FP32 DSMEM reduction window.  The full accumulator tile
+                    # need not fit: each CTA contributes register fragments in
+                    # chunks, and cluster rank 0 converts each completed chunk
+                    # to BF16 exactly once.
+                    scratch_elements = cute.cosize(a_layout) // 4
+                    mma_threads = cfg.num_mma_warps * 32
+                    accum_elements = cute.size(accumulators)
+                    chunk_elements = cutlass.min(
+                        accum_elements,
+                        scratch_elements // mma_threads,
+                    )
+                    scratch = cute.make_tensor(
+                        cute.recast_ptr(s_a.iterator, dtype=Float32),
+                        cute.make_layout((scratch_elements,), stride=(1,)),
+                    )
+                    cluster_rank = cute.arch.block_idx_in_cluster()
+                    leader_ptr = cute.arch.map_dsmem_ptr(
+                        scratch.iterator, Int32(0)
+                    )
+                    chunk_count = cute.ceil_div(accum_elements, chunk_elements)
+                    # The producer warp alone executes producer_tail above.
+                    # Do not overlay the A stages until every warp has observed
+                    # that tail; otherwise a late TMA completion can overwrite
+                    # rank 0's freshly zeroed FP32 reduction window.
+                    cute.arch.sync_threads()
+                    for chunk in cutlass.range_constexpr(chunk_count):
+                        first_elem = chunk * chunk_elements
+                        final_elem = cutlass.min(
+                            first_elem + chunk_elements, accum_elements
+                        )
+                        if cluster_rank == 0 and warp_idx < cfg.num_mma_warps:
+                            for elem in cutlass.range(
+                                first_elem, final_elem, unroll_full=True
+                            ):
+                                scratch[
+                                    tidx * chunk_elements + elem - first_elem
+                                ] = Float32(0.0)
+                        self._cluster_broadcast(
+                            s_cluster_barrier,
+                            0,
+                            Int32((chunk * 2) & 1),
+                            cluster_rank,
+                        )
+                        if warp_idx < cfg.num_mma_warps:
+                            for elem in cutlass.range(
+                                first_elem, final_elem, unroll_full=True
+                            ):
+                                nvvm.red(
+                                    nvvm.ReductionOp.ADD,
+                                    nvvm.ReductionType.F32,
+                                    leader_ptr
+                                    + tidx * chunk_elements
+                                    + elem
+                                    - first_elem,
+                                    accumulators[elem],
+                                    mem_order="relaxed",
+                                    mem_scope="cluster",
+                                )
+                        self._cluster_gather(
+                            s_cluster_barrier,
+                            1,
+                            Int32(chunk & 1),
+                            cluster_rank,
+                        )
+                        if cluster_rank == 0 and warp_idx < cfg.num_mma_warps:
+                            for elem in cutlass.range(
+                                first_elem, final_elem, unroll_full=True
+                            ):
+                                coord = t_cc_out[elem]
+                                if (
+                                    active_tile
+                                    and coord[0] < self.problem.m
+                                    and coord[1] < self.problem.n
+                                ):
+                                    t_cg_out[elem] = BFloat16(
+                                        scratch[
+                                            tidx * chunk_elements
+                                            + elem
+                                            - first_elem
+                                        ]
+                                    )
+                        # Rank 0 must finish reading the window before any CTA
+                        # starts the next chunk's zero/contribution phase.
+                        self._cluster_broadcast(
+                            s_cluster_barrier,
+                            0,
+                            Int32((chunk * 2 + 1) & 1),
+                            cluster_rank,
+                        )
+                elif active_tile:
                     if warp_idx < cfg.num_mma_warps:
                         for elem in cutlass.range(
                             cute.size(accumulators), unroll_full=True
@@ -1023,6 +1224,7 @@ def compile_mxfp8_gemm(
     split_reduction: int = 1,
     reduction_tile: int = 0,
     atomic_output: bool = False,
+    cluster_output: bool = False,
 ):
     kernel = MXFP8GemmKernel(
         problem,
@@ -1030,6 +1232,7 @@ def compile_mxfp8_gemm(
         split_reduction=split_reduction,
         reduction_tile=reduction_tile,
         atomic_output=atomic_output,
+        cluster_output=cluster_output,
     )
     qx = cute.runtime.make_fake_tensor(
         Float8E4M3FN,
@@ -1082,7 +1285,7 @@ def compile_mxfp8_gemm(
             stride=(problem.k // 128 * 512, 512, 1),
             assumed_align=16,
         )
-    if split_reduction > 1:
+    if split_reduction > 1 and not cluster_output:
         out_elements = (
             problem.m * problem.n
             if atomic_output

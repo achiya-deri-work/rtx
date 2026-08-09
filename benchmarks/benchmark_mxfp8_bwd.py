@@ -270,6 +270,45 @@ def _configs(shape: ShapeSpec, *, reuse_sweep: bool = False) -> dict[str, object
                 }
             },
         )
+        if parts <= 8:
+            configs["decomposed_cluster"] = update_bwd_config(
+                DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+                {
+                    "dw": {
+                        **decomposed_split_base,
+                        "reduction": "cluster_fp32",
+                        "workspace_epilogue": "none",
+                    }
+                },
+            )
+        for cluster_parts in (2, 4, 8):
+            cluster_tiles = tuple(
+                candidate
+                for candidate in (128, 256, 512, 1024, 2048, 4096)
+                if (cluster_parts - 1) * candidate
+                < shape.m
+                <= cluster_parts * candidate
+            )
+            if not cluster_tiles:
+                continue
+            cluster_tile = min(
+                cluster_tiles,
+                key=lambda candidate: cluster_parts * candidate - shape.m,
+            )
+            configs[f"decomposed_cluster_s{cluster_parts}_t{cluster_tile}"] = (
+                update_bwd_config(
+                    DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+                    {
+                        "dw": {
+                            **decomposed_split_base,
+                            "reduction": "cluster_fp32",
+                            "split_reduction": cluster_parts,
+                            "reduction_tile": cluster_tile,
+                            "workspace_epilogue": "none",
+                        }
+                    },
+                )
+            )
         configs["fused_tma_workspace"] = update_bwd_config(
             fused_tma,
             {

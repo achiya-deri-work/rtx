@@ -207,7 +207,11 @@ class MXFP8BwdMatmulConfig:
             return "full reduction has no split/workspace coordinates"
         if self.reduction != "full_fp32" and self.split_reduction == 1:
             return "split/cluster reductions require more than one partition"
-        if self.reduction in ("split_fp32_workspace", "split_fp32_atomic"):
+        if self.reduction in (
+            "split_fp32_workspace",
+            "split_fp32_atomic",
+            "cluster_fp32",
+        ):
             if (
                 self.reduction == "split_fp32_workspace"
                 and self.workspace_epilogue == "none"
@@ -218,6 +222,11 @@ class MXFP8BwdMatmulConfig:
                 and self.workspace_epilogue != "none"
             ):
                 return "atomic split reduction does not use a workspace epilogue"
+            if self.reduction == "cluster_fp32":
+                if self.split_reduction not in (2, 4, 8):
+                    return "cluster reduction requires 2, 4, or 8 CTAs"
+                if self.workspace_epilogue != "none":
+                    return "cluster reduction does not use a workspace epilogue"
             if not (
                 (self.split_reduction - 1) * self.reduction_tile < problem.k
                 <= self.split_reduction * self.reduction_tile
@@ -226,7 +235,7 @@ class MXFP8BwdMatmulConfig:
             if self.reduction_tile % self.gemm.tile_k:
                 return "reduction tile must be divisible by GEMM tile_k"
             if self.gemm.epilogue != "direct" or self.gemm.store_vec != 1:
-                return "decomposed split partials require gemm direct FP32 output"
+                return "decomposed split/cluster reduction requires direct GEMM output"
             if self.gemm.tiles_per_cta != 1:
                 return "decomposed split-K cannot also use multi-output persistence"
         if self.tile_scheduler not in ("static", "persistent"):
@@ -260,8 +269,6 @@ class MXFP8BwdMatmulConfig:
             return reason
         if self.backend == "fused":
             return None
-        if self.reduction == "cluster_fp32":
-            return f"reduction family {self.reduction!r} is not implemented yet"
         if self.tile_scheduler != "static":
             return "persistent/multi-output backward GEMM is not implemented yet"
         return None

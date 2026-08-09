@@ -309,10 +309,21 @@ class MXFP8QuantCudaTests(unittest.TestCase):
             reduction_tile=128,
             atomic_output=True,
         )(qx, qw, sx, sw, accumulator)
+        cluster_out = torch.empty_like(expected)
+        compile_mxfp8_gemm(
+            problem,
+            config,
+            split_reduction=4,
+            reduction_tile=128,
+            cluster_output=True,
+        )(qx, qw, sx, sw, cluster_out)
         reduce_one(accumulator, atomic_out)
         torch.cuda.synchronize()
         torch.testing.assert_close(workspace_out, expected, rtol=0, atol=1e-5)
         torch.testing.assert_close(atomic_out, expected, rtol=0, atol=1e-5)
+        # DSMEM FP32 atomics may combine the four partitions in a different
+        # order, so the final BF16 value can differ by one tiny ulp.
+        torch.testing.assert_close(cluster_out, expected, rtol=0, atol=1e-4)
 
     def test_native_scale_tma_paths_match_row_major(self) -> None:
         if torch.cuda.get_device_capability()[0] != 12:

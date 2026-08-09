@@ -121,25 +121,33 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
                 name,
             )
 
-    def test_unimplemented_cluster_reduction_is_named_not_a_noop(self) -> None:
+    def test_cluster_reduction_is_an_executable_search_family(self) -> None:
         candidate = update_bwd_config(
             DEFAULT_DUAL_DECOMPOSED_MXFP8_BWD_CONFIG,
             {
                 "dw": {
                     "reduction": "cluster_fp32",
                     "split_reduction": 4,
+                    "reduction_tile": 128,
+                    "gemm": {
+                        "epilogue": "direct",
+                        "store_vec": 1,
+                    },
                 }
             },
         )
         reason = candidate.implementation_rejection(
             MXFP8Problem(512, 1536, 1536)
         )
-        self.assertIsNotNone(reason)
-        self.assertIn("cluster_fp32", reason)
+        self.assertIsNone(reason)
 
     def test_decomposed_workspace_and_atomic_reductions_are_executable(self) -> None:
         problem = MXFP8Problem(512, 1536, 1536)
-        for reduction in ("split_fp32_workspace", "split_fp32_atomic"):
+        for reduction in (
+            "split_fp32_workspace",
+            "split_fp32_atomic",
+            "cluster_fp32",
+        ):
             update = next(
                 value
                 for value in BWD_SEARCH_SPACE["dw_reduction"]

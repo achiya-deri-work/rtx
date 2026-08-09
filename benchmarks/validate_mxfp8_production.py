@@ -249,6 +249,11 @@ def main() -> None:
             reduction="split_fp32_atomic",
             backend="decomposed",
         ),
+        "long_sequence_dw_decomposed_cluster": lambda: _long_reduction_case(
+            1024 if args.quick else args.long_m,
+            reduction="cluster_fp32",
+            backend="decomposed",
+        ),
         "multiple_streams": _multiple_stream_case,
         "variable_shapes_bounded_cache": _variable_shape_cache_case,
     }
