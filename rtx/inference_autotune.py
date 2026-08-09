@@ -18,7 +18,7 @@ from .configs import (
 from .prequant_autotune import PREQUANT_SEARCH_SPACE
 
 
-INFERENCE_KERNEL_REVISION = 1
+INFERENCE_KERNEL_REVISION = 2
 
 _WEIGHT_ACTIVE_AXES = (
     "layout_transport",
@@ -40,6 +40,7 @@ _WEIGHT_ACTIVE_AXES = (
     "gemm_maxrregcount",
     "epilogue",
     "raster_group",
+    "gemm_persistence",
     "global_l2_fetch",
 )
 _FULLY_ACTIVE_AXES = (
@@ -57,6 +58,7 @@ _FULLY_ACTIVE_AXES = (
     "gemm_maxrregcount",
     "epilogue",
     "raster_group",
+    "gemm_persistence",
     "global_l2_fetch",
 )
 

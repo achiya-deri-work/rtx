@@ -44,6 +44,13 @@ class MXFP8GemmKernel:
         self.problem = problem
         self.config = config
         self.tile_shape_mnk = (config.tile_m, config.tile_n, config.tile_k)
+        self.m_tiles = (problem.m + config.tile_m - 1) // config.tile_m
+        self.n_tiles = (problem.n + config.tile_n - 1) // config.tile_n
+        self.total_tiles = self.m_tiles * self.n_tiles
+        self.grid_ctas = (
+            self.total_tiles + config.tiles_per_cta - 1
+        ) // config.tiles_per_cta
+        self.num_k_tiles = (problem.k + config.tile_k - 1) // config.tile_k
         scale_threads = config.num_mma_warps * 32
         if config.scale_role == "producer":
             scale_threads += 32
@@ -347,7 +354,7 @@ class MXFP8GemmKernel:
                 self.sfa_layout, self.sfb_layout,
                 scale_a_flat_layout, scale_b_flat_layout, self.out_layout,
             ).launch(
-                grid=(m_tiles * n_tiles, 1, 1),
+                grid=(self.grid_ctas, 1, 1),
                 block=(cfg.num_threads, 1, 1),
                 stream=stream,
             )
@@ -361,7 +368,7 @@ class MXFP8GemmKernel:
                 self.sfa_layout, self.sfb_layout,
                 scale_a_flat_layout, scale_b_flat_layout, self.out_layout,
             ).launch(
-                grid=(m_tiles * n_tiles, 1, 1),
+                grid=(self.grid_ctas, 1, 1),
                 block=(cfg.num_threads, 1, 1),
                 stream=stream,
             )
@@ -429,28 +436,9 @@ class MXFP8GemmKernel:
         )
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        linear_tile, _, _ = cute.arch.block_idx()
+        cta_idx, _, _ = cute.arch.block_idx()
         m_tiles = cute.ceil_div(self.problem.m, cfg.tile_m)
         n_tiles = cute.ceil_div(self.problem.n, cfg.tile_n)
-
-        if cutlass.const_expr(cfg.raster == "n"):
-            full_group = n_tiles * cfg.grid_swizzle
-            group = linear_tile // full_group
-            offset = linear_tile % full_group
-            rows_in_group = cutlass.min(
-                cfg.grid_swizzle, m_tiles - group * cfg.grid_swizzle
-            )
-            block_n = offset // rows_in_group
-            block_m = group * cfg.grid_swizzle + offset % rows_in_group
-        else:
-            full_group = m_tiles * cfg.grid_swizzle
-            group = linear_tile // full_group
-            offset = linear_tile % full_group
-            cols_in_group = cutlass.min(
-                cfg.grid_swizzle, n_tiles - group * cfg.grid_swizzle
-            )
-            block_m = offset // cols_in_group
-            block_n = group * cfg.grid_swizzle + offset % cols_in_group
 
         storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage)
         s_a = storage.a.get_tensor(a_layout.outer, swizzle=a_layout.inner)
@@ -528,13 +516,6 @@ class MXFP8GemmKernel:
             barrier_storage=storage.pipeline.data_ptr(),
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
         )
-        producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, cfg.stages
-        )
-        consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, cfg.stages
-        )
-
         thr_mma = tiled_mma.get_slice(tidx)
         t_cs_a = thr_mma.partition_A(s_a)
         t_cs_b = thr_mma.partition_B(s_b)
@@ -591,288 +572,373 @@ class MXFP8GemmKernel:
         t_cr_sfa_copy = thr_copy_sfa.retile(t_cr_sfa)
         t_cr_sfb_copy = thr_copy_sfb.retile(t_cr_sfb)
 
-        g_out = cute.local_tile(
-            out, (cfg.tile_m, cfg.tile_n), (block_m, block_n)
-        )
-        c_out = cute.local_tile(
-            cute.make_identity_tensor((self.problem.m, self.problem.n)),
-            (cfg.tile_m, cfg.tile_n),
-            (block_m, block_n),
-        )
-        t_cg_out = thr_mma.partition_C(g_out)
-        t_cc_out = thr_mma.partition_C(c_out)
-        accumulators = cute.make_rmem_tensor(t_cg_out.shape, Float32)
-        accumulators.fill(0.0)
+        total_tiles = m_tiles * n_tiles
+        for work_slot in cutlass.range_constexpr(cfg.tiles_per_cta):
+            raw_work_linear = cta_idx * cfg.tiles_per_cta + work_slot
+            active_tile = raw_work_linear < total_tiles
+            # A final partial CTA follows the full pipeline on the last valid
+            # tile so every unrolled slot advances identical barrier phases.
+            # Only its epilogue is predicated, avoiding duplicate output stores.
+            work_linear = cutlass.min(raw_work_linear, total_tiles - 1)
+            if cutlass.const_expr(cfg.tile_locality == "same_a"):
+                block_m = work_linear // n_tiles
+                block_n = work_linear % n_tiles
+            elif cutlass.const_expr(cfg.tile_locality == "same_b"):
+                block_n = work_linear // m_tiles
+                block_m = work_linear % m_tiles
+            elif cutlass.const_expr(cfg.tile_locality == "serpentine_a"):
+                block_m = work_linear // n_tiles
+                n_offset = work_linear % n_tiles
+                block_n = (
+                    n_offset
+                    if block_m % 2 == 0
+                    else n_tiles - 1 - n_offset
+                )
+            elif cutlass.const_expr(cfg.tile_locality == "serpentine_b"):
+                block_n = work_linear // m_tiles
+                m_offset = work_linear % m_tiles
+                block_m = (
+                    m_offset
+                    if block_n % 2 == 0
+                    else m_tiles - 1 - m_offset
+                )
+            elif cutlass.const_expr(cfg.raster == "n"):
+                full_group = n_tiles * cfg.grid_swizzle
+                group = work_linear // full_group
+                offset = work_linear % full_group
+                rows_in_group = cutlass.min(
+                    cfg.grid_swizzle,
+                    m_tiles - group * cfg.grid_swizzle,
+                )
+                block_n = offset // rows_in_group
+                block_m = (
+                    group * cfg.grid_swizzle + offset % rows_in_group
+                )
+            else:
+                full_group = m_tiles * cfg.grid_swizzle
+                group = work_linear // full_group
+                offset = work_linear % full_group
+                cols_in_group = cutlass.min(
+                    cfg.grid_swizzle,
+                    n_tiles - group * cfg.grid_swizzle,
+                )
+                block_m = offset // cols_in_group
+                block_n = (
+                    group * cfg.grid_swizzle + offset % cols_in_group
+                )
 
-        if cutlass.const_expr(cfg.epilogue == "tma"):
-            r2s_atom = cute.make_copy_atom(
-                warp.StMatrix8x8x16bOp(False, cfg.store_vec), BFloat16
+            # Reconstruct the exact circular-pipeline phase for this unrolled
+            # output tile. Carrying the mutable PipelineState Python object
+            # across an outer constexpr loop currently produces non-dominating
+            # SSA in CuTe DSL, while the phase itself is fully determined by
+            # the number of K stages completed by preceding work slots.
+            pipeline_count = work_slot * self.num_k_tiles
+            pipeline_index = pipeline_count % cfg.stages
+            pipeline_phase = (pipeline_count // cfg.stages) & 1
+            producer_state = pipeline.PipelineState(
+                cfg.stages,
+                Int32(pipeline_count),
+                Int32(pipeline_index),
+                Int32(1 ^ pipeline_phase),
             )
-            c_atom = cute.make_copy_atom(
-                warp.StMatrix8x8x16bOp(False, cfg.store_vec), BFloat16
+            consumer_state = pipeline.PipelineState(
+                cfg.stages,
+                Int32(pipeline_count),
+                Int32(pipeline_index),
+                Int32(pipeline_phase),
             )
-            c_copy = cute.make_tiled_copy_C_atom(c_atom, tiled_mma)
-            copy_r2s = cute.make_tiled_copy_S(r2s_atom, c_copy)
-            thr_r2s = copy_r2s.get_slice(tidx)
-            t_rs_s = thr_r2s.partition_D(s_out)
-            t_rs_acc = copy_r2s.retile(accumulators)
-            r_out_shape = cute.shape(thr_r2s.partition_S(s_out))
-            r_out = cute.make_rmem_tensor(
-                cute.make_layout(r_out_shape[:3]).shape, BFloat16
+
+            g_out = cute.local_tile(
+                out, (cfg.tile_m, cfg.tile_n), (block_m, block_n)
             )
-            g_out_tma = cute.local_tile(
-                tma_out_tensor,
+            c_out = cute.local_tile(
+                cute.make_identity_tensor((self.problem.m, self.problem.n)),
                 (cfg.tile_m, cfg.tile_n),
-                (None, None, None),
-            )[(None, None, block_m, block_n, 0)]
-            g_out_tma = cute.zipped_divide(
-                g_out_tma, (cfg.tile_m, cfg.tile_n)
+                (block_m, block_n),
             )
-            out_s, out_g = cpasync.tma_partition(
-                tma_out,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(s_out, 0, 2),
-                g_out_tma,
-            )
-            out_pipeline = pipeline.PipelineTmaStore.create(
-                num_stages=1,
-                producer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, cfg.num_mma_warps * 32
-                ),
-            )
+            t_cg_out = thr_mma.partition_C(g_out)
+            t_cc_out = thr_mma.partition_C(c_out)
+            accumulators = cute.make_rmem_tensor(t_cg_out.shape, Float32)
+            accumulators.fill(0.0)
 
-        if warp_idx == cfg.num_mma_warps:
-            cute.arch.setmaxregister_decrease(cfg.producer_registers)
-        else:
-            cute.arch.setmaxregister_increase(cfg.consumer_registers)
+            if cutlass.const_expr(cfg.epilogue == "tma"):
+                r2s_atom = cute.make_copy_atom(
+                    warp.StMatrix8x8x16bOp(False, cfg.store_vec), BFloat16
+                )
+                c_atom = cute.make_copy_atom(
+                    warp.StMatrix8x8x16bOp(False, cfg.store_vec), BFloat16
+                )
+                c_copy = cute.make_tiled_copy_C_atom(c_atom, tiled_mma)
+                copy_r2s = cute.make_tiled_copy_S(r2s_atom, c_copy)
+                thr_r2s = copy_r2s.get_slice(tidx)
+                t_rs_s = thr_r2s.partition_D(s_out)
+                t_rs_acc = copy_r2s.retile(accumulators)
+                r_out_shape = cute.shape(thr_r2s.partition_S(s_out))
+                r_out = cute.make_rmem_tensor(
+                    cute.make_layout(r_out_shape[:3]).shape, BFloat16
+                )
+                g_out_tma = cute.local_tile(
+                    tma_out_tensor,
+                    (cfg.tile_m, cfg.tile_n),
+                    (None, None, None),
+                )[(None, None, block_m, block_n, 0)]
+                g_out_tma = cute.zipped_divide(
+                    g_out_tma, (cfg.tile_m, cfg.tile_n)
+                )
+                out_s, out_g = cpasync.tma_partition(
+                    tma_out,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(s_out, 0, 2),
+                    g_out_tma,
+                )
+                out_pipeline = pipeline.PipelineTmaStore.create(
+                    num_stages=1,
+                    producer_group=pipeline.CooperativeGroup(
+                        pipeline.Agent.Thread, cfg.num_mma_warps * 32
+                    ),
+                )
 
-        num_k_tiles = cute.ceil_div(self.problem.k, cfg.tile_k)
-        scale_blocks_per_tile = cfg.tile_k // SF_VEC_SIZE
-        scale_chunks_per_row = scale_blocks_per_tile // cfg.scale_load_vec
-        a_scale_count = cfg.tile_m * scale_chunks_per_row
-        total_scale_count = (
-            cfg.tile_m + cfg.tile_n
-        ) * scale_chunks_per_row
-        for k_tile in cutlass.range(num_k_tiles, unroll=1):
             if warp_idx == cfg.num_mma_warps:
-                producer_stage = producer_state.index
-                tma_pipeline.producer_acquire(producer_state)
-                cute.copy(
-                    tma_x,
-                    tx_g[(None, block_m, k_tile)],
-                    tx_s[(None, producer_state.index)],
-                    tma_bar_ptr=tma_pipeline.producer_get_barrier(producer_state),
-                )
-                cute.copy(
-                    tma_w,
-                    tw_g[(None, block_n, k_tile)],
-                    tw_s[(None, producer_state.index)],
-                    tma_bar_ptr=tma_pipeline.producer_get_barrier(producer_state),
-                )
-                if cutlass.const_expr(cfg.scale_role == "tma"):
-                    sx_tile = block_m * num_k_tiles + k_tile
-                    sw_tile = block_n * num_k_tiles + k_tile
-                    cute.copy(
-                        tma_sx,
-                        tsx_g[(None, sx_tile)],
-                        tsx_s[(None, producer_stage)],
-                        tma_bar_ptr=tma_pipeline.producer_get_barrier(
-                            producer_state
-                        ),
-                    )
-                    cute.copy(
-                        tma_sw,
-                        tsw_g[(None, sw_tile)],
-                        tsw_s[(None, producer_stage)],
-                        tma_bar_ptr=tma_pipeline.producer_get_barrier(
-                            producer_state
-                        ),
-                    )
-                tma_pipeline.producer_commit(producer_state)
-                producer_state.advance()
-                if cutlass.const_expr(cfg.scale_role == "producer"):
-                    self._stage_scales(
-                        sx_row_view,
-                        sw_row_view,
-                        s_sfa,
-                        s_sfb,
-                        producer_stage,
-                        block_m,
-                        block_n,
-                        k_tile,
-                        tidx - cfg.num_mma_warps * 32,
-                        32,
-                    )
-                    self.scale_barrier.arrive_and_wait()
+                cute.arch.setmaxregister_decrease(cfg.producer_registers)
+            else:
+                cute.arch.setmaxregister_increase(cfg.consumer_registers)
 
-            if warp_idx < cfg.num_mma_warps:
-                stage = consumer_state.index
-                if cutlass.const_expr(
-                    cfg.scale_role == "tma"
-                    or cfg.scale_schedule == "after_wait"
-                ):
-                    ready = tma_pipeline.consumer_try_wait(consumer_state)
-                    tma_pipeline.consumer_wait(consumer_state, ready)
-                scale_start = tidx
-                if cutlass.const_expr(cfg.scale_role in ("producer", "tma")):
-                    scale_start = Int32(total_scale_count)
-                for scale_task in cutlass.range(
-                    scale_start,
-                    total_scale_count,
-                    cfg.num_mma_warps * 32,
-                    unroll=1,
-                ):
-                    is_a = scale_task < a_scale_count
-                    local_task = scale_task if is_a else scale_task - a_scale_count
-                    row = local_task // scale_chunks_per_row
-                    k_chunk = local_task % scale_chunks_per_row
-                    k_block = k_chunk * cfg.scale_load_vec
-                    global_row = (
-                        block_m * cfg.tile_m + row
-                        if is_a
-                        else block_n * cfg.tile_n + row
+            num_k_tiles = cute.ceil_div(self.problem.k, cfg.tile_k)
+            scale_blocks_per_tile = cfg.tile_k // SF_VEC_SIZE
+            scale_chunks_per_row = scale_blocks_per_tile // cfg.scale_load_vec
+            a_scale_count = cfg.tile_m * scale_chunks_per_row
+            total_scale_count = (
+                cfg.tile_m + cfg.tile_n
+            ) * scale_chunks_per_row
+            for k_tile in cutlass.range(num_k_tiles, unroll=1):
+                if warp_idx == cfg.num_mma_warps:
+                    producer_stage = producer_state.index
+                    tma_pipeline.producer_acquire(producer_state)
+                    cute.copy(
+                        tma_x,
+                        tx_g[(None, block_m, k_tile)],
+                        tx_s[(None, producer_state.index)],
+                        tma_bar_ptr=tma_pipeline.producer_get_barrier(producer_state),
                     )
-                    row_limit = self.problem.m if is_a else self.problem.n
-                    global_k_block = (
-                        k_tile * scale_blocks_per_tile + k_block
+                    cute.copy(
+                        tma_w,
+                        tw_g[(None, block_n, k_tile)],
+                        tw_s[(None, producer_state.index)],
+                        tma_bar_ptr=tma_pipeline.producer_get_barrier(producer_state),
                     )
-                    if cutlass.const_expr(cfg.scale_load_vec == 1):
-                        scale = Uint8(0).bitcast(Float8E8M0FNU)
-                        if global_row < row_limit:
+                    if cutlass.const_expr(cfg.scale_role == "tma"):
+                        sx_tile = block_m * num_k_tiles + k_tile
+                        sw_tile = block_n * num_k_tiles + k_tile
+                        cute.copy(
+                            tma_sx,
+                            tsx_g[(None, sx_tile)],
+                            tsx_s[(None, producer_stage)],
+                            tma_bar_ptr=tma_pipeline.producer_get_barrier(
+                                producer_state
+                            ),
+                        )
+                        cute.copy(
+                            tma_sw,
+                            tsw_g[(None, sw_tile)],
+                            tsw_s[(None, producer_stage)],
+                            tma_bar_ptr=tma_pipeline.producer_get_barrier(
+                                producer_state
+                            ),
+                        )
+                    tma_pipeline.producer_commit(producer_state)
+                    producer_state.advance()
+                    if cutlass.const_expr(cfg.scale_role == "producer"):
+                        self._stage_scales(
+                            sx_row_view,
+                            sw_row_view,
+                            s_sfa,
+                            s_sfb,
+                            producer_stage,
+                            block_m,
+                            block_n,
+                            k_tile,
+                            tidx - cfg.num_mma_warps * 32,
+                            32,
+                        )
+                        self.scale_barrier.arrive_and_wait()
+
+                if warp_idx < cfg.num_mma_warps:
+                    stage = consumer_state.index
+                    if cutlass.const_expr(
+                        cfg.scale_role == "tma"
+                        or cfg.scale_schedule == "after_wait"
+                    ):
+                        ready = tma_pipeline.consumer_try_wait(consumer_state)
+                        tma_pipeline.consumer_wait(consumer_state, ready)
+                    scale_start = tidx
+                    if cutlass.const_expr(cfg.scale_role in ("producer", "tma")):
+                        scale_start = Int32(total_scale_count)
+                    for scale_task in cutlass.range(
+                        scale_start,
+                        total_scale_count,
+                        cfg.num_mma_warps * 32,
+                        unroll=1,
+                    ):
+                        is_a = scale_task < a_scale_count
+                        local_task = scale_task if is_a else scale_task - a_scale_count
+                        row = local_task // scale_chunks_per_row
+                        k_chunk = local_task % scale_chunks_per_row
+                        k_block = k_chunk * cfg.scale_load_vec
+                        global_row = (
+                            block_m * cfg.tile_m + row
+                            if is_a
+                            else block_n * cfg.tile_n + row
+                        )
+                        row_limit = self.problem.m if is_a else self.problem.n
+                        global_k_block = (
+                            k_tile * scale_blocks_per_tile + k_block
+                        )
+                        if cutlass.const_expr(cfg.scale_load_vec == 1):
+                            scale = Uint8(0).bitcast(Float8E8M0FNU)
+                            if global_row < row_limit:
+                                if is_a:
+                                    scale = sx_row_view[global_row, global_k_block]
+                                else:
+                                    scale = sw_row_view[global_row, global_k_block]
                             if is_a:
-                                scale = sx_row_view[global_row, global_k_block]
+                                s_sfa[row, k_block * SF_VEC_SIZE, stage] = scale
                             else:
-                                scale = sw_row_view[global_row, global_k_block]
-                        if is_a:
-                            s_sfa[row, k_block * SF_VEC_SIZE, stage] = scale
+                                s_sfb[row, k_block * SF_VEC_SIZE, stage] = scale
                         else:
-                            s_sfb[row, k_block * SF_VEC_SIZE, stage] = scale
-                    else:
-                        if is_a:
-                            if global_row < row_limit:
-                                src_row = sx_row_view[global_row, None]
-                                loaded = nvvm.load_ext(
-                                    src_row.iterator
-                                    + src_row.layout(global_k_block),
-                                    dtype=Uint8,
-                                    count=cfg.scale_load_vec,
-                                    prefetch=scale_prefetch,
-                                    evict=scale_evict,
-                                    cache_modifier=scale_cache,
-                                ).bitcast(Float8E8M0FNU)
-                                for vec in cutlass.range_constexpr(
-                                    cfg.scale_load_vec
-                                ):
-                                    s_sfa[
-                                        row,
-                                        (k_block + vec) * SF_VEC_SIZE,
-                                        stage,
-                                    ] = loaded[vec]
+                            if is_a:
+                                if global_row < row_limit:
+                                    src_row = sx_row_view[global_row, None]
+                                    loaded = nvvm.load_ext(
+                                        src_row.iterator
+                                        + src_row.layout(global_k_block),
+                                        dtype=Uint8,
+                                        count=cfg.scale_load_vec,
+                                        prefetch=scale_prefetch,
+                                        evict=scale_evict,
+                                        cache_modifier=scale_cache,
+                                    ).bitcast(Float8E8M0FNU)
+                                    for vec in cutlass.range_constexpr(
+                                        cfg.scale_load_vec
+                                    ):
+                                        s_sfa[
+                                            row,
+                                            (k_block + vec) * SF_VEC_SIZE,
+                                            stage,
+                                        ] = loaded[vec]
+                                else:
+                                    for vec in cutlass.range_constexpr(
+                                        cfg.scale_load_vec
+                                    ):
+                                        s_sfa[
+                                            row,
+                                            (k_block + vec) * SF_VEC_SIZE,
+                                            stage,
+                                        ] = Uint8(0).bitcast(Float8E8M0FNU)
                             else:
-                                for vec in cutlass.range_constexpr(
-                                    cfg.scale_load_vec
-                                ):
-                                    s_sfa[
-                                        row,
-                                        (k_block + vec) * SF_VEC_SIZE,
-                                        stage,
-                                    ] = Uint8(0).bitcast(Float8E8M0FNU)
-                        else:
-                            if global_row < row_limit:
-                                src_row = sw_row_view[global_row, None]
-                                loaded = nvvm.load_ext(
-                                    src_row.iterator
-                                    + src_row.layout(global_k_block),
-                                    dtype=Uint8,
-                                    count=cfg.scale_load_vec,
-                                    prefetch=scale_prefetch,
-                                    evict=scale_evict,
-                                    cache_modifier=scale_cache,
-                                ).bitcast(Float8E8M0FNU)
-                                for vec in cutlass.range_constexpr(
-                                    cfg.scale_load_vec
-                                ):
-                                    s_sfb[
-                                        row,
-                                        (k_block + vec) * SF_VEC_SIZE,
-                                        stage,
-                                    ] = loaded[vec]
-                            else:
-                                for vec in cutlass.range_constexpr(
-                                    cfg.scale_load_vec
-                                ):
-                                    s_sfb[
-                                        row,
-                                        (k_block + vec) * SF_VEC_SIZE,
-                                        stage,
-                                    ] = Uint8(0).bitcast(Float8E8M0FNU)
-                if cutlass.const_expr(cfg.scale_role != "tma"):
-                    self.scale_barrier.arrive_and_wait()
-                if cutlass.const_expr(
-                    cfg.scale_role != "tma"
-                    and cfg.scale_schedule == "before_wait"
-                ):
-                    ready = tma_pipeline.consumer_try_wait(consumer_state)
-                    tma_pipeline.consumer_wait(consumer_state, ready)
-                for k_block in cutlass.range_constexpr(scale_blocks_per_tile):
-                    cute.copy(
-                        copy_a,
-                        t_cs_a_copy[None, None, k_block, stage],
-                        t_cr_a_copy[None, None, k_block],
-                    )
-                    cute.copy(
-                        copy_b,
-                        t_cs_b_copy[None, None, k_block, stage],
-                        t_cr_b_copy[None, None, k_block],
-                    )
-                    cute.copy(
-                        copy_sfa,
-                        cute.filter_zeros(t_cs_sfa)[None, None, k_block, stage],
-                        cute.filter_zeros(t_cr_sfa_copy)[None, None, k_block],
-                    )
-                    cute.copy(
-                        copy_sfb,
-                        cute.filter_zeros(t_cs_sfb)[None, None, k_block, stage],
-                        cute.filter_zeros(t_cr_sfb_copy)[None, None, k_block],
-                    )
-                    cute.gemm(
-                        tiled_mma,
-                        accumulators,
-                        [
-                            t_cr_a[None, None, k_block],
-                            t_cr_sfa[None, None, k_block],
-                        ],
-                        [
-                            t_cr_b[None, None, k_block],
-                            t_cr_sfb[None, None, k_block],
-                        ],
-                        accumulators,
-                    )
-                tma_pipeline.consumer_release(consumer_state)
-                consumer_state.advance()
+                                if global_row < row_limit:
+                                    src_row = sw_row_view[global_row, None]
+                                    loaded = nvvm.load_ext(
+                                        src_row.iterator
+                                        + src_row.layout(global_k_block),
+                                        dtype=Uint8,
+                                        count=cfg.scale_load_vec,
+                                        prefetch=scale_prefetch,
+                                        evict=scale_evict,
+                                        cache_modifier=scale_cache,
+                                    ).bitcast(Float8E8M0FNU)
+                                    for vec in cutlass.range_constexpr(
+                                        cfg.scale_load_vec
+                                    ):
+                                        s_sfb[
+                                            row,
+                                            (k_block + vec) * SF_VEC_SIZE,
+                                            stage,
+                                        ] = loaded[vec]
+                                else:
+                                    for vec in cutlass.range_constexpr(
+                                        cfg.scale_load_vec
+                                    ):
+                                        s_sfb[
+                                            row,
+                                            (k_block + vec) * SF_VEC_SIZE,
+                                            stage,
+                                        ] = Uint8(0).bitcast(Float8E8M0FNU)
+                    if cutlass.const_expr(cfg.scale_role != "tma"):
+                        self.scale_barrier.arrive_and_wait()
+                    if cutlass.const_expr(
+                        cfg.scale_role != "tma"
+                        and cfg.scale_schedule == "before_wait"
+                    ):
+                        ready = tma_pipeline.consumer_try_wait(consumer_state)
+                        tma_pipeline.consumer_wait(consumer_state, ready)
+                    for k_block in cutlass.range_constexpr(scale_blocks_per_tile):
+                        cute.copy(
+                            copy_a,
+                            t_cs_a_copy[None, None, k_block, stage],
+                            t_cr_a_copy[None, None, k_block],
+                        )
+                        cute.copy(
+                            copy_b,
+                            t_cs_b_copy[None, None, k_block, stage],
+                            t_cr_b_copy[None, None, k_block],
+                        )
+                        cute.copy(
+                            copy_sfa,
+                            cute.filter_zeros(t_cs_sfa)[None, None, k_block, stage],
+                            cute.filter_zeros(t_cr_sfa_copy)[None, None, k_block],
+                        )
+                        cute.copy(
+                            copy_sfb,
+                            cute.filter_zeros(t_cs_sfb)[None, None, k_block, stage],
+                            cute.filter_zeros(t_cr_sfb_copy)[None, None, k_block],
+                        )
+                        cute.gemm(
+                            tiled_mma,
+                            accumulators,
+                            [
+                                t_cr_a[None, None, k_block],
+                                t_cr_sfa[None, None, k_block],
+                            ],
+                            [
+                                t_cr_b[None, None, k_block],
+                                t_cr_sfb[None, None, k_block],
+                            ],
+                            accumulators,
+                        )
+                    tma_pipeline.consumer_release(consumer_state)
+                    consumer_state.advance()
 
-        if warp_idx == cfg.num_mma_warps:
-            tma_pipeline.producer_tail(producer_state)
+            if warp_idx == cfg.num_mma_warps:
+                tma_pipeline.producer_tail(producer_state)
 
-        if cutlass.const_expr(cfg.epilogue == "direct"):
-            if warp_idx < cfg.num_mma_warps:
-                for elem in cutlass.range(cute.size(accumulators), unroll_full=True):
-                    coord = t_cc_out[elem]
-                    if coord[0] < self.problem.m and coord[1] < self.problem.n:
-                        t_cg_out[elem] = BFloat16(accumulators[elem])
-        else:
-            if warp_idx < cfg.num_mma_warps:
-                for elem in cutlass.range(cute.size(r_out), unroll_full=True):
-                    r_out[elem] = BFloat16(t_rs_acc[elem])
-                cute.copy(copy_r2s, r_out, t_rs_s[(None, None, None, 0)])
-                cute.arch.fence_proxy("async.shared", space="cta")
-                self.epilogue_barrier.arrive_and_wait()
-                if warp_idx == 0:
-                    cute.copy(tma_out, out_s[(None, 0)], out_g[(None, 0)])
-                    out_pipeline.producer_commit()
-                    out_pipeline.producer_acquire()
-                    out_pipeline.producer_tail()
+            if cutlass.const_expr(cfg.epilogue == "direct"):
+                if active_tile:
+                    if warp_idx < cfg.num_mma_warps:
+                        for elem in cutlass.range(
+                            cute.size(accumulators), unroll_full=True
+                        ):
+                            coord = t_cc_out[elem]
+                            if (
+                                coord[0] < self.problem.m
+                                and coord[1] < self.problem.n
+                            ):
+                                t_cg_out[elem] = BFloat16(accumulators[elem])
+            else:
+                if active_tile:
+                    if warp_idx < cfg.num_mma_warps:
+                        for elem in cutlass.range(
+                            cute.size(r_out), unroll_full=True
+                        ):
+                            r_out[elem] = BFloat16(t_rs_acc[elem])
+                        cute.copy(copy_r2s, r_out, t_rs_s[(None, None, None, 0)])
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        self.epilogue_barrier.arrive_and_wait()
+                        if warp_idx == 0:
+                            cute.copy(tma_out, out_s[(None, 0)], out_g[(None, 0)])
+                            out_pipeline.producer_commit()
+                            out_pipeline.producer_acquire()
+                            out_pipeline.producer_tail()
 
 
 @lru_cache(maxsize=None)

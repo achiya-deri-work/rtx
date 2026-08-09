@@ -206,6 +206,46 @@ class MXFP8QuantCudaTests(unittest.TestCase):
                 torch.cuda.synchronize()
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
+    def test_persistent_prequantized_gemm_locality_orders(self) -> None:
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("native kernel requires SM120/SM121")
+        # Ten logical tiles exercise both multi-output work and a partial final
+        # CTA for the four/eight-tile schedules.
+        problem = MXFP8Problem(640, 256, 256)
+        torch.manual_seed(1706)
+        x = torch.randn(
+            problem.m, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        weight = torch.randn(
+            problem.n, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        qx, sx = _reference(x)
+        qw, sw = _reference(weight)
+        expected = torch.empty(
+            problem.m, problem.n, device="cuda", dtype=torch.bfloat16
+        )
+        compile_mxfp8_gemm(problem)(qx, qw, sx, sw, expected)
+        variants = (
+            MXFP8GemmConfig(tiles_per_cta=2, tile_locality="same_a"),
+            MXFP8GemmConfig(tiles_per_cta=4, tile_locality="same_b"),
+            MXFP8GemmConfig(
+                tiles_per_cta=4,
+                tile_locality="serpentine_a",
+                epilogue="direct",
+                store_vec=1,
+            ),
+            MXFP8GemmConfig(
+                tiles_per_cta=8,
+                tile_locality="serpentine_b",
+            ),
+        )
+        for config in variants:
+            with self.subTest(config=config):
+                actual = torch.full_like(expected, float("nan"))
+                compile_mxfp8_gemm(problem, config)(qx, qw, sx, sw, actual)
+                torch.cuda.synchronize()
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_native_scale_tma_paths_match_row_major(self) -> None:
         if torch.cuda.get_device_capability()[0] != 12:
             self.skipTest("native kernel requires SM120/SM121")

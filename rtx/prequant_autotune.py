@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover - Linux/CUDA is the supported target.
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_prequant_e2e"
-KERNEL_REVISION = 3
+KERNEL_REVISION = 4
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -264,6 +264,22 @@ PREQUANT_SEARCH_SPACE: dict[str, tuple[dict[str, object], ...]] = {
         {"gemm": {"raster": raster, "grid_swizzle": group}}
         for raster in ("m", "n")
         for group in (1, 2, 4, 8)
+    ),
+    "gemm_persistence": tuple(
+        {
+            "gemm": {
+                "tiles_per_cta": tiles,
+                "tile_locality": locality,
+            }
+        }
+        for tiles in (1, 2, 4, 8)
+        for locality in (
+            "raster",
+            "same_a",
+            "same_b",
+            "serpentine_a",
+            "serpentine_b",
+        )
     ),
     "global_l2_fetch": tuple(
         {"l2_fetch_granularity": value} for value in (None, 0, 32, 64, 128)

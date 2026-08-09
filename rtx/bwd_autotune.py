@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 10
+KERNEL_REVISION = 11
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -273,6 +273,24 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
             wrap({"gemm": {"raster": raster, "grid_swizzle": group}})
             for raster in ("m", "n")
             for group in (1, 2, 4, 8)
+        ),
+        f"{prefix}_gemm_persistence": tuple(
+            wrap(
+                {
+                    "gemm": {
+                        "tiles_per_cta": tiles,
+                        "tile_locality": locality,
+                    }
+                }
+            )
+            for tiles in (1, 2, 4, 8)
+            for locality in (
+                "raster",
+                "same_a",
+                "same_b",
+                "serpentine_a",
+                "serpentine_b",
+            )
         ),
         f"{prefix}_reduction": tuple(
             wrap(value)

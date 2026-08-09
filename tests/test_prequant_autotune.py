@@ -63,6 +63,16 @@ class PrequantAutotuneTests(unittest.TestCase):
         self.assertIn(
             ("row_major", "row_major", "row_major", "producer", 128), layouts
         )
+        persistence = {
+            (
+                update["gemm"]["tiles_per_cta"],
+                update["gemm"]["tile_locality"],
+            )
+            for update in PREQUANT_SEARCH_SPACE["gemm_persistence"]
+        }
+        self.assertIn((1, "raster"), persistence)
+        self.assertIn((4, "same_a"), persistence)
+        self.assertIn((8, "serpentine_b"), persistence)
 
     def test_dual_x_coordinate_updates_the_shared_schedule(self) -> None:
         candidate = update_prequant_config(

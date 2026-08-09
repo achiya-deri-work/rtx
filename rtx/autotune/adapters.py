@@ -151,6 +151,20 @@ def _gemm_features(
     materialized_quant: bool,
 ) -> dict[str, float]:
     profile = _device_dict(device)
+    m_tiles = (problem.m + config.tile_m - 1) // config.tile_m
+    n_tiles = (problem.n + config.tile_n - 1) // config.tile_n
+    natural_ctas = m_tiles * n_tiles
+    grid_ctas = (natural_ctas + config.tiles_per_cta - 1) // config.tiles_per_cta
+    same_a_edges = sum(
+        1
+        for edge in range(1, natural_ctas)
+        if edge % n_tiles and edge % config.tiles_per_cta
+    )
+    same_b_edges = sum(
+        1
+        for edge in range(1, natural_ctas)
+        if edge % m_tiles and edge % config.tiles_per_cta
+    )
     geometry = geometry_features(
         m=problem.m,
         n=problem.n,
@@ -159,8 +173,8 @@ def _gemm_features(
         tile_n=config.tile_n,
         tile_k=config.tile_k,
         profile=profile,
+        grid_ctas=grid_ctas,
     )
-    grid_ctas = int(geometry["grid_ctas"])
     registers = _specialized_register_budget(
         consumer_warps=config.num_mma_warps,
         consumer_registers=config.consumer_registers,
@@ -194,6 +208,39 @@ def _gemm_features(
         tile_flops=float(2 * config.tile_m * config.tile_n * problem.k),
         mma_k_tiles_per_cta=float((problem.k + config.tile_k - 1) // config.tile_k),
         mma_warp_issues_per_k_tile=float(config.num_mma_warps),
+        work_tiles_per_cta=float(config.tiles_per_cta),
+        final_cta_active_fraction=(
+            (natural_ctas - (grid_ctas - 1) * config.tiles_per_cta)
+            / config.tiles_per_cta
+        ),
+        same_a_locality=float(
+            config.tile_locality in ("same_a", "serpentine_a")
+        ),
+        same_b_locality=float(
+            config.tile_locality in ("same_b", "serpentine_b")
+        ),
+        serpentine_locality=float(
+            config.tile_locality in ("serpentine_a", "serpentine_b")
+        ),
+        consecutive_a_reuse_edges=float(
+            same_a_edges
+            if config.tile_locality in ("same_a", "serpentine_a")
+            else 0
+        ),
+        consecutive_b_reuse_edges=float(
+            same_b_edges
+            if config.tile_locality in ("same_b", "serpentine_b")
+            else 0
+        ),
+        consecutive_operand_reuse=float(
+            same_a_edges
+            if config.tile_locality in ("same_a", "serpentine_a")
+            else (
+                same_b_edges
+                if config.tile_locality in ("same_b", "serpentine_b")
+                else 0
+            )
+        ),
     )
     return geometry
 

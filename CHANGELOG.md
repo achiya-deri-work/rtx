@@ -57,6 +57,15 @@ project follows semantic versioning while it is in active alpha development.
   aligned 32-bit store directly into the tensor-core-native `mma128` layout.
   Keep all tile/transport/store combinations searchable; at M512 the 32-K
   promoted schedule remains faster than the wider alternatives.
+- Add persistent multi-output scheduling to the materialized MXFP8 GEMM used
+  by decomposed backward and both packed inference states. Expose one to eight
+  output tiles per CTA with raster, same-A, same-B, and serpentine locality;
+  reconstruct exact TMA pipeline phases across unrolled output work and cover
+  partial final CTAs without duplicate stores. Wire the family into all
+  relevant autotuners and portable cost-model features. Keep one tile per CTA
+  as the default: 5070 Ti measurements were 13.83 us versus roughly 25/49 us
+  for two/four tiles at a 48-tile shape, while the best 768-tile persistent
+  cases remained statistically level to slightly slower than the baseline.
 
 ## 0.9.0
 

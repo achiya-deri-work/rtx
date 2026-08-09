@@ -11,7 +11,11 @@ from rtx.autotune import (
     make_mxfp8_fwd_adapter,
     make_mxfp8_bwd_adapter,
 )
-from rtx.autotune.adapters import _fused_smem_bytes, _gemm_launch_smem_bytes
+from rtx.autotune.adapters import (
+    _fused_smem_bytes,
+    _gemm_features,
+    _gemm_launch_smem_bytes,
+)
 from rtx.autotune.core import Proposal, evaluate_proposal
 from rtx.autotune.hardware import (
     architecture_profile,
@@ -26,6 +30,7 @@ from rtx.kernels.mxfp8 import (
 )
 from rtx.kernels.mxfp8_bwd import DEFAULT_MXFP8_BWD_CONFIG
 from rtx.kernels.mxfp8_bwd import DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG
+from rtx.configs import MXFP8GemmConfig
 
 
 @dataclass(frozen=True)
@@ -35,6 +40,19 @@ class _CompileConfig:
 
 
 class HardwareAutotuneTests(unittest.TestCase):
+    def test_persistent_gemm_features_use_actual_grid_and_reuse_edges(self) -> None:
+        features = _gemm_features(
+            MXFP8Problem(512, 1536, 1536),
+            MXFP8GemmConfig(tiles_per_cta=4, tile_locality="same_a"),
+            None,
+            materialized_quant=True,
+        )
+        self.assertEqual(features["natural_ctas"], 48.0)
+        self.assertEqual(features["grid_ctas"], 12.0)
+        self.assertEqual(features["work_tiles_per_cta"], 4.0)
+        self.assertEqual(features["consecutive_a_reuse_edges"], 36.0)
+        self.assertEqual(features["consecutive_b_reuse_edges"], 0.0)
+
     def test_staged_fused_smem_includes_pipeline_alignment_reserve(self) -> None:
         candidate = normalize_fwd_config(
             load_engine="tma",

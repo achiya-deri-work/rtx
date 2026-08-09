@@ -128,6 +128,8 @@ class MXFP8GemmConfig:
     consumer_registers: int = 192
     raster: str = "n"
     grid_swizzle: int = 2
+    tiles_per_cta: int = 1
+    tile_locality: str = "raster"
 
     @property
     def num_mma_warps(self) -> int:
@@ -253,6 +255,21 @@ class MXFP8GemmConfig:
             )
         if self.raster not in ("m", "n") or self.grid_swizzle not in (1, 2, 4, 8):
             return "invalid raster/grid swizzle"
+        if self.tiles_per_cta not in (1, 2, 4, 8):
+            return "tiles_per_cta must be 1, 2, 4, or 8"
+        output_tiles = (
+            (problem.m + self.tile_m - 1) // self.tile_m
+        ) * ((problem.n + self.tile_n - 1) // self.tile_n)
+        if self.tiles_per_cta > output_tiles:
+            return "tiles_per_cta cannot exceed the logical output tile count"
+        if self.tile_locality not in (
+            "raster",
+            "same_a",
+            "same_b",
+            "serpentine_a",
+            "serpentine_b",
+        ):
+            return "invalid persistent tile locality"
         return None
 
 

@@ -142,6 +142,17 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
     def test_no_physical_transpose_axes_exist(self) -> None:
         self.assertFalse(any("transpose" in name for name in BWD_SEARCH_SPACE))
 
+    def test_real_prequant_gemm_persistence_is_exposed_for_dx_and_dw(self) -> None:
+        for prefix in ("dx", "dw"):
+            axis = BWD_SEARCH_SPACE[f"{prefix}_gemm_persistence"]
+            self.assertTrue(
+                any(
+                    update[prefix]["gemm"]
+                    == {"tiles_per_cta": 4, "tile_locality": "same_a"}
+                    for update in axis
+                )
+            )
+
     def test_b_only_coordinate_crosses_to_independent_quantizers(self) -> None:
         tuner = object.__new__(BwdCoordinateDescentTuner)
         candidate = tuner._candidate(
@@ -560,6 +571,32 @@ class TestMXFP8BwdCuda(unittest.TestCase):
             DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
             {"quant_schedule": "quad"},
         )
+        self._assert_backward_close(config, grad_output, x, weight)
+
+    def test_persistent_prequantized_backward_matches_reference(self) -> None:
+        torch.manual_seed(34)
+        m = n = k = 256
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        grad_output = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+        config = update_bwd_config(
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            {
+                "dx": {
+                    "gemm": {
+                        "tiles_per_cta": 2,
+                        "tile_locality": "same_a",
+                    }
+                },
+                "dw": {
+                    "gemm": {
+                        "tiles_per_cta": 2,
+                        "tile_locality": "same_b",
+                    }
+                },
+            },
+        )
+        self.assertIsNone(config.implementation_rejection(MXFP8Problem(m, n, k)))
         self._assert_backward_close(config, grad_output, x, weight)
 
     def test_quad_cpasync_logical_transport_feeds_both_matmuls(self) -> None:

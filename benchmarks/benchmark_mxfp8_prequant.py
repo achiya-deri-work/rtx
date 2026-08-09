@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import ctypes
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import statistics
@@ -63,6 +63,23 @@ def main() -> None:
         "--component",
         choices=("e2e", "quant", "gemm"),
         default="e2e",
+    )
+    parser.add_argument(
+        "--tiles-per-cta",
+        type=int,
+        choices=(1, 2, 4, 8),
+        default=1,
+    )
+    parser.add_argument(
+        "--tile-locality",
+        choices=(
+            "raster",
+            "same_a",
+            "same_b",
+            "serpentine_a",
+            "serpentine_b",
+        ),
+        default="raster",
     )
     parser.add_argument(
         "--l2-fetch-granularity",
@@ -166,6 +183,11 @@ def main() -> None:
             device="cuda",
             dtype=torch.float8_e8m0fnu,
         )
+    gemm_config = replace(
+        gemm_config,
+        tiles_per_cta=args.tiles_per_cta,
+        tile_locality=args.tile_locality,
+    )
     quant_x = compile_mxfp8_quant(args.m, args.k, quant_config)
     weight_quant_config = MXFP8QuantConfig(
         **{
