@@ -8,6 +8,7 @@ repository root so imports and output paths are predictable.
 | `benchmark_mxfp8_frontend.py` | End-to-end `torch.compile` MXFP8 frontend benchmark |
 | `benchmark_mxfp8_prequant.py` | Dynamic BF16 quantization plus native-scale MXFP8 GEMM |
 | `benchmark_torchao_fp8_rowwise.py` | TorchAO rowwise FP8 comparison baseline |
+| `validate_mxfp8_production.py` | Eager/compiled, training/inference, stream, cache, and long-dW readiness matrix |
 | `tune_composable_prequant.py` | Composable learned/global plus local forward tuning |
 | `tune_composable_bwd.py` | Composable MXFP8 backward tuning |
 | `verify_composable_bwd.py` | Independent backward winner verification and racing |
@@ -28,3 +29,13 @@ resumes the same residual journals when rerun.
 All generated JSON, JSONL, logs, datasets, and compiled artifacts must go to an
 ignored output directory such as `autotune_results/`, `autotune_logs/`, or
 `autotune_datasets/`.
+
+Run the complete frontend matrix before promoting a release:
+
+```bash
+python benchmarks/validate_mxfp8_production.py \
+  --output autotune_reports/mxfp8_production_matrix.json
+```
+
+`--quick` retains every category but reduces the long-reduction check from
+M=8192 to M=1024.

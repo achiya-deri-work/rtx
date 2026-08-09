@@ -188,6 +188,12 @@ their support, confidence interval, contexts, and devices and act only as a
 small ranking adjustment. Leave-one-device-out catalogue replay reports regret
 after 1, 4, 8, 16, and 32 proposals before an artifact is deployed.
 
+Use `rtx-autotune evaluate-pretrained ARTIFACT HELDOUT... --output REPORT` for
+the final prospective check. It scores latency and context-ranking heads,
+feasibility, exact-SKU heads when present, and matched random catalogue replay
+without modifying deployment gates. Exact source-file overlap or an identical
+dataset digest is rejected unless an explicitly in-sample diagnostic opts in.
+
 ## Architecture and SKU features
 
 Dataset campaigns pass a complete SM120/SM121 hardware profile into every
@@ -256,6 +262,13 @@ reading transferable sibling contexts from only the same treatment/replicate.
 Use `rtx-autotune summarize-tuners` to generate fixed-budget regret and failure
 summaries after collection rather than maintaining a monolithic dataset during
 the run.
+
+Before ingestion, `rtx-autotune audit PATH...` checks crash tails, interior
+JSON corruption, identities, context coverage, and duplicate observation or
+verification keys. Once a bundle is audited and its confirmations are trusted,
+`rtx-autotune install-winners PATH... --dry-run` shows the verified consensus
+winners that would be promoted into the runtime cache. Promotion never
+overwrites an existing entry without `--force`.
 
 The learned bandit portfolio contains random, coordinate-local, global
 gradient-boosted, and model-local arms. After random warmup it gives configured

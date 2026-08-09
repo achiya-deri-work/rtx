@@ -8,6 +8,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+import zipfile
 
 from rtx.autotune import (
     DiscountedArmStatistics,
@@ -348,11 +349,19 @@ class DatasetTests(unittest.TestCase):
                 (root,), root / "report" / "optimizers", export_format="csv"
             )
             self.assertEqual(report["units"], 2)
-            self.assertEqual(report["schema_version"], 2)
+            self.assertEqual(report["schema_version"], 3)
+            self.assertIn("mean_compile_failure_rate", report["aggregates"][0])
+            self.assertIn(
+                "ci_low_median_final_regret", report["aggregates"][0]
+            )
             self.assertEqual(len(report["matched_comparisons"]), 1)
+            self.assertTrue(report["shape_aggregates"])
             comparison = report["matched_comparisons"][0]
             self.assertEqual(comparison["treatment"], "online_bandit")
             self.assertLess(comparison["median_delta_final"], 0)
+            self.assertEqual(
+                comparison["probability_beating_random_final"], 1.0
+            )
             self.assertTrue((root / "report" / "optimizers.csv").exists())
 
     def test_every_registered_public_family_constructs_an_adapter(self) -> None:
@@ -469,6 +478,13 @@ class DatasetTests(unittest.TestCase):
                 row for row in rows if row["record_type"] == "context_allocation"
             )
             self.assertEqual(allocation["allocation__reward"], 0.25)
+
+            archive_path = root / "dataset-export-test.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                for path in root.rglob("*.json*"):
+                    archive.write(path, f"bundle/{path.relative_to(root)}")
+            zipped_rows = normalized_rows((archive_path,))
+            self.assertEqual(len(zipped_rows), 3)
 
             report = export_bundle((root,), root / "merged", export_format="csv")
             self.assertEqual(report["rows"], 3)

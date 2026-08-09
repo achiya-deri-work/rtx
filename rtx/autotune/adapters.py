@@ -19,6 +19,7 @@ from ..kernels.mxfp8 import (
     MXFP8_FWD_KERNEL_REVISION,
     MXFP8FwdConfig,
     MXFP8Problem,
+    SM120_GEMM_RUNTIME_SMEM_RESERVE_BYTES,
     fwd_config_from_dict,
     fwd_config_id,
     fwd_config_to_dict,
@@ -96,7 +97,7 @@ def _gemm_launch_smem_bytes(config: object) -> int:
     # barriers/descriptors on the current SM120 GEMM. The raw operand estimate
     # alone allowed a 101,376-byte candidate whose actual launch requested
     # 102,400 bytes on a 101,376-byte device limit.
-    return _gemm_smem_bytes(config) + 1024
+    return _gemm_smem_bytes(config) + SM120_GEMM_RUNTIME_SMEM_RESERVE_BYTES
 
 
 def _gemm_smem_rejection(

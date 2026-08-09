@@ -120,10 +120,17 @@ class ShapeSpec:
 @dataclass(frozen=True, slots=True)
 class BenchmarkProtocol:
     warmup_calls: int = 5
-    samples: int = 7
-    confirm_samples: int = 15
+    samples: int = 5
+    confirm_samples: int = 11
     race_rounds: int = 11
-    target_batch_ms: float = 50.0
+    target_batch_ms: float = 30.0
+    adaptive_sampling: bool = True
+    screen_min_samples: int = 3
+    confirm_min_samples: int = 5
+    race_min_rounds: int = 7
+    screen_stable_cv: float = 0.005
+    confirm_stable_cv: float = 0.0025
+    race_stable_cv: float = 0.005
     min_calls_per_sample: int = 1
     max_calls_per_sample: int = 4096
     correctness_rtol: float = 5e-2
@@ -140,6 +147,18 @@ class BenchmarkProtocol:
             raise ValueError("warmup_calls must be nonnegative")
         if min(self.samples, self.confirm_samples, self.race_rounds) <= 0:
             raise ValueError("sample and race counts must be positive")
+        if min(
+            self.screen_min_samples,
+            self.confirm_min_samples,
+            self.race_min_rounds,
+        ) <= 0:
+            raise ValueError("adaptive sample floors must be positive")
+        if min(
+            self.screen_stable_cv,
+            self.confirm_stable_cv,
+            self.race_stable_cv,
+        ) < 0:
+            raise ValueError("adaptive stability thresholds must be nonnegative")
         if self.target_batch_ms <= 0:
             raise ValueError("target_batch_ms must be positive")
         if not 0 <= self.practical_threshold < 1:
@@ -151,9 +170,115 @@ class BenchmarkProtocol:
         if self.bootstrap_resamples <= 0:
             raise ValueError("bootstrap_resamples must be positive")
 
+    @staticmethod
+    def relative_stdev(values: Sequence[float]) -> float:
+        if len(values) < 2:
+            return math.inf
+        center = statistics.fmean(float(value) for value in values)
+        if center <= 0:
+            return math.inf
+        return float(statistics.stdev(float(value) for value in values) / center)
+
+    def timing_complete(
+        self, values: Sequence[float], *, requested_samples: int
+    ) -> bool:
+        if len(values) >= requested_samples:
+            return True
+        if not self.adaptive_sampling:
+            return False
+        is_confirmation = requested_samples > self.samples
+        floor = min(
+            requested_samples,
+            self.confirm_min_samples if is_confirmation else self.screen_min_samples,
+        )
+        threshold = (
+            self.confirm_stable_cv if is_confirmation else self.screen_stable_cv
+        )
+        return (
+            len(values) >= floor
+            and len(values) % 2 == 1
+            and self.relative_stdev(values) <= threshold
+        )
+
+    def race_complete(
+        self,
+        incumbent: Sequence[float],
+        challenger: Sequence[float],
+    ) -> bool:
+        if len(incumbent) >= self.race_rounds:
+            return True
+        if not self.adaptive_sampling:
+            return False
+        floor = min(self.race_rounds, self.race_min_rounds)
+        return (
+            len(incumbent) >= floor
+            and len(incumbent) % 2 == 1
+            and self.relative_stdev(incumbent) <= self.race_stable_cv
+            and self.relative_stdev(challenger) <= self.race_stable_cv
+        )
+
+    def sampling_metadata(
+        self, values: Sequence[float], *, requested_samples: int
+    ) -> dict[str, object]:
+        is_confirmation = requested_samples > self.samples
+        floor = min(
+            requested_samples,
+            self.confirm_min_samples if is_confirmation else self.screen_min_samples,
+        )
+        threshold = (
+            self.confirm_stable_cv if is_confirmation else self.screen_stable_cv
+        )
+        stopped_early = len(values) < requested_samples
+        return {
+            "adaptive": self.adaptive_sampling,
+            "stage": "confirmation" if is_confirmation else "screen",
+            "requested_samples": requested_samples,
+            "actual_samples": len(values),
+            "minimum_samples": floor,
+            "stable_cv_threshold": threshold,
+            "stopped_early": stopped_early,
+            "stop_reason": "stable_dispersion" if stopped_early else "sample_budget",
+            "relative_stdev": self.relative_stdev(values),
+        }
+
+    def race_sampling_metadata(
+        self,
+        incumbent: Sequence[float],
+        challenger: Sequence[float],
+    ) -> dict[str, object]:
+        stopped_early = len(incumbent) < self.race_rounds
+        return {
+            "adaptive": self.adaptive_sampling,
+            "stage": "paired_race",
+            "requested_rounds": self.race_rounds,
+            "actual_rounds": len(incumbent),
+            "minimum_rounds": min(self.race_rounds, self.race_min_rounds),
+            "stable_cv_threshold": self.race_stable_cv,
+            "stopped_early": stopped_early,
+            "stop_reason": "stable_dispersion" if stopped_early else "round_budget",
+            "incumbent_relative_stdev": self.relative_stdev(incumbent),
+            "challenger_relative_stdev": self.relative_stdev(challenger),
+        }
+
     @classmethod
     def from_dict(cls, value: Mapping[str, object] | None) -> "BenchmarkProtocol":
         return cls() if value is None else cls(**dict(value))  # type: ignore[arg-type]
+
+
+def collect_timing_samples(
+    measure: Callable[[int], float],
+    protocol: BenchmarkProtocol,
+    *,
+    requested_samples: int,
+) -> list[float]:
+    """Collect an odd, dispersion-gated number of calibrated timing batches."""
+
+    timings: list[float] = []
+    for sample in range(requested_samples):
+        timings.append(float(measure(sample)))
+        if protocol.timing_complete(timings, requested_samples=requested_samples):
+            break
+    return timings
 
 
 @dataclass(frozen=True, slots=True)
@@ -868,10 +993,11 @@ class PrequantBenchmarkHarness:
             prepared.runner(x, weight, prepared.out)
         torch.cuda.synchronize(self.device)
         calls, pilot_ms = self.calibrate_calls(prepared)
-        timings = [
-            self._time_batch(prepared, calls, sample * calls)
-            for sample in range(samples)
-        ]
+        timings = collect_timing_samples(
+            lambda sample: self._time_batch(prepared, calls, sample * calls),
+            self.protocol,
+            requested_samples=samples,
+        )
         telemetry_after = (
             _nvidia_smi_snapshot(self.device.index or torch.cuda.current_device())
             if self.protocol.telemetry
@@ -894,6 +1020,9 @@ class PrequantBenchmarkHarness:
             "pilot_ms_per_call": pilot_ms,
             "rotation_buffers": len(self._inputs),
             "timings_ms": timings,
+            "sampling": self.protocol.sampling_metadata(
+                timings, requested_samples=samples
+            ),
             "summary_ms": summary.as_dict(),
             "components": component_results,
             "elapsed_s": time.monotonic() - started,
@@ -926,6 +1055,8 @@ class PrequantBenchmarkHarness:
                 b_time = self._time_batch(b, calls_b, round_index * calls_b)
             a_times.append(a_time)
             b_times.append(b_time)
+            if self.protocol.race_complete(a_times, b_times):
+                break
         speedups = [(a_time - b_time) / a_time for a_time, b_time in zip(a_times, b_times)]
         summary = robust_summary(
             speedups,
@@ -949,6 +1080,7 @@ class PrequantBenchmarkHarness:
             "incumbent_calls_per_sample": calls_a,
             "challenger_calls_per_sample": calls_b,
             "rotation_buffers": len(self._inputs),
+            "sampling": self.protocol.race_sampling_metadata(a_times, b_times),
         }
 
 

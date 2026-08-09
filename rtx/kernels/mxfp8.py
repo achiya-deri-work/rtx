@@ -30,6 +30,10 @@ Raster = Literal["m", "n"]
 Reuse = Literal["none", "x", "weight"]
 Epilogue = Literal["direct", "smem", "tma"]
 SM120_SMEM_CAPACITY_BYTES = 101_376
+# CuTe's prequantized GEMM wrapper adds pipeline barriers/descriptors outside
+# the explicitly modeled operand storage. This reserve is part of legality,
+# not an autotuner heuristic: a 101,376-byte raw tile launches as 102,400 B.
+SM120_GEMM_RUNTIME_SMEM_RESERVE_BYTES = 1_024
 
 
 @dataclass(frozen=True, slots=True)

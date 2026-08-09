@@ -19,6 +19,7 @@ from rtx.prequant_experiments import (
     ShapeSpec,
     _reference_prequant_config,
     config_in_shard,
+    collect_timing_samples,
     derived_features,
     export_journal_csv,
     generate_legal_catalog,
@@ -46,6 +47,49 @@ def _fingerprint() -> DeviceFingerprint:
 
 
 class PrequantExperimentTests(unittest.TestCase):
+    def test_adaptive_sampling_uses_odd_dispersion_gated_stages(self) -> None:
+        protocol = BenchmarkProtocol(
+            samples=5,
+            confirm_samples=11,
+            screen_stable_cv=0.005,
+            confirm_stable_cv=0.0025,
+        )
+        stable = collect_timing_samples(
+            lambda index: (1.0, 1.001, 0.999, 1.0, 1.0)[index],
+            protocol,
+            requested_samples=5,
+        )
+        self.assertEqual(len(stable), 3)
+        self.assertEqual(
+            protocol.sampling_metadata(stable, requested_samples=5)["stop_reason"],
+            "stable_dispersion",
+        )
+        noisy_values = (1.0, 1.1, 0.9, 1.08, 0.92)
+        noisy = collect_timing_samples(
+            lambda index: noisy_values[index],
+            protocol,
+            requested_samples=5,
+        )
+        self.assertEqual(len(noisy), 5)
+        confirmed = collect_timing_samples(
+            lambda index: 1.0 + (index % 2) * 0.001,
+            protocol,
+            requested_samples=11,
+        )
+        self.assertEqual(len(confirmed), 5)
+
+    def test_adaptive_race_extends_noisy_devices(self) -> None:
+        protocol = BenchmarkProtocol(race_rounds=11, race_min_rounds=7)
+        stable = [1.0, 1.001, 0.999, 1.0, 1.001, 0.999, 1.0]
+        self.assertTrue(protocol.race_complete(stable, stable))
+        self.assertEqual(
+            protocol.race_sampling_metadata(stable, stable)["stop_reason"],
+            "stable_dispersion",
+        )
+        noisy = [1.0, 1.05, 0.95, 1.04, 0.96, 1.03, 0.97]
+        self.assertFalse(protocol.race_complete(noisy, noisy))
+        self.assertTrue(protocol.race_complete(noisy + [1.02] * 4, noisy + [0.98] * 4))
+
     def test_reference_config_supports_64_row_campaign_shapes(self) -> None:
         problem = MXFP8Problem(64, 1536, 1536)
         config = _reference_prequant_config(problem)

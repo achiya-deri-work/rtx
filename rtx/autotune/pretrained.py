@@ -271,6 +271,12 @@ def load_offline_observations(
         "source_files": sorted(source_files),
         "observations": len(observations),
         "dataset_sha256": dataset_digest.hexdigest(),
+        "observation_identity_hashes": sorted(
+            hashlib.sha256(
+                f"{item.context_id}:{item.observation_id}".encode()
+            ).hexdigest()[:24]
+            for item in observations
+        ),
         "malformed": malformed,
         "campaign_filter": list(campaigns),
         "families": dict(Counter(item.family for item in observations)),
@@ -915,6 +921,158 @@ def load_pretrained_family(
     )
 
 
+def evaluate_pretrained_bundle(
+    root: Path | str,
+    paths: Sequence[Path | str],
+    *,
+    campaign: str | Sequence[str] | None = None,
+    allow_source_overlap: bool = False,
+) -> dict[str, object]:
+    """Evaluate an immutable pretrained bundle on disjoint copied observations.
+
+    This is deliberately separate from training and never changes deployment
+    gates in the artifact.  The report records both input identities so a
+    prospective study cannot silently become an in-sample score.
+    """
+
+    root = Path(root).expanduser()
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    if (
+        manifest.get("schema_version") != PRETRAINED_SCHEMA_VERSION
+        or manifest.get("type") != "rtx_pretrained_autotune_bundle"
+    ):
+        raise ValueError("unsupported pretrained autotune artifact")
+    observations, evaluation_input = load_offline_observations(
+        paths, campaign=campaign
+    )
+    if not observations:
+        raise ValueError("no held-out autotuning observations were found")
+    training_input = manifest.get("input", {})
+    training_sources = {
+        str(value) for value in training_input.get("source_files", [])
+    } if isinstance(training_input, Mapping) else set()
+    evaluation_sources = {
+        str(value) for value in evaluation_input.get("source_files", [])
+    }
+    overlapping_sources = sorted(training_sources & evaluation_sources)
+    training_identities = {
+        str(value)
+        for value in training_input.get("observation_identity_hashes", [])
+    } if isinstance(training_input, Mapping) else set()
+    evaluation_identities = {
+        str(value)
+        for value in evaluation_input.get("observation_identity_hashes", [])
+    }
+    overlapping_observations = training_identities & evaluation_identities
+    same_dataset = (
+        isinstance(training_input, Mapping)
+        and training_input.get("dataset_sha256")
+        == evaluation_input.get("dataset_sha256")
+    )
+    if (
+        overlapping_sources or overlapping_observations or same_dataset
+    ) and not allow_source_overlap:
+        detail = (
+            "shared observations"
+            if overlapping_observations
+            else "identical dataset digest"
+            if same_dataset
+            else "shared source files"
+        )
+        raise ValueError(
+            f"held-out evaluation overlaps training data ({detail}); "
+            "pass allow_source_overlap=True only for an explicitly in-sample diagnostic"
+        )
+
+    grouped: dict[tuple[str, int], list[Observation[object]]] = defaultdict(list)
+    for item in observations:
+        grouped[(item.family, item.kernel_revision)].append(item)
+    results: dict[str, object] = {}
+    artifact_families = manifest.get("families", {})
+    if not isinstance(artifact_families, Mapping):
+        raise ValueError("pretrained artifact has no family catalog")
+    for key, entry in sorted(artifact_families.items()):
+        if not isinstance(entry, Mapping):
+            continue
+        family = str(entry.get("family", ""))
+        revision = int(entry.get("kernel_revision", -1))
+        rows = grouped.get((family, revision), [])
+        if not rows:
+            results[str(key)] = {"rows": 0, "contexts": 0, "devices": {}}
+            continue
+        cross_device = load_pretrained_family(root, family, revision)
+        by_device: dict[str, list[Observation[object]]] = defaultdict(list)
+        for item in rows:
+            by_device[_device_key(item)].append(item)
+        device_results: dict[str, object] = {}
+        for device, device_rows in sorted(by_device.items()):
+            exact = load_pretrained_family(
+                root, family, revision, device_family=device
+            )
+            device_results[device] = {
+                "rows": len(device_rows),
+                "contexts": len({item.context_id for item in device_rows}),
+                "cross_device": {
+                    "latency": evaluate_latency_model(
+                        cross_device.cost_model, device_rows
+                    ),
+                    "ranking": evaluate_latency_model(
+                        cross_device.ranking_model, device_rows
+                    ),
+                    "deployment": dict(cross_device.deployment),
+                },
+                "selected_exact_device_scope": exact.model_scope,
+                "exact_device": {
+                    "latency": evaluate_latency_model(exact.cost_model, device_rows),
+                    "ranking": evaluate_latency_model(exact.ranking_model, device_rows),
+                    "deployment": dict(exact.deployment),
+                },
+                "feasibility": evaluate_feasibility_model(
+                    cross_device.feasibility_model, device_rows
+                ),
+            }
+        results[str(key)] = {
+            "rows": len(rows),
+            "contexts": len({item.context_id for item in rows}),
+            "cross_device": {
+                "latency": evaluate_latency_model(cross_device.cost_model, rows),
+                "ranking": evaluate_latency_model(cross_device.ranking_model, rows),
+                "feasibility": evaluate_feasibility_model(
+                    cross_device.feasibility_model, rows
+                ),
+                "deployment": dict(cross_device.deployment),
+            },
+            "devices": device_results,
+        }
+    return {
+        "schema_version": 1,
+        "type": "rtx_pretrained_heldout_evaluation",
+        "recorded_at": _utc_now(),
+        "artifact": {
+            "path": str(root.resolve()),
+            "artifact_id": manifest.get("artifact_id"),
+            "training_input": {
+                key: value
+                for key, value in training_input.items()
+                if key != "observation_identity_hashes"
+            } if isinstance(training_input, Mapping) else training_input,
+        },
+        "evaluation_input": {
+            key: value
+            for key, value in evaluation_input.items()
+            if key != "observation_identity_hashes"
+        },
+        "separation": {
+            "held_out": not overlapping_sources and not overlapping_observations and not same_dataset,
+            "same_dataset_sha256": same_dataset,
+            "overlapping_source_files": overlapping_sources,
+            "overlapping_observations": len(overlapping_observations),
+            "overlap_override": allow_source_overlap,
+        },
+        "families": results,
+    }
+
+
 def train_pretrained_bundle(
     paths: Sequence[Path | str],
     output: Path | str,
@@ -1281,6 +1439,7 @@ __all__ = [
     "analytical_baseline_ms",
     "evaluate_latency_model",
     "evaluate_feasibility_model",
+    "evaluate_pretrained_bundle",
     "extract_conditional_rules",
     "load_offline_observations",
     "load_pretrained_family",

@@ -47,6 +47,21 @@ class HardwareAutotuneTests(unittest.TestCase):
         self.assertIsNotNone(rejection)
         self.assertIn("runtime overhead", rejection[1])
 
+    def test_prequant_config_rejects_runtime_smem_reserve_statically(self) -> None:
+        from rtx.configs import MXFP8GemmConfig
+
+        candidate = MXFP8GemmConfig(
+            tile_m=128,
+            tile_n=128,
+            tile_k=128,
+            stages=3,
+            epilogue="direct",
+            store_vec=1,
+        )
+        reason = candidate.rejection(MXFP8Problem(128, 128, 128))
+        self.assertIsNotNone(reason)
+        self.assertIn("runtime reserve", reason)
+
     def test_architecture_and_sku_profiles_cover_target_devices(self) -> None:
         unsupported = architecture_profile((11, 0))
         self.assertEqual(unsupported.execution_model, "unknown")

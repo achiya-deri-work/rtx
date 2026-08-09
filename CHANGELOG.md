@@ -3,6 +3,24 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.9.0
+
+- Add dispersion-gated adaptive timing: stable screens stop after 3 samples,
+  confirmations after 5, and paired races after 7; noisy measurements retain
+  the full 5/11/11 budgets and every stopping decision is recorded.
+- Add `rtx-autotune audit`, crash-tail/interior-corruption and identity checks,
+  and `rtx-autotune install-winners` for atomic promotion of verified,
+  device/shape/layout-specific runtime winners.
+- Add disjoint `evaluate-pretrained` evaluation, ZIP-native dataset ingestion,
+  exact-shape prospective summaries, compile-waste metrics, probabilities of
+  beating random, and bootstrap confidence intervals.
+- Reserve CuTe's measured 1 KiB GEMM wrapper overhead in static SMEM legality,
+  preventing the observed 102,400-byte launch from reaching compilation on a
+  101,376-byte RTX limit.
+- Add a production matrix covering eager and fullgraph training/inference,
+  both packed inference states, M=8192 dW accuracy, multiple streams, variable
+  shapes, and bounded runner-cache eviction.
+
 ## 0.8.1
 
 - Make random search retry progressively larger candidate pools before

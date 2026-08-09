@@ -366,6 +366,8 @@ coordinate descent deliberately does not pay for:
 - explicit `hot` and rotating-input regimes, where the rotation ring targets
   twice the device L2 size when memory permits;
 - low-fidelity screening, high-fidelity confirmation, and AB/BA paired races;
+- dispersion-gated stopping at 3/5 screen samples, 5/11 confirmation samples,
+  and 7/11 paired rounds, with full budgets retained for noisy cases;
 - bootstrap confidence intervals and a practical-equivalence threshold;
 - separate quantizer and materialized-GEMM diagnostics for confirmed
   candidates while end-to-end timing remains authoritative;
@@ -409,7 +411,9 @@ across processes or machines, give each copy a distinct `shard_index` in
 
 JSONL measurement records retain raw timing vectors, confidence summaries,
 configuration dictionaries, protocol, device environment, telemetry and
-features. Resume checks observation keys and never overwrites measurements.
+features. Each measurement also records the requested and actual sample count,
+dispersion threshold, observed relative standard deviation, and stopping
+reason. Resume checks observation keys and never overwrites measurements.
 Completed paired-race decisions are replayed when rebuilding the atomic shard
 summary. Compilation and correctness failures are dataset rows rather than
 reasons to terminate a campaign.
@@ -427,6 +431,16 @@ rtx-autotune pretrain copied_datasets/ laptop-results.zip \
 
 `--campaign` is repeatable for known-compatible collections. This is preferable
 to omitting the filter, which may silently admit obsolete or interrupted runs.
+
+Audit copied residuals before fitting or analysis, and reserve the prospective
+campaign for a frozen-artifact evaluation:
+
+```bash
+rtx-autotune audit copied_datasets/ heldout.zip \
+  --output autotune_reports/copied.audit.json
+rtx-autotune evaluate-pretrained autotune_models/model_v1 heldout.zip \
+  --output autotune_reports/model_v1.heldout.json
+```
 
 Models are split by `(family, kernel_revision)`. Provenance, UUIDs, raw timing
 vectors, and device-name categories are removed from features; physical device

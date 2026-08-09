@@ -22,6 +22,7 @@ from .ask_tell import (
     TrialRequest,
     TrialResponse,
 )
+from .audit import audit_bundles
 from .calibration import calibrate_device
 from .core import (
     ComposableTuningResult,
@@ -80,10 +81,12 @@ from .pretrained import (
     ConditionalRuleSet,
     ContextRankingModel,
     NormalizedCostModel,
+    evaluate_pretrained_bundle,
     load_offline_observations,
     load_pretrained_family,
     train_pretrained_bundle,
 )
+from .promotion import install_verified_winners
 from .store import (
     InMemoryTuningStore,
     JsonlTuningStore,
@@ -231,6 +234,7 @@ __all__ = [
     "UCB1Scheduler",
     "default_cache_dir",
     "architecture_profile",
+    "audit_bundles",
     "calibrate_device",
     "compiled_resource_metadata",
     "contextual_ucb_scores",
@@ -238,11 +242,13 @@ __all__ = [
     "device_properties",
     "export_bundle",
     "failure_scope",
+    "evaluate_pretrained_bundle",
     "load_cached_mxfp8_fwd_config",
     "load_offline_observations",
     "load_pretrained_family",
     "load_runtime_winner",
     "import_legacy_json_database",
+    "install_verified_winners",
     "is_fatal_device_context_error",
     "make_mxfp8_bwd_adapter",
     "make_mxfp8_fully_prequant_adapter",

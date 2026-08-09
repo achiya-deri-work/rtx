@@ -52,6 +52,26 @@ def _bootstrap_median_ci(
     )
 
 
+def _bootstrap_mean_ci(
+    values: Iterable[float], *, seed_key: object, samples: int = 2000
+) -> tuple[float | None, float | None]:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite:
+        return None, None
+    if len(finite) == 1:
+        return finite[0], finite[0]
+    seed = int(hashlib.sha256(repr(seed_key).encode()).hexdigest()[:16], 16)
+    rng = random.Random(seed)
+    means = sorted(
+        statistics.fmean(rng.choices(finite, k=len(finite)))
+        for _ in range(samples)
+    )
+    return (
+        float(means[int(0.025 * (samples - 1))]),
+        float(means[int(0.975 * (samples - 1))]),
+    )
+
+
 def _matched_treatment_comparisons(
     rows: Iterable[Mapping[str, object]], *, baseline: str = "random"
 ) -> list[dict[str, object]]:
@@ -106,7 +126,15 @@ def _matched_treatment_comparisons(
             record[f"median_delta_{suffix}"] = float(statistics.median(values))
             record[f"ci_low_delta_{suffix}"] = low
             record[f"ci_high_delta_{suffix}"] = high
-            record[f"win_rate_{suffix}"] = sum(value < 0 for value in values) / len(values)
+            wins = [float(value < 0) for value in values]
+            win_low, win_high = _bootstrap_mean_ci(
+                wins,
+                seed_key=(machine, family, treatment, baseline, metric, "win"),
+            )
+            record[f"win_rate_{suffix}"] = statistics.fmean(wins)
+            record[f"probability_beating_{baseline}_{suffix}"] = statistics.fmean(wins)
+            record[f"ci_low_probability_beating_{baseline}_{suffix}"] = win_low
+            record[f"ci_high_probability_beating_{baseline}_{suffix}"] = win_high
         comparisons.append(record)
     return comparisons
 
@@ -151,6 +179,55 @@ def _conditional_aggregates(
     return result
 
 
+def _shape_aggregates(
+    rows: Iterable[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    groups: dict[tuple[object, ...], list[Mapping[str, object]]] = defaultdict(list)
+    for row in rows:
+        groups[
+            (
+                row.get("machine_id"),
+                row.get("family"),
+                row.get("m"),
+                row.get("n"),
+                row.get("k"),
+                row.get("regime"),
+                row.get("treatment"),
+            )
+        ].append(row)
+    result = []
+    for key, values in sorted(groups.items(), key=lambda item: repr(item[0])):
+        machine, family, m, n, k, regime, treatment = key
+        result.append(
+            {
+                "machine_id": machine,
+                "family": family,
+                "m": m,
+                "n": n,
+                "k": k,
+                "regime": regime,
+                "treatment": treatment,
+                "replicates": len(values),
+                "median_time_to_first_valid_s": _median(
+                    value.get("time_to_first_valid_s") for value in values
+                ),
+                "mean_compile_failure_rate": statistics.fmean(
+                    float(value.get("compile_failure_rate", 0.0)) for value in values
+                ),
+                "median_wasted_compile_time_rate": _median(
+                    value.get("wasted_compile_time_rate") for value in values
+                ),
+                **{
+                    f"median_regret_at_{budget}": _median(
+                        value.get(f"regret_at_{budget}") for value in values
+                    )
+                    for budget in _BUDGETS
+                },
+            }
+        )
+    return result
+
+
 def optimizer_study_rows(
     paths: Iterable[Path | str],
 ) -> list[dict[str, object]]:
@@ -182,6 +259,7 @@ def optimizer_study_rows(
         statuses: Counter[str] = Counter()
         compile_ms = 0.0
         failed_compile_ms = 0.0
+        compile_error_elapsed_s = 0.0
         for index, row in enumerate(ordered, start=1):
             elapsed = _number(row.get("elapsed_s")) or 0.0
             cumulative_s += elapsed
@@ -191,6 +269,8 @@ def optimizer_study_rows(
             compile_ms += candidate_compile
             if status != "ok":
                 failed_compile_ms += candidate_compile
+            if status == "compile_error":
+                compile_error_elapsed_s += elapsed
             latency = _number(row.get("outcome__median_ms"))
             if status == "ok" and latency is not None:
                 incumbent = min(incumbent, latency)
@@ -217,11 +297,16 @@ def optimizer_study_rows(
             "trials": len(ordered),
             "successful_trials": statuses.get("ok", 0),
             "failure_rate": 1.0 - statuses.get("ok", 0) / len(ordered),
+            "compile_failure_rate": statuses.get("compile_error", 0) / len(ordered),
             "statuses": json.dumps(dict(statuses), sort_keys=True),
             "elapsed_evaluator_s": cumulative_s,
             "time_to_first_valid_s": first_valid_s,
             "compile_ms": compile_ms,
             "failed_compile_ms": failed_compile_ms,
+            "compile_error_elapsed_s": compile_error_elapsed_s,
+            "wasted_compile_time_rate": (
+                compile_error_elapsed_s / cumulative_s if cumulative_s > 0 else 0.0
+            ),
             "best_ms": None if not math.isfinite(incumbent) else incumbent,
         }
         for budget, value in budget_best.items():
@@ -309,19 +394,44 @@ def summarize_optimizer_study(
                 float(value.get("failure_rate", 0.0)) for value in values
             )
             / len(values),
+            "mean_compile_failure_rate": sum(
+                float(value.get("compile_failure_rate", 0.0)) for value in values
+            )
+            / len(values),
+            "median_wasted_compile_time_rate": _median(
+                value.get("wasted_compile_time_rate") for value in values
+            ),
         }
         for budget in _BUDGETS:
             aggregate[f"median_regret_at_{budget}"] = _median(
                 value.get(f"regret_at_{budget}") for value in values
             )
+        for metric in (
+            "final_regret",
+            "time_to_first_valid_s",
+            "compile_failure_rate",
+            "wasted_compile_time_rate",
+        ):
+            finite = [
+                numeric
+                for value in values
+                if (numeric := _number(value.get(metric))) is not None
+            ]
+            low, high = _bootstrap_median_ci(
+                finite,
+                seed_key=(machine, family, treatment, metric),
+            )
+            aggregate[f"ci_low_median_{metric}"] = low
+            aggregate[f"ci_high_median_{metric}"] = high
         aggregates.append(aggregate)
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "type": "rtx_optimizer_prospective_summary",
         "units": len(rows),
         "files": files,
         "aggregates": aggregates,
         "conditional_aggregates": _conditional_aggregates(rows),
+        "shape_aggregates": _shape_aggregates(rows),
         "matched_comparisons": _matched_treatment_comparisons(rows),
         "coverage": {
             "machines": len({str(row.get("machine_id")) for row in rows}),

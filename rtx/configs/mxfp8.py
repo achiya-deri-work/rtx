@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..kernels.mxfp8 import MXFP8Problem, SM120_SMEM_CAPACITY_BYTES
+from ..kernels.mxfp8 import (
+    MXFP8Problem,
+    SM120_GEMM_RUNTIME_SMEM_RESERVE_BYTES,
+    SM120_SMEM_CAPACITY_BYTES,
+)
 
 
 SF_VEC_SIZE = 32
@@ -207,8 +211,17 @@ class MXFP8GemmConfig:
         out_bytes = (
             self.tile_m * self.tile_n * 2 if self.epilogue == "tma" else 0
         )
-        if q_bytes + scale_bytes + out_bytes > SM120_SMEM_CAPACITY_BYTES:
-            return "prequantized GEMM exceeds SM120 shared-memory capacity"
+        launch_bytes = (
+            q_bytes
+            + scale_bytes
+            + out_bytes
+            + SM120_GEMM_RUNTIME_SMEM_RESERVE_BYTES
+        )
+        if launch_bytes > SM120_SMEM_CAPACITY_BYTES:
+            return (
+                "prequantized GEMM exceeds SM120 shared-memory capacity "
+                "including runtime reserve"
+            )
         if self.raster not in ("m", "n") or self.grid_swizzle not in (1, 2, 4, 8):
             return "invalid raster/grid swizzle"
         return None

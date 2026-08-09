@@ -17,6 +17,7 @@ from .prequant_experiments import (
     CacheRegime,
     ShapeSpec,
     _nvidia_smi_snapshot,
+    collect_timing_samples,
     robust_summary,
 )
 
@@ -292,10 +293,11 @@ class BwdBenchmarkHarness:
             )
         torch.cuda.synchronize(self.device)
         calls, pilot_ms = self.calibrate_calls(prepared)
-        timings = [
-            self._time_batch(prepared, calls, sample * calls)
-            for sample in range(samples)
-        ]
+        timings = collect_timing_samples(
+            lambda sample: self._time_batch(prepared, calls, sample * calls),
+            self.protocol,
+            requested_samples=samples,
+        )
         telemetry_after = (
             _nvidia_smi_snapshot(self.device.index or torch.cuda.current_device())
             if self.protocol.telemetry
@@ -311,6 +313,9 @@ class BwdBenchmarkHarness:
             "pilot_ms_per_call": pilot_ms,
             "rotation_buffers": len(self._inputs),
             "timings_ms": timings,
+            "sampling": self.protocol.sampling_metadata(
+                timings, requested_samples=samples
+            ),
             "summary_ms": robust_summary(
                 timings,
                 seed=seed,
@@ -369,6 +374,8 @@ class BwdBenchmarkHarness:
                 b_time = self._time_batch(b, calls_b, round_index * calls_b)
             a_times.append(a_time)
             b_times.append(b_time)
+            if self.protocol.race_complete(a_times, b_times):
+                break
         speedups = [
             (a_time - b_time) / a_time
             for a_time, b_time in zip(a_times, b_times)
@@ -395,6 +402,7 @@ class BwdBenchmarkHarness:
             "incumbent_calls_per_sample": calls_a,
             "challenger_calls_per_sample": calls_b,
             "rotation_buffers": len(self._inputs),
+            "sampling": self.protocol.race_sampling_metadata(a_times, b_times),
         }
 
 

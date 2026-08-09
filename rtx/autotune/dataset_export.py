@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import tempfile
 from typing import Iterable, Literal, Mapping, Sequence
+import zipfile
 
 from .core import canonical_json
 
@@ -44,16 +45,37 @@ def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
 
 
 def _iter_jsonl(paths: Iterable[Path | str], filename: str):
-    seen_paths: set[Path] = set()
+    seen_paths: set[str] = set()
     for root_value in paths:
         root = Path(root_value)
+        if root.is_file() and zipfile.is_zipfile(root):
+            with zipfile.ZipFile(root) as archive:
+                for member in archive.infolist():
+                    if member.is_dir() or not (
+                        member.filename == filename
+                        or member.filename.endswith("/" + filename)
+                    ):
+                        continue
+                    identity = f"{root.resolve()}!{member.filename}"
+                    if identity in seen_paths:
+                        continue
+                    seen_paths.add(identity)
+                    with archive.open(member) as source:
+                        for encoded in source:
+                            if not encoded.strip():
+                                continue
+                            try:
+                                yield identity, json.loads(encoded)
+                            except (UnicodeDecodeError, json.JSONDecodeError):
+                                continue
+            continue
         candidates = (
             [root]
             if root.is_file() and root.name == filename
             else root.rglob(filename)
         )
         for path in candidates:
-            resolved = path.resolve()
+            resolved = str(path.resolve())
             if resolved in seen_paths:
                 continue
             seen_paths.add(resolved)
@@ -68,16 +90,34 @@ def _iter_jsonl(paths: Iterable[Path | str], filename: str):
 
 
 def _json_documents(paths: Iterable[Path | str], filename: str):
-    seen: set[Path] = set()
+    seen: set[str] = set()
     for root_value in paths:
         root = Path(root_value)
+        if root.is_file() and zipfile.is_zipfile(root):
+            with zipfile.ZipFile(root) as archive:
+                for member in archive.infolist():
+                    if member.is_dir() or not (
+                        member.filename == filename
+                        or member.filename.endswith("/" + filename)
+                    ):
+                        continue
+                    identity = f"{root.resolve()}!{member.filename}"
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    try:
+                        with archive.open(member) as source:
+                            yield identity, json.load(source)
+                    except (KeyError, UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+            continue
         candidates = (
             [root]
             if root.is_file() and root.name == filename
             else root.rglob(filename)
         )
         for path in candidates:
-            resolved = path.resolve()
+            resolved = str(path.resolve())
             if resolved in seen:
                 continue
             seen.add(resolved)

@@ -74,6 +74,7 @@ from ..prequant_experiments import (
     _device_properties,
     _nvidia_smi_snapshot,
     _reference_prequant_config,
+    collect_timing_samples,
     probe_device,
     robust_summary,
 )
@@ -544,10 +545,11 @@ class FusedFwdBenchmarkHarness:
             prepared.launcher(x, weight, prepared.out)
         torch.cuda.synchronize(self.device)
         calls, pilot = self.calibrate_calls(prepared)
-        timings = [
-            self._time_batch(prepared, calls, sample * calls)
-            for sample in range(samples)
-        ]
+        timings = collect_timing_samples(
+            lambda sample: self._time_batch(prepared, calls, sample * calls),
+            self.protocol,
+            requested_samples=samples,
+        )
         telemetry_after = (
             _nvidia_smi_snapshot(self.device.index or torch.cuda.current_device())
             if self.protocol.telemetry
@@ -562,6 +564,9 @@ class FusedFwdBenchmarkHarness:
             "pilot_ms_per_call": pilot,
             "rotation_buffers": len(self._inputs),
             "timings_ms": timings,
+            "sampling": self.protocol.sampling_metadata(
+                timings, requested_samples=samples
+            ),
             "summary_ms": robust_summary(
                 timings,
                 seed=seed,
@@ -592,6 +597,8 @@ class FusedFwdBenchmarkHarness:
                 bt = self._time_batch(b, calls_b, index * calls_b)
             a_times.append(at)
             b_times.append(bt)
+            if self.protocol.race_complete(a_times, b_times):
+                break
         speedups = [(a - b) / a for a, b in zip(a_times, b_times)]
         summary = robust_summary(
             speedups,
@@ -616,6 +623,7 @@ class FusedFwdBenchmarkHarness:
             "incumbent_calls_per_sample": calls_a,
             "challenger_calls_per_sample": calls_b,
             "rotation_buffers": len(self._inputs),
+            "sampling": self.protocol.race_sampling_metadata(a_times, b_times),
         }
 
 
@@ -2297,6 +2305,31 @@ def _build_parser() -> argparse.ArgumentParser:
         "--format", choices=("csv", "parquet", "both"), default="both"
     )
 
+    audit = subparsers.add_parser(
+        "audit",
+        help="audit JSONL integrity, identities, duplicates, and context coverage",
+    )
+    audit.add_argument("paths", type=Path, nargs="+")
+    audit.add_argument("--output", type=Path)
+    audit.add_argument(
+        "--allow-errors",
+        action="store_true",
+        help="report integrity errors without returning a failing exit status",
+    )
+
+    install = subparsers.add_parser(
+        "install-winners",
+        help="promote verified dataset winners into the MXFP8 runtime cache",
+    )
+    install.add_argument("paths", type=Path, nargs="+")
+    install.add_argument("--cache-dir", type=Path)
+    install.add_argument("--family", action="append")
+    install.add_argument("--treatment", action="append")
+    install.add_argument("--device-id", action="append")
+    install.add_argument("--minimum-support", type=int, default=1)
+    install.add_argument("--dry-run", action="store_true")
+    install.add_argument("--force", action="store_true")
+
     pretrain = subparsers.add_parser(
         "pretrain", help="fit portable cost models and conditional-effect rules"
     )
@@ -2329,6 +2362,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print the complete validation manifest instead of a concise summary",
     )
 
+    evaluate_pretrained = subparsers.add_parser(
+        "evaluate-pretrained",
+        help="evaluate a frozen pretrained artifact on disjoint held-out data",
+    )
+    evaluate_pretrained.add_argument("artifact", type=Path)
+    evaluate_pretrained.add_argument("paths", type=Path, nargs="+")
+    evaluate_pretrained.add_argument("--output", type=Path, required=True)
+    evaluate_pretrained.add_argument(
+        "--campaign",
+        action="append",
+        help="only consume observations under this held-out campaign",
+    )
+    evaluate_pretrained.add_argument(
+        "--allow-source-overlap",
+        action="store_true",
+        help="allow an explicitly in-sample diagnostic (never changes the artifact)",
+    )
+    evaluate_pretrained.add_argument(
+        "--full-report",
+        action="store_true",
+        help="print all held-out metrics (the output file is always complete)",
+    )
+
     validate = subparsers.add_parser("validate", help="validate and summarize a manifest")
     validate.add_argument("manifest", type=Path)
     probe = subparsers.add_parser("probe", help="print machine and GPU capability metadata")
@@ -2348,6 +2404,52 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command == "evaluate-pretrained":
+        from .pretrained import evaluate_pretrained_bundle
+
+        report = evaluate_pretrained_bundle(
+            args.artifact,
+            args.paths,
+            campaign=args.campaign,
+            allow_source_overlap=args.allow_source_overlap,
+        )
+        _atomic_json(args.output, report)
+        printable = report if args.full_report else {
+            "output": str(args.output.resolve()),
+            "artifact_id": report["artifact"]["artifact_id"],
+            "held_out": report["separation"]["held_out"],
+            "overlapping_observations": report["separation"][
+                "overlapping_observations"
+            ],
+            "evaluation_input": {
+                key: report["evaluation_input"][key]
+                for key in ("observations", "malformed", "devices", "families")
+            },
+            "families": {
+                key: {
+                    "rows": value["rows"],
+                    "contexts": value["contexts"],
+                    "latency_regret_at_4": value.get("cross_device", {})
+                    .get("latency", {})
+                    .get("catalog_replay_regret", {})
+                    .get("4"),
+                    "ranking_regret_at_4": value.get("cross_device", {})
+                    .get("ranking", {})
+                    .get("catalog_replay_regret", {})
+                    .get("4"),
+                    "matched_random_regret_at_4": value.get("cross_device", {})
+                    .get("ranking", {})
+                    .get("random_catalog_replay_regret", {})
+                    .get("4"),
+                    "feasibility_auc": value.get("cross_device", {})
+                    .get("feasibility", {})
+                    .get("auc"),
+                }
+                for key, value in report["families"].items()
+            },
+        }
+        print(json.dumps(printable, indent=2, sort_keys=True))
+        return
     if args.command == "pretrain":
         from .pretrained import train_pretrained_bundle
 
@@ -2450,6 +2552,31 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         report = summarize_optimizer_study(
             args.paths, args.output, export_format=args.format
+        )
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+    if args.command == "audit":
+        from .audit import audit_bundles
+
+        report = audit_bundles(args.paths)
+        if args.output is not None:
+            _atomic_json(args.output, report)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        if not report["ok"] and not args.allow_errors:
+            raise SystemExit(2)
+        return
+    if args.command == "install-winners":
+        from .promotion import install_verified_winners
+
+        report = install_verified_winners(
+            args.paths,
+            cache_dir=args.cache_dir,
+            families=args.family,
+            treatments=args.treatment,
+            device_ids=args.device_id,
+            minimum_support=args.minimum_support,
+            dry_run=args.dry_run,
+            force=args.force,
         )
         print(json.dumps(report, indent=2, sort_keys=True))
         return

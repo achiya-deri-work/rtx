@@ -25,6 +25,7 @@ from rtx.autotune.pretrained import (
     analytical_baseline_ms,
     extract_conditional_rules,
     evaluate_latency_model,
+    evaluate_pretrained_bundle,
     load_offline_observations,
     load_pretrained_family,
     train_pretrained_bundle,
@@ -230,6 +231,22 @@ class PretrainedAutotuneTests(unittest.TestCase):
             self.assertTrue(family.cost_model.fitted)
             self.assertEqual(family.artifact_id, manifest["artifact_id"])
             self.assertTrue((output / "manifest.json").exists())
+
+            heldout_path = root / "heldout" / "observations.jsonl"
+            heldout_path.parent.mkdir()
+            heldout_path.write_text(payload_b, encoding="utf-8")
+            evaluation = evaluate_pretrained_bundle(output, [heldout_path])
+            self.assertTrue(evaluation["separation"]["held_out"])
+            self.assertEqual(evaluation["families"]["toy@7"]["rows"], 12)
+            with self.assertRaisesRegex(ValueError, "overlaps training data"):
+                evaluate_pretrained_bundle(
+                    output, [archive_path], campaign="bundle-a"
+                )
+            copied_overlap = root / "copied" / "observations.jsonl"
+            copied_overlap.parent.mkdir()
+            copied_overlap.write_text(payload, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "shared observations"):
+                evaluate_pretrained_bundle(output, [copied_overlap])
 
 
 if __name__ == "__main__":

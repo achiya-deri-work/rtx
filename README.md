@@ -306,19 +306,31 @@ After copying the two `autotune_datasets/` trees together, create the optimizer
 comparison only once:
 
 ```bash
-rtx-autotune summarize-tuners \
+rtx-autotune audit \
   autotune_datasets/mxfp8_autotuner_prospective_5070_v1 \
+  laptop-results.zip \
+  --output autotune_reports/5070_prospective_v1.audit.json
+
+rtx-autotune summarize-tuners \
+  autotune_datasets/mxfp8_autotuner_prospective_5070_v1 laptop-results.zip \
   --output autotune_reports/5070_prospective_v1 \
   --format both
 ```
 
 The report includes validity and compiler-waste rates, evaluator time to first
 valid candidate, best latency and observed-oracle regret at 1/4/8/16/32/64
-trials, and treatment aggregates per machine and kernel family. Schema v2 also
-records minimum/median/maximum context coverage, category/regime splits, and
-matched deltas against random search with deterministic bootstrap confidence
-intervals. A context which silently exhausts early is therefore visible in the
-primary report rather than only in its residual journal.
+trials, and treatment aggregates per machine and kernel family. Schema v3 also
+records minimum/median/maximum context coverage, exact shape/cache-regime
+splits, compile-failure and wasted-compiler-time rates, matched deltas and the
+empirical probability of beating random search with deterministic bootstrap
+confidence intervals. A context which silently exhausts early is therefore
+visible in the primary report rather than only in its residual journal.
+
+`audit` is read-only. It verifies JSONL tails, interior corruption, machine and
+manifest identities, unit coverage, observation/config duplicates, and
+repeated confirmation keys before any bundle is ingested. A single malformed
+final line is reported as a recoverable crash tail; malformed interior records
+or conflicting identities make the command fail.
 
 If this scheduler is pulled while a v2 run made by an older checkout already
 exists, explicitly adopt that bundle's context identity so the old observations
@@ -434,6 +446,33 @@ Conditional rules only adjust ranking; they never reject a legal candidate or
 install an unverified winner.
 Artifacts are ignored by Git because they are reproducible from the source
 JSONL datasets.
+
+Keep a prospective study out of training, then evaluate the frozen artifact on
+it explicitly:
+
+```bash
+rtx-autotune evaluate-pretrained \
+  autotune_models/mxfp8_blackwell_bandit_v1 \
+  prospective-5070-ti/ prospective-5070-laptop.zip \
+  --output autotune_reports/mxfp8_blackwell_bandit_v1.heldout.json
+```
+
+The command rejects identical dataset digests or overlapping source files by
+default and records both input identities. It never changes the artifact's
+deployment gates.
+
+After audit and numerical verification, preview and install runtime winners:
+
+```bash
+rtx-autotune install-winners copied_datasets/ laptop-results.zip \
+  --minimum-support 2 --dry-run
+rtx-autotune install-winners copied_datasets/ laptop-results.zip \
+  --minimum-support 2
+```
+
+Promotion is atomic and keyed by kernel family, exact device fingerprint,
+shape, cache regime, and packed scale-layout variant. Existing entries are not
+overwritten unless `--force` is supplied.
 
 ## Dataset manifest
 
