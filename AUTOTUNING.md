@@ -221,6 +221,26 @@ selection stores all arm scores and sufficient statistics for offline replay.
 The original sequential and breadth-first schedulers remain selectable control
 policies.
 
+## Interruption-safe prospective optimizer studies
+
+`storage_mode: residual_context` gives every family/treatment/replicate/shape/
+regime context its own append-only journals. Writes are flushed and fsync'd per
+accepted observation. A malformed crash tail is ignored and terminated before
+the next append. Consequently, corruption is bounded to one residual and does
+not consume the first record written after resume.
+
+`rotation_mode: balanced_categories` greedily orders contexts so useful
+prefixes stay balanced across treatment, family, named shape category, cache
+regime, and replicate. Breadth-first absolute milestones then deepen that same
+balanced order. Treatment and replicate are included in context identity;
+cross-context transfer is scoped inside a single treatment/replicate to prevent
+prospective leakage.
+
+The 5070 study exposes `random`, `random_local`, and `online_bandit` as explicit
+portfolios rather than inferring optimizer behavior after collection. Summarize
+copied residuals with `rtx-autotune summarize-tuners`; it reports success,
+compiler waste, time-to-valid, and regret curves at fixed trial budgets.
+
 ## Native-scale prequant backend
 
 The production materialize-once backend has a joint end-to-end tuner. It times

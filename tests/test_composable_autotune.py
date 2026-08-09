@@ -18,6 +18,7 @@ from rtx.autotune import (
     InMemoryTuningStore,
     JsonlTuningStore,
     KernelContext,
+    HybridTuningPolicy,
     RandomSearch,
     RuntimeWinnerKey,
     SequentialScheduler,
@@ -31,6 +32,7 @@ from rtx.autotune import (
     make_mxfp8_prequant_adapter,
     make_mxfp8_weight_prequant_adapter,
     load_runtime_winner,
+    make_hybrid_autotuner,
     save_runtime_winner,
 )
 from rtx.autotune.core import Proposal, evaluate_proposal
@@ -75,6 +77,31 @@ def _toy_adapter() -> DiscreteKernelAdapter[_ToyConfig]:
 
 
 class ComposableAutotuneTests(unittest.TestCase):
+    def test_recipe_portfolios_are_explicit_experimental_arms(self) -> None:
+        random_tuner = make_hybrid_autotuner(
+            _toy_adapter(),
+            InMemoryTuningStore(),
+            HybridTuningPolicy(portfolio="random", max_trials=4),
+        )
+        self.assertEqual(set(random_tuner.strategies), {"random"})
+
+        local_tuner = make_hybrid_autotuner(
+            _toy_adapter(),
+            InMemoryTuningStore(),
+            HybridTuningPolicy(
+                portfolio="random_local",
+                max_trials=8,
+                cost_model_trials=4,
+            ),
+        )
+        self.assertEqual(
+            set(local_tuner.strategies), {"random", "coordinate_local"}
+        )
+        result = local_tuner.tune()
+        self.assertEqual(result.evaluated_trials, 8)
+        self.assertGreater(result.strategy_trials["random"], 0)
+        self.assertGreater(result.strategy_trials["coordinate_local"], 0)
+
     def test_adaptive_bandit_replays_state_across_resume(self) -> None:
         adapter = _toy_adapter()
         with tempfile.TemporaryDirectory() as directory:

@@ -239,6 +239,15 @@ override is recorded in the run's anytime policy. Use
 `--adopt-existing-context-identity` only for a compatible runner-only upgrade
 as described in the repository README.
 
+For interruption-prone prospective comparisons, manifests may define named
+optimizer `treatments`, independent `replicates`,
+`storage_mode: residual_context`, and
+`rotation_mode: balanced_categories`. The residual store writes locally while
+reading transferable sibling contexts from only the same treatment/replicate.
+Use `rtx-autotune summarize-tuners` to generate fixed-budget regret and failure
+summaries after collection rather than maintaining a monolithic dataset during
+the run.
+
 ## Recorded schema
 
 Every observation includes:

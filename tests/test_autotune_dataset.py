@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import csv
 from dataclasses import asdict, dataclass, replace
 import json
@@ -13,6 +14,7 @@ from rtx.autotune import (
     DiscreteKernelAdapter,
     JsonlTuningStore,
     KernelContext,
+    ResidualTuningStore,
     TrialOutcome,
     contextual_ucb_scores,
 )
@@ -26,6 +28,10 @@ from rtx.autotune.dataset import (
     normalized_rows,
 )
 from rtx.autotune import dataset as dataset_module
+from rtx.autotune.optimizer_benchmark import (
+    optimizer_study_rows,
+    summarize_optimizer_study,
+)
 from rtx.prequant_experiments import ExperimentJournal
 
 
@@ -154,12 +160,143 @@ class DatasetTests(unittest.TestCase):
             "cross_device_dataset_v2.json",
             "cross_device_dataset_bandit_v1.json",
             "inference_states_pilot_v1.json",
+            "autotuner_prospective_5070_v1.json",
         ):
             manifest = DatasetManifest.load(root / "autotune_manifests" / name)
             restored = DatasetManifest.from_dict(manifest.as_dict())
             self.assertEqual(restored, manifest)
             self.assertEqual(restored.digest, manifest.digest)
             self.assertGreater(sum(len(job.shapes) for job in manifest.jobs), 0)
+
+    def test_prospective_matrix_rotates_balanced_residual_units(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        manifest = DatasetManifest.load(
+            root / "autotune_manifests" / "autotuner_prospective_5070_v1.json"
+        )
+        campaign = DatasetCampaign.__new__(DatasetCampaign)
+        campaign.manifest = manifest
+        campaign.anytime = AnytimeRunPolicy(60.0)
+        contexts = campaign._assigned_contexts()
+        self.assertEqual(len(contexts), 144)
+        domains = (
+            {job.tags["treatment"] for job, _shape, _regime in contexts},
+            {job.family for job, _shape, _regime in contexts},
+            {shape.name for _job, shape, _regime in contexts},
+            {regime for _job, _shape, regime in contexts},
+            {job.tags["replicate"] for job, _shape, _regime in contexts},
+        )
+        for prefix_size in (12, 24, 36, 72, 144):
+            prefix = contexts[:prefix_size]
+            dimensions = (
+                [job.tags["treatment"] for job, _shape, _regime in prefix],
+                [job.family for job, _shape, _regime in prefix],
+                [shape.name for _job, shape, _regime in prefix],
+                [regime for _job, _shape, regime in prefix],
+                [job.tags["replicate"] for job, _shape, _regime in prefix],
+            )
+            for values, domain in zip(dimensions, domains):
+                counts = Counter(values)
+                loads = [counts[value] for value in domain]
+                self.assertLessEqual(max(loads) - min(loads), 1)
+        self.assertEqual(manifest.storage_mode, "residual_context")
+        self.assertEqual(manifest.rotation_mode, "balanced_categories")
+
+    def test_residual_store_isolates_corrupt_tail_and_reads_siblings(self) -> None:
+        first_adapter = _adapter()
+        second_adapter = replace(
+            first_adapter,
+            context=replace(
+                first_adapter.context,
+                workload={"m": 256, "n": 256, "k": 512},
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            family_root = Path(directory) / "residuals" / "test_kernel"
+            first = ResidualTuningStore(
+                family_root / "unit-a", transfer_root=family_root, fsync=False
+            )
+            second = ResidualTuningStore(
+                family_root / "unit-b", transfer_root=family_root, fsync=False
+            )
+            first.record_observation(
+                evaluate_proposal(
+                    first_adapter,
+                    Proposal(_Config(64), "random"),
+                    session_id="first",
+                    sequence=0,
+                )
+            )
+            second.record_observation(
+                evaluate_proposal(
+                    second_adapter,
+                    Proposal(_Config(128), "random"),
+                    session_id="second",
+                    sequence=0,
+                )
+            )
+            with first.local.observations_path.open("a", encoding="utf-8") as sink:
+                sink.write('{"truncated":')
+            self.assertEqual(len(list(first.records())), 2)
+            self.assertEqual(
+                len(list(first.records(second_adapter.context))), 1
+            )
+            self.assertNotEqual(first.path, second.path)
+
+            first.record_observation(
+                evaluate_proposal(
+                    first_adapter,
+                    Proposal(_Config(128), "random"),
+                    session_id="resumed",
+                    sequence=1,
+                )
+            )
+            self.assertEqual(len(list(first.records(first_adapter.context))), 2)
+
+    def test_optimizer_study_reports_prospective_regret(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for treatment, timings in (
+                ("random", (2.0, 1.8, 1.7, 1.6)),
+                ("online_bandit", (1.7, 1.4, 1.2, 1.0)),
+            ):
+                adapter = _adapter()
+                adapter.context = replace(
+                    adapter.context,
+                    tags={
+                        **adapter.context.tags,
+                        "machine_id": "gpu-one",
+                        "treatment": treatment,
+                        "replicate": 0,
+                        "task_category": "balanced",
+                    },
+                )
+                store = JsonlTuningStore(root / treatment, fsync=False)
+                session = store.start_session(adapter.context, {"seed": 1})
+                for sequence, timing in enumerate(timings):
+                    observation = evaluate_proposal(
+                        adapter,
+                        Proposal(
+                            _Config(64 if sequence < 2 else 128), treatment
+                        ),
+                        session_id=session,
+                        sequence=sequence,
+                    )
+                    observation.outcome.median_ms = timing
+                    observation.outcome.timings_ms = [timing]
+                    store.record_observation(observation)
+
+            rows = optimizer_study_rows((root,))
+            self.assertEqual(len(rows), 2)
+            by_treatment = {str(row["treatment"]): row for row in rows}
+            self.assertEqual(by_treatment["online_bandit"]["final_regret"], 0.0)
+            self.assertAlmostEqual(
+                float(by_treatment["random"]["final_regret"]), 0.6
+            )
+            report = summarize_optimizer_study(
+                (root,), root / "report" / "optimizers", export_format="csv"
+            )
+            self.assertEqual(report["units"], 2)
+            self.assertTrue((root / "report" / "optimizers.csv").exists())
 
     def test_every_registered_public_family_constructs_an_adapter(self) -> None:
         root = Path(__file__).resolve().parents[1]

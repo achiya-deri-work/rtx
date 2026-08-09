@@ -12,6 +12,7 @@ dist/
 autotune_datasets/
 autotune_datasets*.zip
 autotune_models/
+autotune_reports/
 copied_datasets/
 hardware_calibration*.json
 *.log

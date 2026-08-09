@@ -69,7 +69,12 @@ from .pretrained import (
     load_pretrained_family,
     train_pretrained_bundle,
 )
-from .store import InMemoryTuningStore, JsonlTuningStore, TuningStore
+from .store import (
+    InMemoryTuningStore,
+    JsonlTuningStore,
+    ResidualTuningStore,
+    TuningStore,
+)
 from .space import (
     Condition,
     ConditionalSearchSpace,
@@ -118,11 +123,16 @@ def __getattr__(name: str):
         "DatasetBackend",
         "DatasetJob",
         "DatasetManifest",
+        "DatasetTreatment",
         "register_dataset_backend",
     }:
         from . import dataset
 
         return getattr(dataset, name)
+    if name in {"optimizer_study_rows", "summarize_optimizer_study"}:
+        from . import optimizer_benchmark
+
+        return getattr(optimizer_benchmark, name)
     # Some existing internal users import private forward-reference helpers.
     if hasattr(_legacy, name):
         return getattr(_legacy, name)
@@ -158,6 +168,7 @@ __all__ = [
     "DatasetBackend",
     "DatasetJob",
     "DatasetManifest",
+    "DatasetTreatment",
     "DiscreteKernelAdapter",
     "DiscreteParameter",
     "EvaluationPlan",
@@ -178,6 +189,7 @@ __all__ = [
     "Proposal",
     "PortableKernelTask",
     "RandomSearch",
+    "ResidualTuningStore",
     "RuntimeWinnerKey",
     "SearchHistory",
     "SearchSpace",
@@ -217,10 +229,12 @@ __all__ = [
     "make_mxfp8_weight_prequant_adapter",
     "make_hybrid_autotuner",
     "normalized_rows",
+    "optimizer_study_rows",
     "register_dataset_backend",
     "runtime_winner_key",
     "save_runtime_winner",
     "static_device_profile",
+    "summarize_optimizer_study",
     "tune_mxfp8_fwd",
     "train_pretrained_bundle",
 ]

@@ -239,6 +239,49 @@ that manifest's digest. Both levels replay their append-only history after
 interruption. Strategy decisions live in each store's `events.jsonl`; context
 decisions live in `context_allocations.jsonl` and are exported to CSV/Parquet.
 
+### Prospective 5070 optimizer study
+
+The dedicated study compares pure random coverage, random followed by
+coordinate-local search, and the online learned/bandit portfolio. It uses two
+replicates and rotates the launch order so every interrupted prefix remains
+balanced across optimizer treatment, kernel family, shape category, cache
+regime, and replicate.
+
+On the RTX 5070 laptop:
+
+```bash
+git pull
+./benchmarks/run_5070_autotuner_study.sh laptop-3h
+```
+
+On the RTX 5070 Ti:
+
+```bash
+git pull
+./benchmarks/run_5070_autotuner_study.sh ti-6h
+```
+
+Each tuning context owns independent `observations.jsonl`, `sessions.jsonl`,
+`events.jsonl`, and `verification.jsonl` residuals. A truncated tail is skipped
+and isolated before the next append, so one damaged file cannot corrupt the
+campaign or the first resumed observation. `SAVE` records are fsync'd. Pressing
+Ctrl-C and running the same command resumes at absolute 4/8/16/32/64-trial
+milestones. The script intentionally uses `--format none`; raw residuals are
+authoritative and no large monolithic export is rewritten during collection.
+
+After copying the two `autotune_datasets/` trees together, create the optimizer
+comparison only once:
+
+```bash
+rtx-autotune summarize-tuners autotune_datasets \
+  --output autotune_reports/5070_prospective_v1 \
+  --format both
+```
+
+The report includes validity and compiler-waste rates, evaluator time to first
+valid candidate, best latency and observed-oracle regret at 1/4/8/16/32/64
+trials, and treatment aggregates per machine and kernel family.
+
 If this scheduler is pulled while a v2 run made by an older checkout already
 exists, explicitly adopt that bundle's context identity so the old observations
 count toward the same milestones:
@@ -304,6 +347,10 @@ and calibrated roofline data, raw timing arrays, compiler latency and available
 compiled-resource attributes, correctness results, telemetry, proposal
 provenance, device/environment context, confirmation measurements, and
 paired-race decisions. The JSONL files remain authoritative.
+
+Campaigns using `storage_mode: residual_context` place the same four journals
+under one directory per family/treatment/replicate/category/regime/shape/context
+instead of the shared `stores/<kernel>/<regime>` path shown above.
 
 ## Pretraining the autotuner
 

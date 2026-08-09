@@ -65,8 +65,18 @@ class JsonlTuningStore(Generic[ConfigT]):
     def _append(self, path: Path, value: Mapping[str, object]) -> None:
         encoded = canonical_json(dict(value)) + "\n"
         with self._lock():
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(encoded)
+            with path.open("a+b") as handle:
+                # A power loss may leave a partial final JSON object. Isolate
+                # it before appending so the first record after resume remains
+                # independently decodable.
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() > 0:
+                    handle.seek(-1, os.SEEK_END)
+                    if handle.read(1) != b"\n":
+                        handle.seek(0, os.SEEK_END)
+                        handle.write(b"\n")
+                handle.seek(0, os.SEEK_END)
+                handle.write(encoded.encode("utf-8"))
                 handle.flush()
                 if self.fsync:
                     os.fsync(handle.fileno())
@@ -147,6 +157,73 @@ class JsonlTuningStore(Generic[ConfigT]):
         return iterator()
 
 
+class ResidualTuningStore(Generic[ConfigT]):
+    """Write one task residual while reading transferable sibling residuals.
+
+    Each tuning unit owns independent JSONL files, so a truncated or lost file
+    cannot damage an entire family/regime campaign. Reads may span a family
+    root to preserve cross-context model training. Malformed tail records are
+    skipped independently by ``JsonlTuningStore``.
+    """
+
+    def __init__(
+        self,
+        unit_root: Path | str,
+        *,
+        transfer_root: Path | str | None = None,
+        fsync: bool = True,
+    ) -> None:
+        self.local = JsonlTuningStore[ConfigT](unit_root, fsync=fsync)
+        self.transfer_root = (
+            self.local.root
+            if transfer_root is None
+            else Path(transfer_root).expanduser()
+        )
+
+    @property
+    def path(self) -> Path:
+        return self.local.path
+
+    def start_session(
+        self, context: KernelContext, metadata: Mapping[str, object]
+    ) -> str:
+        return self.local.start_session(context, metadata)
+
+    def record_observation(self, observation: Observation[ConfigT]) -> None:
+        self.local.record_observation(observation)
+
+    def record_event(
+        self, session_id: str, kind: str, payload: Mapping[str, object]
+    ) -> None:
+        self.local.record_event(session_id, kind, payload)
+
+    def finish_session(
+        self, session_id: str, payload: Mapping[str, object]
+    ) -> None:
+        self.local.finish_session(session_id, payload)
+
+    def records(
+        self, context: KernelContext | None = None
+    ) -> Iterable[Mapping[str, object]]:
+        paths = sorted(self.transfer_root.rglob("observations.jsonl"))
+
+        def iterator() -> Iterator[Mapping[str, object]]:
+            seen: set[tuple[object, object]] = set()
+            for path in paths:
+                store = JsonlTuningStore[ConfigT](path.parent, fsync=False)
+                for value in store.records(context):
+                    identity = (
+                        value.get("context_id"),
+                        value.get("observation_id"),
+                    )
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    yield value
+
+        return iterator()
+
+
 class InMemoryTuningStore(Generic[ConfigT]):
     """Testing/embedding store with the same event model as the JSONL backend."""
 
@@ -187,4 +264,9 @@ class InMemoryTuningStore(Generic[ConfigT]):
         )
 
 
-__all__ = ["InMemoryTuningStore", "JsonlTuningStore", "TuningStore"]
+__all__ = [
+    "InMemoryTuningStore",
+    "JsonlTuningStore",
+    "ResidualTuningStore",
+    "TuningStore",
+]

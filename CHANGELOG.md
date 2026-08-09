@@ -13,6 +13,11 @@ project follows semantic versioning while it is in active alpha development.
   out-of-order completion, partial evaluation, and explicit promotion.
 - Wrap existing kernel adapters as portable tasks without changing RTX kernel
   integrations, and move trial outcomes out of the legacy MXFP8 module.
+- Add per-context residual journals with crash-tail recovery and experimental
+  treatment/replicate isolation.
+- Add prefix-balanced task rotation, explicit random/random-local/hybrid
+  portfolios, 5070 3-hour/6-hour launch profiles, and fixed-budget prospective
+  optimizer summaries.
 
 ## 0.6.0
 

@@ -13,10 +13,17 @@ repository root so imports and output paths are predictable.
 | `verify_composable_bwd.py` | Independent backward winner verification and racing |
 | `tune_mxfp8_native_quant.py` | Standalone native quantizer coordinate sweep |
 | `tune_mxfp8_native_gemm.py` | Standalone prequantized GEMM coordinate sweep |
+| `run_5070_autotuner_study.sh` | Resumable 3-hour laptop / 6-hour desktop prospective optimizer study |
 
 Portable multi-shape and cross-device campaigns belong in
 `autotune_manifests/` and should be launched with `rtx-autotune`; these scripts
 are for focused kernel investigation.
+
+After pulling the same commit on each 5070 machine, launch with
+`./benchmarks/run_5070_autotuner_study.sh laptop-3h` or
+`./benchmarks/run_5070_autotuner_study.sh ti-6h`. The script calibrates once,
+uses the pulled checkout even with a non-editable environment install, and
+resumes the same residual journals when rerun.
 
 All generated JSON, JSONL, logs, datasets, and compiled artifacts must go to an
 ignored output directory such as `autotune_results/`, `autotune_logs/`, or

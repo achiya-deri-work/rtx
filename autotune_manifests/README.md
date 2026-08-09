@@ -8,6 +8,7 @@ context identity. Add a newly versioned file instead.
 
 | Manifest | Purpose | Contexts |
 | --- | --- | ---: |
+| `autotuner_prospective_5070_v1.json` | Interruption-safe random vs. random+local vs. online-bandit study on the two 5070s | 144 residual units |
 | `cross_device_dataset_bandit_v1.json` | Hierarchical strategy/context-bandit campaign for new cross-device measurements | 54 |
 | `cross_device_dataset_v2.json` | Sequential-strategy control campaign and active resumable v2 dataset | 54 |
 | `inference_states_pilot_v1.json` | Dynamic-X/AOT-W and fully prequantized inference-state pilot | 12 |
@@ -22,6 +23,13 @@ Validate a composable manifest without launching a kernel:
 ```bash
 rtx-autotune validate autotune_manifests/cross_device_dataset_bandit_v1.json
 ```
+
+The prospective 5070 manifest expands every base workload across three search
+treatments and two independent replicates. Its order balances every prefix
+across kernel family, shape category, hot/rotating inputs, treatment, and
+replicate. Each context writes its own residual journal. Transfer learning is
+allowed between shapes inside one treatment/replicate, but never across
+experimental arms.
 
 ## Legacy experiment-runner manifests
 

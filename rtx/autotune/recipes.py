@@ -15,11 +15,17 @@ from .orchestrator import (
 )
 from .pretrained import load_pretrained_family
 from .store import TuningStore
-from .strategies import CostModelGuidedSearch, CostModelLocalSearch, RandomSearch
+from .strategies import (
+    CoordinateLocalSearch,
+    CostModelGuidedSearch,
+    CostModelLocalSearch,
+    RandomSearch,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class HybridTuningPolicy:
+    portfolio: Literal["hybrid", "random", "random_local"] = "hybrid"
     orchestration: Literal["sequential", "bandit"] = "sequential"
     max_trials: int = 512
     time_budget_s: float = 1800.0
@@ -51,6 +57,7 @@ class HybridTuningPolicy:
     max_trials_includes_resumed: bool = True
     transfer_history: bool = True
     pretrained_artifact: str | None = None
+    use_pretrained: bool = True
     pretrained_warmup_trials: int = 4
     pretrained_rule_weight: float = 0.15
 
@@ -65,10 +72,64 @@ def make_hybrid_autotuner(
     """Build GBT-guided global search followed by/bandited with local search."""
 
     random_search = RandomSearch[ConfigT]()
+    if policy.portfolio == "random":
+        return AutotuneOrchestrator(
+            adapter,
+            store,
+            [random_search],
+            SequentialScheduler(((random_search.name, None),)),
+            TuningBudget(policy.max_trials, policy.time_budget_s),
+            seed=policy.seed,
+            resume=policy.resume,
+            max_trials_includes_resumed=policy.max_trials_includes_resumed,
+            transfer_history=policy.transfer_history,
+            confirmation=ConfirmationPolicy(
+                repeats=policy.confirmation_repeats,
+                contender_ratio=policy.confirmation_ratio,
+                confirm_initial=policy.confirm_initial,
+            ),
+            progress=progress,
+        )
+    if policy.portfolio == "random_local":
+        coordinate = CoordinateLocalSearch[ConfigT](
+            beam_width=policy.local_beam_width
+        )
+        if policy.orchestration == "sequential":
+            scheduler = SequentialScheduler(
+                (
+                    (random_search.name, policy.cost_model_trials),
+                    (coordinate.name, None),
+                )
+            )
+        else:
+            scheduler = AdaptiveBanditScheduler(
+                exploration=policy.bandit_exploration,
+                warmup_trials=policy.model_warmup,
+                warmup_arm=random_search.name,
+            )
+        return AutotuneOrchestrator(
+            adapter,
+            store,
+            [random_search, coordinate],
+            scheduler,
+            TuningBudget(policy.max_trials, policy.time_budget_s),
+            seed=policy.seed,
+            resume=policy.resume,
+            max_trials_includes_resumed=policy.max_trials_includes_resumed,
+            transfer_history=policy.transfer_history,
+            confirmation=ConfirmationPolicy(
+                repeats=policy.confirmation_repeats,
+                contender_ratio=policy.confirmation_ratio,
+                confirm_initial=policy.confirm_initial,
+            ),
+            progress=progress,
+        )
+    if policy.portfolio != "hybrid":
+        raise ValueError(f"unknown strategy portfolio {policy.portfolio!r}")
     rules = None
     provenance = None
     pretrained = None
-    if policy.pretrained_artifact is not None:
+    if policy.use_pretrained and policy.pretrained_artifact is not None:
         sku = adapter.context.device.get("sku", {})
         device_family = (
             str(sku.get("sku_family"))

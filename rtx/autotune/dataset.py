@@ -46,7 +46,7 @@ from .evaluators import CalibratedBwdEvaluator, CalibratedPrequantEvaluator
 from .hardware import compiled_resource_metadata
 from .legacy import DeviceFingerprint
 from .recipes import HybridTuningPolicy, make_hybrid_autotuner
-from .store import JsonlTuningStore
+from .store import JsonlTuningStore, ResidualTuningStore, TuningStore
 from .winners import runtime_winner_key, save_runtime_winner
 from ..bwd_experiments import BwdBenchmarkHarness
 from ..kernels.mxfp8 import (
@@ -224,12 +224,64 @@ class DatasetJob:
 
 
 @dataclass(frozen=True, slots=True)
+class DatasetTreatment:
+    """Named optimizer-policy override expanded across every base task."""
+
+    name: str
+    tuning: Mapping[str, object] = field(default_factory=dict)
+    tags: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.name or any(part in self.name for part in ("/", "\\", "..")):
+            raise ValueError("treatment names must be safe path components")
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> "DatasetTreatment":
+        return cls(
+            name=str(value["name"]),
+            tuning=dict(value.get("tuning", {})),  # type: ignore[arg-type]
+            tags=dict(value.get("tags", {})),  # type: ignore[arg-type]
+        )
+
+    def apply(
+        self, job: DatasetJob, *, replicate: int, campaign_seed: int
+    ) -> DatasetJob:
+        treatment_seed = int(
+            hashlib.sha256(
+                f"{campaign_seed}:{self.name}:{replicate}:{job.family}".encode()
+            ).hexdigest()[:16],
+            16,
+        )
+        tuning = dict(self.tuning)
+        tuning["seed"] = campaign_seed ^ treatment_seed
+        return replace(
+            job,
+            tuning=replace(job.tuning, **tuning),
+            tags={
+                **dict(job.tags),
+                **dict(self.tags),
+                "treatment": self.name,
+                "replicate": replicate,
+                "optimizer_category": self.tags.get(
+                    "optimizer_category", self.name
+                ),
+            },
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class DatasetManifest:
     name: str
     jobs: tuple[DatasetJob, ...]
     seed: int = 0
     shard_index: int = 0
     shard_count: int = 1
+    treatments: tuple[DatasetTreatment, ...] = ()
+    replicates: int = 1
+    storage_mode: Literal["shared_family_regime", "residual_context"] = (
+        "shared_family_regime"
+    )
+    rotation_mode: Literal["legacy", "balanced_categories"] = "legacy"
 
     def __post_init__(self) -> None:
         if not self.name or any(part in self.name for part in ("/", "\\", "..")):
@@ -238,6 +290,15 @@ class DatasetManifest:
             raise ValueError("dataset manifest requires at least one job")
         if self.shard_count <= 0 or not 0 <= self.shard_index < self.shard_count:
             raise ValueError("invalid shard index/count")
+        if self.replicates <= 0:
+            raise ValueError("manifest replicates must be positive")
+        treatment_names = [treatment.name for treatment in self.treatments]
+        if len(treatment_names) != len(set(treatment_names)):
+            raise ValueError("manifest treatment names must be unique")
+        if self.storage_mode not in ("shared_family_regime", "residual_context"):
+            raise ValueError("unknown dataset storage mode")
+        if self.rotation_mode not in ("legacy", "balanced_categories"):
+            raise ValueError("unknown dataset rotation mode")
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "DatasetManifest":
@@ -253,6 +314,15 @@ class DatasetManifest:
             seed=int(value.get("seed", 0)),
             shard_index=int(value.get("shard_index", 0)),
             shard_count=int(value.get("shard_count", 1)),
+            treatments=tuple(
+                DatasetTreatment.from_dict(item)
+                for item in value.get("treatments", ())  # type: ignore[union-attr]
+            ),
+            replicates=int(value.get("replicates", 1)),
+            storage_mode=str(  # type: ignore[arg-type]
+                value.get("storage_mode", "shared_family_regime")
+            ),
+            rotation_mode=str(value.get("rotation_mode", "legacy")),  # type: ignore[arg-type]
         )
 
     @classmethod
@@ -261,7 +331,23 @@ class DatasetManifest:
             return cls.from_dict(json.load(source))
 
     def as_dict(self) -> dict[str, object]:
-        return {"schema_version": DATASET_SCHEMA_VERSION, **asdict(self)}
+        value: dict[str, object] = {
+            "schema_version": DATASET_SCHEMA_VERSION,
+            "name": self.name,
+            "jobs": [asdict(job) for job in self.jobs],
+            "seed": self.seed,
+            "shard_index": self.shard_index,
+            "shard_count": self.shard_count,
+        }
+        if self.treatments:
+            value["treatments"] = [asdict(treatment) for treatment in self.treatments]
+        if self.replicates != 1:
+            value["replicates"] = self.replicates
+        if self.storage_mode != "shared_family_regime":
+            value["storage_mode"] = self.storage_mode
+        if self.rotation_mode != "legacy":
+            value["rotation_mode"] = self.rotation_mode
+        return value
 
     @property
     def digest(self) -> str:
@@ -867,6 +953,8 @@ class DatasetCampaign:
             "git_commit": self.context_source.get("git_commit"),
             "git_dirty": self.context_source.get("git_dirty"),
         }
+        if self.manifest.rotation_mode == "balanced_categories":
+            tags["task_category"] = shape.name or "unnamed"
         return _BACKENDS[job.family].make_adapter(
             self, job, shape, regime, harness, tags
         )
@@ -897,8 +985,13 @@ class DatasetCampaign:
         job: DatasetJob,
         shape: ShapeSpec,
         regime: CacheRegime,
-        store: JsonlTuningStore,
+        store: TuningStore,
     ) -> dict[str, object]:
+        verification_journal = (
+            self.verification
+            if self.manifest.storage_mode == "shared_family_regime"
+            else ExperimentJournal(Path(store.path) / "verification.jsonl")
+        )
         observations = [
             record
             for record in store.records(adapter.context)
@@ -917,7 +1010,7 @@ class DatasetCampaign:
             best_by_config.values(),
             key=lambda record: float(record["outcome"]["median_ms"]),  # type: ignore[index]
         )[: job.promote]
-        completed = self.verification.completed_keys()
+        completed = verification_journal.completed_keys()
         base = self._verification_base(adapter, job, shape, regime)
         for record in finalists:
             config_id = str(record["config_id"])
@@ -932,7 +1025,7 @@ class DatasetCampaign:
                 seed=self.manifest.seed ^ int(config_id[:8], 16),
                 components=True,
             )
-            self.verification.append(
+            verification_journal.append(
                 {
                     **base,
                     "record_type": "verification_measurement",
@@ -948,7 +1041,7 @@ class DatasetCampaign:
 
         records = [
             record
-            for record in self.verification.records()
+            for record in verification_journal.records()
             if record.get("record_type") == "verification_measurement"
             and record.get("context_id") == adapter.context.identifier
             and isinstance(record.get("outcome"), dict)
@@ -963,7 +1056,7 @@ class DatasetCampaign:
         incumbent = adapter.deserialize(confirmed[0]["config"])  # type: ignore[arg-type]
         prior_races = {
             str(record.get("observation_key")): record
-            for record in self.verification.records()
+            for record in verification_journal.records()
             if record.get("record_type") == "race"
         }
         for record in confirmed[1:]:
@@ -993,7 +1086,7 @@ class DatasetCampaign:
                 challenger,
                 seed=self.manifest.seed ^ int(key[:8], 16),
             )
-            self.verification.append(
+            verification_journal.append(
                 {
                     **base,
                     "record_type": "race",
@@ -1058,15 +1151,43 @@ class DatasetCampaign:
     def _assigned_contexts(
         self,
     ) -> list[tuple[DatasetJob, ShapeSpec, CacheRegime]]:
+        expanded_jobs: list[DatasetJob] = []
+        if self.manifest.treatments:
+            for job in self.manifest.jobs:
+                for replicate in range(self.manifest.replicates):
+                    for treatment in self.manifest.treatments:
+                        expanded_jobs.append(
+                            treatment.apply(
+                                job,
+                                replicate=replicate,
+                                campaign_seed=self.manifest.seed,
+                            )
+                        )
+        elif self.manifest.replicates > 1:
+            default = DatasetTreatment("default")
+            for job in self.manifest.jobs:
+                for replicate in range(self.manifest.replicates):
+                    expanded_jobs.append(
+                        default.apply(
+                            job,
+                            replicate=replicate,
+                            campaign_seed=self.manifest.seed,
+                        )
+                    )
+        else:
+            expanded_jobs.extend(self.manifest.jobs)
         contexts = [
             (job, shape, regime)
-            for job in self.manifest.jobs
+            for job in expanded_jobs
             for shape in job.shapes
             for regime in job.regimes
             if _assigned(self.manifest, job.family, shape, regime)
         ]
         if self.anytime is None:
             return contexts
+
+        if self.manifest.rotation_mode == "balanced_categories":
+            return self._balanced_context_order(contexts)
 
         family_order = {
             "mxfp8_fused_fwd": 0,
@@ -1110,13 +1231,142 @@ class DatasetCampaign:
             ),
         )
 
+    def _balanced_context_order(
+        self,
+        contexts: Sequence[tuple[DatasetJob, ShapeSpec, CacheRegime]],
+    ) -> list[tuple[DatasetJob, ShapeSpec, CacheRegime]]:
+        """Greedily balance every prefix across independent task categories."""
+
+        def labels(
+            item: tuple[DatasetJob, ShapeSpec, CacheRegime]
+        ) -> tuple[str, ...]:
+            job, shape, regime = item
+            return (
+                str(job.tags.get("treatment", "default")),
+                job.family,
+                str(shape.name or "unnamed"),
+                regime,
+                str(job.tags.get("replicate", 0)),
+            )
+
+        remaining = list(enumerate(contexts))
+        counts: list[dict[str, int]] = [{} for _ in range(5)]
+        domains = [
+            {labels(item)[index] for item in contexts} for index in range(5)
+        ]
+        result: list[tuple[DatasetJob, ShapeSpec, CacheRegime]] = []
+        previous: tuple[str, ...] | None = None
+        while remaining:
+            def score(
+                indexed: tuple[int, tuple[DatasetJob, ShapeSpec, CacheRegime]]
+            ) -> tuple[object, ...]:
+                original_index, item = indexed
+                item_labels = labels(item)
+                imbalances = []
+                for index, label in enumerate(item_labels):
+                    loads = [
+                        counts[index].get(value, 0) + int(value == label)
+                        for value in domains[index]
+                    ]
+                    imbalances.append(max(loads) - min(loads))
+                squared_load = sum(
+                    (counts[index].get(label, 0) + 1) ** 2
+                    for index, label in enumerate(item_labels)
+                )
+                repeated = (
+                    0
+                    if previous is None
+                    else sum(
+                        left == right
+                        for left, right in zip(previous, item_labels)
+                    )
+                )
+                tie = stable_id(
+                    {
+                        "seed": self.manifest.seed,
+                        "position": len(result),
+                        "index": original_index,
+                        "labels": item_labels,
+                    }
+                )
+                return (
+                    max(imbalances),
+                    sum(imbalances),
+                    squared_load,
+                    repeated,
+                    tie,
+                )
+
+            chosen = min(remaining, key=score)
+            remaining.remove(chosen)
+            item = chosen[1]
+            previous = labels(item)
+            for index, label in enumerate(previous):
+                counts[index][label] = counts[index].get(label, 0) + 1
+            result.append(item)
+        return result
+
     @staticmethod
-    def _context_trials(store: JsonlTuningStore, adapter: KernelAdapter) -> int:
+    def _safe_component(value: object) -> str:
+        text = "".join(
+            character if character.isalnum() or character in ("-", "_") else "_"
+            for character in str(value)
+        ).strip("_")
+        return text[:96] or "unnamed"
+
+    def _store(
+        self,
+        adapter: KernelAdapter,
+        job: DatasetJob,
+        shape: ShapeSpec,
+        regime: CacheRegime,
+    ) -> TuningStore:
+        if self.manifest.storage_mode == "shared_family_regime":
+            return JsonlTuningStore(self.bundle / "stores" / job.family / regime)
+        family_root = self.bundle / "residuals" / self._safe_component(job.family)
+        treatment_root = (
+            family_root
+            / self._safe_component(job.tags.get("treatment", "default"))
+            / f"replicate-{int(job.tags.get('replicate', 0)):03d}"
+        )
+        unit_root = (
+            treatment_root
+            / self._safe_component(shape.name or "unnamed")
+            / self._safe_component(regime)
+            / self._safe_component(shape.key)
+            / adapter.context.identifier
+        )
+        descriptor = unit_root / "unit.json"
+        if not descriptor.exists():
+            _atomic_json(
+                descriptor,
+                {
+                    "schema_version": DATASET_SCHEMA_VERSION,
+                    "record_type": "residual_unit",
+                    "manifest_digest": self.manifest.digest,
+                    "context_id": adapter.context.identifier,
+                    "family": job.family,
+                    "shape": asdict(shape),
+                    "shape_key": shape.key,
+                    "task_category": shape.name or "unnamed",
+                    "regime": regime,
+                    "treatment": job.tags.get("treatment", "default"),
+                    "replicate": int(job.tags.get("replicate", 0)),
+                    "tuning": asdict(job.tuning),
+                    "protocol": asdict(job.protocol),
+                },
+            )
+        # Retain cross-task learning inside an arm without leaking observations
+        # between prospective treatments or independent replicates.
+        return ResidualTuningStore(unit_root, transfer_root=treatment_root)
+
+    @staticmethod
+    def _context_trials(store: TuningStore, adapter: KernelAdapter) -> int:
         return sum(1 for _record in store.records(adapter.context))
 
     @staticmethod
     def _context_best_ms(
-        store: JsonlTuningStore, adapter: KernelAdapter
+        store: TuningStore, adapter: KernelAdapter
     ) -> float:
         best = math.inf
         for record in store.records(adapter.context):
@@ -1145,7 +1395,7 @@ class DatasetCampaign:
     ) -> tuple[dict[str, object], int, int]:
         harness = self._make_harness(job, shape, regime)
         adapter = self._make_adapter(job, shape, regime, harness)
-        store = JsonlTuningStore(self.bundle / "stores" / job.family / regime)
+        store = self._store(adapter, job, shape, regime)
         before = self._context_trials(store, adapter)
         effective_job = job
         if self.anytime is not None and (
@@ -1185,7 +1435,10 @@ class DatasetCampaign:
                     ),
                 ),
             )
-        if self.pretrained_artifact is not None:
+        if (
+            self.pretrained_artifact is not None
+            and effective_job.tuning.use_pretrained
+        ):
             effective_job = replace(
                 effective_job,
                 tuning=replace(
@@ -1213,6 +1466,9 @@ class DatasetCampaign:
                 "family": job.family,
                 "shape": shape.key,
                 "regime": regime,
+                "task_category": shape.name or "unnamed",
+                "treatment": job.tags.get("treatment", "default"),
+                "replicate": int(job.tags.get("replicate", 0)),
                 "context_id": adapter.context.identifier,
                 "target_trials": target_trials,
                 "trials_before": before,
@@ -1228,7 +1484,11 @@ class DatasetCampaign:
 
     def _run_sequential(self, results: list[dict[str, object]]) -> str:
         for job, shape, regime in self._assigned_contexts():
-            self._log(f"START   {job.family} {shape.key} {regime}")
+            self._log(
+                f"START   {job.family} {shape.key} {regime} "
+                f"treatment={job.tags.get('treatment', 'default')} "
+                f"replicate={job.tags.get('replicate', 0)}"
+            )
             result, _before, _after = self._run_context(job, shape, regime)
             results.append(result)
         return "complete"
@@ -1268,7 +1528,7 @@ class DatasetCampaign:
             try:
                 harness = self._make_harness(job, shape, regime)
                 adapter = self._make_adapter(job, shape, regime, harness)
-                store = JsonlTuningStore(self.bundle / "stores" / job.family / regime)
+                store = self._store(adapter, job, shape, regime)
                 key = adapter.context.identifier
                 items[key] = (job, shape, regime)
                 descriptors[key] = (job.family, shape, regime)
@@ -1381,6 +1641,8 @@ class DatasetCampaign:
             )
             self._log(
                 f"ALLOC   {reason} {job.family} {shape.key} {regime} "
+                f"treatment={job.tags.get('treatment', 'default')} "
+                f"replicate={job.tags.get('replicate', 0)} "
                 f"trials={before}->{target} score={all_scores[selected]:.5f}"
             )
             success = False
@@ -1411,9 +1673,7 @@ class DatasetCampaign:
                 if reached_first or reached_final:
                     harness = self._make_harness(job, shape, regime)
                     adapter = self._make_adapter(job, shape, regime, harness)
-                    store = JsonlTuningStore(
-                        self.bundle / "stores" / job.family / regime
-                    )
+                    store = self._store(adapter, job, shape, regime)
                     result["verification"] = self._verify(
                         adapter,
                         harness,
@@ -1432,9 +1692,7 @@ class DatasetCampaign:
                 try:
                     harness = self._make_harness(job, shape, regime)
                     adapter = self._make_adapter(job, shape, regime, harness)
-                    store = JsonlTuningStore(
-                        self.bundle / "stores" / job.family / regime
-                    )
+                    store = self._store(adapter, job, shape, regime)
                     trials[selected] = self._context_trials(store, adapter)
                     best_ms[selected] = self._context_best_ms(store, adapter)
                     del harness, adapter, store
@@ -1500,6 +1758,9 @@ class DatasetCampaign:
                     "shape": asdict(shape),
                     "shape_key": shape.key,
                     "regime": regime,
+                    "task_category": shape.name or "unnamed",
+                    "treatment": job.tags.get("treatment", "default"),
+                    "replicate": int(job.tags.get("replicate", 0)),
                     "reason": reason,
                     "target_trials": target,
                     "trials_before": before,
@@ -1565,14 +1826,14 @@ class DatasetCampaign:
                     target = phase_targets[index]
                     self._log(
                         f"CONTEXT {index + 1}/{total} {job.family} "
-                        f"{shape.key} {regime} target={target}"
+                        f"{shape.key} {regime} "
+                        f"treatment={job.tags.get('treatment', 'default')} "
+                        f"replicate={job.tags.get('replicate', 0)} target={target}"
                     )
                     try:
                         harness = self._make_harness(job, shape, regime)
                         adapter = self._make_adapter(job, shape, regime, harness)
-                        store = JsonlTuningStore(
-                            self.bundle / "stores" / job.family / regime
-                        )
+                        store = self._store(adapter, job, shape, regime)
                         current = self._context_trials(store, adapter)
                     except Exception as exc:
                         blocked.add(index)
@@ -1618,9 +1879,7 @@ class DatasetCampaign:
                             # done only at broad coverage and final depth.
                             harness = self._make_harness(job, shape, regime)
                             adapter = self._make_adapter(job, shape, regime, harness)
-                            store = JsonlTuningStore(
-                                self.bundle / "stores" / job.family / regime
-                            )
+                            store = self._store(adapter, job, shape, regime)
                             verify_job = replace(job, promote=promote)
                             result["verification"] = self._verify(
                                 adapter, harness, verify_job, shape, regime, store
@@ -1852,6 +2111,16 @@ def _build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--output", type=Path, required=True, help="output path without extension")
     collect.add_argument("--format", choices=("csv", "parquet", "both"), default="csv")
 
+    summarize = subparsers.add_parser(
+        "summarize-tuners",
+        help="summarize prospective optimizer treatments from residual journals",
+    )
+    summarize.add_argument("paths", type=Path, nargs="+")
+    summarize.add_argument("--output", type=Path, required=True)
+    summarize.add_argument(
+        "--format", choices=("csv", "parquet", "both"), default="both"
+    )
+
     pretrain = subparsers.add_parser(
         "pretrain", help="fit portable cost models and conditional-effect rules"
     )
@@ -1948,8 +2217,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
     if args.command == "validate":
         manifest = DatasetManifest.load(args.manifest)
-        contexts = sum(len(job.shapes) * len(job.regimes) for job in manifest.jobs)
-        print(json.dumps({"manifest": manifest.as_dict(), "digest": manifest.digest, "contexts": contexts}, indent=2))
+        base_contexts = sum(
+            len(job.shapes) * len(job.regimes) for job in manifest.jobs
+        )
+        contexts = (
+            base_contexts
+            * max(1, len(manifest.treatments))
+            * manifest.replicates
+        )
+        print(
+            json.dumps(
+                {
+                    "manifest": manifest.as_dict(),
+                    "digest": manifest.digest,
+                    "base_contexts": base_contexts,
+                    "contexts": contexts,
+                },
+                indent=2,
+            )
+        )
         return
     if args.command == "probe":
         if not torch.cuda.is_available():
@@ -1981,6 +2267,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
     if args.command == "collect":
         report = export_bundle(args.paths, args.output, export_format=args.format)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+    if args.command == "summarize-tuners":
+        from .optimizer_benchmark import summarize_optimizer_study
+
+        report = summarize_optimizer_study(
+            args.paths, args.output, export_format=args.format
+        )
         print(json.dumps(report, indent=2, sort_keys=True))
         return
     if not torch.cuda.is_available():
