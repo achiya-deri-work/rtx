@@ -275,6 +275,7 @@ and resumes the existing residuals. It also preserves compatible context
 identity across these runner-only upgrades. The launcher pins `CUDA_HOME` to
 the available CUDA 13.2 toolkit when the calling shell omitted it, keeping
 libNVVM discovery and the compiler/machine fingerprint stable across restarts.
+It also restores the toolkit's `nvcc` path and unbuffers progress output.
 
 After copying the two `autotune_datasets/` trees together, create the optimizer
 comparison only once:

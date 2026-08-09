@@ -29,6 +29,13 @@ if [[ -z "${CUDA_HOME:-}" && -d "/usr/local/cuda-13.2" ]]; then
 elif [[ -z "${CUDA_HOME:-}" && -d "/usr/local/cuda" ]]; then
   export CUDA_HOME="/usr/local/cuda"
 fi
+if [[ -n "${CUDA_HOME:-}" && -x "$CUDA_HOME/bin/nvcc" ]]; then
+  case ":$PATH:" in
+    *":$CUDA_HOME/bin:"*) ;;
+    *) export PATH="$CUDA_HOME/bin:$PATH" ;;
+  esac
+fi
+export PYTHONUNBUFFERED=1
 
 if [[ -x ".venv/bin/python" ]]; then
   # Import the just-pulled checkout even if the environment was originally
