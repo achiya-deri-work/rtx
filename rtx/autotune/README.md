@@ -248,6 +248,12 @@ Use `rtx-autotune summarize-tuners` to generate fixed-budget regret and failure
 summaries after collection rather than maintaining a monolithic dataset during
 the run.
 
+Sticky accelerator failures use a supervisor boundary. A worker durably records
+the responsible proposal, raises `FatalDeviceContextError`, and the CLI exits
+75. Supervisors may restart that code only; ordinary Python, manifest, and
+dependency failures remain terminal. This prevents one illegal kernel from
+turning all later contexts into correlated setup failures.
+
 ## Recorded schema
 
 Every observation includes:

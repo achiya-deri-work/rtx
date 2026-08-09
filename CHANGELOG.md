@@ -18,6 +18,9 @@ project follows semantic versioning while it is in active alpha development.
 - Add prefix-balanced task rotation, explicit random/random-local/hybrid
   portfolios, 5070 3-hour/6-hour launch profiles, and fixed-budget prospective
   optimizer summaries.
+- Contain sticky CUDA device faults at worker-process scope, preserving the
+  responsible observation and automatically resuming with the remaining
+  campaign deadline instead of logging poisoned-context fallout.
 
 ## 0.6.0
 

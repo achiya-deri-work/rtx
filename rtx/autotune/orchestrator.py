@@ -22,7 +22,7 @@ from .core import (
     observation_from_dict,
     utc_now,
 )
-from .outcomes import TrialOutcome
+from .outcomes import TrialOutcome, raise_if_fatal_device_context_error
 from .store import TuningStore
 from .strategies import SearchStrategy
 
@@ -287,6 +287,11 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                     + " ".join(observation.outcome.error.splitlines())[:240]
                 ),
             )
+            # Sticky CUDA launch faults poison all subsequent work in this
+            # process. The observation is already durable; abort now so a
+            # supervisor can resume past it in a fresh device context.
+            if observation.outcome.error is not None:
+                raise_if_fatal_device_context_error(observation.outcome.error)
             return observation
 
         initial_id = self.adapter.config_id(self.adapter.initial_config)

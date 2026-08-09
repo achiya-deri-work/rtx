@@ -52,7 +52,12 @@ from .legacy import (
     load_cached_mxfp8_fwd_config,
     tune_mxfp8_fwd,
 )
-from .outcomes import TrialOutcome, TrialStatus
+from .outcomes import (
+    FatalDeviceContextError,
+    TrialOutcome,
+    TrialStatus,
+    is_fatal_device_context_error,
+)
 from .orchestrator import (
     AutotuneOrchestrator,
     ConfirmationPolicy,
@@ -174,6 +179,7 @@ __all__ = [
     "EvaluationPlan",
     "EvaluationStage",
     "FunctionKernelTask",
+    "FatalDeviceContextError",
     "GradientBoostedCostModel",
     "GradientBoostedFeasibilityModel",
     "HybridTuningPolicy",
@@ -222,6 +228,7 @@ __all__ = [
     "load_pretrained_family",
     "load_runtime_winner",
     "import_legacy_json_database",
+    "is_fatal_device_context_error",
     "make_mxfp8_bwd_adapter",
     "make_mxfp8_fully_prequant_adapter",
     "make_mxfp8_fwd_adapter",

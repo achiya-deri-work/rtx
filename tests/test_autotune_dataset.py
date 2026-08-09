@@ -77,6 +77,9 @@ class DatasetTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             AnytimeRunPolicy(10.0, context_bandit_discount=0.0)
 
+    def test_cli_reserves_exit_75_for_worker_restart(self) -> None:
+        self.assertEqual(dataset_module.FATAL_DEVICE_CONTEXT_EXIT_CODE, 75)
+
     def test_context_bandit_uses_similarity_and_forces_real_samples(self) -> None:
         shape_a = dataset_module.ShapeSpec(128, 1536, 1536, "a")
         shape_b = dataset_module.ShapeSpec(256, 1536, 1536, "b")

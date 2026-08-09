@@ -268,6 +268,11 @@ campaign or the first resumed observation. `SAVE` records are fsync'd. Pressing
 Ctrl-C and running the same command resumes at absolute 4/8/16/32/64-trial
 milestones. The script intentionally uses `--format none`; raw residuals are
 authoritative and no large monolithic export is rewritten during collection.
+Sticky CUDA faults such as illegal instructions are saved against the candidate
+that caused them, then terminate only that worker process. The launch script
+automatically starts a fresh CUDA context with the remaining global wall-time
+and resumes the existing residuals. It also preserves compatible context
+identity across these runner-only upgrades.
 
 After copying the two `autotune_datasets/` trees together, create the optimizer
 comparison only once:

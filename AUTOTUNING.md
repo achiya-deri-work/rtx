@@ -236,6 +236,13 @@ balanced order. Treatment and replicate are included in context identity;
 cross-context transfer is scoped inside a single treatment/replicate to prevent
 prospective leakage.
 
+Device faults such as illegal instructions, illegal addresses, device asserts,
+and launch failures are sticky at CUDA-context scope. The orchestrator persists
+the triggering observation and raises `FatalDeviceContextError`; campaign CLI
+workers exit with status 75 instead of misclassifying every later setup as an
+independent failure. The 5070 supervisor restarts only this status, passes the
+remaining global deadline to the new worker, and resumes from the residuals.
+
 The 5070 study exposes `random`, `random_local`, and `online_bandit` as explicit
 portfolios rather than inferring optimizer behavior after collection. Summarize
 copied residuals with `rtx-autotune summarize-tuners`; it reports success,

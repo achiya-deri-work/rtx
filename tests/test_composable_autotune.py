@@ -15,6 +15,7 @@ from rtx.autotune import (
     CostModelGuidedSearch,
     DiscreteKernelAdapter,
     GradientBoostedCostModel,
+    FatalDeviceContextError,
     InMemoryTuningStore,
     JsonlTuningStore,
     KernelContext,
@@ -77,6 +78,26 @@ def _toy_adapter() -> DiscreteKernelAdapter[_ToyConfig]:
 
 
 class ComposableAutotuneTests(unittest.TestCase):
+    def test_sticky_device_fault_is_durable_then_aborts_worker(self) -> None:
+        adapter = _toy_adapter()
+        adapter.initial_config = _ToyConfig(1, 0)
+        adapter.evaluator = lambda _config: TrialOutcome(
+            "runtime_error",
+            error="CUDA error: an illegal instruction was encountered",
+        )
+        store = InMemoryTuningStore()
+        tuner = AutotuneOrchestrator(
+            adapter,
+            store,
+            [RandomSearch()],
+            SequentialScheduler((("random", None),)),
+            TuningBudget(max_trials=2, time_budget_s=10),
+        )
+        with self.assertRaises(FatalDeviceContextError):
+            tuner.tune()
+        self.assertEqual(len(store.observations), 1)
+        self.assertEqual(store.observations[0].outcome.status, "runtime_error")
+
     def test_recipe_portfolios_are_explicit_experimental_arms(self) -> None:
         random_tuner = make_hybrid_autotuner(
             _toy_adapter(),

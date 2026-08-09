@@ -16,6 +16,36 @@ TrialStatus = Literal[
 ]
 
 
+_FATAL_DEVICE_CONTEXT_MARKERS = (
+    "cudaerrorillegalinstruction",
+    "illegal instruction was encountered",
+    "cudaerrorillegaladdress",
+    "illegal memory access was encountered",
+    "cudaerrorassert",
+    "device-side assert triggered",
+    "cudaerrorlaunchfailure",
+    "unspecified launch failure",
+    "cudaerrormisalignedaddress",
+    "misaligned address",
+    "cudaerrorhardwarestackerror",
+    "cudaerroreccuncorrectable",
+)
+
+
+class FatalDeviceContextError(RuntimeError):
+    """A sticky accelerator fault requiring a fresh worker process."""
+
+
+def is_fatal_device_context_error(error: object) -> bool:
+    message = str(error).lower()
+    return any(marker in message for marker in _FATAL_DEVICE_CONTEXT_MARKERS)
+
+
+def raise_if_fatal_device_context_error(error: object) -> None:
+    if is_fatal_device_context_error(error):
+        raise FatalDeviceContextError(str(error)[:4000])
+
+
 @dataclass(slots=True)
 class TrialOutcome:
     status: TrialStatus
@@ -60,4 +90,10 @@ class TrialOutcome:
         )
 
 
-__all__ = ["TrialOutcome", "TrialStatus"]
+__all__ = [
+    "FatalDeviceContextError",
+    "TrialOutcome",
+    "TrialStatus",
+    "is_fatal_device_context_error",
+    "raise_if_fatal_device_context_error",
+]

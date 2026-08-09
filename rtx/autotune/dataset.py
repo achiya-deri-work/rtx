@@ -45,6 +45,10 @@ from .dataset_export import (
 from .evaluators import CalibratedBwdEvaluator, CalibratedPrequantEvaluator
 from .hardware import compiled_resource_metadata
 from .legacy import DeviceFingerprint
+from .outcomes import (
+    FatalDeviceContextError,
+    raise_if_fatal_device_context_error,
+)
 from .recipes import HybridTuningPolicy, make_hybrid_autotuner
 from .store import JsonlTuningStore, ResidualTuningStore, TuningStore
 from .winners import runtime_winner_key, save_runtime_winner
@@ -72,6 +76,9 @@ from ..inference_experiments import (
     FullyPrequantBenchmarkHarness,
     WeightPrequantBenchmarkHarness,
 )
+
+
+FATAL_DEVICE_CONTEXT_EXIT_CODE = 75
 
 
 KernelFamily = str
@@ -869,6 +876,7 @@ class DatasetCampaign:
         calibration: Mapping[str, object] | None = None,
         anytime: AnytimeRunPolicy | None = None,
         adopt_existing_context_identity: bool = False,
+        adopt_existing_context_identity_if_present: bool = False,
         pretrained_artifact: Path | str | None = None,
         progress=print,
     ) -> None:
@@ -897,8 +905,13 @@ class DatasetCampaign:
             / str(self.machine["machine_id"])
             / f"shard-{manifest.shard_index:03d}-of-{manifest.shard_count:03d}"
         )
+        if adopt_existing_context_identity_if_present:
+            self.adopt_existing_context_identity = (
+                (self.bundle / "machine.json").is_file()
+                and (self.bundle / "manifest.json").is_file()
+            )
         self.context_source = self.machine["source"]
-        if adopt_existing_context_identity:
+        if self.adopt_existing_context_identity:
             self.context_source = self._existing_context_source()
         self.verification = ExperimentJournal(self.bundle / "verification.jsonl")
         self.context_allocations = ExperimentJournal(
@@ -1037,6 +1050,8 @@ class DatasetCampaign:
                     "outcome": outcome,
                 }
             )
+            if isinstance(outcome, Mapping) and outcome.get("error") is not None:
+                raise_if_fatal_device_context_error(outcome["error"])
             completed.add(key)
 
         records = [
@@ -1099,6 +1114,8 @@ class DatasetCampaign:
                     "outcome": outcome,
                 }
             )
+            if isinstance(outcome, Mapping) and outcome.get("error") is not None:
+                raise_if_fatal_device_context_error(outcome["error"])
             completed.add(key)
             if outcome.get("decision") == "challenger":
                 incumbent = challenger
@@ -1536,6 +1553,7 @@ class DatasetCampaign:
                 best_ms[key] = self._context_best_ms(store, adapter)
                 del harness, adapter, store
             except Exception as exc:
+                raise_if_fatal_device_context_error(exc)
                 self._log(
                     f"SKIP    {job.family} {shape.key} {regime} setup_error "
                     f"{type(exc).__name__}: {exc}"
@@ -1684,6 +1702,7 @@ class DatasetCampaign:
                     )
                 results.append(result)
             except Exception as exc:
+                raise_if_fatal_device_context_error(exc)
                 blocked.add(selected)
                 error = f"{type(exc).__name__}: {exc}"[:4000]
                 # A tuner may have durably saved observations before raising.
@@ -1836,6 +1855,7 @@ class DatasetCampaign:
                         store = self._store(adapter, job, shape, regime)
                         current = self._context_trials(store, adapter)
                     except Exception as exc:
+                        raise_if_fatal_device_context_error(exc)
                         blocked.add(index)
                         self._log(
                             f"SKIP    {job.family} {shape.key} {regime} "
@@ -1886,6 +1906,7 @@ class DatasetCampaign:
                             )
                         results.append(result)
                     except Exception as exc:
+                        raise_if_fatal_device_context_error(exc)
                         blocked.add(index)
                         self._log(
                             f"SKIP    {job.family} {shape.key} {regime} "
@@ -2101,6 +2122,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="resume a v2 bundle across runner-only source changes",
     )
     run.add_argument(
+        "--adopt-existing-context-identity-if-present",
+        action="store_true",
+        help=(
+            "adopt a compatible existing bundle across runner-only changes, "
+            "but start normally when no local bundle exists"
+        ),
+    )
+    run.add_argument(
         "--pretrained-artifact",
         type=Path,
         help="offline model bundle produced by 'rtx-autotune pretrain'",
@@ -2310,10 +2339,22 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         ),
         adopt_existing_context_identity=args.adopt_existing_context_identity,
+        adopt_existing_context_identity_if_present=(
+            args.adopt_existing_context_identity_if_present
+        ),
         pretrained_artifact=args.pretrained_artifact,
         progress=None if args.quiet else print,
     )
-    bundle = campaign.run(export_format=args.format)
+    try:
+        bundle = campaign.run(export_format=args.format)
+    except FatalDeviceContextError as exc:
+        print(
+            "FATAL_DEVICE_CONTEXT restart_required "
+            + " ".join(str(exc).splitlines())[:1000],
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(FATAL_DEVICE_CONTEXT_EXIT_CODE) from exc
     print(json.dumps({"bundle": str(bundle)}, indent=2))
 
 
@@ -2325,6 +2366,7 @@ __all__ = [
     "DatasetJob",
     "DatasetManifest",
     "FusedFwdBenchmarkHarness",
+    "FATAL_DEVICE_CONTEXT_EXIT_CODE",
     "export_bundle",
     "export_csv",
     "export_parquet",

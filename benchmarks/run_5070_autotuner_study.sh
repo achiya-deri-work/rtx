@@ -9,10 +9,10 @@ usage() {
 profile="${1:-}"
 case "$profile" in
   laptop-3h)
-    wall_time="3h"
+    wall_seconds=10800
     ;;
   ti-6h)
-    wall_time="6h"
+    wall_seconds=21600
     ;;
   *)
     usage
@@ -43,17 +43,38 @@ if [[ ! -f "$calibration" ]]; then
     --target-ms 30
 fi
 
-echo "profile=$profile wall_time=$wall_time output=$output_dir calibration=$calibration"
-"${autotune_cmd[@]}" run \
-  autotune_manifests/autotuner_prospective_5070_v1.json \
-  --device cuda:0 \
-  --output-dir "$output_dir" \
-  --format none \
-  --calibration "$calibration" \
-  --wall-time "$wall_time" \
-  --context-slice 45s \
-  --trial-milestones 4,8,16,32,64 \
-  --initial-promote 1 \
-  --strategy-orchestration manifest \
-  --context-orchestration breadth_first \
-  2>&1 | tee -a "$log_dir/autotuner_${profile}.log"
+deadline_epoch=$(($(date +%s) + wall_seconds))
+attempt=0
+while true; do
+  remaining_seconds=$((deadline_epoch - $(date +%s)))
+  if ((remaining_seconds <= 0)); then
+    echo "DEADLINE supervisor wall-time exhausted"
+    break
+  fi
+  attempt=$((attempt + 1))
+  echo "profile=$profile attempt=$attempt remaining=${remaining_seconds}s output=$output_dir calibration=$calibration"
+  set +e
+  "${autotune_cmd[@]}" run \
+    autotune_manifests/autotuner_prospective_5070_v1.json \
+    --device cuda:0 \
+    --output-dir "$output_dir" \
+    --format none \
+    --calibration "$calibration" \
+    --wall-time "${remaining_seconds}s" \
+    --context-slice 45s \
+    --trial-milestones 4,8,16,32,64 \
+    --initial-promote 1 \
+    --strategy-orchestration manifest \
+    --context-orchestration breadth_first \
+    --adopt-existing-context-identity-if-present \
+    2>&1 | tee -a "$log_dir/autotuner_${profile}.log"
+  status=${PIPESTATUS[0]}
+  set -e
+  if ((status == 0)); then
+    break
+  fi
+  if ((status != 75)); then
+    exit "$status"
+  fi
+  echo "RESTART fatal device context; residuals are durable"
+done
