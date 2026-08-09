@@ -296,6 +296,44 @@ compiled-resource attributes, correctness results, telemetry, proposal
 provenance, device/environment context, confirmation measurements, and
 paired-race decisions. The JSONL files remain authoritative.
 
+## Pretraining the autotuner
+
+The CPU-only pretrainer accepts copied directories and ZIP archives directly.
+Filter to compatible campaigns so obsolete or interrupted kernel revisions
+cannot enter the artifact accidentally. Repeat `--campaign` when a device used
+an earlier campaign name but the same kernel revisions and feature schema:
+
+```bash
+rtx-autotune pretrain autotune_datasets autotune_datasets.zip \
+  --campaign mxfp8_blackwell_cross_device_bandit_v1 \
+  --output autotune_models/mxfp8_blackwell_bandit_v1 \
+  --seed 20260809
+```
+
+It writes revision-scoped absolute-latency and context-ranking models, exact-SKU
+heads validated on unseen contexts, an end-to-end feasibility classifier,
+confidence-qualified paired-coordinate rules, and leave-one-device-out
+validation metrics. Unknown SKUs only receive models that passed cross-device
+replay; an exact SKU model must separately beat random replay in at least three
+of four context-held-out folds. Use the artifact as a soft proposal prior:
+
+```bash
+rtx-autotune run autotune_manifests/cross_device_dataset_bandit_v1.json \
+  --device cuda:0 --output-dir autotune_datasets --format both \
+  --wall-time 2h --context-orchestration bandit \
+  --pretrained-artifact autotune_models/mxfp8_blackwell_bandit_v1
+```
+
+Only a head that beats matched random catalogue replay on every held-out device
+is allowed to propose from the first model-guided trial. Otherwise the family
+keeps its ordinary online model and uses only validated feasibility/rule priors.
+Four initial random trials retain local exploration for an enabled model, and
+measured local data refits it after the configured adaptation interval.
+Conditional rules only adjust ranking; they never reject a legal candidate or
+install an unverified winner.
+Artifacts are ignored by Git because they are reproducible from the source
+JSONL datasets.
+
 ## Dataset manifest
 
 The portable manifest can contain forward and backward jobs. Each job has its

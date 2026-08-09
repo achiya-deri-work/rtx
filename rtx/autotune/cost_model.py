@@ -15,6 +15,12 @@ from .core import FeatureMap, Observation
 
 
 class CostModel(Protocol):
+    @property
+    def fitted(self) -> bool: ...
+
+    @property
+    def parameter_count(self) -> int: ...
+
     def fit(self, observations: Sequence[Observation[object]]) -> None: ...
 
     def predict(self, features: Sequence[FeatureMap]) -> tuple[np.ndarray, np.ndarray]: ...
@@ -305,8 +311,9 @@ class GradientBoostedCostModel:
         Path(path).write_text(json.dumps(self.state_dict(), sort_keys=True), encoding="utf-8")
 
     @classmethod
-    def load(cls, path: Path | str) -> "GradientBoostedCostModel":
-        state = json.loads(Path(path).read_text(encoding="utf-8"))
+    def from_state_dict(
+        cls, state: Mapping[str, object]
+    ) -> "GradientBoostedCostModel":
         model = cls(**state["params"])
         model.vectorizer.load_state_dict(state["vectorizer"])
         model.residual_std = float(state["residual_std"])
@@ -319,13 +326,18 @@ class GradientBoostedCostModel:
         ]
         return model
 
+    @classmethod
+    def load(cls, path: Path | str) -> "GradientBoostedCostModel":
+        state = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls.from_state_dict(state)
+
 
 class GradientBoostedFeasibilityModel:
-    """Small bagged classifier for whether generated device IR will compile.
+    """Small bagged classifier for candidate feasibility.
 
-    Only explicit ``ok`` and ``compile_error`` outcomes are labels. Correctness
-    and runtime failures are intentionally excluded because they do not provide
-    a reliable compile-boundary label across harness implementations.
+    The default remains a compile-boundary model. Offline artifacts can widen
+    ``negative_statuses`` to include launch and correctness failures so the
+    same interface supplies an end-to-end probability of a useful trial.
     """
 
     def __init__(
@@ -341,7 +353,16 @@ class GradientBoostedFeasibilityModel:
         max_thresholds: int = 10,
         max_features: int = 64,
         seed: int = 0,
+        positive_statuses: Sequence[str] = ("ok",),
+        negative_statuses: Sequence[str] = ("compile_error",),
+        negative_fraction: float | None = None,
     ) -> None:
+        if not positive_statuses or not negative_statuses:
+            raise ValueError("feasibility status sets cannot be empty")
+        if set(positive_statuses) & set(negative_statuses):
+            raise ValueError("positive and negative feasibility statuses overlap")
+        if negative_fraction is not None and not 0 < negative_fraction < 1:
+            raise ValueError("negative_fraction must be in (0, 1)")
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.learning_rate = learning_rate
@@ -352,6 +373,9 @@ class GradientBoostedFeasibilityModel:
         self.max_thresholds = max_thresholds
         self.max_features = max_features
         self.seed = seed
+        self.positive_statuses = tuple(str(item) for item in positive_statuses)
+        self.negative_statuses = tuple(str(item) for item in negative_statuses)
+        self.negative_fraction = negative_fraction
         self.vectorizer = SparseFeatureVectorizer()
         self.models: list[_BoostedEnsemble] = []
 
@@ -365,20 +389,18 @@ class GradientBoostedFeasibilityModel:
             len(tree.nodes) * 5 + 1 for model in self.models for tree in model.trees
         )
 
-    @staticmethod
-    def labeled_count(observations: Sequence[Observation[object]]) -> int:
+    def labeled_count(self, observations: Sequence[Observation[object]]) -> int:
+        labeled = set(self.positive_statuses) | set(self.negative_statuses)
         return sum(
-            item.outcome.status in ("ok", "compile_error") for item in observations
+            item.outcome.status in labeled for item in observations
         )
 
     def fit(self, observations: Sequence[Observation[object]]) -> None:
-        usable = [
-            item
-            for item in observations
-            if item.outcome.status in ("ok", "compile_error")
-        ]
+        positive = set(self.positive_statuses)
+        negative = set(self.negative_statuses)
+        usable = [item for item in observations if item.outcome.status in positive | negative]
         labels = np.asarray(
-            [1.0 if item.outcome.status == "ok" else 0.0 for item in usable],
+            [1.0 if item.outcome.status in positive else 0.0 for item in usable],
             dtype=np.float64,
         )
         if (
@@ -386,8 +408,32 @@ class GradientBoostedFeasibilityModel:
             or labels.size == 0
             or float(np.min(labels)) == float(np.max(labels))
         ):
-            self.models = []
+            # Preserve a loaded prior until local evidence contains both
+            # classes. A cold model already has an empty ensemble, so this
+            # retains the original online-training behavior as well.
             return
+        if self.negative_fraction is not None:
+            positive_indices = np.flatnonzero(labels == 1.0)
+            negative_indices = np.flatnonzero(labels == 0.0)
+            desired_negative = int(
+                math.ceil(
+                    len(positive_indices)
+                    * self.negative_fraction
+                    / (1.0 - self.negative_fraction)
+                )
+            )
+            if 0 < len(negative_indices) < desired_negative:
+                balance_rng = np.random.default_rng(self.seed ^ 0xBA1A)
+                extra = balance_rng.choice(
+                    negative_indices,
+                    desired_negative - len(negative_indices),
+                    replace=True,
+                )
+                selected = np.concatenate(
+                    [np.arange(len(usable), dtype=np.int64), extra]
+                )
+                usable = [usable[int(index)] for index in selected]
+                labels = labels[selected]
         rng = np.random.default_rng(self.seed)
         if len(usable) > self.max_training_rows:
             indices = rng.choice(len(usable), self.max_training_rows, replace=False)
@@ -436,6 +482,58 @@ class GradientBoostedFeasibilityModel:
             + probability * (1.0 - probability) / max(1, len(self.models))
         )
         return probability, uncertainty
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": 2,
+            "type": "gradient_boosted_feasibility_model",
+            "params": {
+                "n_estimators": self.n_estimators,
+                "max_depth": self.max_depth,
+                "learning_rate": self.learning_rate,
+                "min_leaf": self.min_leaf,
+                "ensembles": self.ensembles,
+                "row_subsample": self.row_subsample,
+                "max_training_rows": self.max_training_rows,
+                "max_thresholds": self.max_thresholds,
+                "max_features": self.max_features,
+                "seed": self.seed,
+                "positive_statuses": list(self.positive_statuses),
+                "negative_statuses": list(self.negative_statuses),
+                "negative_fraction": self.negative_fraction,
+            },
+            "vectorizer": self.vectorizer.state_dict(),
+            "models": [
+                {"base": model.base, "trees": [tree.state_dict() for tree in model.trees]}
+                for model in self.models
+            ],
+        }
+
+    @classmethod
+    def from_state_dict(
+        cls, state: Mapping[str, object]
+    ) -> "GradientBoostedFeasibilityModel":
+        model = cls(**state["params"])
+        model.vectorizer.load_state_dict(state["vectorizer"])
+        model.models = [
+            _BoostedEnsemble(
+                float(item["base"]),
+                [_RegressionTree.from_state_dict(tree) for tree in item["trees"]],
+            )
+            for item in state["models"]
+        ]
+        return model
+
+    def save(self, path: Path | str) -> None:
+        Path(path).write_text(
+            json.dumps(self.state_dict(), sort_keys=True), encoding="utf-8"
+        )
+
+    @classmethod
+    def load(cls, path: Path | str) -> "GradientBoostedFeasibilityModel":
+        return cls.from_state_dict(
+            json.loads(Path(path).read_text(encoding="utf-8"))
+        )
 
 
 __all__ = [

@@ -783,6 +783,7 @@ class DatasetCampaign:
         calibration: Mapping[str, object] | None = None,
         anytime: AnytimeRunPolicy | None = None,
         adopt_existing_context_identity: bool = False,
+        pretrained_artifact: Path | str | None = None,
         progress=print,
     ) -> None:
         self.manifest = manifest
@@ -791,6 +792,11 @@ class DatasetCampaign:
         self.progress = progress
         self.anytime = anytime
         self.adopt_existing_context_identity = adopt_existing_context_identity
+        self.pretrained_artifact = (
+            None
+            if pretrained_artifact is None
+            else str(Path(pretrained_artifact).expanduser().resolve())
+        )
         self.fingerprint = DeviceFingerprint.current(self.device)
         if self.fingerprint.capability[0] != 12:
             raise RuntimeError(
@@ -1177,6 +1183,14 @@ class DatasetCampaign:
                         if time_budget_s is None
                         else min(time_budget_s, effective_job.tuning.time_budget_s)
                     ),
+                ),
+            )
+        if self.pretrained_artifact is not None:
+            effective_job = replace(
+                effective_job,
+                tuning=replace(
+                    effective_job.tuning,
+                    pretrained_artifact=self.pretrained_artifact,
                 ),
             )
         if promote is not None:
@@ -1827,11 +1841,48 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="resume a v2 bundle across runner-only source changes",
     )
+    run.add_argument(
+        "--pretrained-artifact",
+        type=Path,
+        help="offline model bundle produced by 'rtx-autotune pretrain'",
+    )
 
     collect = subparsers.add_parser("collect", help="merge copied campaign bundles")
     collect.add_argument("paths", type=Path, nargs="+")
     collect.add_argument("--output", type=Path, required=True, help="output path without extension")
     collect.add_argument("--format", choices=("csv", "parquet", "both"), default="csv")
+
+    pretrain = subparsers.add_parser(
+        "pretrain", help="fit portable cost models and conditional-effect rules"
+    )
+    pretrain.add_argument("paths", type=Path, nargs="+")
+    pretrain.add_argument("--output", type=Path, required=True)
+    pretrain.add_argument("--seed", type=int, default=0)
+    pretrain.add_argument(
+        "--campaign",
+        action="append",
+        help=(
+            "only consume observations under this campaign directory; repeat "
+            "to combine compatible campaigns"
+        ),
+    )
+    pretrain.add_argument("--estimators", type=int, default=28)
+    pretrain.add_argument("--ensembles", type=int, default=3)
+    pretrain.add_argument("--max-depth", type=int, default=3)
+    pretrain.add_argument("--min-leaf", type=int, default=4)
+    pretrain.add_argument("--max-features", type=int, default=96)
+    pretrain.add_argument("--min-rule-support", type=int, default=12)
+    pretrain.add_argument("--max-rules", type=int, default=256)
+    pretrain.add_argument(
+        "--skip-device-validation",
+        action="store_true",
+        help="skip leave-one-device-out transfer evaluation",
+    )
+    pretrain.add_argument(
+        "--full-report",
+        action="store_true",
+        help="print the complete validation manifest instead of a concise summary",
+    )
 
     validate = subparsers.add_parser("validate", help="validate and summarize a manifest")
     validate.add_argument("manifest", type=Path)
@@ -1852,6 +1903,49 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command == "pretrain":
+        from .pretrained import train_pretrained_bundle
+
+        report = train_pretrained_bundle(
+            args.paths,
+            args.output,
+            seed=args.seed,
+            n_estimators=args.estimators,
+            ensembles=args.ensembles,
+            max_depth=args.max_depth,
+            min_leaf=args.min_leaf,
+            max_features=args.max_features,
+            min_rule_support=args.min_rule_support,
+            max_rules=args.max_rules,
+            validate_devices=not args.skip_device_validation,
+            campaign=args.campaign,
+        )
+        if args.full_report:
+            printable = report
+        else:
+            printable = {
+                "artifact_id": report["artifact_id"],
+                "output": str(args.output.resolve()),
+                "input": {
+                    key: report["input"][key]
+                    for key in ("observations", "malformed", "devices", "families")
+                },
+                "families": {
+                    key: {
+                        "rows": value["rows"],
+                        "deployment": value["deployment"],
+                        "device_deployment": {
+                            device: device_value["deployment"]
+                            for device, device_value in value.get(
+                                "device_models", {}
+                            ).items()
+                        },
+                    }
+                    for key, value in report["families"].items()
+                },
+            }
+        print(json.dumps(printable, indent=2, sort_keys=True))
+        return
     if args.command == "validate":
         manifest = DatasetManifest.load(args.manifest)
         contexts = sum(len(job.shapes) * len(job.regimes) for job in manifest.jobs)
@@ -1922,6 +2016,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         ),
         adopt_existing_context_identity=args.adopt_existing_context_identity,
+        pretrained_artifact=args.pretrained_artifact,
         progress=None if args.quiet else print,
     )
     bundle = campaign.run(export_format=args.format)

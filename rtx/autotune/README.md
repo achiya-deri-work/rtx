@@ -80,6 +80,21 @@ optimistic probability adjusts ranking but never hard-prunes an uncertain
 region. The local stage explores complete coordinate neighborhoods around the
 best measured configurations and refits both shared models as labels arrive.
 
+For cross-machine warm starts, `rtx-autotune pretrain` fits three distinct
+revision-scoped heads from directories or ZIP archives:
+
+- absolute log latency residualized by calibrated analytical rooflines;
+- configuration ranking centered within each device/workload/cache context;
+- feasibility over compile, launch, correctness, and implementation failures.
+
+The ranking and latency heads compete against matched random catalogue replay;
+a head drives proposal order only when it wins on every held-out device.
+Otherwise both remain diagnostic outputs. Parent-linked local moves also
+produce bootstrap-qualified conditional-effect rules. Rules record
+their support, confidence interval, contexts, and devices and act only as a
+small ranking adjustment. Leave-one-device-out catalogue replay reports regret
+after 1, 4, 8, 16, and 32 proposals before an artifact is deployed.
+
 ## Architecture and SKU features
 
 Dataset campaigns pass a complete SM120/SM121 hardware profile into every
@@ -149,6 +164,7 @@ Every observation includes:
 - exact serialized configuration and stable ID;
 - sparse raw and derived model features;
 - strategy, parent configuration, coordinate, and acquisition metadata;
+- candidate-pool size/rank and the available proposal-probability semantics;
 - status for rejection, compile, correctness, runtime, or success;
 - raw timing samples, median, compilation latency, and numerical error;
 - session sequence, timestamps, and full evaluator duration.

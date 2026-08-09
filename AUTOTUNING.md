@@ -368,6 +368,35 @@ Completed paired-race decisions are replayed when rebuilding the atomic shard
 summary. Compilation and correctness failures are dataset rows rather than
 reasons to terminate a campaign.
 
+### Offline model and heuristic artifacts
+
+Once compatible bundles have returned, train on the authoritative JSONL rather
+than flattened CSV columns:
+
+```bash
+rtx-autotune pretrain copied_datasets/ laptop-results.zip \
+  --campaign mxfp8_blackwell_cross_device_bandit_v1 \
+  --output autotune_models/mxfp8_blackwell_bandit_v1
+```
+
+`--campaign` is repeatable for known-compatible collections. This is preferable
+to omitting the filter, which may silently admit obsolete or interrupted runs.
+
+Models are split by `(family, kernel_revision)`. Provenance, UUIDs, raw timing
+vectors, and device-name categories are removed from features; physical device
+limits and calibrated rooflines remain. Strategy/context balancing limits
+adaptive-sampling dominance, while paired `parent_config_id` transitions feed
+conditional rules. A rule becomes active only when its bootstrapped median
+effect excludes zero with the requested support. This remains observational
+evidence, so it changes proposal priority rather than legality.
+
+Deployment is hierarchical. A portable model is gated by leave-one-device-out
+catalog replay. If it fails that gate, an exact-SKU model may still be used when
+it beats matched random replay in at least three of four held-out-context folds
+on that SKU. Neither model is used on an unrecognized device unless the
+cross-device gate passed. Feasibility and conditional-rule gates are independent
+from latency-head selection.
+
 After copying device result directories to one machine, merge and flatten all
 shards with:
 

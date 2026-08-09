@@ -5,6 +5,11 @@ project follows semantic versioning while it is in active alpha development.
 
 ## 0.6.0
 
+- Add CPU-only cross-device pretraining with revision-scoped latency, ranking,
+  feasibility, conditional-effect, leave-one-device-out, and exact-SKU
+  context-held-out artifacts with content integrity checks.
+- Allow pretrained proposal priors in GPU campaigns while retaining local
+  adaptation, bandit exploration, validation, and device-specific winners.
 - Narrow the supported hardware surface to SM120/SM121 RTX Blackwell; remove
   planned SM110/Jetson Thor profiling and support claims.
 - Add a resumable, nonstationary contextual bandit over random, learned-global,

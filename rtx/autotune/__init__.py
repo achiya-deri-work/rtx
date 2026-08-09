@@ -59,6 +59,15 @@ from .orchestrator import (
 )
 from .migration import import_legacy_json_database
 from .recipes import HybridTuningPolicy, make_hybrid_autotuner
+from .pretrained import (
+    ConditionalEffectRule,
+    ConditionalRuleSet,
+    ContextRankingModel,
+    NormalizedCostModel,
+    load_offline_observations,
+    load_pretrained_family,
+    train_pretrained_bundle,
+)
 from .store import InMemoryTuningStore, JsonlTuningStore, TuningStore
 from .winners import (
     RuntimeWinnerKey,
@@ -111,6 +120,9 @@ __all__ = [
     "CalibratedPrequantEvaluator",
     "ComposableTuningResult",
     "ConfirmationPolicy",
+    "ConditionalEffectRule",
+    "ConditionalRuleSet",
+    "ContextRankingModel",
     "CoordinateDescentPolicy",
     "CoordinateDescentTuner",
     "CoordinateLocalSearch",
@@ -132,6 +144,7 @@ __all__ = [
     "KernelAdapter",
     "KernelContext",
     "MXFP8ForwardEvaluator",
+    "NormalizedCostModel",
     "Observation",
     "Proposal",
     "RandomSearch",
@@ -155,6 +168,8 @@ __all__ = [
     "device_properties",
     "export_bundle",
     "load_cached_mxfp8_fwd_config",
+    "load_offline_observations",
+    "load_pretrained_family",
     "load_runtime_winner",
     "import_legacy_json_database",
     "make_mxfp8_bwd_adapter",
@@ -169,4 +184,5 @@ __all__ = [
     "save_runtime_winner",
     "static_device_profile",
     "tune_mxfp8_fwd",
+    "train_pretrained_bundle",
 ]

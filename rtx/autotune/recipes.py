@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Mapping
 
 from .bandit import AdaptiveBanditScheduler
 from .core import ConfigT, KernelAdapter, TuningBudget
@@ -13,6 +13,7 @@ from .orchestrator import (
     ConfirmationPolicy,
     SequentialScheduler,
 )
+from .pretrained import load_pretrained_family
 from .store import TuningStore
 from .strategies import CostModelGuidedSearch, CostModelLocalSearch, RandomSearch
 
@@ -49,6 +50,9 @@ class HybridTuningPolicy:
     resume: bool = True
     max_trials_includes_resumed: bool = True
     transfer_history: bool = True
+    pretrained_artifact: str | None = None
+    pretrained_warmup_trials: int = 4
+    pretrained_rule_weight: float = 0.15
 
 
 def make_hybrid_autotuner(
@@ -61,17 +65,44 @@ def make_hybrid_autotuner(
     """Build GBT-guided global search followed by/bandited with local search."""
 
     random_search = RandomSearch[ConfigT]()
-    feasibility = GradientBoostedFeasibilityModel(
-        n_estimators=policy.feasibility_estimators,
-        ensembles=policy.feasibility_ensembles,
-        max_depth=policy.feasibility_max_depth,
-        min_leaf=policy.feasibility_min_leaf,
-        max_features=policy.model_max_features,
-        max_thresholds=policy.model_max_thresholds,
-        seed=policy.seed ^ 0x5EED,
+    rules = None
+    provenance = None
+    pretrained = None
+    if policy.pretrained_artifact is not None:
+        sku = adapter.context.device.get("sku", {})
+        device_family = (
+            str(sku.get("sku_family"))
+            if isinstance(sku, Mapping) and sku.get("sku_family") is not None
+            else None
+        )
+        try:
+            pretrained = load_pretrained_family(
+                policy.pretrained_artifact,
+                adapter.context.family,
+                adapter.context.kernel_revision,
+                device_family=device_family,
+            )
+        except KeyError:
+            # One artifact may cover only mature families. New kernels retain
+            # the ordinary cold-start tuner instead of making the campaign fail.
+            pretrained = None
+    selected_head = (
+        "none"
+        if pretrained is None
+        else str(pretrained.deployment.get("selected_cost_head", "none"))
     )
-    learned = CostModelGuidedSearch[ConfigT](
-        model=GradientBoostedCostModel(
+    pretrained_model_active = pretrained is not None and selected_head in {
+        "latency",
+        "ranking",
+    }
+    if pretrained_model_active:
+        cost_model = (
+            pretrained.ranking_model
+            if selected_head == "ranking"
+            else pretrained.cost_model
+        )
+    else:
+        cost_model = GradientBoostedCostModel(
             n_estimators=policy.model_estimators,
             ensembles=policy.model_ensembles,
             max_depth=policy.model_max_depth,
@@ -79,7 +110,41 @@ def make_hybrid_autotuner(
             max_features=policy.model_max_features,
             max_thresholds=policy.model_max_thresholds,
             seed=policy.seed,
-        ),
+        )
+    if pretrained is not None and bool(
+        pretrained.deployment.get("feasibility_enabled", False)
+    ):
+        feasibility = pretrained.feasibility_model
+    else:
+        feasibility = GradientBoostedFeasibilityModel(
+            n_estimators=policy.feasibility_estimators,
+            ensembles=policy.feasibility_ensembles,
+            max_depth=policy.feasibility_max_depth,
+            min_leaf=policy.feasibility_min_leaf,
+            max_features=policy.model_max_features,
+            max_thresholds=policy.model_max_thresholds,
+            seed=policy.seed ^ 0x5EED,
+        )
+    if pretrained is not None and bool(
+        pretrained.deployment.get("conditional_rules_enabled", False)
+    ):
+        rules = pretrained.rules
+    if pretrained is not None:
+        provenance = {
+            "artifact_id": pretrained.artifact_id,
+            "family": pretrained.family,
+            "kernel_revision": pretrained.kernel_revision,
+            "model_scope": pretrained.model_scope,
+            "selected_cost_head": selected_head,
+            "feasibility_enabled": bool(
+                pretrained.deployment.get("feasibility_enabled", False)
+            ),
+            "conditional_rules_enabled": bool(
+                pretrained.deployment.get("conditional_rules_enabled", False)
+            ),
+        }
+    learned = CostModelGuidedSearch[ConfigT](
+        model=cost_model,
         warmup=random_search,
         min_observations=policy.model_warmup,
         pool_size=policy.model_pool_size,
@@ -88,10 +153,14 @@ def make_hybrid_autotuner(
         feasibility_model=feasibility,
         feasibility_exploration=policy.feasibility_exploration,
         minimum_optimistic_feasibility=policy.minimum_optimistic_feasibility,
+        model_provenance=provenance,
     )
     local = CostModelLocalSearch[ConfigT](
         model=learned.model,
         feasibility_model=feasibility,
+        rule_prior=rules,
+        rule_weight=policy.pretrained_rule_weight,
+        model_provenance=provenance,
         beam_width=policy.local_beam_width,
         exploration=policy.model_exploration * 0.25,
         refit_interval=policy.local_model_refit_interval,
@@ -107,7 +176,11 @@ def make_hybrid_autotuner(
         strategies = [random_search, learned, local]
         scheduler = AdaptiveBanditScheduler(
             exploration=policy.bandit_exploration,
-            warmup_trials=policy.model_warmup,
+            warmup_trials=(
+                policy.model_warmup
+                if not pretrained_model_active
+                else policy.pretrained_warmup_trials
+            ),
             warmup_arm=random_search.name,
         )
     return AutotuneOrchestrator(

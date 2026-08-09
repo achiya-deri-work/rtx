@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import random
-from typing import Generic, Protocol, Sequence
+from typing import Generic, Mapping, Protocol, Sequence
 
 import numpy as np
 
 from .core import ConfigT, KernelAdapter, Observation, Proposal, SearchHistory
-from .cost_model import GradientBoostedCostModel, GradientBoostedFeasibilityModel
+from .cost_model import CostModel, GradientBoostedCostModel, GradientBoostedFeasibilityModel
+from .pretrained import ConditionalRuleSet
 
 
 class SearchStrategy(Protocol, Generic[ConfigT]):
@@ -41,12 +42,27 @@ class RandomSearch(Generic[ConfigT]):
         seeds = [item.config for item in sorted(history.successful, key=lambda item: item.score)[:8]]
         candidates = adapter.sample(rng, max(limit * self.pool_multiplier, limit), seeds)
         proposals: list[Proposal[ConfigT]] = []
-        for candidate in candidates:
-            if adapter.config_id(candidate) in history.seen_ids:
-                continue
-            if adapter.rejection(candidate) is not None:
-                continue
-            proposals.append(Proposal(candidate, self.name))
+        eligible = [
+            candidate
+            for candidate in candidates
+            if adapter.config_id(candidate) not in history.seen_ids
+            and adapter.rejection(candidate) is None
+        ]
+        for rank, candidate in enumerate(eligible):
+            proposals.append(
+                Proposal(
+                    candidate,
+                    self.name,
+                    metadata={
+                        "candidate_pool_size": len(eligible),
+                        "candidate_rank": rank,
+                        "proposal_probability": (
+                            None if not eligible else 1.0 / len(eligible)
+                        ),
+                        "proposal_probability_kind": "approximate_pool_uniform",
+                    },
+                )
+            )
             if len(proposals) >= limit:
                 break
         return proposals
@@ -108,7 +124,7 @@ class CoordinateLocalSearch(Generic[ConfigT]):
 class CostModelGuidedSearch(Generic[ConfigT]):
     """Train gradient boosting on measured trials and rank a broad legal pool."""
 
-    model: GradientBoostedCostModel = field(default_factory=GradientBoostedCostModel)
+    model: CostModel = field(default_factory=GradientBoostedCostModel)
     feasibility_model: GradientBoostedFeasibilityModel = field(
         default_factory=GradientBoostedFeasibilityModel
     )
@@ -120,6 +136,7 @@ class CostModelGuidedSearch(Generic[ConfigT]):
     feasibility_exploration: float = 0.5
     minimum_optimistic_feasibility: float = 0.05
     include_local_neighbors: int = 4
+    model_provenance: Mapping[str, object] | None = None
     name: str = "gradient_boosted"
     _fitted_count: int = field(default=0, init=False, repr=False)
     _feasibility_fitted_count: int = field(default=0, init=False, repr=False)
@@ -134,7 +151,7 @@ class CostModelGuidedSearch(Generic[ConfigT]):
     ) -> list[Proposal[ConfigT]]:
         current_successes = history.successful
         training_successes = history.training_successful
-        if len(training_successes) < self.min_observations:
+        if len(training_successes) < self.min_observations and not self.model.fitted:
             proposals = self.warmup.propose(adapter, history, rng, limit)
             for proposal in proposals:
                 proposal.strategy = self.name
@@ -209,7 +226,8 @@ class CostModelGuidedSearch(Generic[ConfigT]):
             acquisition = mean / optimistic_probability - self.exploration * uncertainty
         order = sorted(range(len(candidates)), key=lambda index: float(acquisition[index]))
         queue_limit = min(len(order), max(256, self.refit_interval * 8))
-        for index in order[:queue_limit]:
+        best_acquisition = float(acquisition[order[0]])
+        for rank, index in enumerate(order[:queue_limit]):
             metadata = {
                 "predicted_ms": float(mean[index]),
                 "predicted_std_ms": float(uncertainty[index]),
@@ -219,7 +237,14 @@ class CostModelGuidedSearch(Generic[ConfigT]):
                 "model_parameters": self.model.parameter_count,
                 "compile_training_labels": feasibility_count,
                 "feasibility_model_parameters": self.feasibility_model.parameter_count,
+                "candidate_pool_size": len(candidates),
+                "candidate_rank": rank,
+                "acquisition_gap_to_best": float(acquisition[index]) - best_acquisition,
+                "proposal_probability": None,
+                "proposal_probability_kind": "deterministic_rank_after_stochastic_pool",
             }
+            if self.model_provenance is not None:
+                metadata["pretrained"] = dict(self.model_provenance)
             if compile_probability is not None and compile_uncertainty is not None:
                 metadata.update(
                     predicted_compile_probability=float(compile_probability[index]),
@@ -246,8 +271,11 @@ class CostModelGuidedSearch(Generic[ConfigT]):
 class CostModelLocalSearch(Generic[ConfigT]):
     """Rank complete legal coordinate neighborhoods with a fitted cost model."""
 
-    model: GradientBoostedCostModel
+    model: CostModel
     feasibility_model: GradientBoostedFeasibilityModel | None = None
+    rule_prior: ConditionalRuleSet | None = None
+    rule_weight: float = 0.15
+    model_provenance: Mapping[str, object] | None = None
     beam_width: int = 3
     exploration: float = 0.05
     feasibility_exploration: float = 0.5
@@ -268,7 +296,7 @@ class CostModelLocalSearch(Generic[ConfigT]):
         limit: int,
     ) -> list[Proposal[ConfigT]]:
         training_count = len(history.training_successful)
-        if self.model.fitted and (
+        if self.model.fitted and training_count >= self.refit_interval and (
             self._fitted_count == 0
             or training_count - self._fitted_count >= self.refit_interval
         ):
@@ -325,7 +353,22 @@ class CostModelLocalSearch(Generic[ConfigT]):
             return selected
         feature_rows = [adapter.features(item.config) for item in candidates]
         mean, uncertainty = self.model.predict(feature_rows)
-        acquisition = mean - self.exploration * uncertainty
+        adjusted_mean = mean.copy()
+        rule_effects = np.zeros(len(candidates), dtype=np.float64)
+        rule_matches: list[list[int]] = [[] for _ in candidates]
+        if self.rule_prior is not None and self.rule_weight != 0:
+            for index, proposal in enumerate(candidates):
+                effect, matches = self.rule_prior.adjustment(
+                    feature_rows[index],
+                    coordinate=proposal.coordinate,
+                    coordinate_value=proposal.coordinate_value,
+                )
+                rule_effects[index] = effect
+                rule_matches[index] = matches
+            adjusted_mean = mean * np.exp(
+                np.clip(self.rule_weight * rule_effects, -0.5, 0.5)
+            )
+        acquisition = adjusted_mean - self.exploration * uncertainty
         compile_probability = None
         compile_uncertainty = None
         if self.feasibility_model is not None and self.feasibility_model.fitted:
@@ -338,15 +381,29 @@ class CostModelLocalSearch(Generic[ConfigT]):
                 self.minimum_optimistic_feasibility,
                 1.0,
             )
-            acquisition = mean / optimistic_probability - self.exploration * uncertainty
+            acquisition = (
+                adjusted_mean / optimistic_probability
+                - self.exploration * uncertainty
+            )
         order = sorted(range(len(candidates)), key=lambda index: float(acquisition[index]))
-        for index in order:
+        best_acquisition = float(acquisition[order[0]])
+        for rank, index in enumerate(order):
             proposal = candidates[index]
             proposal.metadata.update(
                 predicted_ms=float(mean[index]),
+                prior_adjusted_ms=float(adjusted_mean[index]),
                 predicted_std_ms=float(uncertainty[index]),
                 acquisition=float(acquisition[index]),
+                conditional_rule_effect=float(rule_effects[index]),
+                conditional_rule_matches=rule_matches[index],
+                candidate_pool_size=len(candidates),
+                candidate_rank=rank,
+                acquisition_gap_to_best=float(acquisition[index]) - best_acquisition,
+                proposal_probability=None,
+                proposal_probability_kind="deterministic_coordinate_rank",
             )
+            if self.model_provenance is not None:
+                proposal.metadata["pretrained"] = dict(self.model_provenance)
             if compile_probability is not None and compile_uncertainty is not None:
                 proposal.metadata.update(
                     predicted_compile_probability=float(compile_probability[index]),
