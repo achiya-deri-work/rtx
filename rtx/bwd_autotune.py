@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 11
+KERNEL_REVISION = 12
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -307,6 +307,12 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
                         "split_reduction": split,
                         "reduction_tile": tile,
                         "workspace_epilogue": epilogue,
+                        "gemm": {
+                            "epilogue": "direct",
+                            "store_vec": 1,
+                            "tiles_per_cta": 1,
+                            "tile_locality": "raster",
+                        },
                     }
                     for split in (2, 4, 8, 16, 32)
                     for tile in (128, 256, 512, 1024, 2048, 4096)
@@ -318,6 +324,12 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
                         "split_reduction": split,
                         "reduction_tile": tile,
                         "workspace_epilogue": "none",
+                        "gemm": {
+                            "epilogue": "direct",
+                            "store_vec": 1,
+                            "tiles_per_cta": 1,
+                            "tile_locality": "raster",
+                        },
                     }
                     for family in ("split_fp32_atomic",)
                     for split in (2, 4, 8, 16)
@@ -493,7 +505,20 @@ BWD_SEARCH_SPACE: dict[str, tuple[dict[str, object], ...]] = {
     **_matmul_axes("dx"),
     **_matmul_axes("dw"),
 }
-BWD_COORDINATE_ORDER = tuple(BWD_SEARCH_SPACE)
+_EARLY_BWD_COORDINATES = (
+    "execution_order",
+    "stream_schedule",
+    "quant_schedule",
+    "dx_backend",
+    "dw_backend",
+    "dw_reduction",
+    "dw_reduction_epilogue_launch",
+    "dx_reduction",
+    "dx_reduction_epilogue_launch",
+)
+BWD_COORDINATE_ORDER = _EARLY_BWD_COORDINATES + tuple(
+    name for name in BWD_SEARCH_SPACE if name not in _EARLY_BWD_COORDINATES
+)
 
 
 def _matmul_from_dict(value: Mapping[str, object]) -> MXFP8BwdMatmulConfig:

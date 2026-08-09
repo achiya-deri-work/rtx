@@ -66,6 +66,16 @@ project follows semantic versioning while it is in active alpha development.
   as the default: 5070 Ti measurements were 13.83 us versus roughly 25/49 us
   for two/four tiles at a 48-tile shape, while the best 768-tile persistent
   cases remained statistically level to slightly slower than the baseline.
+- Add FP32 workspace and FP32 atomic split-K directly to the prequantized GEMM
+  so the quantize-once backward seed can parallelize long dW reductions without
+  duplicating operand quantization. Compose both paths with quad quantization,
+  dual-stream execution, and the existing serial/tree/persistent-tree reducer;
+  move dW reduction near the front of autotuning and model its actual split
+  grid, launch count, and FP32 workspace. On a 5070 Ti at M=8192,N=K=512,
+  four-way workspace/atomic split-K won paired races by about 28.9%; excessive
+  splits lost, and every tested N=K=1536 case also lost because its unsplit dW
+  grid already filled the GPU. Keep full reduction as the portable default and
+  let the shape/device-aware tuner select this conditional family.
 
 ## 0.9.0
 

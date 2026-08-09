@@ -9,7 +9,7 @@ repository root so imports and output paths are predictable.
 | `benchmark_mxfp8_prequant.py` | Dynamic BF16 quantization plus native-scale MXFP8 GEMM |
 | `benchmark_torchao_fp8_rowwise.py` | TorchAO rowwise FP8 comparison baseline |
 | `validate_mxfp8_production.py` | Eager/compiled, training/inference, stream, cache, and long-dW readiness matrix |
-| `benchmark_mxfp8_bwd.py` | Fused scalar/TMA/full/workspace/atomic, one-launch quad-quant, dual-stream, and wide-CTA operand-reuse backward families |
+| `benchmark_mxfp8_bwd.py` | Fused and quantize-once full/workspace/atomic, one-launch quad-quant, dual-stream, and wide-CTA operand-reuse backward families |
 | `tune_composable_prequant.py` | Composable learned/global plus local forward tuning |
 | `tune_composable_bwd.py` | Composable MXFP8 backward tuning |
 | `verify_composable_bwd.py` | Independent backward winner verification and racing |

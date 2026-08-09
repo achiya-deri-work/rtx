@@ -18,6 +18,7 @@ from rtx.kernels.mxfp8_quant import (
 )
 from rtx.kernels.mxfp8 import MXFP8Problem
 from rtx.kernels.mxfp8_gemm import MXFP8GemmConfig, compile_mxfp8_gemm
+from rtx.kernels.mxfp8_reduce import compile_mxfp8_workspace_reduce
 from rtx.prequant_experiments import BenchmarkProtocol, ShapeSpec
 
 
@@ -245,6 +246,73 @@ class MXFP8QuantCudaTests(unittest.TestCase):
                 compile_mxfp8_gemm(problem, config)(qx, qw, sx, sw, actual)
                 torch.cuda.synchronize()
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_prequantized_split_k_workspace_and_atomic_outputs(self) -> None:
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("native kernel requires SM120/SM121")
+        problem = MXFP8Problem(128, 128, 512)
+        config = MXFP8GemmConfig(epilogue="direct", store_vec=1)
+        torch.manual_seed(1707)
+        x = torch.randn(
+            problem.m, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        weight = torch.randn(
+            problem.n, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        qx, sx = _reference(x)
+        qw, sw = _reference(weight)
+        expected = torch.empty(
+            problem.m, problem.n, device="cuda", dtype=torch.bfloat16
+        )
+        compile_mxfp8_gemm(problem, config)(qx, qw, sx, sw, expected)
+        reduce_four = compile_mxfp8_workspace_reduce(
+            problem.m,
+            problem.n,
+            4,
+            algorithm="tree",
+            threads=256,
+            vector=4,
+            persistent_waves=1,
+        )
+        reduce_one = compile_mxfp8_workspace_reduce(
+            problem.m,
+            problem.n,
+            1,
+            algorithm="serial",
+            threads=256,
+            vector=4,
+            persistent_waves=1,
+        )
+        workspace = torch.empty(
+            4 * problem.m * problem.n,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        workspace_out = torch.empty_like(expected)
+        compile_mxfp8_gemm(
+            problem,
+            config,
+            split_reduction=4,
+            reduction_tile=128,
+        )(qx, qw, sx, sw, workspace)
+        reduce_four(workspace, workspace_out)
+        accumulator = torch.zeros(
+            problem.m * problem.n,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        atomic_out = torch.empty_like(expected)
+        compile_mxfp8_gemm(
+            problem,
+            config,
+            split_reduction=4,
+            reduction_tile=128,
+            atomic_output=True,
+        )(qx, qw, sx, sw, accumulator)
+        reduce_one(accumulator, atomic_out)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(workspace_out, expected, rtol=0, atol=1e-5)
+        torch.testing.assert_close(atomic_out, expected, rtol=0, atol=1e-5)
 
     def test_native_scale_tma_paths_match_row_major(self) -> None:
         if torch.cuda.get_device_capability()[0] != 12:

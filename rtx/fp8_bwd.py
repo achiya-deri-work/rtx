@@ -105,6 +105,9 @@ class _MatmulRunner:
     quantized_b: torch.Tensor
     scales_a: torch.Tensor
     scales_b: torch.Tensor
+    workspace: torch.Tensor | None = None
+    reducer: object | None = None
+    zero_workspace: bool = False
 
     def quantize(self, source_a: torch.Tensor, source_b: torch.Tensor) -> None:
         assert self.quant_a is not None
@@ -123,13 +126,21 @@ class _MatmulRunner:
             self.quant_b(source_b, self.quantized_b, self.scales_b)
 
     def matmul(self, out: torch.Tensor) -> None:
+        target = out
+        if self.workspace is not None:
+            if self.zero_workspace:
+                self.workspace.zero_()
+            target = self.workspace
         self.gemm(
             self.quantized_a,
             self.quantized_b,
             self.scales_a,
             self.scales_b,
-            out,
+            target,
         )
+        if self.reducer is not None:
+            assert self.workspace is not None
+            self.reducer(self.workspace, out)
 
     def __call__(
         self,
@@ -402,15 +413,67 @@ def _build_matmul_runner(
         )
         quant_a_launcher = compile_a(problem.m, problem.k, config.quant_a)
         quant_b_launcher = compile_b(problem.n, problem.k, quant_b_config)
+    workspace = None
+    reducer = None
+    zero_workspace = False
+    if config.reduction == "split_fp32_workspace":
+        workspace = torch.empty(
+            config.split_reduction * problem.m * problem.n,
+            dtype=torch.float32,
+            device=device,
+        )
+        gemm = compile_mxfp8_gemm(
+            problem,
+            config.gemm,
+            split_reduction=config.split_reduction,
+            reduction_tile=config.reduction_tile,
+        )
+        reducer = compile_mxfp8_workspace_reduce(
+            problem.m,
+            problem.n,
+            config.split_reduction,
+            algorithm=config.workspace_epilogue,
+            threads=config.reduction_threads,
+            vector=config.reduction_vector,
+            persistent_waves=config.reduction_waves,
+        )
+    elif config.reduction == "split_fp32_atomic":
+        workspace = torch.empty(
+            problem.m * problem.n,
+            dtype=torch.float32,
+            device=device,
+        )
+        zero_workspace = True
+        gemm = compile_mxfp8_gemm(
+            problem,
+            config.gemm,
+            split_reduction=config.split_reduction,
+            reduction_tile=config.reduction_tile,
+            atomic_output=True,
+        )
+        reducer = compile_mxfp8_workspace_reduce(
+            problem.m,
+            problem.n,
+            1,
+            algorithm="serial",
+            threads=config.reduction_threads,
+            vector=config.reduction_vector,
+            persistent_waves=config.reduction_waves,
+        )
+    else:
+        gemm = compile_mxfp8_gemm(problem, config.gemm)
     return _MatmulRunner(
         quant_launches=config.quant_launches,
         quant_a=quant_a_launcher,
         quant_b=quant_b_launcher,
-        gemm=compile_mxfp8_gemm(problem, config.gemm),
+        gemm=gemm,
         quantized_a=quantized_a,
         quantized_b=quantized_b,
         scales_a=scales_a,
         scales_b=scales_b,
+        workspace=workspace,
+        reducer=reducer,
+        zero_workspace=zero_workspace,
     )
 
 

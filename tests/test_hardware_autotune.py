@@ -52,6 +52,16 @@ class HardwareAutotuneTests(unittest.TestCase):
         self.assertEqual(features["work_tiles_per_cta"], 4.0)
         self.assertEqual(features["consecutive_a_reuse_edges"], 36.0)
         self.assertEqual(features["consecutive_b_reuse_edges"], 0.0)
+        split_features = _gemm_features(
+            MXFP8Problem(512, 1536, 1536),
+            MXFP8GemmConfig(epilogue="direct", store_vec=1),
+            None,
+            materialized_quant=True,
+            split_reduction=4,
+        )
+        self.assertEqual(split_features["natural_ctas"], 48.0)
+        self.assertEqual(split_features["split_work_ctas"], 192.0)
+        self.assertEqual(split_features["grid_ctas"], 192.0)
 
     def test_staged_fused_smem_includes_pipeline_alignment_reserve(self) -> None:
         candidate = normalize_fwd_config(

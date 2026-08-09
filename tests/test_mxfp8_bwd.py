@@ -121,15 +121,13 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
                 name,
             )
 
-    def test_unimplemented_reduction_is_named_not_benchmarked_as_noop(self) -> None:
+    def test_unimplemented_cluster_reduction_is_named_not_a_noop(self) -> None:
         candidate = update_bwd_config(
             DEFAULT_DUAL_DECOMPOSED_MXFP8_BWD_CONFIG,
             {
                 "dw": {
-                    "reduction": "split_fp32_workspace",
+                    "reduction": "cluster_fp32",
                     "split_reduction": 4,
-                    "reduction_tile": 512,
-                    "workspace_epilogue": "tree",
                 }
             },
         )
@@ -137,7 +135,21 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
             MXFP8Problem(512, 1536, 1536)
         )
         self.assertIsNotNone(reason)
-        self.assertIn("split_fp32_workspace", reason)
+        self.assertIn("cluster_fp32", reason)
+
+    def test_decomposed_workspace_and_atomic_reductions_are_executable(self) -> None:
+        problem = MXFP8Problem(512, 1536, 1536)
+        for reduction in ("split_fp32_workspace", "split_fp32_atomic"):
+            update = next(
+                value
+                for value in BWD_SEARCH_SPACE["dw_reduction"]
+                if value["dw"]["reduction"] == reduction
+                and value["dw"]["split_reduction"] == 4
+                and value["dw"]["reduction_tile"] == 128
+            )
+            candidate = update_bwd_config(DEFAULT_MXFP8_BWD_CONFIG, update)
+            with self.subTest(reduction=reduction):
+                self.assertIsNone(candidate.implementation_rejection(problem))
 
     def test_no_physical_transpose_axes_exist(self) -> None:
         self.assertFalse(any("transpose" in name for name in BWD_SEARCH_SPACE))
@@ -598,6 +610,26 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         )
         self.assertIsNone(config.implementation_rejection(MXFP8Problem(m, n, k)))
         self._assert_backward_close(config, grad_output, x, weight)
+
+    def test_decomposed_split_dw_reductions_match_reference(self) -> None:
+        torch.manual_seed(36)
+        m, n, k = 512, 256, 256
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        grad_output = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+        problem = MXFP8Problem(m, n, k)
+        for reduction in ("split_fp32_workspace", "split_fp32_atomic"):
+            update = next(
+                value
+                for value in BWD_SEARCH_SPACE["dw_reduction"]
+                if value["dw"]["reduction"] == reduction
+                and value["dw"]["split_reduction"] == 4
+                and value["dw"]["reduction_tile"] == 128
+            )
+            config = update_bwd_config(DEFAULT_MXFP8_BWD_CONFIG, update)
+            with self.subTest(reduction=reduction):
+                self.assertIsNone(config.implementation_rejection(problem))
+                self._assert_backward_close(config, grad_output, x, weight)
 
     def test_quad_cpasync_logical_transport_feeds_both_matmuls(self) -> None:
         torch.manual_seed(35)

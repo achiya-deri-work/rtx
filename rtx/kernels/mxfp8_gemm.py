@@ -37,18 +37,46 @@ from .mxfp8_fwd import (
 
 
 class MXFP8GemmKernel:
-    def __init__(self, problem: MXFP8Problem, config: MXFP8GemmConfig):
+    def __init__(
+        self,
+        problem: MXFP8Problem,
+        config: MXFP8GemmConfig,
+        *,
+        split_reduction: int = 1,
+        reduction_tile: int = 0,
+        atomic_output: bool = False,
+    ):
         rejection = config.rejection(problem)
         if rejection is not None:
             raise ValueError(f"illegal prequantized MXFP8 GEMM: {rejection}")
         self.problem = problem
         self.config = config
+        self.split_reduction = split_reduction
+        self.reduction_tile = reduction_tile
+        self.atomic_output = atomic_output
+        if split_reduction < 1:
+            raise ValueError("split_reduction must be positive")
+        if split_reduction == 1 and (reduction_tile != 0 or atomic_output):
+            raise ValueError("an unsplit GEMM must use reduction_tile=0")
+        if split_reduction > 1:
+            if config.epilogue != "direct":
+                raise ValueError("split-K prequant GEMM requires direct FP32 output")
+            if config.tiles_per_cta != 1:
+                raise ValueError("split-K and multi-output persistence are independent")
+            if reduction_tile <= 0 or reduction_tile % config.tile_k:
+                raise ValueError("reduction_tile must be a positive tile-K multiple")
+            if not (
+                (split_reduction - 1) * reduction_tile < problem.k
+                <= split_reduction * reduction_tile
+            ):
+                raise ValueError("split count/tile must cover K without an empty slice")
         self.tile_shape_mnk = (config.tile_m, config.tile_n, config.tile_k)
         self.m_tiles = (problem.m + config.tile_m - 1) // config.tile_m
         self.n_tiles = (problem.n + config.tile_n - 1) // config.tile_n
         self.total_tiles = self.m_tiles * self.n_tiles
+        self.total_work_tiles = self.total_tiles * split_reduction
         self.grid_ctas = (
-            self.total_tiles + config.tiles_per_cta - 1
+            self.total_work_tiles + config.tiles_per_cta - 1
         ) // config.tiles_per_cta
         self.num_k_tiles = (problem.k + config.tile_k - 1) // config.tile_k
         scale_threads = config.num_mma_warps * 32
@@ -273,19 +301,25 @@ class MXFP8GemmKernel:
             (scale_b_tile_elems, cfg.stages),
             stride=(1, scale_b_tile_elems),
         )
-        out_view = cute.make_tensor(
-            out.iterator,
-            cute.make_layout(
-                (self.problem.m, self.problem.n, 1),
-                stride=(self.problem.n, 1, self.problem.m * self.problem.n),
-            ),
-        )
-        tma_out, tma_out_tensor = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
-            out_view,
-            cute.slice_(self.out_layout, (None, None, 0)),
-            (cfg.tile_m, cfg.tile_n),
-        )
+        if cutlass.const_expr(cfg.epilogue == "tma"):
+            out_view = cute.make_tensor(
+                out.iterator,
+                cute.make_layout(
+                    (self.problem.m, self.problem.n, 1),
+                    stride=(self.problem.n, 1, self.problem.m * self.problem.n),
+                ),
+            )
+            tma_out, tma_out_tensor = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                out_view,
+                cute.slice_(self.out_layout, (None, None, 0)),
+                (cfg.tile_m, cfg.tile_n),
+            )
+        else:
+            # Direct and split-K epilogues never instantiate the constexpr TMA
+            # store branch. Reuse a typed placeholder instead of attempting to
+            # build a BF16 tensor map over an FP32 workspace.
+            tma_out, tma_out_tensor = tma_x, tma_x_tensor
 
         @cute.struct
         class SharedStorage:
@@ -573,13 +607,18 @@ class MXFP8GemmKernel:
         t_cr_sfb_copy = thr_copy_sfb.retile(t_cr_sfb)
 
         total_tiles = m_tiles * n_tiles
+        total_work_tiles = total_tiles * self.split_reduction
         for work_slot in cutlass.range_constexpr(cfg.tiles_per_cta):
             raw_work_linear = cta_idx * cfg.tiles_per_cta + work_slot
-            active_tile = raw_work_linear < total_tiles
+            active_tile = raw_work_linear < total_work_tiles
             # A final partial CTA follows the full pipeline on the last valid
             # tile so every unrolled slot advances identical barrier phases.
             # Only its epilogue is predicated, avoiding duplicate output stores.
-            work_linear = cutlass.min(raw_work_linear, total_tiles - 1)
+            work_linear = cutlass.min(raw_work_linear, total_work_tiles - 1)
+            split_id = Int32(0)
+            if cutlass.const_expr(self.split_reduction > 1):
+                split_id = work_linear // total_tiles
+                work_linear = work_linear % total_tiles
             if cutlass.const_expr(cfg.tile_locality == "same_a"):
                 block_m = work_linear // n_tiles
                 block_n = work_linear % n_tiles
@@ -648,8 +687,20 @@ class MXFP8GemmKernel:
                 Int32(pipeline_phase),
             )
 
+            out_matrix = cute.make_tensor(
+                out.iterator
+                + (
+                    split_id * self.problem.m * self.problem.n
+                    if self.split_reduction > 1 and not self.atomic_output
+                    else 0
+                ),
+                cute.make_layout(
+                    (self.problem.m, self.problem.n),
+                    stride=(self.problem.n, 1),
+                ),
+            )
             g_out = cute.local_tile(
-                out, (cfg.tile_m, cfg.tile_n), (block_m, block_n)
+                out_matrix, (cfg.tile_m, cfg.tile_n), (block_m, block_n)
             )
             c_out = cute.local_tile(
                 cute.make_identity_tensor((self.problem.m, self.problem.n)),
@@ -711,7 +762,20 @@ class MXFP8GemmKernel:
             total_scale_count = (
                 cfg.tile_m + cfg.tile_n
             ) * scale_chunks_per_row
-            for k_tile in cutlass.range(num_k_tiles, unroll=1):
+            first_k_tile = Int32(0)
+            final_k_tile = Int32(num_k_tiles)
+            if cutlass.const_expr(self.split_reduction > 1):
+                reduction_tiles = self.reduction_tile // cfg.tile_k
+                first_k_tile = split_id * reduction_tiles
+                final_k_tile = cutlass.min(
+                    first_k_tile + reduction_tiles,
+                    num_k_tiles,
+                )
+            for k_tile in cutlass.range(
+                first_k_tile,
+                final_k_tile,
+                unroll=1,
+            ):
                 if warp_idx == cfg.num_mma_warps:
                     producer_stage = producer_state.index
                     tma_pipeline.producer_acquire(producer_state)
@@ -923,7 +987,17 @@ class MXFP8GemmKernel:
                                 coord[0] < self.problem.m
                                 and coord[1] < self.problem.n
                             ):
-                                t_cg_out[elem] = BFloat16(accumulators[elem])
+                                if cutlass.const_expr(self.atomic_output):
+                                    cute.arch.atomic_add(
+                                        t_cg_out.iterator + t_cg_out.layout(elem),
+                                        accumulators[elem],
+                                        sem="relaxed",
+                                        scope="gpu",
+                                    )
+                                elif cutlass.const_expr(self.split_reduction > 1):
+                                    t_cg_out[elem] = accumulators[elem]
+                                else:
+                                    t_cg_out[elem] = BFloat16(accumulators[elem])
             else:
                 if active_tile:
                     if warp_idx < cfg.num_mma_warps:
@@ -945,8 +1019,18 @@ class MXFP8GemmKernel:
 def compile_mxfp8_gemm(
     problem: MXFP8Problem,
     config: MXFP8GemmConfig = MXFP8GemmConfig(),
+    *,
+    split_reduction: int = 1,
+    reduction_tile: int = 0,
+    atomic_output: bool = False,
 ):
-    kernel = MXFP8GemmKernel(problem, config)
+    kernel = MXFP8GemmKernel(
+        problem,
+        config,
+        split_reduction=split_reduction,
+        reduction_tile=reduction_tile,
+        atomic_output=atomic_output,
+    )
     qx = cute.runtime.make_fake_tensor(
         Float8E4M3FN,
         (problem.m, problem.k),
@@ -998,12 +1082,25 @@ def compile_mxfp8_gemm(
             stride=(problem.k // 128 * 512, 512, 1),
             assumed_align=16,
         )
-    out = cute.runtime.make_fake_tensor(
-        BFloat16,
-        (problem.m, problem.n),
-        stride=(problem.n, 1),
-        assumed_align=16,
-    )
+    if split_reduction > 1:
+        out_elements = (
+            problem.m * problem.n
+            if atomic_output
+            else split_reduction * problem.m * problem.n
+        )
+        out = cute.runtime.make_fake_tensor(
+            Float32,
+            (out_elements,),
+            stride=(1,),
+            assumed_align=16,
+        )
+    else:
+        out = cute.runtime.make_fake_tensor(
+            BFloat16,
+            (problem.m, problem.n),
+            stride=(problem.n, 1),
+            assumed_align=16,
+        )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile(
         kernel,

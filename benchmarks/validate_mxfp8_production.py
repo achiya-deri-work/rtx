@@ -91,15 +91,22 @@ def _packed_inference_case(*, fully_prequantized: bool) -> dict[str, object]:
     }
 
 
-def _long_reduction_case(m: int, *, reduction: str) -> dict[str, object]:
+def _long_reduction_case(
+    m: int,
+    *,
+    reduction: str,
+    backend: str = "fused",
+) -> dict[str, object]:
     torch.manual_seed(307)
     n = k = 512
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
     grad_output = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
-    # Exercise fused backward explicitly. The public untuned seed remains the
-    # measured quantize-once family until cross-CTA quantization reuse lands.
-    config = rtx.DEFAULT_FUSED_MXFP8_BWD_CONFIG
+    config = (
+        rtx.DEFAULT_FUSED_MXFP8_BWD_CONFIG
+        if backend == "fused"
+        else rtx.DEFAULT_MXFP8_BWD_CONFIG
+    )
     if reduction != "full_fp32":
         choices = tuple(
             (parts, reduction_tile)
@@ -121,6 +128,18 @@ def _long_reduction_case(m: int, *, reduction: str) -> dict[str, object]:
                     "workspace_epilogue": (
                         "tree" if reduction == "split_fp32_workspace" else "none"
                     ),
+                    **(
+                        {
+                            "gemm": {
+                                "epilogue": "direct",
+                                "store_vec": 1,
+                                "tiles_per_cta": 1,
+                                "tile_locality": "raster",
+                            }
+                        }
+                        if backend == "decomposed"
+                        else {}
+                    ),
                 }
             },
         )
@@ -137,6 +156,7 @@ def _long_reduction_case(m: int, *, reduction: str) -> dict[str, object]:
         "n": n,
         "k": k,
         "reduction": reduction,
+        "backend": backend,
         "dw_relative_l2": error,
     }
 
@@ -218,6 +238,16 @@ def main() -> None:
         "long_sequence_dw_atomic": lambda: _long_reduction_case(
             1024 if args.quick else args.long_m,
             reduction="split_fp32_atomic",
+        ),
+        "long_sequence_dw_decomposed_workspace": lambda: _long_reduction_case(
+            1024 if args.quick else args.long_m,
+            reduction="split_fp32_workspace",
+            backend="decomposed",
+        ),
+        "long_sequence_dw_decomposed_atomic": lambda: _long_reduction_case(
+            1024 if args.quick else args.long_m,
+            reduction="split_fp32_atomic",
+            backend="decomposed",
         ),
         "multiple_streams": _multiple_stream_case,
         "variable_shapes_bounded_cache": _variable_shape_cache_case,

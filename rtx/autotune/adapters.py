@@ -149,12 +149,16 @@ def _gemm_features(
     device: DeviceFingerprint | Mapping[str, object] | None,
     *,
     materialized_quant: bool,
+    split_reduction: int = 1,
 ) -> dict[str, float]:
     profile = _device_dict(device)
     m_tiles = (problem.m + config.tile_m - 1) // config.tile_m
     n_tiles = (problem.n + config.tile_n - 1) // config.tile_n
     natural_ctas = m_tiles * n_tiles
-    grid_ctas = (natural_ctas + config.tiles_per_cta - 1) // config.tiles_per_cta
+    total_work_ctas = natural_ctas * split_reduction
+    grid_ctas = (
+        total_work_ctas + config.tiles_per_cta - 1
+    ) // config.tiles_per_cta
     same_a_edges = sum(
         1
         for edge in range(1, natural_ctas)
@@ -209,8 +213,9 @@ def _gemm_features(
         mma_k_tiles_per_cta=float((problem.k + config.tile_k - 1) // config.tile_k),
         mma_warp_issues_per_k_tile=float(config.num_mma_warps),
         work_tiles_per_cta=float(config.tiles_per_cta),
+        split_work_ctas=float(total_work_ctas),
         final_cta_active_fraction=(
-            (natural_ctas - (grid_ctas - 1) * config.tiles_per_cta)
+            (total_work_ctas - (grid_ctas - 1) * config.tiles_per_cta)
             / config.tiles_per_cta
         ),
         same_a_locality=float(
@@ -834,6 +839,7 @@ def make_mxfp8_bwd_adapter(
                         matmul.gemm,
                         device,
                         materialized_quant=True,
+                        split_reduction=matmul.split_reduction,
                     ),
                     f"{name}_",
                 )
@@ -868,7 +874,16 @@ def make_mxfp8_bwd_adapter(
             )
             values[f"{name}_backend_fused"] = 0.0
             values[f"{name}_total_kernel_launches"] = (
-                values[f"{name}_quant_launch_count"] + 1.0
+                values[f"{name}_quant_launch_count"]
+                + (
+                    2.0
+                    if matmul.reduction == "split_fp32_workspace"
+                    else (
+                        3.0
+                        if matmul.reduction == "split_fp32_atomic"
+                        else 1.0
+                    )
+                )
             )
             values[f"{name}_split_reduction"] = float(matmul.split_reduction)
             values[f"{name}_reduction_tile"] = float(matmul.reduction_tile)
@@ -877,8 +892,21 @@ def make_mxfp8_bwd_adapter(
                 if matmul.reduction == "full_fp32"
                 else matmul_problem.m
                 * matmul_problem.n
-                * matmul.split_reduction
+                * (
+                    matmul.split_reduction
+                    if matmul.reduction == "split_fp32_workspace"
+                    else 1
+                )
                 * 4
+            )
+            values[f"{name}_reduction_threads"] = float(
+                matmul.reduction_threads
+            )
+            values[f"{name}_reduction_vector"] = float(
+                matmul.reduction_vector
+            )
+            values[f"{name}_reduction_waves"] = float(
+                matmul.reduction_waves
             )
         values["dw_reduction_length"] = problem.m
         values["dx_reduction_length"] = problem.n

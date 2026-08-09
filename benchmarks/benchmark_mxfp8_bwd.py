@@ -240,6 +240,36 @@ def _configs(shape: ShapeSpec, *, reuse_sweep: bool = False) -> dict[str, object
     split = _split_for(shape.m)
     if split is not None:
         parts, tile = split
+        decomposed_split_base = {
+            "gemm": {
+                "epilogue": "direct",
+                "store_vec": 1,
+                "tiles_per_cta": 1,
+                "tile_locality": "raster",
+            },
+            "split_reduction": parts,
+            "reduction_tile": tile,
+        }
+        configs["decomposed_workspace"] = update_bwd_config(
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            {
+                "dw": {
+                    **decomposed_split_base,
+                    "reduction": "split_fp32_workspace",
+                    "workspace_epilogue": "tree",
+                }
+            },
+        )
+        configs["decomposed_atomic"] = update_bwd_config(
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            {
+                "dw": {
+                    **decomposed_split_base,
+                    "reduction": "split_fp32_atomic",
+                    "workspace_epilogue": "none",
+                }
+            },
+        )
         configs["fused_tma_workspace"] = update_bwd_config(
             fused_tma,
             {
