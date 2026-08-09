@@ -152,10 +152,10 @@ class MXFP8LinearFwdKernel:
         if split_reduction > 1:
             if config.epilogue != "direct":
                 raise ValueError("split reduction requires the FP32 direct epilogue")
-            if config.persistent:
-                raise ValueError("split reduction persistence is tuned in its epilogue")
             if cluster_output and split_reduction not in (2, 4, 8):
                 raise ValueError("SM120 CTA clusters support split counts 2, 4, or 8")
+            if cluster_output and config.persistent:
+                raise ValueError("cluster split reduction has a fixed CTA topology")
             if cluster_output and config.cluster_reuse != "none":
                 raise ValueError(
                     "split reduction and operand reuse require separate CTA clusters"
@@ -174,17 +174,33 @@ class MXFP8LinearFwdKernel:
         self.tile_shape_mnk = (config.tile_m, config.tile_n, config.tile_k)
         self.num_mma_warps = config.num_mma_warps
         self.threads_per_cta = config.num_threads
-        total_tiles = split_reduction * (
+        output_tiles = (
             (problem.m + config.tile_m - 1) // config.tile_m
         ) * ((problem.n + config.tile_n - 1) // config.tile_n)
+        total_tiles = split_reduction * output_tiles
+        self.split_grid_ctas = output_tiles
         self.grid_ctas = total_tiles
         if config.persistent:
             sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
-            self.grid_ctas = min(
-                total_tiles, sm_count * config.persistent_waves
-            )
-            while total_tiles % self.grid_ctas:
-                self.grid_ctas -= 1
+            if split_reduction > 1:
+                # Keep every CTA on one reduction slice so its TMA and
+                # quantizer pipelines can remain live across output tiles.
+                # Divide the device budget among slices, then choose an exact
+                # divisor so every CTA owns the same constexpr work count.
+                per_split_budget = max(
+                    1,
+                    sm_count * config.persistent_waves // split_reduction,
+                )
+                self.split_grid_ctas = min(output_tiles, per_split_budget)
+                while output_tiles % self.split_grid_ctas:
+                    self.split_grid_ctas -= 1
+                self.grid_ctas = split_reduction * self.split_grid_ctas
+            else:
+                self.grid_ctas = min(
+                    total_tiles, sm_count * config.persistent_waves
+                )
+                while total_tiles % self.grid_ctas:
+                    self.grid_ctas -= 1
         self.work_tiles_per_cta = total_tiles // self.grid_ctas
         self.mma_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1,
@@ -446,16 +462,39 @@ class MXFP8LinearFwdKernel:
             num_bits_per_copy=128,
         )
         cp_async_values = 128 // BFloat16.width
-        cp_async_k_threads = cfg.bf16_tile_k // cp_async_values
-        cp_async_thread_layout = cute.make_layout(
-            (cfg.num_threads // cp_async_k_threads, cp_async_k_threads),
-            stride=(cp_async_k_threads, 1),
+
+        def make_oriented_cpasync_copy(
+            rows: cutlass.Constexpr,
+            orientation: cutlass.Constexpr,
+        ):
+            if cutlass.const_expr(orientation == "transpose"):
+                # Logical-K is physically strided, but logical rows are the
+                # contiguous basis. Vectorize that M/N basis and land it in
+                # the matching MN-major SMEM layout; no transpose copy exists.
+                row_threads = rows // cp_async_values
+                thread_layout = cute.make_layout(
+                    (row_threads, cfg.num_threads // row_threads),
+                    stride=(1, row_threads),
+                )
+                value_layout = cute.make_layout((cp_async_values, 1))
+            else:
+                k_threads = cfg.bf16_tile_k // cp_async_values
+                thread_layout = cute.make_layout(
+                    (cfg.num_threads // k_threads, k_threads),
+                    stride=(k_threads, 1),
+                )
+                value_layout = cute.make_layout((1, cp_async_values))
+            return cute.make_tiled_copy_tv(
+                cp_async_atom,
+                thread_layout,
+                value_layout,
+            )
+
+        cp_async_tiled_copy_a = make_oriented_cpasync_copy(
+            cfg.tile_m, self.a_orientation
         )
-        cp_async_value_layout = cute.make_layout((1, cp_async_values))
-        cp_async_tiled_copy = cute.make_tiled_copy_tv(
-            cp_async_atom,
-            cp_async_thread_layout,
-            cp_async_value_layout,
+        cp_async_tiled_copy_b = make_oriented_cpasync_copy(
+            cfg.tile_n, self.b_orientation
         )
 
         @cute.struct
@@ -595,7 +634,8 @@ class MXFP8LinearFwdKernel:
             self.bf16_a_smem_layout,
             self.bf16_b_smem_layout,
             self.out_smem_layout,
-            cp_async_tiled_copy,
+            cp_async_tiled_copy_a,
+            cp_async_tiled_copy_b,
         )
         if cutlass.const_expr(self.cluster_output):
             kernel.launch(
@@ -708,7 +748,8 @@ class MXFP8LinearFwdKernel:
         bf16_a_smem_layout: cute.ComposedLayout,
         bf16_b_smem_layout: cute.ComposedLayout,
         out_smem_layout: cute.ComposedLayout,
-        cp_async_tiled_copy: cute.TiledCopy,
+        cp_async_tiled_copy_a: cute.TiledCopy,
+        cp_async_tiled_copy_b: cute.TiledCopy,
     ):
         cfg = self.config
         tidx, _, _ = cute.arch.thread_idx()
@@ -908,7 +949,46 @@ class MXFP8LinearFwdKernel:
             cute.arch.cluster_wait()
 
         total_tiles = m_tiles * n_tiles
+        num_k_tiles = cute.ceil_div(self.problem.k, cfg.bf16_tile_k)
+        persistent_split_id = Int32(0)
+        persistent_split_k_tiles = Int32(num_k_tiles)
+        if cutlass.const_expr(
+            self.split_reduction > 1 and cfg.persistent
+        ):
+            persistent_split_id = linear_tile // self.split_grid_ctas
+            reduction_tiles = self.reduction_tile // cfg.bf16_tile_k
+            persistent_first_k = persistent_split_id * reduction_tiles
+            persistent_final_k = cutlass.min(
+                persistent_first_k + reduction_tiles, num_k_tiles
+            )
+            persistent_split_k_tiles = persistent_final_k - persistent_first_k
         for work_slot in cutlass.range_constexpr(self.work_tiles_per_cta):
+            split_id = Int32(0)
+            if cutlass.const_expr(self.cluster_output):
+                split_id = cute.arch.block_idx_in_cluster()
+                work_linear = linear_tile // self.split_reduction
+            elif cutlass.const_expr(
+                self.split_reduction > 1 and cfg.persistent
+            ):
+                split_id = persistent_split_id
+                local_cta = linear_tile - split_id * self.split_grid_ctas
+                work_linear = local_cta + work_slot * self.split_grid_ctas
+                if cutlass.const_expr(cfg.reuse != "none"):
+                    work_linear = (
+                        local_cta * self.work_tiles_per_cta + work_slot
+                    )
+            else:
+                work_linear = linear_tile + work_slot * self.grid_ctas
+                if cutlass.const_expr(cfg.persistent and cfg.reuse != "none"):
+                    # Contiguous chunks preserve an operand coordinate across
+                    # adjacent work: N-varying for X, M-varying for weight.
+                    work_linear = (
+                        linear_tile * self.work_tiles_per_cta + work_slot
+                    )
+                if cutlass.const_expr(self.split_reduction > 1):
+                    split_id = work_linear // total_tiles
+                    work_linear = work_linear % total_tiles
+
             # Mutable PipelineState objects carried across this constexpr
             # output loop produce non-dominating SSA in CuTe DSL. The exact
             # phase is a pure function of the preceding output tiles, so
@@ -916,6 +996,12 @@ class MXFP8LinearFwdKernel:
             pipeline_count = work_slot * cute.ceil_div(
                 self.problem.k, cfg.bf16_tile_k
             )
+            if cutlass.const_expr(
+                self.split_reduction > 1 and cfg.persistent
+            ):
+                pipeline_count = work_slot * persistent_split_k_tiles
+            elif cutlass.const_expr(self.split_reduction > 1):
+                pipeline_count = 0
             if cutlass.const_expr(cfg.load_engine == "tma"):
                 tma_index = pipeline_count % cfg.bf16_stages
                 tma_phase = (pipeline_count // cfg.bf16_stages) & 1
@@ -946,20 +1032,6 @@ class MXFP8LinearFwdKernel:
                     Int32(quant_index),
                     Int32(quant_phase),
                 )
-            work_linear = linear_tile + work_slot * self.grid_ctas
-            if cutlass.const_expr(cfg.persistent and cfg.reuse != "none"):
-                # Contiguous chunks preserve an operand coordinate across
-                # adjacent work: N-varying for X, M-varying for weight.
-                work_linear = (
-                    linear_tile * self.work_tiles_per_cta + work_slot
-                )
-            split_id = Int32(0)
-            if cutlass.const_expr(self.cluster_output):
-                split_id = cute.arch.block_idx_in_cluster()
-                work_linear = linear_tile // self.split_reduction
-            elif cutlass.const_expr(self.split_reduction > 1):
-                split_id = work_linear // total_tiles
-                work_linear = work_linear % total_tiles
             # Grouped rasterization is bijective even for a partial final
             # group.  Reuse policies select the matching contiguous order.
             raster_n = cfg.raster == "n"
@@ -1081,8 +1153,6 @@ class MXFP8LinearFwdKernel:
             loads_per_mma_tile = cfg.tile_k // cfg.bf16_tile_k
             a_scale_blocks = cfg.tile_m * blocks_per_load
             b_scale_blocks = cfg.tile_n * blocks_per_load
-            num_k_tiles = cute.ceil_div(self.problem.k, cfg.bf16_tile_k)
-    
             if cutlass.const_expr(
                 cfg.schedule in ("warp_specialized", "three_role")
             ):
@@ -1168,18 +1238,19 @@ class MXFP8LinearFwdKernel:
                         (cfg.tile_n, cfg.bf16_tile_k),
                         (block_n, k_tile),
                     )
-                    cp_async_thread = cp_async_tiled_copy.get_slice(tidx)
+                    cp_async_thread_a = cp_async_tiled_copy_a.get_slice(tidx)
+                    cp_async_thread_b = cp_async_tiled_copy_b.get_slice(tidx)
                     cute.copy(
-                        cp_async_tiled_copy,
-                        cp_async_thread.partition_S(g_x_tile),
-                        cp_async_thread.partition_D(
+                        cp_async_tiled_copy_a,
+                        cp_async_thread_a.partition_S(g_x_tile),
+                        cp_async_thread_a.partition_D(
                             s_bf16_a[None, None, bf16_stage]
                         ),
                     )
                     cute.copy(
-                        cp_async_tiled_copy,
-                        cp_async_thread.partition_S(g_weight_tile),
-                        cp_async_thread.partition_D(
+                        cp_async_tiled_copy_b,
+                        cp_async_thread_b.partition_S(g_weight_tile),
+                        cp_async_thread_b.partition_D(
                             s_bf16_b[None, None, bf16_stage]
                         ),
                     )
@@ -1756,7 +1827,9 @@ class MXFP8LinearFwdKernel:
                 else:
                     cute.arch.sync_threads()
     
-            if cutlass.const_expr(self.split_reduction > 1):
+            if cutlass.const_expr(
+                self.split_reduction > 1 and not cfg.persistent
+            ):
                 if cutlass.const_expr(
                     cfg.schedule in ("warp_specialized", "three_role")
                 ):
@@ -1924,13 +1997,14 @@ class MXFP8LinearFwdKernel:
                                 t_cg_out[elem] = BFloat16(accumulators[elem])
 
         if cutlass.const_expr(
-            self.split_reduction == 1
+            (self.split_reduction == 1 or cfg.persistent)
             and cfg.load_engine == "tma"
             and cfg.schedule in ("warp_specialized", "three_role")
         ):
-            final_count = self.work_tiles_per_cta * cute.ceil_div(
-                self.problem.k, cfg.bf16_tile_k
-            )
+            final_k_count = Int32(num_k_tiles)
+            if cutlass.const_expr(self.split_reduction > 1):
+                final_k_count = persistent_split_k_tiles
+            final_count = self.work_tiles_per_cta * final_k_count
             tma_final_index = final_count % cfg.bf16_stages
             tma_final_phase = (final_count // cfg.bf16_stages) & 1
             tma_final_state = pipeline.PipelineState(
@@ -1946,11 +2020,13 @@ class MXFP8LinearFwdKernel:
                 tma_pipeline.producer_tail(tma_final_state)
 
         if cutlass.const_expr(
-            self.split_reduction == 1 and cfg.schedule == "three_role"
+            (self.split_reduction == 1 or cfg.persistent)
+            and cfg.schedule == "three_role"
         ):
-            final_count = self.work_tiles_per_cta * cute.ceil_div(
-                self.problem.k, cfg.bf16_tile_k
-            )
+            final_k_count = Int32(num_k_tiles)
+            if cutlass.const_expr(self.split_reduction > 1):
+                final_k_count = persistent_split_k_tiles
+            final_count = self.work_tiles_per_cta * final_k_count
             quant_final_index = final_count % cfg.mxfp8_stages
             quant_final_phase = (final_count // cfg.mxfp8_stages) & 1
             quant_final_state = pipeline.PipelineState(

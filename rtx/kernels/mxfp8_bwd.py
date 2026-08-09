@@ -175,8 +175,8 @@ class MXFP8BwdMatmulConfig:
                     return "reduction tile must be divisible by the BF16 transport tile"
                 if self.fused.epilogue != "direct":
                     return "split partials require fused.epilogue='direct'"
-                if self.fused.persistent:
-                    return "split partial GEMM cannot also be persistent"
+                if self.reduction == "cluster_fp32" and self.fused.persistent:
+                    return "cluster split reduction has a fixed CTA topology"
             reason = self.fused.oriented_implementation_rejection(
                 problem, self.a_orientation, self.b_orientation
             )

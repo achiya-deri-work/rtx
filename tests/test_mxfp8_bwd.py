@@ -323,6 +323,47 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
         )
         self.assertIn("single-stream", dual_stream.implementation_rejection(problem))
 
+    def test_fused_split_reductions_admit_persistent_locality_schedules(self) -> None:
+        problem = MXFP8Problem(1024, 512, 512)
+        for reduction, reuse in (
+            ("split_fp32_workspace", "x"),
+            ("split_fp32_atomic", "weight"),
+        ):
+            fused = normalize_fwd_config(
+                DEFAULT_FUSED_MXFP8_BWD_CONFIG.dw.fused,
+                persistent=True,
+                persistent_waves=1,
+                reuse=reuse,
+            )
+            candidate = update_bwd_config(
+                DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+                {
+                    "dw": {
+                        "fused": asdict(fused),
+                        "reduction": reduction,
+                        "split_reduction": 8,
+                        "reduction_tile": 128,
+                        "workspace_epilogue": (
+                            "tree" if reduction == "split_fp32_workspace" else "none"
+                        ),
+                    }
+                },
+            )
+            with self.subTest(reduction=reduction, reuse=reuse):
+                self.assertIsNone(candidate.implementation_rejection(problem))
+        clustered = update_bwd_config(
+            candidate,
+            {
+                "dw": {
+                    "reduction": "cluster_fp32",
+                    "workspace_epilogue": "none",
+                }
+            },
+        )
+        self.assertIn(
+            "fixed CTA topology", clustered.implementation_rejection(problem)
+        )
+
     def test_quad_quantization_is_a_real_shared_decomposed_schedule(self) -> None:
         problem = MXFP8Problem(512, 1536, 1536)
         candidate = update_bwd_config(
@@ -935,6 +976,130 @@ class TestMXFP8BwdCuda(unittest.TestCase):
                     self._assert_backward_close(
                         config, grad_output, x, weight
                     )
+
+    def test_persistent_fused_split_dw_crosses_output_and_split_tiles(self) -> None:
+        torch.manual_seed(129)
+        # Seven full 128-wide slices plus a 32-wide final slice exercise
+        # persistent pipeline phase accounting across unequal reductions.
+        m, n, k = 928, 512, 512
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        grad_output = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+        tma = normalize_fwd_config(
+            load_engine="tma",
+            schedule="three_role",
+            bf16_tile_k=32,
+            bf16_swizzle="none",
+            bf16_stages=2,
+            mxfp8_stages=2,
+            quantizer_warps=4,
+            quant_vec=8,
+            quant_math="bf16x2",
+            quant_amax="bf16_bits",
+            quant_load_bits=128,
+            persistent=True,
+            persistent_waves=1,
+        )
+        problem = MXFP8Problem(m, n, k)
+        for reduction, reuse in (
+            ("split_fp32_workspace", "x"),
+            ("split_fp32_atomic", "weight"),
+        ):
+            persistent = normalize_fwd_config(tma, reuse=reuse)
+            config = update_bwd_config(
+                DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+                {
+                    "dw": {
+                        "fused": asdict(persistent),
+                        "reduction": reduction,
+                        "split_reduction": 8,
+                        "reduction_tile": 128,
+                        "workspace_epilogue": (
+                            "tree" if reduction == "split_fp32_workspace" else "none"
+                        ),
+                    }
+                },
+            )
+            with self.subTest(reduction=reduction, reuse=reuse):
+                self.assertIsNone(config.implementation_rejection(problem))
+                for _ in range(4):
+                    self._assert_backward_close(config, grad_output, x, weight)
+        scalar = normalize_fwd_config(
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG.dw.fused,
+            persistent=True,
+            persistent_waves=1,
+            reuse="none",
+        )
+        cpasync = normalize_fwd_config(
+            load_engine="cpasync",
+            bf16_tile_k=32,
+            bf16_stages=4,
+            bf16_swizzle="64b",
+            quant_vec=8,
+            persistent=True,
+            persistent_waves=1,
+            reuse="x",
+        )
+        cpasync_ldmatrix = normalize_fwd_config(
+            cpasync,
+            bf16_swizzle="none",
+            quant_load_bits=128,
+        )
+        for name, transport in (
+            ("scalar", scalar),
+            ("cpasync", cpasync),
+            ("cpasync_ldmatrix", cpasync_ldmatrix),
+        ):
+            config = update_bwd_config(
+                DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+                {
+                    "dw": {
+                        "fused": asdict(transport),
+                        "reduction": "split_fp32_workspace",
+                        "split_reduction": 8,
+                        "reduction_tile": 128,
+                        "workspace_epilogue": "tree",
+                    }
+                },
+            )
+            with self.subTest(transport=name):
+                self.assertIsNone(config.implementation_rejection(problem))
+                self._assert_backward_close(config, grad_output, x, weight)
+
+    def test_fused_cpasync_uses_physical_basis_for_all_backward_orientations(self) -> None:
+        torch.manual_seed(130)
+        m = n = k = 256
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        grad_output = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+        cpasync_scalar_load = normalize_fwd_config(
+            load_engine="cpasync",
+            bf16_tile_k=32,
+            bf16_stages=4,
+            bf16_swizzle="64b",
+            quant_vec=8,
+        )
+        cpasync_ldmatrix = normalize_fwd_config(
+            cpasync_scalar_load,
+            bf16_swizzle="none",
+            quant_load_bits=128,
+        )
+        for name, transport in (
+            ("scalar_smem_load", cpasync_scalar_load),
+            ("ldmatrix_x4", cpasync_ldmatrix),
+        ):
+            config = update_bwd_config(
+                DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+                {
+                    "dx": {"fused": asdict(transport)},
+                    "dw": {"fused": asdict(transport)},
+                },
+            )
+            with self.subTest(transport=name):
+                self.assertIsNone(
+                    config.implementation_rejection(MXFP8Problem(m, n, k))
+                )
+                self._assert_backward_close(config, grad_output, x, weight)
 
     def test_calibrated_harness_measures_and_races_backward(self) -> None:
         protocol = BenchmarkProtocol(

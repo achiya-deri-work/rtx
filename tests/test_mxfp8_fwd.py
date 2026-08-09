@@ -170,7 +170,7 @@ class MXFP8ConfigTests(unittest.TestCase):
             quant_load_bits=64,
         )
         self.assertIn(
-            "TMA/ldmatrix x4 path",
+            "staged ldmatrix x4 path",
             unsupported.oriented_implementation_rejection(
                 problem, "row", "transpose"
             ),
@@ -181,6 +181,21 @@ class MXFP8ConfigTests(unittest.TestCase):
         self.assertIsNone(
             scalar.oriented_implementation_rejection(
                 problem, "transpose", "transpose"
+            )
+        )
+
+    def test_cpasync_ldmatrix_is_a_compound_oriented_pipeline(self) -> None:
+        candidate = normalize_fwd_config(
+            cpasync_ldmatrix_pipeline=(4, 1, "bf16x2", "bf16_bits")
+        )
+        self.assertEqual(candidate.load_engine, "cpasync")
+        self.assertEqual(candidate.bf16_tile_k, 32)
+        self.assertEqual(candidate.bf16_swizzle, "none")
+        self.assertEqual(candidate.quant_vec, 8)
+        self.assertEqual(candidate.quant_load_bits, 128)
+        self.assertIsNone(
+            candidate.oriented_implementation_rejection(
+                MXFP8Problem(256, 256, 256), "transpose", "transpose"
             )
         )
 

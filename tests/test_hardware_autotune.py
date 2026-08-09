@@ -28,7 +28,10 @@ from rtx.kernels.mxfp8 import (
     MXFP8Problem,
     normalize_fwd_config,
 )
-from rtx.kernels.mxfp8_bwd import DEFAULT_MXFP8_BWD_CONFIG
+from rtx.kernels.mxfp8_bwd import (
+    DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+    DEFAULT_MXFP8_BWD_CONFIG,
+)
 from rtx.kernels.mxfp8_bwd import DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG
 from rtx.configs import MXFP8GemmConfig
 from rtx.bwd_autotune import BWD_SEARCH_SPACE, update_bwd_config
@@ -124,6 +127,73 @@ class HardwareAutotuneTests(unittest.TestCase):
         )
         self.assertEqual(
             shared_features["derived.backward_total_kernel_launches"], 3
+        )
+
+    def test_backward_features_model_persistent_split_pipeline_topology(self) -> None:
+        problem = MXFP8Problem(1024, 512, 512)
+        persistent = normalize_fwd_config(
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG.dw.fused,
+            persistent=True,
+            persistent_waves=1,
+            reuse="x",
+        )
+        candidate = update_bwd_config(
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+            {
+                "dw": {
+                    "fused": asdict(persistent),
+                    "reduction": "split_fp32_workspace",
+                    "split_reduction": 8,
+                    "reduction_tile": 128,
+                    "workspace_epilogue": "tree",
+                }
+            },
+        )
+        adapter = make_mxfp8_bwd_adapter(
+            problem,
+            lambda _config: TrialOutcome("ok", median_ms=1.0),
+            device={"properties": {"multiprocessor_count": 70}},
+        )
+        features = adapter.features(candidate)
+        self.assertEqual(features["derived.dw_natural_ctas"], 16)
+        self.assertEqual(features["derived.dw_split_work_ctas"], 16 * 8)
+        self.assertEqual(features["derived.dw_grid_ctas"], 64)
+        self.assertEqual(features["derived.dw_work_tiles_per_cta"], 2)
+        self.assertEqual(features["derived.dw_persistent_split"], 1)
+        self.assertEqual(
+            features["derived.dw_persistent_split_grid_ctas_per_slice"], 8
+        )
+        self.assertEqual(
+            features["derived.dw_persistent_split_pipeline_tail_count"], 1
+        )
+        self.assertEqual(
+            features["derived.dw_persistent_split_tiles_per_pipeline_tail"], 2
+        )
+
+    def test_backward_features_identify_oriented_cpasync_ldmatrix(self) -> None:
+        problem = MXFP8Problem(512, 1536, 1536)
+        transport = normalize_fwd_config(
+            cpasync_ldmatrix_pipeline=(4, 1, "bf16x2", "bf16_bits")
+        )
+        candidate = update_bwd_config(
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+            {
+                "dx": {"fused": asdict(transport)},
+                "dw": {"fused": asdict(transport)},
+            },
+        )
+        adapter = make_mxfp8_bwd_adapter(
+            problem,
+            lambda _config: TrialOutcome("ok", median_ms=1.0),
+        )
+        features = adapter.features(candidate)
+        self.assertEqual(features["derived.dx_logical_transpose_operands"], 1)
+        self.assertEqual(features["derived.dw_logical_transpose_operands"], 2)
+        self.assertEqual(
+            features["derived.dx_oriented_cpasync_ldmatrix_operands"], 1
+        )
+        self.assertEqual(
+            features["derived.dw_oriented_cpasync_ldmatrix_operands"], 2
         )
 
     def test_prequant_config_rejects_runtime_smem_reserve_statically(self) -> None:

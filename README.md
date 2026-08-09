@@ -12,7 +12,9 @@ current implementation contains:
   one-to-four-stage mainloops and epilogues, locality scheduling, and up to
   eight output tiles per persistent CTA;
 - fused dynamic MXFP8 backward for `dX` and the FP32-accumulating `dW`,
-  including logical-transpose TMA transport and split-FP32 workspace reduction;
+  including logical-transpose cp.async/TMA transport, persistent multi-output
+  split-FP32 workspace/atomic schedules, and continuous cross-output pipeline
+  state;
 - one-launch four-operand backward quantizers, including a shared-G family
   that emits row and transposed MXFP8 encodings from one BF16 SMEM tile, with
   concurrent dX/dW GEMMs,

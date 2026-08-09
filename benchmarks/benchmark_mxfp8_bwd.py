@@ -64,6 +64,32 @@ def _configs(shape: ShapeSpec, *, reuse_sweep: bool = False) -> dict[str, object
             "dw": {"fused": asdict(tma_three_role)},
         },
     )
+    cpasync = normalize_fwd_config(
+        load_engine="cpasync",
+        bf16_tile_k=32,
+        bf16_stages=4,
+        bf16_swizzle="64b",
+        quant_vec=8,
+    )
+    fused_cpasync = update_bwd_config(
+        DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+        {
+            "dx": {"fused": asdict(cpasync)},
+            "dw": {"fused": asdict(cpasync)},
+        },
+    )
+    cpasync_ldmatrix = normalize_fwd_config(
+        cpasync,
+        bf16_swizzle="none",
+        quant_load_bits=128,
+    )
+    fused_cpasync_ldmatrix = update_bwd_config(
+        DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+        {
+            "dx": {"fused": asdict(cpasync_ldmatrix)},
+            "dw": {"fused": asdict(cpasync_ldmatrix)},
+        },
+    )
     fused_tma_cluster = update_bwd_config(
         fused_tma,
         {
@@ -120,6 +146,8 @@ def _configs(shape: ShapeSpec, *, reuse_sweep: bool = False) -> dict[str, object
             {"quant_schedule": "quad", "stream_schedule": "dual_stream"},
         ),
         "fused_scalar": DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+        "fused_cpasync": fused_cpasync,
+        "fused_cpasync_ldmatrix": fused_cpasync_ldmatrix,
         "fused_tma_three_role": fused_tma,
         "fused_tma_m64": fused_tma_m64,
         "fused_tma_m64_dual_stream": update_bwd_config(
@@ -383,6 +411,66 @@ def _configs(shape: ShapeSpec, *, reuse_sweep: bool = False) -> dict[str, object
                 }
             },
         )
+        configs["fused_cpasync_ldmatrix_workspace"] = update_bwd_config(
+            fused_cpasync_ldmatrix,
+            {
+                "dw": {
+                    "fused": asdict(cpasync_ldmatrix),
+                    "reduction": "split_fp32_workspace",
+                    "split_reduction": parts,
+                    "reduction_tile": tile,
+                    "workspace_epilogue": "tree",
+                }
+            },
+        )
+        configs["fused_cpasync_ldmatrix_atomic"] = update_bwd_config(
+            fused_cpasync_ldmatrix,
+            {
+                "dw": {
+                    "fused": asdict(cpasync_ldmatrix),
+                    "reduction": "split_fp32_atomic",
+                    "split_reduction": parts,
+                    "reduction_tile": tile,
+                    "workspace_epilogue": "none",
+                }
+            },
+        )
+        for waves in (1, 2, 4):
+            for reuse in ("none", "x", "weight"):
+                persistent_split = normalize_fwd_config(
+                    tma_three_role,
+                    epilogue="direct",
+                    epilogue_stages=1,
+                    store_vec=1,
+                    persistent=True,
+                    persistent_waves=waves,
+                    reuse=reuse,
+                )
+                suffix = f"persistent_w{waves}_{reuse}"
+                configs[f"fused_tma_workspace_{suffix}"] = update_bwd_config(
+                    fused_tma,
+                    {
+                        "dw": {
+                            "fused": asdict(persistent_split),
+                            "reduction": "split_fp32_workspace",
+                            "split_reduction": parts,
+                            "reduction_tile": tile,
+                            "workspace_epilogue": "tree",
+                        }
+                    },
+                )
+                configs[f"fused_tma_atomic_{suffix}"] = update_bwd_config(
+                    fused_tma,
+                    {
+                        "dw": {
+                            "fused": asdict(persistent_split),
+                            "reduction": "split_fp32_atomic",
+                            "split_reduction": parts,
+                            "reduction_tile": tile,
+                            "workspace_epilogue": "none",
+                        }
+                    },
+                )
     if reuse_sweep:
         resource_points = (
             # quantizer warps, consumer registers, quantizer registers

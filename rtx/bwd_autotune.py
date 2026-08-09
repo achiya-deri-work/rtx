@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 16
+KERNEL_REVISION = 18
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -494,6 +494,23 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
             )
             for coordinate, variants in FWD_SEARCH_SPACE.items()
         }
+    )
+    axes[f"{prefix}_fused_split_persistence"] = tuple(
+        wrap(
+            {
+                "fused": {
+                    "epilogue": "direct",
+                    "epilogue_stages": 1,
+                    "store_vec": 1,
+                    "persistent": persistent,
+                    "persistent_waves": waves if persistent else 1,
+                    "reuse": reuse if persistent else "none",
+                }
+            }
+        )
+        for persistent in (False, True)
+        for waves in ((1, 2, 3, 4) if persistent else (1,))
+        for reuse in (("none", "x", "weight") if persistent else ("none",))
     )
     transposed_tiles = tuple(
         {

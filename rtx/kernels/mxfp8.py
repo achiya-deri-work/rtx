@@ -466,10 +466,10 @@ class MXFP8FwdConfig:
         """Validate the fused kernel for physical row or logical-transpose views.
 
         A transpose is represented only by the GMEM tensor layout ``(1, rows)``.
-        TMA moves that physical layout into an MN-major staging tile and the
-        quantizer emits the ordinary K-major FP8 MMA tile. ``cp.async`` and
-        vector SMEM/register loads require adjacent logical-K values and are not
-        legal for a transposed source; the layout-aware 16-bit path is.
+        TMA moves that physical layout into an MN-major staging tile. The
+        cp.async path instead vectorizes the contiguous physical row basis and
+        lands it in the same MN-major logical SMEM view. In both cases the
+        quantizer emits the ordinary K-major FP8 MMA tile without a transpose.
         """
 
         reason = self.implementation_rejection(problem)
@@ -480,11 +480,19 @@ class MXFP8FwdConfig:
         if b_orientation not in ("row", "transpose"):
             return "B orientation must be row or transpose"
         transposed = a_orientation == "transpose" or b_orientation == "transpose"
-        if transposed and self.load_engine == "cpasync":
-            return "logical-transpose operands require scalar or TMA transport"
+        if self.load_engine == "cpasync":
+            cp_values = 128 // 16
+            for tile_rows, orientation in (
+                (self.tile_m, a_orientation),
+                (self.tile_n, b_orientation),
+            ):
+                if orientation == "transpose" and self.num_threads % (
+                    tile_rows // cp_values
+                ):
+                    return "logical-transpose cp.async has no aligned thread layout"
         if transposed and self.quant_load_bits != 16:
             transposed_ldmatrix = (
-                self.load_engine == "tma"
+                self.load_engine in ("tma", "cpasync")
                 and self.quant_load_bits == 128
                 and self.quant_vec == 8
                 and self.bf16_tile_k == 32
@@ -493,14 +501,14 @@ class MXFP8FwdConfig:
             if not transposed_ldmatrix:
                 return (
                     "logical-transpose vector quantization requires the "
-                    "TMA/ldmatrix x4 path (128-bit, quant_vec=8, "
+                    "staged ldmatrix x4 path (128-bit, quant_vec=8, "
                     "bf16_tile_k=32, unswizzled)"
                 )
         return None
 
 
 DEFAULT_MXFP8_FWD_CONFIG = MXFP8FwdConfig()
-MXFP8_FWD_KERNEL_REVISION = 17
+MXFP8_FWD_KERNEL_REVISION = 18
 
 
 # Block coordinates supplement, rather than replace, their primitive fields.
@@ -564,6 +572,16 @@ BF16_PIPELINE_COORDINATES: tuple[tuple[str, str, int, str, int], ...] = (
     ),
 )
 
+CPASYNC_LDMATRIX_PIPELINE_COORDINATES: tuple[
+    tuple[int, int, str, str], ...
+] = tuple(
+    (bf16_stages, mxfp8_stages, quant_math, quant_amax)
+    for bf16_stages in (1, 2, 3, 4)
+    for mxfp8_stages in (1, 2, 3, 4)
+    for quant_math in ("fp32", "bf16x2")
+    for quant_amax in ("fp32", "bf16_bits")
+)
+
 PERSISTENT_TMA_PIPELINE_COORDINATES: tuple[
     tuple[int, int, int, str], ...
 ] = tuple(
@@ -582,6 +600,7 @@ FWD_SEARCH_SPACE: dict[str, tuple[object, ...]] = {
     "cta_reuse_tile": CTA_REUSE_TILE_COORDINATES,
     "cluster_reuse_tile": CLUSTER_REUSE_COORDINATES,
     "bf16_pipeline": BF16_PIPELINE_COORDINATES,
+    "cpasync_ldmatrix_pipeline": CPASYNC_LDMATRIX_PIPELINE_COORDINATES,
     "persistent_tma_pipeline": PERSISTENT_TMA_PIPELINE_COORDINATES,
     "tile_m": (64, 128, 256),
     "tile_n": (128, 256),
@@ -632,6 +651,7 @@ FWD_COORDINATE_ORDER: tuple[str, ...] = (
     "cta_reuse_tile",
     "cluster_reuse_tile",
     "bf16_pipeline",
+    "cpasync_ldmatrix_pipeline",
     "persistent_tma_pipeline",
     # Probe the data path before growing the CTA.  A 128x128 TMA tile fits in
     # SMEM, while a 256-row/column scalar winner can make every neighboring
@@ -691,6 +711,7 @@ def normalize_fwd_config(
         "cta_reuse_tile",
         "cluster_reuse_tile",
         "bf16_pipeline",
+        "cpasync_ldmatrix_pipeline",
         "persistent_tma_pipeline",
     }
     unknown = set(updates).difference(values).difference(compound_names)
@@ -774,6 +795,29 @@ def normalize_fwd_config(
             bf16_tile_k=bf16_tile_k,
             bf16_swizzle=bf16_swizzle,
             bf16_stages=bf16_stages,
+        )
+
+    cpasync_ldmatrix_pipeline = updates.pop(
+        "cpasync_ldmatrix_pipeline", None
+    )
+    if cpasync_ldmatrix_pipeline is not None:
+        bf16_stages, mxfp8_stages, quant_math, quant_amax = (
+            cpasync_ldmatrix_pipeline
+        )
+        updates.update(
+            load_engine="cpasync",
+            schedule="cooperative",
+            bf16_tile_k=32,
+            bf16_swizzle="none",
+            bf16_stages=bf16_stages,
+            mxfp8_stages=mxfp8_stages,
+            producer_warps=0,
+            quant_vec=8,
+            quant_load_bits=128,
+            quant_math=quant_math,
+            quant_amax=quant_amax,
+            cluster_reuse="none",
+            cluster_size=1,
         )
 
     persistent_tma_pipeline = updates.pop("persistent_tma_pipeline", None)

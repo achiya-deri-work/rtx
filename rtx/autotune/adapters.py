@@ -797,11 +797,28 @@ def make_mxfp8_bwd_adapter(
                         1,
                         int(profile_value(profile, "multiprocessor_count", 1) or 1),
                     )
-                    grid_ctas = min(
-                        natural_ctas, sm_count * fused.persistent_waves
-                    )
-                    while grid_ctas > 1 and natural_ctas % grid_ctas:
-                        grid_ctas -= 1
+                    if matmul.reduction != "full_fp32":
+                        per_split_grid = min(
+                            natural_output_ctas,
+                            max(
+                                1,
+                                sm_count
+                                * fused.persistent_waves
+                                // matmul.split_reduction,
+                            ),
+                        )
+                        while (
+                            per_split_grid > 1
+                            and natural_output_ctas % per_split_grid
+                        ):
+                            per_split_grid -= 1
+                        grid_ctas = matmul.split_reduction * per_split_grid
+                    else:
+                        grid_ctas = min(
+                            natural_ctas, sm_count * fused.persistent_waves
+                        )
+                        while grid_ctas > 1 and natural_ctas % grid_ctas:
+                            grid_ctas -= 1
                 matmul_values = geometry_features(
                     m=matmul_problem.m,
                     n=matmul_problem.n,
@@ -837,6 +854,7 @@ def make_mxfp8_bwd_adapter(
                         )
                     ),
                     quantized_materialization_bytes=0.0,
+                    split_work_ctas=float(natural_ctas),
                     work_tiles_per_cta=natural_ctas / max(1, grid_ctas),
                     pipeline_buffer_bytes=float(_fused_smem_bytes(fused)),
                 )
@@ -903,6 +921,37 @@ def make_mxfp8_bwd_adapter(
                 )
                 values[f"{name}_reduction_waves"] = float(
                     matmul.reduction_waves
+                )
+                values[f"{name}_persistent_split"] = float(
+                    fused.persistent and matmul.reduction != "full_fp32"
+                )
+                values[f"{name}_persistent_split_grid_ctas_per_slice"] = float(
+                    grid_ctas / matmul.split_reduction
+                    if fused.persistent and matmul.reduction != "full_fp32"
+                    else 0
+                )
+                values[f"{name}_persistent_split_pipeline_tail_count"] = float(
+                    1 if fused.persistent and matmul.reduction != "full_fp32" else 0
+                )
+                values[f"{name}_persistent_split_tiles_per_pipeline_tail"] = float(
+                    natural_ctas / max(1, grid_ctas)
+                    if fused.persistent and matmul.reduction != "full_fp32"
+                    else 0
+                )
+                transpose_operands = int(matmul.a_orientation == "transpose") + int(
+                    matmul.b_orientation == "transpose"
+                )
+                values[f"{name}_logical_transpose_operands"] = float(
+                    transpose_operands
+                )
+                values[f"{name}_oriented_cpasync"] = float(
+                    fused.load_engine == "cpasync" and transpose_operands > 0
+                )
+                values[f"{name}_oriented_cpasync_ldmatrix_operands"] = float(
+                    transpose_operands
+                    if fused.load_engine == "cpasync"
+                    and fused.quant_load_bits == 128
+                    else 0
                 )
                 continue
 
@@ -1020,6 +1069,16 @@ def make_mxfp8_bwd_adapter(
             values[f"{name}_reduction_waves"] = float(
                 matmul.reduction_waves
             )
+            values[f"{name}_persistent_split"] = 0.0
+            values[f"{name}_persistent_split_grid_ctas_per_slice"] = 0.0
+            values[f"{name}_persistent_split_pipeline_tail_count"] = 0.0
+            values[f"{name}_persistent_split_tiles_per_pipeline_tail"] = 0.0
+            values[f"{name}_logical_transpose_operands"] = float(
+                int(matmul.a_orientation == "transpose")
+                + int(matmul.b_orientation == "transpose")
+            )
+            values[f"{name}_oriented_cpasync"] = 0.0
+            values[f"{name}_oriented_cpasync_ldmatrix_operands"] = 0.0
         quant_schedule = config.quant_schedule  # type: ignore[attr-defined]
         is_quad = quant_schedule in ("quad", "shared_g_quad")
         is_shared_g = quant_schedule == "shared_g_quad"
