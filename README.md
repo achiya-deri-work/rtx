@@ -272,7 +272,9 @@ Sticky CUDA faults such as illegal instructions are saved against the candidate
 that caused them, then terminate only that worker process. The launch script
 automatically starts a fresh CUDA context with the remaining global wall-time
 and resumes the existing residuals. It also preserves compatible context
-identity across these runner-only upgrades.
+identity across these runner-only upgrades. The launcher pins `CUDA_HOME` to
+the available CUDA 13.2 toolkit when the calling shell omitted it, keeping
+libNVVM discovery and the compiler/machine fingerprint stable across restarts.
 
 After copying the two `autotune_datasets/` trees together, create the optimizer
 comparison only once:

@@ -21,6 +21,8 @@ project follows semantic versioning while it is in active alpha development.
 - Contain sticky CUDA device faults at worker-process scope, preserving the
   responsible observation and automatically resuming with the remaining
   campaign deadline instead of logging poisoned-context fallout.
+- Stabilize supervised-run compiler identity and libNVVM discovery by restoring
+  the preferred CUDA 13.2 toolkit path when a remote shell omits `CUDA_HOME`.
 
 ## 0.6.0
 

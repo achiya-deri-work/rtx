@@ -22,6 +22,14 @@ esac
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+# Keep compiler identity and libNVVM discovery stable across interactive,
+# remote, and supervised shells. CUDA 13.2 is the preferred project toolkit.
+if [[ -z "${CUDA_HOME:-}" && -d "/usr/local/cuda-13.2" ]]; then
+  export CUDA_HOME="/usr/local/cuda-13.2"
+elif [[ -z "${CUDA_HOME:-}" && -d "/usr/local/cuda" ]]; then
+  export CUDA_HOME="/usr/local/cuda"
+fi
+
 if [[ -x ".venv/bin/python" ]]; then
   # Import the just-pulled checkout even if the environment was originally
   # installed non-editably.
