@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 9
+KERNEL_REVISION = 10
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -334,14 +334,27 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
     transposed_tiles = tuple(
         {
             "transposed_tile_rows": rows,
+            "transposed_tile_k": tile_k,
             "transposed_smem_padding": padding,
         }
         for rows in (32, 64, 128, 256)
+        for tile_k in (32, 64, 128)
         for padding in (0, 1, 2, 4, 8)
     )
     if prefix == "dx":
         axes["dx_b_logical_tile"] = tuple(
             wrap({"quant_b": value}) for value in transposed_tiles
+        )
+        axes["dx_b_scale_store"] = tuple(
+            wrap(
+                {
+                    "quant_b": {
+                        "native_scale_store": value,
+                        "transposed_tile_k": 128 if value == "packed" else 32,
+                    }
+                }
+            )
+            for value in ("scalar", "packed")
         )
     else:
         axes["dw_a_logical_tile"] = tuple(
@@ -350,6 +363,20 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
         axes["dw_b_logical_tile"] = tuple(
             wrap({"quant_b": value}) for value in transposed_tiles
         )
+        for operand in ("a", "b"):
+            axes[f"dw_{operand}_scale_store"] = tuple(
+                wrap(
+                    {
+                        f"quant_{operand}": {
+                            "native_scale_store": value,
+                            "transposed_tile_k": (
+                                128 if value == "packed" else 32
+                            ),
+                        }
+                    }
+                )
+                for value in ("scalar", "packed")
+            )
     if prefix == "dx":
         axes["dx_b_logical_transport"] = tuple(
             wrap(
@@ -423,6 +450,27 @@ BWD_SEARCH_SPACE: dict[str, tuple[dict[str, object], ...]] = {
             },
         }
         for value in ("register", "cp_async")
+    ),
+    "quad_native_scale_store": tuple(
+        {
+            "dx": {
+                "quant_b": {
+                    "native_scale_store": value,
+                    "transposed_tile_k": 128 if value == "packed" else 32,
+                }
+            },
+            "dw": {
+                "quant_a": {
+                    "native_scale_store": value,
+                    "transposed_tile_k": 128 if value == "packed" else 32,
+                },
+                "quant_b": {
+                    "native_scale_store": value,
+                    "transposed_tile_k": 128 if value == "packed" else 32,
+                },
+            },
+        }
+        for value in ("scalar", "packed")
     ),
     **_matmul_axes("dx"),
     **_matmul_axes("dw"),

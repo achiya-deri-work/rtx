@@ -73,6 +73,20 @@ class MXFP8QuantConfigTests(unittest.TestCase):
                 transposed_smem_padding=1,
             ).rejection(128, 256),
         )
+        self.assertIn(
+            "tile_k=128",
+            MXFP8QuantConfig(
+                scale_layout="mma128",
+                native_scale_store="packed",
+            ).transposed_rejection(128, 256),
+        )
+        self.assertIsNone(
+            MXFP8QuantConfig(
+                scale_layout="mma128",
+                native_scale_store="packed",
+                transposed_tile_k=128,
+            ).transposed_rejection(128, 256)
+        )
         self.assertIsNone(
             MXFP8GemmConfig().rejection(MXFP8Problem(128, 128, 256))
         )

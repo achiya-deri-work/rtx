@@ -500,6 +500,9 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
 
     def __init__(self, rows: int, k: int, config: MXFP8QuantConfig):
         super().__init__(rows, k, config)
+        rejection = config.transposed_rejection(rows, k)
+        if rejection is not None:
+            raise ValueError(f"illegal logical-transpose quantizer: {rejection}")
         if rows % config.transposed_tile_rows:
             raise ValueError("logical-transpose rows must contain full SMEM tiles")
         rows_per_phase = config.num_warps * config.quant_vec
@@ -508,7 +511,7 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
                 "transposed_tile_rows must be divisible by num_warps * quant_vec"
             )
         self.task_groups = (
-            rows // config.transposed_tile_rows * (k // SF_VEC_SIZE)
+            rows // config.transposed_tile_rows * (k // config.transposed_tile_k)
         )
         sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
         self.grid_ctas = min(
@@ -545,8 +548,10 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
         local_row: Int32,
         global_row: Int32,
         scale_block: Int32,
+        local_scale_block: Int32,
         lane_in_scale: Int32,
         scale_tile_rows: cutlass.Constexpr,
+        packed_scale_smem: cute.Tensor,
     ):
         cfg = self.config
         lane_idx = cute.arch.lane_idx()
@@ -555,7 +560,7 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
         quantized_values = [Float8E4M3FN(0.0)] * cfg.quant_vec
         maximum = Float32(0.0)
         maximum_bits = Int32(0)
-        k_local = lane_in_scale * cfg.quant_vec
+        k_local = local_scale_block * SF_VEC_SIZE + lane_in_scale * cfg.quant_vec
         for vec in cutlass.range_constexpr(cfg.quant_vec):
             value = logical_smem[local_row, k_local + vec]
             values[vec] = value
@@ -574,7 +579,9 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
             maximum, threads_per_scale, lane_idx, False
         )
         scale_e8m0, inv_scale = self._scale_from_amax(amax)
-        global_k = scale_block * SF_VEC_SIZE + k_local
+        global_k = (
+            scale_block * SF_VEC_SIZE + lane_in_scale * cfg.quant_vec
+        )
         for pair in cutlass.range_constexpr((cfg.quant_vec + 1) // 2):
             vec0 = pair * 2
             vec1 = cutlass.min(vec0 + 1, cfg.quant_vec - 1)
@@ -665,9 +672,11 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
                     ],
                 )
         if lane_in_scale == 0:
-            self._store_transposed_scale(
-                scales, global_row, scale_block, scale_e8m0, scale_tile_rows
-            )
+            packed_scale_smem[local_row, local_scale_block] = scale_e8m0
+            if cutlass.const_expr(cfg.transposed_tile_k == SF_VEC_SIZE):
+                self._store_transposed_scale(
+                    scales, global_row, scale_block, scale_e8m0, scale_tile_rows
+                )
 
     @cute.kernel
     def kernel(
@@ -682,18 +691,27 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         block_idx, _, _ = cute.arch.block_idx()
         physical_stride = cfg.transposed_tile_rows + cfg.transposed_smem_padding
-        physical_smem = cutlass.utils.SmemAllocator().allocate_tensor(
+        smem_allocator = cutlass.utils.SmemAllocator()
+        physical_smem = smem_allocator.allocate_tensor(
             BFloat16,
             cute.make_layout(
-                (SF_VEC_SIZE, physical_stride),
+                (cfg.transposed_tile_k, physical_stride),
                 stride=(physical_stride, 1),
+            ),
+            byte_alignment=16,
+        )
+        packed_scale_smem = smem_allocator.allocate_tensor(
+            Float8E8M0FNU,
+            cute.make_layout(
+                (cfg.transposed_tile_rows, cfg.transposed_tile_k // SF_VEC_SIZE),
+                stride=(cfg.transposed_tile_k // SF_VEC_SIZE, 1),
             ),
             byte_alignment=16,
         )
         logical_smem = cute.make_tensor(
             physical_smem.iterator,
             cute.make_layout(
-                (cfg.transposed_tile_rows, SF_VEC_SIZE),
+                (cfg.transposed_tile_rows, cfg.transposed_tile_k),
                 stride=(1, physical_stride),
             ),
         )
@@ -706,6 +724,7 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
                 scales,
                 physical_smem,
                 logical_smem,
+                packed_scale_smem,
                 task_group,
                 self.scale_tile_rows,
                 self.k,
@@ -719,6 +738,7 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
         scales: cute.Tensor,
         physical_smem: cute.Tensor,
         logical_smem: cute.Tensor,
+        packed_scale_smem: cute.Tensor,
         task_group: Int32,
         scale_tile_rows: cutlass.Constexpr,
         k: cutlass.Constexpr,
@@ -730,18 +750,19 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         physical_stride = cfg.transposed_tile_rows + cfg.transposed_smem_padding
-        blocks_per_row = k // SF_VEC_SIZE
-        tile_values = cfg.transposed_tile_rows * SF_VEC_SIZE
+        blocks_per_tile = cfg.transposed_tile_k // SF_VEC_SIZE
+        k_tiles = k // cfg.transposed_tile_k
+        tile_values = cfg.transposed_tile_rows * cfg.transposed_tile_k
         values_per_load = cfg.load_bits // BFloat16.width
         load_tasks = tile_values // values_per_load
         threads_per_scale = 32 // cfg.quant_vec
         scale_in_warp = lane_idx // threads_per_scale
         lane_in_scale = lane_idx % threads_per_scale
         rows_per_phase = cfg.num_warps * cfg.quant_vec
-        row_tile = task_group // blocks_per_row
-        scale_block = task_group - row_tile * blocks_per_row
+        row_tile = task_group // k_tiles
+        k_tile = task_group - row_tile * k_tiles
         row_base = row_tile * cfg.transposed_tile_rows
-        k_base = scale_block * SF_VEC_SIZE
+        k_base = k_tile * cfg.transposed_tile_k
         # The source iterator has logical stride (1, rows), so this resolves
         # directly to contiguous physical [K, row] addresses. SMEM is written
         # in that same physical order; logical_smem is only another CuTe layout
@@ -770,15 +791,10 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
             cp_tiled_copy = cute.make_tiled_copy_tv(
                 cp_atom, cp_thread_layout, cp_value_layout
             )
-            src_tile = cute.local_tile(
-                src,
-                (cfg.transposed_tile_rows, SF_VEC_SIZE),
-                (row_tile, scale_block),
-            )
             src_physical = cute.make_tensor(
                 (src.iterator + src.layout((row_base, k_base))).align(16),
                 cute.make_layout(
-                    (SF_VEC_SIZE, cfg.transposed_tile_rows),
+                    (cfg.transposed_tile_k, cfg.transposed_tile_rows),
                     stride=(src.layout.stride[1], 1),
                 ),
             )
@@ -824,23 +840,76 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
                 + warp_idx * cfg.quant_vec
                 + scale_in_warp
             )
-            self._quantize_smem_row(
-                logical_smem,
-                quantized,
-                scales,
-                local_row,
-                row_base + local_row,
-                scale_block,
-                lane_in_scale,
-                scale_tile_rows,
-            )
+            if cutlass.const_expr(cfg.native_scale_store == "packed"):
+                packed_scales = Int32(0)
+                for local_block in cutlass.range_constexpr(blocks_per_tile):
+                    scale_block = k_tile * blocks_per_tile + local_block
+                    self._quantize_smem_row(
+                        logical_smem,
+                        quantized,
+                        scales,
+                        local_row,
+                        row_base + local_row,
+                        scale_block,
+                        Int32(local_block),
+                        lane_in_scale,
+                        scale_tile_rows,
+                        packed_scale_smem,
+                    )
+                if lane_in_scale == 0:
+                    for local_block in cutlass.range_constexpr(blocks_per_tile):
+                        packed_scales |= (
+                            Int32(
+                                packed_scale_smem[
+                                    local_row, local_block
+                                ].bitcast(Uint8)
+                            )
+                            << (local_block * 8)
+                        )
+                    global_row = row_base + local_row
+                    physical = (
+                        (global_row % 32) * 16
+                        + ((global_row // 32) % 4) * 4
+                    )
+                    nvvm.store_ext(
+                        packed_scales,
+                        scales.iterator
+                        + scales.layout(
+                            (global_row // 128, k_tile, physical)
+                        ),
+                    )
+            else:
+                for local_block in cutlass.range_constexpr(blocks_per_tile):
+                    scale_block = k_tile * blocks_per_tile + local_block
+                    self._quantize_smem_row(
+                        logical_smem,
+                        quantized,
+                        scales,
+                        local_row,
+                        row_base + local_row,
+                        scale_block,
+                        Int32(local_block),
+                        lane_in_scale,
+                        scale_tile_rows,
+                        packed_scale_smem,
+                    )
+                if lane_in_scale == 0 and cutlass.const_expr(blocks_per_tile > 1):
+                    for local_block in cutlass.range_constexpr(blocks_per_tile):
+                        self._store_transposed_scale(
+                            scales,
+                            row_base + local_row,
+                            k_tile * blocks_per_tile + local_block,
+                            packed_scale_smem[local_row, local_block],
+                            scale_tile_rows,
+                        )
         cute.arch.sync_threads()
 
 
 class MXFP8OrientedDualQuantKernel(MXFP8TransposedQuantKernel):
     """Quantize two independently oriented operands in one CTA-level launch.
 
-    Logical-transpose work owns one CTA per ``[tile_rows, 32]`` source tile.
+    Logical-transpose work owns one CTA per configurable
+    ``[tile_rows, tile_k]`` source tile.
     Row-major work packs the ordinary warp-task quantizer into CTA-sized work
     groups.  A CTA therefore follows one uniform orientation branch at a time;
     no source is materialized or transposed and the two branches share only the
@@ -871,7 +940,11 @@ class MXFP8OrientedDualQuantKernel(MXFP8TransposedQuantKernel):
             (a_rows, a_orientation, config),
             (b_rows, b_orientation, b_config),
         ):
-            rejection = operand_config.rejection(rows, k)
+            rejection = (
+                operand_config.transposed_rejection(rows, k)
+                if orientation == "transpose"
+                else operand_config.rejection(rows, k)
+            )
             if rejection is not None:
                 raise ValueError(f"illegal oriented quantizer: {rejection}")
             if (
@@ -911,12 +984,16 @@ class MXFP8OrientedDualQuantKernel(MXFP8TransposedQuantKernel):
         self.a_task_groups = (
             cute.ceil_div(self.a_warp_tasks, config.num_warps)
             if a_orientation == "row"
-            else a_rows // config.transposed_tile_rows * blocks_per_row
+            else a_rows
+            // config.transposed_tile_rows
+            * (k // config.transposed_tile_k)
         )
         self.b_task_groups = (
             cute.ceil_div(self.b_warp_tasks, b_config.num_warps)
             if b_orientation == "row"
-            else b_rows // b_config.transposed_tile_rows * blocks_per_row
+            else b_rows
+            // b_config.transposed_tile_rows
+            * (k // b_config.transposed_tile_k)
         )
         self.task_groups = self.a_task_groups + self.b_task_groups
         sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
@@ -954,18 +1031,27 @@ class MXFP8OrientedDualQuantKernel(MXFP8TransposedQuantKernel):
     ):
         cfg = self.config
         physical_stride = cfg.transposed_tile_rows + cfg.transposed_smem_padding
-        physical_smem = cutlass.utils.SmemAllocator().allocate_tensor(
+        smem_allocator = cutlass.utils.SmemAllocator()
+        physical_smem = smem_allocator.allocate_tensor(
             BFloat16,
             cute.make_layout(
-                (SF_VEC_SIZE, physical_stride),
+                (cfg.transposed_tile_k, physical_stride),
                 stride=(physical_stride, 1),
+            ),
+            byte_alignment=16,
+        )
+        packed_scale_smem = smem_allocator.allocate_tensor(
+            Float8E8M0FNU,
+            cute.make_layout(
+                (cfg.transposed_tile_rows, cfg.transposed_tile_k // SF_VEC_SIZE),
+                stride=(cfg.transposed_tile_k // SF_VEC_SIZE, 1),
             ),
             byte_alignment=16,
         )
         logical_smem = cute.make_tensor(
             physical_smem.iterator,
             cute.make_layout(
-                (cfg.transposed_tile_rows, SF_VEC_SIZE),
+                (cfg.transposed_tile_rows, cfg.transposed_tile_k),
                 stride=(1, physical_stride),
             ),
         )
@@ -986,6 +1072,7 @@ class MXFP8OrientedDualQuantKernel(MXFP8TransposedQuantKernel):
                         sa,
                         physical_smem,
                         logical_smem,
+                        packed_scale_smem,
                         task_group,
                         self.a_scale_tile_rows,
                         self.k,
@@ -1004,6 +1091,7 @@ class MXFP8OrientedDualQuantKernel(MXFP8TransposedQuantKernel):
                         sb,
                         physical_smem,
                         logical_smem,
+                        packed_scale_smem,
                         local_task,
                         self.b_scale_tile_rows,
                         self.k,
@@ -1084,7 +1172,7 @@ class MXFP8BackwardQuadQuantKernel(MXFP8OrientedDualQuantKernel):
         if row_config.num_warps != transposed_config.num_warps:
             raise ValueError("quad quantization requires one CTA warp count")
         for rows in (c_rows, d_rows):
-            rejection = transposed_config.rejection(rows, k_cd)
+            rejection = transposed_config.transposed_rejection(rows, k_cd)
             if rejection is not None:
                 raise ValueError(f"illegal quad transposed quantizer: {rejection}")
             if rows % transposed_config.transposed_tile_rows:
@@ -1099,12 +1187,15 @@ class MXFP8BackwardQuadQuantKernel(MXFP8OrientedDualQuantKernel):
         )
         self.d_scale_tile_rows = self.c_scale_tile_rows
         self.ab_task_groups = self.task_groups
-        blocks_per_row = k_cd // SF_VEC_SIZE
         self.c_task_groups = (
-            c_rows // transposed_config.transposed_tile_rows * blocks_per_row
+            c_rows
+            // transposed_config.transposed_tile_rows
+            * (k_cd // transposed_config.transposed_tile_k)
         )
         self.d_task_groups = (
-            d_rows // transposed_config.transposed_tile_rows * blocks_per_row
+            d_rows
+            // transposed_config.transposed_tile_rows
+            * (k_cd // transposed_config.transposed_tile_k)
         )
         self.task_groups = (
             self.ab_task_groups + self.c_task_groups + self.d_task_groups
@@ -1157,18 +1248,27 @@ class MXFP8BackwardQuadQuantKernel(MXFP8OrientedDualQuantKernel):
     ):
         cfg = self.config
         physical_stride = cfg.transposed_tile_rows + cfg.transposed_smem_padding
-        physical_smem = cutlass.utils.SmemAllocator().allocate_tensor(
+        smem_allocator = cutlass.utils.SmemAllocator()
+        physical_smem = smem_allocator.allocate_tensor(
             BFloat16,
             cute.make_layout(
-                (SF_VEC_SIZE, physical_stride),
+                (cfg.transposed_tile_k, physical_stride),
                 stride=(physical_stride, 1),
+            ),
+            byte_alignment=16,
+        )
+        packed_scale_smem = smem_allocator.allocate_tensor(
+            Float8E8M0FNU,
+            cute.make_layout(
+                (cfg.transposed_tile_rows, cfg.transposed_tile_k // SF_VEC_SIZE),
+                stride=(cfg.transposed_tile_k // SF_VEC_SIZE, 1),
             ),
             byte_alignment=16,
         )
         logical_smem = cute.make_tensor(
             physical_smem.iterator,
             cute.make_layout(
-                (cfg.transposed_tile_rows, SF_VEC_SIZE),
+                (cfg.transposed_tile_rows, cfg.transposed_tile_k),
                 stride=(1, physical_stride),
             ),
         )
@@ -1193,6 +1293,7 @@ class MXFP8BackwardQuadQuantKernel(MXFP8OrientedDualQuantKernel):
                     sb,
                     physical_smem,
                     logical_smem,
+                    packed_scale_smem,
                     local_task,
                     self.b_scale_tile_rows,
                     self.k,
@@ -1205,6 +1306,7 @@ class MXFP8BackwardQuadQuantKernel(MXFP8OrientedDualQuantKernel):
                     sc,
                     physical_smem,
                     logical_smem,
+                    packed_scale_smem,
                     local_task,
                     self.c_scale_tile_rows,
                     self.k_cd,
@@ -1219,6 +1321,7 @@ class MXFP8BackwardQuadQuantKernel(MXFP8OrientedDualQuantKernel):
                     sd,
                     physical_smem,
                     logical_smem,
+                    packed_scale_smem,
                     local_task,
                     self.d_scale_tile_rows,
                     self.k_cd,

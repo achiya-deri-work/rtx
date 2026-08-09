@@ -29,6 +29,7 @@ class MXFP8QuantConfig:
     native_scale_store: str = "scalar"
     transposed_load_engine: str = "register"
     transposed_tile_rows: int = 128
+    transposed_tile_k: int = 32
     transposed_smem_padding: int = 1
 
     def rejection(self, rows: int, k: int) -> str | None:
@@ -76,6 +77,8 @@ class MXFP8QuantConfig:
             return "transposed_load_engine must be register or cp_async"
         if self.transposed_tile_rows not in (32, 64, 128, 256):
             return "transposed_tile_rows must be 32, 64, 128, or 256"
+        if self.transposed_tile_k not in (32, 64, 128):
+            return "transposed_tile_k must be 32, 64, or 128"
         if self.transposed_smem_padding not in (0, 1, 2, 4, 8):
             return "transposed_smem_padding must be 0, 1, 2, 4, or 8"
         if (
@@ -84,6 +87,16 @@ class MXFP8QuantConfig:
             % 16
         ):
             return "cp_async transposed SMEM rows must match the copy alignment"
+        return None
+
+    def transposed_rejection(self, rows: int, k: int) -> str | None:
+        reason = self.rejection(rows, k)
+        if reason is not None:
+            return reason
+        if k % self.transposed_tile_k:
+            return "logical-transpose K must contain full SMEM tiles"
+        if self.native_scale_store == "packed" and self.transposed_tile_k != 128:
+            return "packed transposed native scales require tile_k=128"
         return None
 
 

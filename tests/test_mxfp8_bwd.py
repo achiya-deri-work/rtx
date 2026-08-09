@@ -178,6 +178,22 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
         self.assertEqual(candidate.dx.quant_launches, "dual")
         self.assertEqual(candidate.dx.resolved_quant_b().maxrregcount, 160)
 
+    def test_quad_native_scale_coordinate_crosses_wide_k_legality_atomically(self) -> None:
+        packed = next(
+            value
+            for value in BWD_SEARCH_SPACE["quad_native_scale_store"]
+            if value["dx"]["quant_b"]["native_scale_store"] == "packed"
+        )
+        candidate = update_bwd_config(DEFAULT_MXFP8_BWD_CONFIG, packed)
+        self.assertEqual(candidate.dx.resolved_quant_b().transposed_tile_k, 128)
+        self.assertEqual(
+            candidate.dw.quant_a.native_scale_store,
+            "packed",
+        )
+        self.assertIsNone(
+            candidate.implementation_rejection(MXFP8Problem(512, 1536, 1536))
+        )
+
     def test_long_dw_reduction_requires_explicit_fp32_strategy(self) -> None:
         invalid = replace(
             DEFAULT_MXFP8_BWD_CONFIG,
@@ -402,6 +418,65 @@ class TestMXFP8BwdCuda(unittest.TestCase):
                     )
                 )
 
+    def test_wide_k_transpose_tile_packs_native_scales(self) -> None:
+        rows, k = 256, 256
+        source = torch.randn(k, rows, device="cuda", dtype=torch.bfloat16)
+        logical = source.T
+        scalar = MXFP8QuantConfig(
+            quant_vec=4,
+            load_bits=32,
+            quant_store_bits=32,
+            scale_layout="mma128",
+            native_scale_store="scalar",
+            transposed_tile_rows=128,
+            transposed_tile_k=128,
+        )
+        expected_q = torch.empty(
+            rows, k, device="cuda", dtype=torch.float8_e4m3fn
+        )
+        expected_s = torch.empty(
+            rows // 128,
+            k // 128,
+            512,
+            device="cuda",
+            dtype=torch.float8_e8m0fnu,
+        )
+        compile_mxfp8_transposed_quant(rows, k, scalar)(
+            logical, expected_q, expected_s
+        )
+        row = torch.arange(rows, device="cuda")[:, None]
+        block = torch.arange(k // 32, device="cuda")[None, :]
+        physical = (
+            (row % 32) * 16 + ((row // 32) % 4) * 4 + block % 4
+        )
+        expected_used = expected_s[row // 128, block // 4, physical]
+        for engine in ("register", "cp_async"):
+            packed = replace(
+                scalar,
+                native_scale_store="packed",
+                transposed_load_engine=engine,
+                transposed_smem_padding=0 if engine == "cp_async" else 1,
+            )
+            actual_q = torch.empty_like(expected_q)
+            actual_s = torch.empty_like(expected_s)
+            compile_mxfp8_transposed_quant(rows, k, packed)(
+                logical, actual_q, actual_s
+            )
+            torch.cuda.synchronize()
+            actual_used = actual_s[row // 128, block // 4, physical]
+            with self.subTest(engine=engine):
+                self.assertTrue(
+                    torch.equal(
+                        actual_q.view(torch.uint8), expected_q.view(torch.uint8)
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        actual_used.view(torch.uint8),
+                        expected_used.view(torch.uint8),
+                    )
+                )
+
     def test_dual_dw_quantization_uses_two_logical_views(self) -> None:
         torch.manual_seed(11)
         x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
@@ -497,7 +572,9 @@ class TestMXFP8BwdCuda(unittest.TestCase):
             "transposed_load_engine": "cp_async",
             "transposed_smem_padding": 0,
             "transposed_tile_rows": 128,
-            "quant_store_bits": 16,
+            "transposed_tile_k": 128,
+            "native_scale_store": "packed",
+            "quant_store_bits": 32,
         }
         config = update_bwd_config(
             DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,

@@ -184,6 +184,40 @@ def _configs(shape: ShapeSpec, *, reuse_sweep: bool = False) -> dict[str, object
                 },
             },
         )
+    for engine, scale_store in (
+        ("register", "scalar"),
+        ("register", "packed"),
+        ("cp_async", "packed"),
+    ):
+        transport = {
+            "transposed_load_engine": engine,
+            "transposed_smem_padding": 0 if engine == "cp_async" else 1,
+            "transposed_tile_k": 128,
+            "native_scale_store": scale_store,
+        }
+        configs[
+            f"decomposed_quad_k128_{engine}_{scale_store}"
+        ] = update_bwd_config(
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            {
+                "dx": {"quant_b": transport},
+                "dw": {"quant_a": transport, "quant_b": transport},
+            },
+        )
+    for engine in ("register", "cp_async"):
+        transport = {
+            "transposed_load_engine": engine,
+            "transposed_smem_padding": 0 if engine == "cp_async" else 1,
+            "transposed_tile_k": 64,
+            "native_scale_store": "scalar",
+        }
+        configs[f"decomposed_quad_k64_{engine}_scalar"] = update_bwd_config(
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            {
+                "dx": {"quant_b": transport},
+                "dw": {"quant_a": transport, "quant_b": transport},
+            },
+        )
     problem = MXFP8Problem(shape.m, shape.n, shape.k)
     for operand in ("a", "b"):
         for cluster_size in (2, 4):

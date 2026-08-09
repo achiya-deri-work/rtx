@@ -52,6 +52,11 @@ project follows semantic versioning while it is in active alpha development.
   remaining neutral at M128. Keep asynchronous transport independently
   autotunable: it beats the old seed in one representative case but loses to
   the matched register schedule.
+- Generalize logical-transpose staging to 32/64/128-K CTA tiles. The 128-K
+  family retains four E8M0 codes per row in SMEM and emits them with one
+  aligned 32-bit store directly into the tensor-core-native `mma128` layout.
+  Keep all tile/transport/store combinations searchable; at M512 the 32-K
+  promoted schedule remains faster than the wider alternatives.
 
 ## 0.9.0
 

@@ -209,7 +209,9 @@ def _quant_features(
     profile = _device_dict(device)
     sm_count = max(1, int(profile_value(profile, "multiprocessor_count", 1) or 1))
     if transposed:
-        task_groups = rows // config.transposed_tile_rows * (k // 32)
+        task_groups = rows // config.transposed_tile_rows * (
+            k // config.transposed_tile_k
+        )
         natural_ctas = task_groups
     else:
         warp_tasks = rows * (k // 32) // config.quant_vec
@@ -221,7 +223,13 @@ def _quant_features(
     if transposed:
         # One logical [row,K] tile is backed by physical [K,row] SMEM with a
         # configurable padding column. The kernel uses BF16 elements.
-        smem = 32 * (config.transposed_tile_rows + config.transposed_smem_padding) * 2
+        smem = (
+            config.transposed_tile_k
+            * (config.transposed_tile_rows + config.transposed_smem_padding)
+            * 2
+            + config.transposed_tile_rows
+            * (config.transposed_tile_k // 32)
+        )
     values = {
         "rows": float(rows),
         "task_groups": float(task_groups),
@@ -231,6 +239,19 @@ def _quant_features(
         "scale_blocks": float(rows * (k // 32)),
         "values_per_warp_task": float(config.quant_vec * 32),
         "transposed_source": float(transposed),
+        "transposed_tile_values": float(
+            config.transposed_tile_rows * config.transposed_tile_k
+            if transposed
+            else 0
+        ),
+        "transposed_scale_store_bytes": float(
+            4
+            if transposed and config.native_scale_store == "packed"
+            else (1 if transposed else 0)
+        ),
+        "transposed_async_load": float(
+            transposed and config.transposed_load_engine == "cp_async"
+        ),
     }
     values.update(
         launch_resource_features(

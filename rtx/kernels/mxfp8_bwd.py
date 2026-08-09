@@ -138,20 +138,24 @@ class MXFP8BwdMatmulConfig:
         if self.quant_launches not in ("dual", "separate"):
             return "quant_launches must be dual or separate"
         quant_b = self.resolved_quant_b()
-        reason = self.quant_a.rejection(problem.m, problem.k)
+        reason = (
+            self.quant_a.transposed_rejection(problem.m, problem.k)
+            if self.a_orientation == "transpose"
+            else self.quant_a.rejection(problem.m, problem.k)
+        )
         if reason is not None:
             return f"A quantizer: {reason}"
-        reason = quant_b.rejection(problem.n, problem.k)
+        reason = (
+            quant_b.transposed_rejection(problem.n, problem.k)
+            if self.b_orientation == "transpose"
+            else quant_b.rejection(problem.n, problem.k)
+        )
         if reason is not None:
             return f"B quantizer: {reason}"
         if self.a_orientation == "transpose" and problem.m % 32:
             return "logical-transpose A rows must be divisible by 32"
         if self.b_orientation == "transpose" and problem.n % 32:
             return "logical-transpose B rows must be divisible by 32"
-        if self.a_orientation == "transpose" and self.quant_a.native_scale_store == "packed":
-            return "logical-transpose A currently requires scalar native scale stores"
-        if self.b_orientation == "transpose" and quant_b.native_scale_store == "packed":
-            return "logical-transpose B currently requires scalar native scale stores"
         expected_layouts = {
             "row_major": ("row_major", "row_major"),
             "mma128": ("mma128", "mma128"),
