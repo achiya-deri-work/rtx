@@ -239,13 +239,28 @@ class MXFP8QuantCudaTests(unittest.TestCase):
                 tiles_per_cta=8,
                 tile_locality="serpentine_b",
             ),
+            MXFP8GemmConfig(
+                tile_m=64,
+                atom_layout_m=2,
+                stages=1,
+                epilogue="tma",
+                epilogue_stages=2,
+                store_vec=4,
+                tiles_per_cta=2,
+                tile_locality="same_a",
+            ),
         )
         for config in variants:
             with self.subTest(config=config):
                 actual = torch.full_like(expected, float("nan"))
-                compile_mxfp8_gemm(problem, config)(qx, qw, sx, sw, actual)
-                torch.cuda.synchronize()
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                runner = compile_mxfp8_gemm(problem, config)
+                for _ in range(8):
+                    actual.fill_(float("nan"))
+                    runner(qx, qw, sx, sw, actual)
+                    torch.cuda.synchronize()
+                    torch.testing.assert_close(
+                        actual, expected, rtol=0, atol=0
+                    )
 
     def test_prequantized_split_k_workspace_and_atomic_outputs(self) -> None:
         if torch.cuda.get_device_capability()[0] != 12:

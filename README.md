@@ -5,8 +5,12 @@ inference on NVIDIA RTX Blackwell GPUs. Its two public linear
 frontends are `rtx.MXFP8Linear` and `rtx.NVFP4Linear`. The
 current implementation contains:
 
-- fused BF16 input/weight quantization and MXFP8 forward GEMM;
-- materialized dynamic MXFP8 quantization plus GEMM;
+- fused BF16 input/weight quantization and MXFP8 forward GEMM, including
+  persistent three-role TMA producer/quantizer/MMA schedules and staged async
+  TMA epilogues;
+- materialized dynamic MXFP8 quantization plus GEMM, including autotunable
+  one-to-four-stage mainloops and epilogues, locality scheduling, and up to
+  eight output tiles per persistent CTA;
 - fused dynamic MXFP8 backward for `dX` and the FP32-accumulating `dW`,
   including logical-transpose TMA transport and split-FP32 workspace reduction;
 - a one-launch four-operand backward quantizer with concurrent dX/dW GEMMs,

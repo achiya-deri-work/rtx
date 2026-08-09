@@ -6,7 +6,7 @@ repository root so imports and output paths are predictable.
 | Script | Purpose |
 | --- | --- |
 | `benchmark_mxfp8_frontend.py` | End-to-end `torch.compile` MXFP8 frontend benchmark |
-| `benchmark_mxfp8_prequant.py` | Dynamic BF16 quantization plus native-scale MXFP8 GEMM |
+| `benchmark_mxfp8_prequant.py` | Dynamic BF16 quantization plus native-scale MXFP8 GEMM, with mainloop/epilogue stage and persistent-locality controls |
 | `benchmark_torchao_fp8_rowwise.py` | TorchAO rowwise FP8 comparison baseline |
 | `validate_mxfp8_production.py` | Eager/compiled, training/inference, stream, cache, and long-dW readiness matrix |
 | `benchmark_mxfp8_bwd.py` | Fused and quantize-once full/workspace/atomic, one-launch quad-quant, dual-stream, and wide-CTA operand-reuse backward families |

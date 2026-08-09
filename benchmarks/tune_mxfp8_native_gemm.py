@@ -77,7 +77,7 @@ COORDINATES: tuple[tuple[str, tuple[dict[str, object], ...]], ...] = (
             {"epilogue": "tma", "store_vec": 1},
             {"epilogue": "tma", "store_vec": 2},
             {"epilogue": "tma", "store_vec": 4},
-            {"epilogue": "direct", "store_vec": 1},
+            {"epilogue": "direct", "epilogue_stages": 1, "store_vec": 1},
         ),
     ),
     (

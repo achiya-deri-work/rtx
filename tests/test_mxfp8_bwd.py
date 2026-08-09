@@ -131,6 +131,7 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
                     "reduction_tile": 128,
                     "gemm": {
                         "epilogue": "direct",
+                        "epilogue_stages": 1,
                         "store_vec": 1,
                     },
                 }

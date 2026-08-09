@@ -70,6 +70,10 @@ def main() -> None:
         choices=(1, 2, 4, 8),
         default=1,
     )
+    parser.add_argument("--stages", type=int, choices=(1, 2, 3, 4))
+    parser.add_argument("--epilogue", choices=("direct", "tma"))
+    parser.add_argument("--epilogue-stages", type=int, choices=(1, 2, 3, 4))
+    parser.add_argument("--store-vec", type=int, choices=(1, 2, 4))
     parser.add_argument(
         "--tile-locality",
         choices=(
@@ -183,11 +187,19 @@ def main() -> None:
             device="cuda",
             dtype=torch.float8_e8m0fnu,
         )
-    gemm_config = replace(
-        gemm_config,
-        tiles_per_cta=args.tiles_per_cta,
-        tile_locality=args.tile_locality,
-    )
+    gemm_updates = {
+        "tiles_per_cta": args.tiles_per_cta,
+        "tile_locality": args.tile_locality,
+    }
+    for name, value in (
+        ("stages", args.stages),
+        ("epilogue", args.epilogue),
+        ("epilogue_stages", args.epilogue_stages),
+        ("store_vec", args.store_vec),
+    ):
+        if value is not None:
+            gemm_updates[name] = value
+    gemm_config = replace(gemm_config, **gemm_updates)
     quant_x = compile_mxfp8_quant(args.m, args.k, quant_config)
     weight_quant_config = MXFP8QuantConfig(
         **{

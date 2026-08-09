@@ -701,12 +701,6 @@ class MXFP8LinearFwdKernel:
                 barrier_storage=pipeline_storage,
                 cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
             )
-            tma_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, cfg.bf16_stages
-            )
-            tma_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, cfg.bf16_stages
-            )
         if cutlass.const_expr(cfg.schedule == "three_role"):
             quant_pipeline = pipeline.PipelineAsync.create(
                 num_stages=cfg.mxfp8_stages,
@@ -717,12 +711,6 @@ class MXFP8LinearFwdKernel:
                     pipeline.Agent.Thread, self.num_mma_warps * 32
                 ),
                 barrier_storage=storage.quant_pipeline.data_ptr(),
-            )
-            quant_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, cfg.mxfp8_stages
-            )
-            quant_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, cfg.mxfp8_stages
             )
 
         if cutlass.const_expr(cfg.cluster_reuse != "none"):
@@ -818,6 +806,43 @@ class MXFP8LinearFwdKernel:
 
         total_tiles = m_tiles * n_tiles
         for work_slot in cutlass.range_constexpr(self.work_tiles_per_cta):
+            # Mutable PipelineState objects carried across this constexpr
+            # output loop produce non-dominating SSA in CuTe DSL. The exact
+            # phase is a pure function of the preceding output tiles, so
+            # reconstruct it at each slot just as the prequantized GEMM does.
+            pipeline_count = work_slot * cute.ceil_div(
+                self.problem.k, cfg.bf16_tile_k
+            )
+            if cutlass.const_expr(cfg.load_engine == "tma"):
+                tma_index = pipeline_count % cfg.bf16_stages
+                tma_phase = (pipeline_count // cfg.bf16_stages) & 1
+                tma_producer_state = pipeline.PipelineState(
+                    cfg.bf16_stages,
+                    Int32(pipeline_count),
+                    Int32(tma_index),
+                    Int32(1 ^ tma_phase),
+                )
+                tma_consumer_state = pipeline.PipelineState(
+                    cfg.bf16_stages,
+                    Int32(pipeline_count),
+                    Int32(tma_index),
+                    Int32(tma_phase),
+                )
+            if cutlass.const_expr(cfg.schedule == "three_role"):
+                quant_index = pipeline_count % cfg.mxfp8_stages
+                quant_phase = (pipeline_count // cfg.mxfp8_stages) & 1
+                quant_producer_state = pipeline.PipelineState(
+                    cfg.mxfp8_stages,
+                    Int32(pipeline_count),
+                    Int32(quant_index),
+                    Int32(1 ^ quant_phase),
+                )
+                quant_consumer_state = pipeline.PipelineState(
+                    cfg.mxfp8_stages,
+                    Int32(pipeline_count),
+                    Int32(quant_index),
+                    Int32(quant_phase),
+                )
             work_linear = linear_tile + work_slot * self.grid_ctas
             if cutlass.const_expr(cfg.persistent and cfg.reuse != "none"):
                 # Contiguous chunks preserve an operand coordinate across
@@ -1623,20 +1648,22 @@ class MXFP8LinearFwdKernel:
                 else:
                     cute.arch.sync_threads()
     
-            if cutlass.const_expr(
-                cfg.schedule in ("warp_specialized", "three_role")
-            ):
-                producer_warp = self.num_mma_warps
-                if cutlass.const_expr(cfg.schedule == "three_role"):
-                    producer_warp += cfg.quantizer_warps
-                if warp_idx == producer_warp:
-                    tma_pipeline.producer_tail(tma_producer_state)
-            if cutlass.const_expr(cfg.schedule == "three_role"):
-                if (
-                    warp_idx >= self.num_mma_warps
-                    and warp_idx < self.num_mma_warps + cfg.quantizer_warps
+            if cutlass.const_expr(self.split_reduction > 1):
+                if cutlass.const_expr(
+                    cfg.schedule in ("warp_specialized", "three_role")
                 ):
-                    quant_pipeline.producer_tail(quant_producer_state)
+                    producer_warp = self.num_mma_warps
+                    if cutlass.const_expr(cfg.schedule == "three_role"):
+                        producer_warp += cfg.quantizer_warps
+                    if warp_idx == producer_warp:
+                        tma_pipeline.producer_tail(tma_producer_state)
+                if cutlass.const_expr(cfg.schedule == "three_role"):
+                    if (
+                        warp_idx >= self.num_mma_warps
+                        and warp_idx
+                        < self.num_mma_warps + cfg.quantizer_warps
+                    ):
+                        quant_pipeline.producer_tail(quant_producer_state)
     
             if cutlass.const_expr(cfg.epilogue == "direct"):
                 if warp_idx < self.num_mma_warps:
@@ -1655,6 +1682,7 @@ class MXFP8LinearFwdKernel:
                             else:
                                 t_cg_out[elem] = self.c_dtype(accumulators[elem])
             elif cutlass.const_expr(cfg.epilogue == "tma"):
+                epilogue_stage = Int32(work_slot % cfg.epilogue_stages)
                 full_output_tile = (
                     (block_m + 1) * cfg.tile_m <= self.problem.m
                     and (block_n + 1) * cfg.tile_n <= self.problem.n
@@ -1665,24 +1693,26 @@ class MXFP8LinearFwdKernel:
                             cute.size(t_rs_r_out), unroll_full=True
                         ):
                             t_rs_r_out[elem] = BFloat16(t_rs_r_acc[elem])
+                        # Warp 0 reaches this only after its previous TMA wait;
+                        # use that arrival to gate stage reuse by all MMA warps.
+                        self.epilogue_sync_barrier.arrive_and_wait()
                         cute.copy(
                             copy_r2s,
                             t_rs_r_out,
-                            t_rs_s_out[(None, None, None, 0)],
+                            t_rs_s_out[
+                                (None, None, None, epilogue_stage)
+                            ],
                         )
                         cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilogue_sync_barrier.arrive_and_wait()
                         if warp_idx == 0:
                             cute.copy(
                                 tma_atom_out,
-                                b_sg_s_out[(None, 0)],
+                                b_sg_s_out[(None, epilogue_stage)],
                                 b_sg_g_out[(None, 0)],
                             )
                             tma_store_pipeline.producer_commit()
                             tma_store_pipeline.producer_acquire()
-                            # A TMA store may overlap all work after its issue, but
-                            # the final group must drain before the CTA exits.
-                            tma_store_pipeline.producer_tail()
                 else:
                     # Tensor-map stores do not predicate a partial output tile on
                     # this SM120 stack.  Preserve exact boundary semantics with the
@@ -1698,6 +1728,54 @@ class MXFP8LinearFwdKernel:
                                 and coord[1] < self.problem.n
                             ):
                                 t_cg_out[elem] = BFloat16(accumulators[elem])
+
+        if cutlass.const_expr(
+            self.split_reduction == 1
+            and cfg.load_engine == "tma"
+            and cfg.schedule in ("warp_specialized", "three_role")
+        ):
+            final_count = self.work_tiles_per_cta * cute.ceil_div(
+                self.problem.k, cfg.bf16_tile_k
+            )
+            tma_final_index = final_count % cfg.bf16_stages
+            tma_final_phase = (final_count // cfg.bf16_stages) & 1
+            tma_final_state = pipeline.PipelineState(
+                cfg.bf16_stages,
+                Int32(final_count),
+                Int32(tma_final_index),
+                Int32(1 ^ tma_final_phase),
+            )
+            producer_warp = self.num_mma_warps
+            if cutlass.const_expr(cfg.schedule == "three_role"):
+                producer_warp += cfg.quantizer_warps
+            if warp_idx == producer_warp:
+                tma_pipeline.producer_tail(tma_final_state)
+
+        if cutlass.const_expr(
+            self.split_reduction == 1 and cfg.schedule == "three_role"
+        ):
+            final_count = self.work_tiles_per_cta * cute.ceil_div(
+                self.problem.k, cfg.bf16_tile_k
+            )
+            quant_final_index = final_count % cfg.mxfp8_stages
+            quant_final_phase = (final_count // cfg.mxfp8_stages) & 1
+            quant_final_state = pipeline.PipelineState(
+                cfg.mxfp8_stages,
+                Int32(final_count),
+                Int32(quant_final_index),
+                Int32(1 ^ quant_final_phase),
+            )
+            if (
+                warp_idx >= self.num_mma_warps
+                and warp_idx < self.num_mma_warps + cfg.quantizer_warps
+            ):
+                quant_pipeline.producer_tail(quant_final_state)
+
+        if cutlass.const_expr(cfg.epilogue == "tma"):
+            if warp_idx == 0:
+                # Earlier stores remain in flight while later output tiles run;
+                # only the final groups must drain before the CTA exits.
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
 
 
 @lru_cache(maxsize=None)

@@ -122,6 +122,7 @@ class MXFP8GemmConfig:
     scale_role: str = "consumers"
     scale_layout: str = "row_major"
     epilogue: str = "tma"
+    epilogue_stages: int = 1
     store_vec: int = 4
     maxrregcount: int = 255
     producer_registers: int = 48
@@ -226,6 +227,10 @@ class MXFP8GemmConfig:
                 return "TMA scale transport requires a compatible native layout"
         if self.epilogue not in ("direct", "tma"):
             return "epilogue must be direct or tma"
+        if self.epilogue_stages not in (1, 2, 3, 4):
+            return "epilogue_stages must be one of 1, 2, 3, 4"
+        if self.epilogue == "direct" and self.epilogue_stages != 1:
+            return "epilogue stages only apply to the TMA epilogue"
         if self.store_vec not in (1, 2, 4):
             return "store_vec must be x1, x2, or x4"
         if self.epilogue == "direct" and self.store_vec != 1:
@@ -240,7 +245,9 @@ class MXFP8GemmConfig:
             + ((self.tile_n + 127) // 128) * 128
         ) * (self.tile_k // SF_VEC_SIZE)
         out_bytes = (
-            self.tile_m * self.tile_n * 2 if self.epilogue == "tma" else 0
+            self.epilogue_stages * self.tile_m * self.tile_n * 2
+            if self.epilogue == "tma"
+            else 0
         )
         launch_bytes = (
             q_bytes

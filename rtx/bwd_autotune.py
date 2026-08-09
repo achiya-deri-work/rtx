@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 13
+KERNEL_REVISION = 14
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -261,12 +261,22 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
             )
         ),
         f"{prefix}_epilogue": tuple(
-            wrap({"gemm": {"epilogue": epilogue, "store_vec": vector}})
-            for epilogue, vector in (
-                ("direct", 1),
-                ("tma", 1),
-                ("tma", 2),
-                ("tma", 4),
+            wrap(
+                {
+                    "gemm": {
+                        "epilogue": epilogue,
+                        "epilogue_stages": stages,
+                        "store_vec": vector,
+                    }
+                }
+            )
+            for epilogue, stages, vector in (
+                ("direct", 1, 1),
+                *(
+                    ("tma", stages, vector)
+                    for stages in (1, 2, 3, 4)
+                    for vector in (1, 2, 4)
+                ),
             )
         ),
         f"{prefix}_raster_group": tuple(
@@ -280,16 +290,43 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
                     "gemm": {
                         "tiles_per_cta": tiles,
                         "tile_locality": locality,
+                        **(
+                            {
+                                "stages": 1,
+                                "epilogue": "tma",
+                                "epilogue_stages": epilogue_stages,
+                                "store_vec": 4,
+                            }
+                            if epilogue_stages is not None
+                            else {}
+                        ),
                     }
                 }
             )
-            for tiles in (1, 2, 4, 8)
-            for locality in (
-                "raster",
-                "same_a",
-                "same_b",
-                "serpentine_a",
-                "serpentine_b",
+            for tiles, locality, epilogue_stages in (
+                *(
+                    (tiles, locality, None)
+                    for tiles in (1, 2, 4, 8)
+                    for locality in (
+                        "raster",
+                        "same_a",
+                        "same_b",
+                        "serpentine_a",
+                        "serpentine_b",
+                    )
+                ),
+                *(
+                    (tiles, locality, stages)
+                    for tiles in (2, 4, 8)
+                    for stages in range(2, min(4, tiles) + 1)
+                    for locality in (
+                        "raster",
+                        "same_a",
+                        "same_b",
+                        "serpentine_a",
+                        "serpentine_b",
+                    )
+                ),
             )
         ),
         f"{prefix}_reduction": tuple(
@@ -309,6 +346,7 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
                         "workspace_epilogue": epilogue,
                         "gemm": {
                             "epilogue": "direct",
+                            "epilogue_stages": 1,
                             "store_vec": 1,
                             "tiles_per_cta": 1,
                             "tile_locality": "raster",
@@ -326,6 +364,7 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
                         "workspace_epilogue": "none",
                         "gemm": {
                             "epilogue": "direct",
+                            "epilogue_stages": 1,
                             "store_vec": 1,
                             "tiles_per_cta": 1,
                             "tile_locality": "raster",
@@ -344,6 +383,7 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
                         "workspace_epilogue": "none",
                         "gemm": {
                             "epilogue": "direct",
+                            "epilogue_stages": 1,
                             "store_vec": 1,
                             "tiles_per_cta": 1,
                             "tile_locality": "raster",

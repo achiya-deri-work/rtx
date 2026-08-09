@@ -202,7 +202,7 @@ class MXFP8GemmKernel:
                 cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128,
                 BFloat16,
             ),
-            (cfg.tile_m, cfg.tile_n, 1),
+            (cfg.tile_m, cfg.tile_n, cfg.epilogue_stages),
             order=(0, 1, 2),
         )
 
@@ -823,6 +823,10 @@ class MXFP8GemmKernel:
             accumulators.fill(0.0)
 
             if cutlass.const_expr(cfg.epilogue == "tma"):
+                epilogue_stage = Int32(
+                    work_slot % cfg.epilogue_stages
+                )
+                s_out_stage = s_out[(None, None, epilogue_stage)]
                 r2s_atom = cute.make_copy_atom(
                     warp.StMatrix8x8x16bOp(False, cfg.store_vec), BFloat16
                 )
@@ -832,9 +836,9 @@ class MXFP8GemmKernel:
                 c_copy = cute.make_tiled_copy_C_atom(c_atom, tiled_mma)
                 copy_r2s = cute.make_tiled_copy_S(r2s_atom, c_copy)
                 thr_r2s = copy_r2s.get_slice(tidx)
-                t_rs_s = thr_r2s.partition_D(s_out)
+                t_rs_s = thr_r2s.partition_D(s_out_stage)
                 t_rs_acc = copy_r2s.retile(accumulators)
-                r_out_shape = cute.shape(thr_r2s.partition_S(s_out))
+                r_out_shape = cute.shape(thr_r2s.partition_S(s_out_stage))
                 r_out = cute.make_rmem_tensor(
                     cute.make_layout(r_out_shape[:3]).shape, BFloat16
                 )
@@ -850,11 +854,11 @@ class MXFP8GemmKernel:
                     tma_out,
                     0,
                     cute.make_layout(1),
-                    cute.group_modes(s_out, 0, 2),
+                    cute.group_modes(s_out_stage, 0, 2),
                     g_out_tma,
                 )
                 out_pipeline = pipeline.PipelineTmaStore.create(
-                    num_stages=1,
+                    num_stages=cfg.epilogue_stages,
                     producer_group=pipeline.CooperativeGroup(
                         pipeline.Agent.Thread, cfg.num_mma_warps * 32
                     ),
@@ -1080,11 +1084,18 @@ class MXFP8GemmKernel:
                             ],
                             accumulators,
                         )
+                    if cutlass.const_expr(cfg.scale_role == "consumers"):
+                        # Consumer warps write the next K tile's scales without
+                        # passing through the TMA pipeline's empty barrier.  Do
+                        # not let a fast warp recycle this scale stage while a
+                        # slower peer is still loading its final fragments.
+                        self.scale_barrier.arrive_and_wait()
                     tma_pipeline.consumer_release(consumer_state)
                     consumer_state.advance()
 
-            if warp_idx == cfg.num_mma_warps:
-                tma_pipeline.producer_tail(producer_state)
+            if cutlass.const_expr(self.split_reduction > 1):
+                if warp_idx == cfg.num_mma_warps:
+                    tma_pipeline.producer_tail(producer_state)
 
             if cutlass.const_expr(cfg.epilogue == "direct"):
                 if cutlass.const_expr(self.cluster_output):
@@ -1206,14 +1217,46 @@ class MXFP8GemmKernel:
                             cute.size(r_out), unroll_full=True
                         ):
                             r_out[elem] = BFloat16(t_rs_acc[elem])
-                        cute.copy(copy_r2s, r_out, t_rs_s[(None, None, None, 0)])
+                        # Warp 0 cannot enter this barrier until its preceding
+                        # TMA wait has completed, so it also guards reuse of the
+                        # selected shared-memory stage by every MMA warp.
+                        self.epilogue_barrier.arrive_and_wait()
+                        cute.copy(
+                            copy_r2s,
+                            r_out,
+                            t_rs_s,
+                        )
                         cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilogue_barrier.arrive_and_wait()
                         if warp_idx == 0:
-                            cute.copy(tma_out, out_s[(None, 0)], out_g[(None, 0)])
+                            cute.copy(
+                                tma_out,
+                                out_s,
+                                out_g[(None, 0)],
+                            )
                             out_pipeline.producer_commit()
                             out_pipeline.producer_acquire()
-                            out_pipeline.producer_tail()
+
+        if cutlass.const_expr(self.split_reduction == 1):
+            final_count = cfg.tiles_per_cta * self.num_k_tiles
+            final_index = final_count % cfg.stages
+            final_phase = (final_count // cfg.stages) & 1
+            final_producer_state = pipeline.PipelineState(
+                cfg.stages,
+                Int32(final_count),
+                Int32(final_index),
+                Int32(1 ^ final_phase),
+            )
+            if warp_idx == cfg.num_mma_warps:
+                # Drain once after the complete persistent sequence.  Draining
+                # every output tile advances the producer state by ``stages``;
+                # reconstructing the next tile from only its K-count then uses
+                # stale mbarrier phases and intermittently consumes old data.
+                tma_pipeline.producer_tail(final_producer_state)
+
+        if cutlass.const_expr(cfg.epilogue == "tma"):
+            if warp_idx == 0:
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
 
 
 @lru_cache(maxsize=None)

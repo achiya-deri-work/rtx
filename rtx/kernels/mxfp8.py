@@ -356,12 +356,6 @@ class MXFP8FwdConfig:
             problem.m % self.tile_m or problem.n % self.tile_n
         ):
             return "TMA epilogue currently requires full M/N output tiles"
-        if self.persistent and (
-            self.load_engine != "scalar"
-            or self.schedule != "cooperative"
-            or self.epilogue != "direct"
-        ):
-            return "persistent revision currently supports scalar/cooperative/direct"
         if self.reuse != "none" and not self.persistent:
             return "operand-locality scheduling requires a persistent CTA"
         if not self.persistent and self.persistent_waves != 1:
@@ -506,7 +500,7 @@ class MXFP8FwdConfig:
 
 
 DEFAULT_MXFP8_FWD_CONFIG = MXFP8FwdConfig()
-MXFP8_FWD_KERNEL_REVISION = 16
+MXFP8_FWD_KERNEL_REVISION = 17
 
 
 # Block coordinates supplement, rather than replace, their primitive fields.
@@ -570,6 +564,16 @@ BF16_PIPELINE_COORDINATES: tuple[tuple[str, str, int, str, int], ...] = (
     ),
 )
 
+PERSISTENT_TMA_PIPELINE_COORDINATES: tuple[
+    tuple[int, int, int, str], ...
+] = tuple(
+    (epilogue_stages, store_vec, persistent_waves, reuse)
+    for epilogue_stages in (1, 2, 3)
+    for store_vec in (1, 2, 4)
+    for persistent_waves in (1, 2, 3, 4)
+    for reuse in ("none", "x", "weight")
+)
+
 
 # These axes define the intended search space.  ``iter_fwd_candidates`` is lazy:
 # the cross product is deliberately large enough for long, shape-local tuning.
@@ -578,6 +582,7 @@ FWD_SEARCH_SPACE: dict[str, tuple[object, ...]] = {
     "cta_reuse_tile": CTA_REUSE_TILE_COORDINATES,
     "cluster_reuse_tile": CLUSTER_REUSE_COORDINATES,
     "bf16_pipeline": BF16_PIPELINE_COORDINATES,
+    "persistent_tma_pipeline": PERSISTENT_TMA_PIPELINE_COORDINATES,
     "tile_m": (64, 128, 256),
     "tile_n": (128, 256),
     "tile_k": (128, 256),
@@ -627,6 +632,7 @@ FWD_COORDINATE_ORDER: tuple[str, ...] = (
     "cta_reuse_tile",
     "cluster_reuse_tile",
     "bf16_pipeline",
+    "persistent_tma_pipeline",
     # Probe the data path before growing the CTA.  A 128x128 TMA tile fits in
     # SMEM, while a 256-row/column scalar winner can make every neighboring
     # TMA candidate illegal and strand ordinary coordinate descent.
@@ -685,6 +691,7 @@ def normalize_fwd_config(
         "cta_reuse_tile",
         "cluster_reuse_tile",
         "bf16_pipeline",
+        "persistent_tma_pipeline",
     }
     unknown = set(updates).difference(values).difference(compound_names)
     if unknown:
@@ -767,6 +774,41 @@ def normalize_fwd_config(
             bf16_tile_k=bf16_tile_k,
             bf16_swizzle=bf16_swizzle,
             bf16_stages=bf16_stages,
+        )
+
+    persistent_tma_pipeline = updates.pop("persistent_tma_pipeline", None)
+    if persistent_tma_pipeline is not None:
+        (
+            epilogue_stages,
+            store_vec,
+            persistent_waves,
+            reuse,
+        ) = persistent_tma_pipeline
+        updates.update(
+            tile_m=64,
+            tile_n=128,
+            tile_k=128,
+            atom_layout_m=2,
+            atom_layout_n=2,
+            load_engine="tma",
+            schedule="three_role",
+            bf16_tile_k=32,
+            bf16_swizzle="none",
+            bf16_stages=1,
+            mxfp8_stages=1,
+            quantizer_warps=4,
+            quant_vec=8,
+            quant_load_bits=128,
+            quant_math="bf16x2",
+            quant_amax="bf16_bits",
+            epilogue="tma",
+            epilogue_stages=epilogue_stages,
+            store_vec=store_vec,
+            persistent=True,
+            persistent_waves=persistent_waves,
+            reuse=reuse,
+            cluster_reuse="none",
+            cluster_size=1,
         )
 
     values.update(updates)

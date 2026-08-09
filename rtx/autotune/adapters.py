@@ -94,7 +94,11 @@ def _gemm_smem_bytes(config: object) -> int:
     scale_bytes = _sm120_scale_bytes(
         config.tile_m, config.tile_n, config.tile_k, config.stages
     )
-    out_bytes = config.tile_m * config.tile_n * 2 if config.epilogue == "tma" else 0
+    out_bytes = (
+        config.epilogue_stages * config.tile_m * config.tile_n * 2
+        if config.epilogue == "tma"
+        else 0
+    )
     return q_bytes + scale_bytes + out_bytes
 
 
@@ -213,6 +217,17 @@ def _gemm_features(
         mma_k_tiles_per_cta=float((problem.k + config.tile_k - 1) // config.tile_k),
         mma_warp_issues_per_k_tile=float(config.num_mma_warps),
         work_tiles_per_cta=float(config.tiles_per_cta),
+        epilogue_stages=float(config.epilogue_stages),
+        epilogue_smem_bytes=float(
+            config.epilogue_stages * config.tile_m * config.tile_n * 2
+            if config.epilogue == "tma"
+            else 0
+        ),
+        epilogue_async_overlap_tiles=float(
+            min(config.epilogue_stages, config.tiles_per_cta)
+            if config.epilogue == "tma"
+            else 0
+        ),
         split_work_ctas=float(total_work_ctas),
         final_cta_active_fraction=(
             (total_work_ctas - (grid_ctas - 1) * config.tiles_per_cta)
@@ -417,6 +432,20 @@ def make_mxfp8_fwd_adapter(
         )
         values.update(
             work_tiles_per_cta=natural_ctas / max(1, grid_ctas),
+            epilogue_stages=float(config.epilogue_stages),
+            epilogue_smem_bytes=float(
+                config.epilogue_stages * config.tile_m * config.tile_n * 2
+                if config.epilogue == "tma"
+                else 0
+            ),
+            epilogue_async_overlap_tiles=float(
+                min(
+                    config.epilogue_stages,
+                    natural_ctas / max(1, grid_ctas),
+                )
+                if config.epilogue == "tma"
+                else 0
+            ),
             bf16_values_quantized_per_output_cta=float(
                 (config.tile_m + config.tile_n) * problem.k
             ),

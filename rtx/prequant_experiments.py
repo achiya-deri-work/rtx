@@ -404,7 +404,14 @@ def _apply_conditional_variant(
     ):
         candidate = update_prequant_config(
             candidate,
-            {"gemm": {"stages": 1, "epilogue": "direct", "store_vec": 1}},
+            {
+                "gemm": {
+                    "stages": 1,
+                    "epilogue": "direct",
+                    "epilogue_stages": 1,
+                    "store_vec": 1,
+                }
+            },
         )
     return candidate
 
@@ -444,7 +451,11 @@ def _coverage_tokens(config: MXFP8PrequantConfig) -> tuple[str, ...]:
         ("smem", (gemm.a_swizzle, gemm.b_swizzle)),
         ("scale", (gemm.scale_schedule, gemm.scale_load_vec, gemm.sfa_s2r_bits, gemm.sfb_s2r_bits)),
         ("registers", (gemm.producer_registers, gemm.consumer_registers, gemm.maxrregcount)),
-        ("epilogue", (gemm.epilogue, gemm.store_vec)),
+        (
+            "epilogue",
+            (gemm.epilogue, gemm.epilogue_stages, gemm.store_vec),
+        ),
+        ("persistence", (gemm.tiles_per_cta, gemm.tile_locality)),
         ("raster", (gemm.raster, gemm.grid_swizzle)),
         ("l2", config.l2_fetch_granularity),
     )

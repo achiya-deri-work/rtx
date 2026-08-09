@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover - Linux/CUDA is the supported target.
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_prequant_e2e"
-KERNEL_REVISION = 4
+KERNEL_REVISION = 5
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -108,7 +108,7 @@ def _layout_variant(
             # layout. Other families retain the incumbent stage count.
             **({"stages": 1} if gemm_layout == "mma64x128" or tile_m == 256 else {}),
             **(
-                {"epilogue": "direct", "store_vec": 1}
+                {"epilogue": "direct", "epilogue_stages": 1, "store_vec": 1}
                 if tile_m == 256
                 else {}
             ),
@@ -255,31 +255,62 @@ PREQUANT_SEARCH_SPACE: dict[str, tuple[dict[str, object], ...]] = {
         for value in (128, 144, 160, 176, 192, 208, 224, 240, 255)
     ),
     "epilogue": (
-        {"gemm": {"epilogue": "direct", "store_vec": 1}},
-        {"gemm": {"epilogue": "tma", "store_vec": 1}},
-        {"gemm": {"epilogue": "tma", "store_vec": 2}},
-        {"gemm": {"epilogue": "tma", "store_vec": 4}},
+        {"gemm": {"epilogue": "direct", "epilogue_stages": 1, "store_vec": 1}},
+        *(
+            {
+                "gemm": {
+                    "epilogue": "tma",
+                    "epilogue_stages": stages,
+                    "store_vec": vector,
+                }
+            }
+            for stages in (1, 2, 3, 4)
+            for vector in (1, 2, 4)
+        ),
     ),
     "raster_group": tuple(
         {"gemm": {"raster": raster, "grid_swizzle": group}}
         for raster in ("m", "n")
         for group in (1, 2, 4, 8)
     ),
-    "gemm_persistence": tuple(
-        {
-            "gemm": {
-                "tiles_per_cta": tiles,
-                "tile_locality": locality,
+    "gemm_persistence": (
+        *(
+            {
+                "gemm": {
+                    "tiles_per_cta": tiles,
+                    "tile_locality": locality,
+                }
             }
-        }
-        for tiles in (1, 2, 4, 8)
-        for locality in (
-            "raster",
-            "same_a",
-            "same_b",
-            "serpentine_a",
-            "serpentine_b",
-        )
+            for tiles in (1, 2, 4, 8)
+            for locality in (
+                "raster",
+                "same_a",
+                "same_b",
+                "serpentine_a",
+                "serpentine_b",
+            )
+        ),
+        *(
+            {
+                "gemm": {
+                    "stages": 1,
+                    "epilogue": "tma",
+                    "epilogue_stages": epilogue_stages,
+                    "store_vec": 4,
+                    "tiles_per_cta": tiles,
+                    "tile_locality": locality,
+                }
+            }
+            for tiles in (2, 4, 8)
+            for epilogue_stages in range(2, min(4, tiles) + 1)
+            for locality in (
+                "raster",
+                "same_a",
+                "same_b",
+                "serpentine_a",
+                "serpentine_b",
+            )
+        ),
     ),
     "global_l2_fetch": tuple(
         {"l2_fetch_granularity": value} for value in (None, 0, 32, 64, 128)
@@ -816,7 +847,14 @@ class PrequantCoordinateDescentTuner:
         ):
             candidate = update_prequant_config(
                 candidate,
-                {"gemm": {"stages": 1, "epilogue": "direct", "store_vec": 1}},
+                {
+                    "gemm": {
+                        "stages": 1,
+                        "epilogue": "direct",
+                        "epilogue_stages": 1,
+                        "store_vec": 1,
+                    }
+                },
             )
         return candidate
 

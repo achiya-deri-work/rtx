@@ -243,6 +243,7 @@ def _configs(shape: ShapeSpec, *, reuse_sweep: bool = False) -> dict[str, object
         decomposed_split_base = {
             "gemm": {
                 "epilogue": "direct",
+                "epilogue_stages": 1,
                 "store_vec": 1,
                 "tiles_per_cta": 1,
                 "tile_locality": "raster",

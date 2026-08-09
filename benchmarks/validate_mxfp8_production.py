@@ -132,6 +132,7 @@ def _long_reduction_case(
                         {
                             "gemm": {
                                 "epilogue": "direct",
+                                "epilogue_stages": 1,
                                 "store_vec": 1,
                                 "tiles_per_cta": 1,
                                 "tile_locality": "raster",

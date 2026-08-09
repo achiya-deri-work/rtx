@@ -477,6 +477,35 @@ class MXFP8CudaTests(unittest.TestCase):
                 torch.cuda.synchronize()
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
+        staged = normalize_fwd_config(
+            base,
+            load_engine="tma",
+            schedule="three_role",
+            bf16_tile_k=32,
+            bf16_swizzle="none",
+            bf16_stages=1,
+            mxfp8_stages=1,
+            quantizer_warps=4,
+            quant_load_bits=128,
+            quant_math="bf16x2",
+            quant_amax="bf16_bits",
+            epilogue="tma",
+            epilogue_stages=2,
+            store_vec=4,
+            persistent=True,
+            persistent_waves=1,
+            reuse="none",
+        )
+        staged_out = torch.empty_like(expected)
+        staged_runner = compile_mxfp8_fwd(problem, staged)
+        for _ in range(8):
+            staged_out.fill_(float("nan"))
+            staged_runner(x, weight, staged_out)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                staged_out, expected, rtol=0, atol=0
+            )
+
     def test_wide_cta_reuse_tile_matches_reference(self) -> None:
         if torch.cuda.get_device_capability()[0] != 12:
             self.skipTest("native kernel requires SM120/SM121")
