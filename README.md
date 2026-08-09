@@ -273,7 +273,8 @@ After copying the two `autotune_datasets/` trees together, create the optimizer
 comparison only once:
 
 ```bash
-rtx-autotune summarize-tuners autotune_datasets \
+rtx-autotune summarize-tuners \
+  autotune_datasets/mxfp8_autotuner_prospective_5070_v1 \
   --output autotune_reports/5070_prospective_v1 \
   --format both
 ```
