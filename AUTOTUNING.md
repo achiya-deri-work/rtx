@@ -201,11 +201,12 @@ those measurements.
 
 The composable tuner has two independent allocation levels. Inside one
 device/shape/regime context, `AdaptiveBanditScheduler` treats random search,
-gradient-boosted global search, and model-guided local search as arms. Its
-reward is dimensionless and bounded: incumbent improvement and model
-uncertainty are balanced against invalid candidates and actual evaluator wall
-time. Discounting makes the policy adapt as the cost model improves. A fixed
-warmup and one mandatory local pull per arm prevent transfer priors from
+observed coordinate-local search, gradient-boosted global search, and
+model-guided local search as arms. Its reward is dimensionless and bounded:
+incumbent improvement and model uncertainty are balanced against invalid
+candidates and actual evaluator wall time. Discounting makes the policy adapt
+as the cost model improves. A fixed warmup followed by configurable minimum
+pulls for each local and learned arm prevents transfer priors from
 short-circuiting direct evidence.
 
 Across contexts, anytime mode can use a second discounted contextual UCB. It
@@ -247,6 +248,24 @@ The 5070 study exposes `random`, `random_local`, and `online_bandit` as explicit
 portfolios rather than inferring optimizer behavior after collection. Summarize
 copied residuals with `rtx-autotune summarize-tuners`; it reports success,
 compiler waste, time-to-valid, and regret curves at fixed trial budgets.
+
+The first prospective 5070 study collected 17,693 observations over 288
+contexts on an RTX 5070 Ti and RTX 5070 Laptop. Its matched results rule out a
+single universal optimizer: coordinate-local search was the strongest portable
+choice, while the online portfolio was especially strong for backward GEMMs on
+the Ti. Both substantially outperformed pure random search for fused forward;
+all methods nearly saturated the Ti prequant contexts. Leave-one-device-out
+validation also showed that hardware-conditioned ranking models can improve
+four-proposal selection over random on all three families.
+
+That study also exposed a control defect: 19 random-search contexts stopped at
+16--39 trials because a small sampled pool was mistaken for exhaustion of the
+conditional space. Random search now retries progressively larger deduplicated
+pools. Reports use matched context comparisons and display minimum, median, and
+maximum coverage so this failure cannot remain hidden. Do not resume the v1
+prospective bundle with the updated optimizer: changing an arm's behavior
+inside an existing treatment would invalidate the experiment. Start a new
+campaign identity for follow-up collection.
 
 ## Native-scale prequant backend
 

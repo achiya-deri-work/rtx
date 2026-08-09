@@ -348,6 +348,11 @@ class DatasetTests(unittest.TestCase):
                 (root,), root / "report" / "optimizers", export_format="csv"
             )
             self.assertEqual(report["units"], 2)
+            self.assertEqual(report["schema_version"], 2)
+            self.assertEqual(len(report["matched_comparisons"]), 1)
+            comparison = report["matched_comparisons"][0]
+            self.assertEqual(comparison["treatment"], "online_bandit")
+            self.assertLess(comparison["median_delta_final"], 0)
             self.assertTrue((root / "report" / "optimizers.csv").exists())
 
     def test_every_registered_public_family_constructs_an_adapter(self) -> None:

@@ -257,6 +257,14 @@ Use `rtx-autotune summarize-tuners` to generate fixed-budget regret and failure
 summaries after collection rather than maintaining a monolithic dataset during
 the run.
 
+The learned bandit portfolio contains random, coordinate-local, global
+gradient-boosted, and model-local arms. After random warmup it gives configured
+minimum pulls to each local/learned arm before discounted contextual UCB takes
+over. This prevents a strong local method from receiving no evidence merely
+because another arm inherited a favorable prior. Random search likewise retries
+progressively larger pools before reporting exhaustion in a sparse conditional
+space.
+
 Sticky accelerator failures use a supervisor boundary. A worker durably records
 the responsible proposal, raises `FatalDeviceContextError`, and the CLI exits
 75. Supervisors may restart that code only; ordinary Python, manifest, and

@@ -314,7 +314,11 @@ rtx-autotune summarize-tuners \
 
 The report includes validity and compiler-waste rates, evaluator time to first
 valid candidate, best latency and observed-oracle regret at 1/4/8/16/32/64
-trials, and treatment aggregates per machine and kernel family.
+trials, and treatment aggregates per machine and kernel family. Schema v2 also
+records minimum/median/maximum context coverage, category/regime splits, and
+matched deltas against random search with deterministic bootstrap confidence
+intervals. A context which silently exhausts early is therefore visible in the
+primary report rather than only in its residual journal.
 
 If this scheduler is pulled while a v2 run made by an older checkout already
 exists, explicitly adopt that bundle's context identity so the old observations

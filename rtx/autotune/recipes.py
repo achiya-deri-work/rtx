@@ -31,7 +31,7 @@ class HybridTuningPolicy:
     max_trials: int = 512
     time_budget_s: float = 1800.0
     cost_model_trials: int = 320
-    model_warmup: int = 32
+    model_warmup: int = 16
     model_pool_size: int = 4096
     model_refit_interval: int = 16
     model_exploration: float = 0.15
@@ -49,7 +49,10 @@ class HybridTuningPolicy:
     minimum_optimistic_feasibility: float = 0.05
     local_beam_width: int = 3
     local_model_refit_interval: int = 32
-    bandit_exploration: float = 1.25
+    bandit_exploration: float = 0.15
+    bandit_coordinate_bootstrap: int = 8
+    bandit_learned_bootstrap: int = 4
+    bandit_model_local_bootstrap: int = 4
     confirmation_repeats: int = 0
     confirmation_ratio: float = 0.0
     confirm_initial: bool = False
@@ -235,7 +238,10 @@ def make_hybrid_autotuner(
             ((learned.name, policy.cost_model_trials), (local.name, None))
         )
     else:
-        strategies = [random_search, learned, local]
+        coordinate = CoordinateLocalSearch[ConfigT](
+            beam_width=policy.local_beam_width
+        )
+        strategies = [random_search, coordinate, learned, local]
         scheduler = AdaptiveBanditScheduler(
             exploration=policy.bandit_exploration,
             warmup_trials=(
@@ -244,6 +250,11 @@ def make_hybrid_autotuner(
                 else policy.pretrained_warmup_trials
             ),
             warmup_arm=random_search.name,
+            minimum_pulls={
+                coordinate.name: policy.bandit_coordinate_bootstrap,
+                learned.name: policy.bandit_learned_bootstrap,
+                local.name: policy.bandit_model_local_bootstrap,
+            },
         )
     return AutotuneOrchestrator(
         adapter,

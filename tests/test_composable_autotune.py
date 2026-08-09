@@ -9,6 +9,7 @@ import unittest
 
 from rtx.autotune import (
     AdaptiveBanditScheduler,
+    ArmStatistics,
     AutotuneOrchestrator,
     ConfirmationPolicy,
     CoordinateLocalSearch,
@@ -22,6 +23,7 @@ from rtx.autotune import (
     HybridTuningPolicy,
     RandomSearch,
     RuntimeWinnerKey,
+    SearchHistory,
     SequentialScheduler,
     TrialOutcome,
     TuningBudget,
@@ -153,6 +155,40 @@ class ComposableAutotuneTests(unittest.TestCase):
         self.assertGreater(result.strategy_trials["random"], 0)
         self.assertGreater(result.strategy_trials["coordinate_local"], 0)
 
+    def test_random_search_retries_after_a_seen_only_pool(self) -> None:
+        base = _toy_adapter()
+        seen = evaluate_proposal(
+            base,
+            Proposal(_ToyConfig(), "seed"),
+            session_id="seed",
+            sequence=0,
+        )
+
+        class RetryAdapter:
+            def __init__(self):
+                self.context = base.context
+                self.initial_config = base.initial_config
+                self.calls = 0
+
+            def __getattr__(self, name):
+                return getattr(base, name)
+
+            def sample(self, rng, count, seeds):
+                self.calls += 1
+                return [_ToyConfig()] if self.calls == 1 else [_ToyConfig(1, 1)]
+
+        adapter = RetryAdapter()
+        proposals = RandomSearch(
+            pool_multiplier=1, max_batches=2, max_pool_size=8
+        ).propose(
+            adapter,
+            SearchHistory([seen], base.context.identifier),
+            random.Random(3),
+            1,
+        )
+        self.assertEqual(adapter.calls, 2)
+        self.assertEqual(proposals[0].config, _ToyConfig(1, 1))
+
     def test_adaptive_bandit_replays_state_across_resume(self) -> None:
         adapter = _toy_adapter()
         with tempfile.TemporaryDirectory() as directory:
@@ -212,6 +248,46 @@ class ComposableAutotuneTests(unittest.TestCase):
         fast.elapsed_s = 0.01
         slow = replace(fast, elapsed_s=10.0)
         self.assertLess(scheduler.reward(float("inf"), slow), scheduler.reward(float("inf"), fast))
+
+    def test_adaptive_bandit_bootstraps_each_configured_arm_after_warmup(self) -> None:
+        scheduler = AdaptiveBanditScheduler(
+            warmup_trials=2,
+            warmup_arm="random",
+            minimum_pulls={"coordinate_local": 2, "gradient_boosted": 1},
+        )
+        names = ("random", "coordinate_local", "gradient_boosted")
+        statistics = {name: ArmStatistics() for name in names}
+        self.assertEqual(scheduler.select(names, statistics, 0), "random")
+        statistics["random"].pulls = 2
+        self.assertEqual(
+            scheduler.select(names, statistics, 2), "coordinate_local"
+        )
+        statistics["coordinate_local"].pulls = 2
+        self.assertEqual(
+            scheduler.select(names, statistics, 4), "gradient_boosted"
+        )
+        statistics["gradient_boosted"].pulls = 1
+        snapshot = scheduler.snapshot(names, statistics, 5)
+        self.assertEqual(snapshot["minimum_pulls"]["coordinate_local"], 2)
+
+    def test_hybrid_bandit_contains_observed_coordinate_local_arm(self) -> None:
+        tuner = make_hybrid_autotuner(
+            _toy_adapter(),
+            InMemoryTuningStore(),
+            HybridTuningPolicy(
+                portfolio="hybrid",
+                orchestration="bandit",
+                max_trials=32,
+                model_warmup=8,
+            ),
+        )
+        self.assertEqual(
+            set(tuner.strategies),
+            {"random", "coordinate_local", "gradient_boosted", "model_local"},
+        )
+        self.assertEqual(
+            tuner.scheduler.minimum_pulls["coordinate_local"], 8
+        )
 
     def test_gradient_boosted_model_learns_schedule_order(self) -> None:
         adapter = _toy_adapter()

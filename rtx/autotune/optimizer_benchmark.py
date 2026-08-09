@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+import hashlib
 import json
 import math
 from pathlib import Path
+import random
 import statistics
 from typing import Iterable, Mapping
 
@@ -26,6 +28,127 @@ def _number(value: object) -> float | None:
 def _median(values) -> float | None:
     finite = [float(value) for value in values if value is not None]
     return None if not finite else float(statistics.median(finite))
+
+
+def _bootstrap_median_ci(
+    values: Iterable[float], *, seed_key: object, samples: int = 2000
+) -> tuple[float | None, float | None]:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite:
+        return None, None
+    if len(finite) == 1:
+        return finite[0], finite[0]
+    seed = int(
+        hashlib.sha256(repr(seed_key).encode()).hexdigest()[:16], 16
+    )
+    rng = random.Random(seed)
+    medians = sorted(
+        statistics.median(rng.choices(finite, k=len(finite)))
+        for _ in range(samples)
+    )
+    return (
+        float(medians[int(0.025 * (samples - 1))]),
+        float(medians[int(0.975 * (samples - 1))]),
+    )
+
+
+def _matched_treatment_comparisons(
+    rows: Iterable[Mapping[str, object]], *, baseline: str = "random"
+) -> list[dict[str, object]]:
+    by_task: dict[tuple[object, ...], dict[str, Mapping[str, object]]] = defaultdict(dict)
+    for row in rows:
+        task = (
+            row.get("machine_id"),
+            row.get("family"),
+            row.get("regime"),
+            row.get("m"),
+            row.get("n"),
+            row.get("k"),
+            row.get("replicate"),
+        )
+        by_task[task][str(row.get("treatment"))] = row
+    deltas: dict[tuple[str, str, str], dict[str, list[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for task, treatments in by_task.items():
+        control = treatments.get(baseline)
+        if control is None:
+            continue
+        machine, family = str(task[0]), str(task[1])
+        for treatment, candidate in treatments.items():
+            if treatment == baseline:
+                continue
+            for metric in ("final_regret",) + tuple(
+                f"regret_at_{budget}" for budget in _BUDGETS
+            ):
+                candidate_value = _number(candidate.get(metric))
+                control_value = _number(control.get(metric))
+                if candidate_value is not None and control_value is not None:
+                    deltas[(machine, family, treatment)][metric].append(
+                        candidate_value - control_value
+                    )
+
+    comparisons = []
+    for (machine, family, treatment), metrics in sorted(deltas.items()):
+        record: dict[str, object] = {
+            "machine_id": machine,
+            "family": family,
+            "treatment": treatment,
+            "baseline": baseline,
+        }
+        for metric, values in sorted(metrics.items()):
+            low, high = _bootstrap_median_ci(
+                values,
+                seed_key=(machine, family, treatment, baseline, metric),
+            )
+            suffix = "final" if metric == "final_regret" else metric.removeprefix("regret_")
+            record[f"matched_{suffix}"] = len(values)
+            record[f"median_delta_{suffix}"] = float(statistics.median(values))
+            record[f"ci_low_delta_{suffix}"] = low
+            record[f"ci_high_delta_{suffix}"] = high
+            record[f"win_rate_{suffix}"] = sum(value < 0 for value in values) / len(values)
+        comparisons.append(record)
+    return comparisons
+
+
+def _conditional_aggregates(
+    rows: Iterable[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    groups: dict[tuple[str, ...], list[Mapping[str, object]]] = defaultdict(list)
+    for row in rows:
+        groups[
+            (
+                str(row.get("machine_id")),
+                str(row.get("family")),
+                str(row.get("task_category")),
+                str(row.get("regime")),
+                str(row.get("treatment")),
+            )
+        ].append(row)
+    result = []
+    for key, values in sorted(groups.items()):
+        machine, family, category, regime, treatment = key
+        result.append(
+            {
+                "machine_id": machine,
+                "family": family,
+                "task_category": category,
+                "regime": regime,
+                "treatment": treatment,
+                "contexts": len(values),
+                "median_trials": _median(value.get("trials") for value in values),
+                "median_final_regret": _median(
+                    value.get("final_regret") for value in values
+                ),
+                **{
+                    f"median_regret_at_{budget}": _median(
+                        value.get(f"regret_at_{budget}") for value in values
+                    )
+                    for budget in _BUDGETS
+                },
+            }
+        )
+    return result
 
 
 def optimizer_study_rows(
@@ -193,11 +316,21 @@ def summarize_optimizer_study(
             )
         aggregates.append(aggregate)
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "type": "rtx_optimizer_prospective_summary",
         "units": len(rows),
         "files": files,
         "aggregates": aggregates,
+        "conditional_aggregates": _conditional_aggregates(rows),
+        "matched_comparisons": _matched_treatment_comparisons(rows),
+        "coverage": {
+            "machines": len({str(row.get("machine_id")) for row in rows}),
+            "families": len({str(row.get("family")) for row in rows}),
+            "treatments": len({str(row.get("treatment")) for row in rows}),
+            "minimum_trials": min((int(row.get("trials", 0)) for row in rows), default=0),
+            "median_trials": _median(row.get("trials") for row in rows),
+            "maximum_trials": max((int(row.get("trials", 0)) for row in rows), default=0),
+        },
     }
     report_path = prefix.with_suffix(".summary.json")
     _atomic_json(report_path, report)

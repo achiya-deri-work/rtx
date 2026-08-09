@@ -11,6 +11,8 @@ dist/
 *.egg-info/
 autotune_datasets/
 autotune_datasets*.zip
+*autotuner*dataset*.zip
+*autotuner*prospective*.zip
 autotune_models/
 autotune_reports/
 copied_datasets/

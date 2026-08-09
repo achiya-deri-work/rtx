@@ -8,7 +8,7 @@ other RTX kernel families without importing the dataset CLI.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import math
 from typing import Callable, Mapping, Sequence
 
@@ -180,6 +180,7 @@ class AdaptiveBanditScheduler:
     discount: float = 0.985
     warmup_trials: int = 32
     warmup_arm: str = "random"
+    minimum_pulls: Mapping[str, int] = field(default_factory=dict)
     transfer_prior_strength: float = 3.0
     cost_scale_s: float = 2.0
     name: str = "adaptive_contextual_bandit"
@@ -191,6 +192,8 @@ class AdaptiveBanditScheduler:
             raise ValueError("bandit discount must be in (0, 1]")
         if self.warmup_trials < 0 or self.transfer_prior_strength < 0:
             raise ValueError("bandit warmup/prior strength cannot be negative")
+        if any(int(value) < 0 for value in self.minimum_pulls.values()):
+            raise ValueError("bandit minimum arm pulls cannot be negative")
         if self.cost_scale_s <= 0:
             raise ValueError("bandit cost scale must be positive")
 
@@ -308,6 +311,12 @@ class AdaptiveBanditScheduler:
             return None
         if trial_index < self.warmup_trials and self.warmup_arm in available:
             return self.warmup_arm
+        # A learned or local arm cannot establish a reward estimate if UCB is
+        # allowed to starve it immediately after random warmup. This phase is
+        # resumable because it is expressed against durable arm pull counts.
+        for name in available:
+            if statistics[name].pulls < int(self.minimum_pulls.get(name, 0)):
+                return name
         for name in available:
             if statistics[name].pulls == 0:
                 return name
@@ -326,6 +335,9 @@ class AdaptiveBanditScheduler:
             "trial": trial_index,
             "discount": self.discount,
             "exploration": self.exploration,
+            "minimum_pulls": {
+                name: int(self.minimum_pulls.get(name, 0)) for name in names
+            },
             "scores": {
                 name: None if value is None or not math.isfinite(value) else value
                 for name, value in raw_scores.items()

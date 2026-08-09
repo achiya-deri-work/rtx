@@ -30,7 +30,15 @@ class SearchStrategy(Protocol, Generic[ConfigT]):
 @dataclass(slots=True)
 class RandomSearch(Generic[ConfigT]):
     pool_multiplier: int = 4
+    max_batches: int = 8
+    max_pool_size: int = 4096
     name: str = "random"
+
+    def __post_init__(self) -> None:
+        if self.pool_multiplier <= 0 or self.max_batches <= 0:
+            raise ValueError("random-search pool and retry counts must be positive")
+        if self.max_pool_size <= 0:
+            raise ValueError("random-search maximum pool size must be positive")
 
     def propose(
         self,
@@ -40,14 +48,27 @@ class RandomSearch(Generic[ConfigT]):
         limit: int,
     ) -> list[Proposal[ConfigT]]:
         seeds = [item.config for item in sorted(history.successful, key=lambda item: item.score)[:8]]
-        candidates = adapter.sample(rng, max(limit * self.pool_multiplier, limit), seeds)
+        pool_size = max(limit * self.pool_multiplier, limit)
+        eligible: list[ConfigT] = []
+        eligible_ids: set[str] = set()
+        for _batch in range(self.max_batches):
+            candidates = adapter.sample(
+                rng, min(pool_size, self.max_pool_size), seeds
+            )
+            for candidate in candidates:
+                config_id = adapter.config_id(candidate)
+                if (
+                    config_id in history.seen_ids
+                    or config_id in eligible_ids
+                    or adapter.rejection(candidate) is not None
+                ):
+                    continue
+                eligible_ids.add(config_id)
+                eligible.append(candidate)
+            if len(eligible) >= limit or pool_size >= self.max_pool_size:
+                break
+            pool_size = min(self.max_pool_size, pool_size * 2)
         proposals: list[Proposal[ConfigT]] = []
-        eligible = [
-            candidate
-            for candidate in candidates
-            if adapter.config_id(candidate) not in history.seen_ids
-            and adapter.rejection(candidate) is None
-        ]
         for rank, candidate in enumerate(eligible):
             proposals.append(
                 Proposal(
@@ -56,6 +77,7 @@ class RandomSearch(Generic[ConfigT]):
                     metadata={
                         "candidate_pool_size": len(eligible),
                         "candidate_rank": rank,
+                        "candidate_draw_pool": pool_size,
                         "proposal_probability": (
                             None if not eligible else 1.0 / len(eligible)
                         ),

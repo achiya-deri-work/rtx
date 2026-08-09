@@ -3,6 +3,16 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.8.1
+
+- Make random search retry progressively larger candidate pools before
+  declaring a finite conditional space exhausted.
+- Add coordinate-local search to the learned bandit portfolio and guarantee
+  configurable bootstrap pulls for local and learned arms before UCB takes
+  over.
+- Report prospective coverage bounds, category/regime breakdowns, and matched
+  treatment deltas with deterministic bootstrap confidence intervals.
+
 ## 0.8.0
 
 - Bound shape/stream-specific MXFP8 forward and backward runner caches with
