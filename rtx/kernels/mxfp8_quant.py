@@ -152,11 +152,7 @@ class MXFP8QuantKernel:
         threads_per_scale = 32 // cfg.quant_vec
         scale_in_warp = lane_idx // threads_per_scale
         bf16_values = [BFloat16(0.0)] * cfg.quant_vec
-        values_per_load = (
-            128 // BFloat16.width
-            if cutlass.const_expr(cfg.transposed_load_engine == "cp_async")
-            else cfg.load_bits // BFloat16.width
-        )
+        values_per_load = cfg.load_bits // BFloat16.width
         loads_per_lane = cfg.quant_vec // values_per_load
         src_row = src[row, None]
         for load_idx in cutlass.range_constexpr(loads_per_lane):

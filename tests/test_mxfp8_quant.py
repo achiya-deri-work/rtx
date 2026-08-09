@@ -137,6 +137,12 @@ class MXFP8QuantCudaTests(unittest.TestCase):
             MXFP8QuantConfig(load_bits=64),
             MXFP8QuantConfig(quant_store_bits=16),
             MXFP8QuantConfig(quant_store_bits=32),
+            # Logical-transpose transport is intentionally inactive for the
+            # ordinary row-major quantizer.
+            MXFP8QuantConfig(
+                transposed_load_engine="cp_async",
+                transposed_smem_padding=0,
+            ),
             MXFP8QuantConfig(quant_math="fp32"),
             MXFP8QuantConfig(quant_amax="fp32"),
             MXFP8QuantConfig(reduction="redux"),
