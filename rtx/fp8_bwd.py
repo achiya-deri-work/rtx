@@ -63,6 +63,12 @@ def compile_mxfp8_oriented_dual_quant(*args, **kwargs):
         *args, **kwargs
     )
 
+
+def compile_mxfp8_backward_quad_quant(*args, **kwargs):
+    return load_kernel_symbol(
+        "mxfp8_quant", "compile_mxfp8_backward_quad_quant"
+    )(*args, **kwargs)
+
 if TYPE_CHECKING:
     from .autotune import CoordinateDescentPolicy
 
@@ -92,7 +98,7 @@ def _allocate_scales(
 @dataclass(slots=True)
 class _MatmulRunner:
     quant_launches: str
-    quant_a: object
+    quant_a: object | None
     quant_b: object | None
     gemm: object
     quantized_a: torch.Tensor
@@ -101,6 +107,7 @@ class _MatmulRunner:
     scales_b: torch.Tensor
 
     def quantize(self, source_a: torch.Tensor, source_b: torch.Tensor) -> None:
+        assert self.quant_a is not None
         if self.quant_launches == "dual":
             self.quant_a(
                 source_a,
@@ -194,9 +201,34 @@ class _BwdRunner:
     execution_order: str
     dx: _MatmulRunner | _FusedMatmulRunner | _SplitFusedMatmulRunner | _AtomicSplitFusedMatmulRunner
     dw: _MatmulRunner | _FusedMatmulRunner | _SplitFusedMatmulRunner | _AtomicSplitFusedMatmulRunner
+    quad_quant: object | None = None
     stream_schedule: str = "single"
     dx_stream: torch.cuda.Stream | None = None
     dw_stream: torch.cuda.Stream | None = None
+
+    def quantize_quad(
+        self,
+        grad_output: torch.Tensor,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> None:
+        assert self.quad_quant is not None
+        assert isinstance(self.dx, _MatmulRunner)
+        assert isinstance(self.dw, _MatmulRunner)
+        self.quad_quant(
+            grad_output,
+            weight.T,
+            grad_output.T,
+            x.T,
+            self.dx.quantized_a,
+            self.dx.quantized_b,
+            self.dw.quantized_a,
+            self.dw.quantized_b,
+            self.dx.scales_a,
+            self.dx.scales_b,
+            self.dw.scales_a,
+            self.dw.scales_b,
+        )
 
     def __call__(
         self,
@@ -206,6 +238,29 @@ class _BwdRunner:
         grad_x: torch.Tensor,
         grad_weight: torch.Tensor,
     ) -> None:
+        if self.quad_quant is not None:
+            assert isinstance(self.dx, _MatmulRunner)
+            assert isinstance(self.dw, _MatmulRunner)
+            self.quantize_quad(grad_output, x, weight)
+            if self.stream_schedule == "dual_stream":
+                assert self.dx_stream is not None and self.dw_stream is not None
+                caller = torch.cuda.current_stream(grad_output.device)
+                self.dx_stream.wait_stream(caller)
+                self.dw_stream.wait_stream(caller)
+                with torch.cuda.stream(self.dx_stream):
+                    self.dx.matmul(grad_x)
+                with torch.cuda.stream(self.dw_stream):
+                    self.dw.matmul(grad_weight)
+                caller.wait_stream(self.dx_stream)
+                caller.wait_stream(self.dw_stream)
+                return
+            if self.execution_order == "dw_first":
+                self.dw.matmul(grad_weight)
+                self.dx.matmul(grad_x)
+            else:
+                self.dx.matmul(grad_x)
+                self.dw.matmul(grad_weight)
+            return
         if self.stream_schedule == "dual_stream":
             assert self.dx_stream is not None and self.dw_stream is not None
             caller = torch.cuda.current_stream(grad_output.device)
@@ -245,6 +300,7 @@ def _build_matmul_runner(
     problem: MXFP8Problem,
     config: MXFP8BwdMatmulConfig,
     device: torch.device,
+    compile_quantizer: bool = True,
 ) -> _MatmulRunner | _FusedMatmulRunner | _SplitFusedMatmulRunner | _AtomicSplitFusedMatmulRunner:
     if config.backend == "fused":
         if config.reduction == "split_fp32_workspace":
@@ -319,7 +375,10 @@ def _build_matmul_runner(
     scales_b = _allocate_scales(
         problem.n, problem.k, quant_b_config.scale_layout, device
     )
-    if config.quant_launches == "dual":
+    if not compile_quantizer:
+        quant_a_launcher = None
+        quant_b_launcher = None
+    elif config.quant_launches == "dual":
         quant_a_launcher = compile_mxfp8_oriented_dual_quant(
             problem.m,
             problem.n,
@@ -363,27 +422,44 @@ def _build_bwd_runner(
     reason = config.implementation_rejection(problem)
     if reason is not None:
         raise RuntimeError(f"MXFP8 backward cannot run this configuration: {reason}")
+    use_quad = config.quant_schedule == "quad"
     dx = _build_matmul_runner(
         problem=MXFP8Problem(problem.m, problem.k, problem.n),
         config=config.dx,
         device=device,
+        compile_quantizer=not use_quad,
     )
     dw = _build_matmul_runner(
         problem=MXFP8Problem(problem.n, problem.k, problem.m),
         config=config.dw,
         device=device,
+        compile_quantizer=not use_quad,
     )
+    quad_quant = None
+    if use_quad:
+        assert isinstance(dx, _MatmulRunner) and isinstance(dw, _MatmulRunner)
+        quad_quant = compile_mxfp8_backward_quad_quant(
+            problem.m,
+            problem.k,
+            problem.n,
+            problem.n,
+            problem.k,
+            problem.m,
+            config.dx.quant_a,
+            config.dx.resolved_quant_b(),
+        )
     dx_stream = dw_stream = None
     if config.stream_schedule == "dual_stream":
         dx_stream = torch.cuda.Stream(device=device)
         dw_stream = torch.cuda.Stream(device=device)
     return _BwdRunner(
-        config.execution_order,
-        dx,
-        dw,
-        config.stream_schedule,
-        dx_stream,
-        dw_stream,
+        execution_order=config.execution_order,
+        dx=dx,
+        dw=dw,
+        quad_quant=quad_quant,
+        stream_schedule=config.stream_schedule,
+        dx_stream=dx_stream,
+        dw_stream=dw_stream,
     )
 
 

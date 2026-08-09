@@ -175,6 +175,10 @@ class MXFP8FwdConfig:
             return "MXFP8/E8M0 SM120 scale layouts require tile K divisible by 128"
         if self.atom_layout_m * self.atom_layout_n != self.num_mma_warps:
             return "atom layout product must equal num_mma_warps"
+        if self.atom_layout_m not in (2, 4, 8):
+            return "SM120 SFA fragments require 2, 4, or 8 M atoms"
+        if self.atom_layout_n not in (1, 2, 4):
+            return "SM120 SFB fragments require 1, 2, or 4 N atoms"
         if self.num_threads > 1024:
             return "CUDA limits one CTA to at most 1024 threads"
         # The SM120 warp-level block-scale fragment mapping has a fixed N
@@ -302,6 +306,8 @@ class MXFP8FwdConfig:
             return "warp-specialized forward requires the TMA load engine"
         if self.schedule == "three_role" and self.load_engine != "tma":
             return "three-role forward requires the TMA load engine"
+        if self.schedule == "three_role" and self.quantizer_warps % 4:
+            return "three-role quantizers must occupy complete warpgroups"
         if self.load_engine == "cpasync" and self.schedule != "cooperative":
             return "cp.async staging currently uses the cooperative schedule"
         if self.schedule == "cooperative" and self.producer_warps != 0:
@@ -310,6 +316,18 @@ class MXFP8FwdConfig:
             return "specialized schedules require one TMA producer warp"
         if self.schedule != "three_role" and self.quantizer_warps != self.num_mma_warps:
             return "non-three-role schedules quantize with every MMA warp"
+        if (
+            self.schedule == "three_role"
+            and (self.tile_m > 128 or self.tile_n > 128)
+            and (
+                self.consumer_registers < 96
+                or self.quantizer_warps != 4
+            )
+        ):
+            return (
+                "wide three-role CTAs require four quantizer warps and at least "
+                "96 consumer registers"
+            )
         if self.load_engine == "scalar" and self.bf16_stages != 1:
             return "BF16 stages only apply to staged load engines"
         if self.load_engine == "scalar" and self.bf16_tile_k != self.tile_k:
@@ -462,6 +480,20 @@ SMEM_RMEM_TILE_COORDINATES: tuple[tuple[int, int, int, int, int], ...] = tuple(
     if smem_m % rmem_m == 0
 )
 
+# Wide CTAs reuse one quantized operand across multiple 128-wide output macro
+# tiles, but they only fit when MXFP8 staging and the per-consumer register
+# allocation change in the same proposal. Expose those coupled basin entries
+# explicitly so coordinate descent never has to accept an illegal intermediate.
+CTA_REUSE_TILE_COORDINATES: tuple[tuple[int, int, int, int, int, int], ...] = (
+    (128, 128, 2, 2, 232, 255),
+    *tuple(
+        (tile_m, tile_n, bf16_stages, 1, consumer_registers, 160)
+        for tile_m, tile_n in ((128, 256), (256, 128))
+        for bf16_stages in (1, 2)
+        for consumer_registers in (96,)
+    ),
+)
+
 BF16_PIPELINE_COORDINATES: tuple[tuple[str, str, int, str, int], ...] = (
     # Scalar anchors retain a route back from staged basins.
     ("scalar", "cooperative", 128, "128b", 1),
@@ -491,6 +523,7 @@ BF16_PIPELINE_COORDINATES: tuple[tuple[str, str, int, str, int], ...] = (
 # the cross product is deliberately large enough for long, shape-local tuning.
 FWD_SEARCH_SPACE: dict[str, tuple[object, ...]] = {
     "smem_rmem_tile": SMEM_RMEM_TILE_COORDINATES,
+    "cta_reuse_tile": CTA_REUSE_TILE_COORDINATES,
     "bf16_pipeline": BF16_PIPELINE_COORDINATES,
     "tile_m": (64, 128, 256),
     "tile_n": (128, 256),
@@ -503,7 +536,7 @@ FWD_SEARCH_SPACE: dict[str, tuple[object, ...]] = {
     "bf16_swizzle": ("none", "32b", "64b", "128b"),
     "bf16_stages": (1, 2, 3, 4),
     "mxfp8_stages": (1, 2, 3, 4),
-    "quantizer_warps": (1, 2, 4, 8, 16),
+    "quantizer_warps": (4, 8, 16),
     "reduction": ("redux", "shuffle"),
     "quant_math": ("fp32", "bf16x2"),
     "quant_amax": ("fp32", "bf16_bits"),
@@ -513,7 +546,7 @@ FWD_SEARCH_SPACE: dict[str, tuple[object, ...]] = {
     "maxrregcount": (128, 160, 192, 224, 255),
     "producer_registers": (32, 40, 48, 56),
     "quantizer_registers": (64, 80, 96, 112, 128),
-    "consumer_registers": (160, 192, 224, 232),
+    "consumer_registers": (96, 128, 160, 192, 224, 232),
     "a_swizzle": ("none", "32b", "64b", "128b"),
     "b_swizzle": ("none", "32b", "64b", "128b"),
     "a_ldmatrix_matrices": (1, 2, 4),
@@ -536,6 +569,7 @@ FWD_COORDINATE_ORDER: tuple[str, ...] = (
     # Block moves come first so the search can enter coupled basins without
     # requiring every slower one-field intermediate to win.
     "smem_rmem_tile",
+    "cta_reuse_tile",
     "bf16_pipeline",
     # Probe the data path before growing the CTA.  A 128x128 TMA tile fits in
     # SMEM, while a 256-row/column scalar winner can make every neighboring
@@ -588,7 +622,7 @@ def normalize_fwd_config(
 
     values = asdict(base or DEFAULT_MXFP8_FWD_CONFIG)
     updates = dict(updates)
-    compound_names = {"smem_rmem_tile", "bf16_pipeline"}
+    compound_names = {"smem_rmem_tile", "cta_reuse_tile", "bf16_pipeline"}
     unknown = set(updates).difference(values).difference(compound_names)
     if unknown:
         raise ValueError(f"unknown MXFP8 forward coordinates: {sorted(unknown)}")
@@ -606,6 +640,34 @@ def normalize_fwd_config(
             tile_k=smem_k,
             atom_layout_m=smem_m // rmem_m,
             atom_layout_n=smem_n // rmem_n,
+        )
+
+    cta_reuse_tile = updates.pop("cta_reuse_tile", None)
+    if cta_reuse_tile is not None:
+        (
+            tile_m,
+            tile_n,
+            bf16_stages,
+            mxfp8_stages,
+            consumer_registers,
+            maxrregcount,
+        ) = cta_reuse_tile
+        updates.update(
+            tile_m=tile_m,
+            tile_n=tile_n,
+            load_engine="tma",
+            schedule="three_role",
+            bf16_tile_k=32,
+            bf16_swizzle="none",
+            bf16_stages=bf16_stages,
+            mxfp8_stages=mxfp8_stages,
+            quantizer_warps=4,
+            quant_vec=8,
+            quant_load_bits=128,
+            quant_math="bf16x2",
+            quant_amax="bf16_bits",
+            consumer_registers=consumer_registers,
+            maxrregcount=maxrregcount,
         )
 
     bf16_pipeline = updates.pop("bf16_pipeline", None)

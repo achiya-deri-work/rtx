@@ -30,6 +30,17 @@ project follows semantic versioning while it is in active alpha development.
 - Implement launch-level interleaved decomposed backward execution and remove
   unimplemented graph, cluster-reduction, and legacy persistent-GEMM choices
   from the active backward search space instead of spending trials on rejects.
+- Add compound 128x256/256x128 TMA reuse-tile basins that lower MXFP8 staging
+  and consumer registers atomically, allowing the backward tuner to discover
+  true intra-CTA operand reuse without crossing an illegal intermediate.
+- Add a persistent four-operand backward quantizer that emits the dX and dW
+  E4M3/E8M0 operand pairs in one launch despite their different reduction
+  lengths. Make it the runtime seed together with concurrent dX/dW GEMMs after
+  paired races improved representative SM120 shapes by roughly 4--14%; retain
+  the former per-matmul dual quantizers as an independent search schedule.
+- Encode SM120 SFA/SFB atom-layout, complete-quantizer-warpgroup, and wide-CTA
+  register constraints before compilation, and benchmark wide-CTA reuse with
+  paired confidence intervals and a dedicated register/stage sweep.
 
 ## 0.9.0
 

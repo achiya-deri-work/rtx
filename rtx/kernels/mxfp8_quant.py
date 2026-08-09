@@ -601,6 +601,7 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
                 logical_smem,
                 task_group,
                 self.scale_tile_rows,
+                self.k,
             )
 
     @cute.jit
@@ -613,6 +614,7 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
         logical_smem: cute.Tensor,
         task_group: Int32,
         scale_tile_rows: cutlass.Constexpr,
+        k: cutlass.Constexpr,
     ):
         """Quantize one tile using two layouts over the same SMEM bytes."""
 
@@ -621,7 +623,7 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         physical_stride = cfg.transposed_tile_rows + cfg.transposed_smem_padding
-        blocks_per_row = self.k // SF_VEC_SIZE
+        blocks_per_row = k // SF_VEC_SIZE
         tile_values = cfg.transposed_tile_rows * SF_VEC_SIZE
         values_per_load = cfg.load_bits // BFloat16.width
         load_tasks = tile_values // values_per_load
@@ -831,6 +833,7 @@ class MXFP8OrientedDualQuantKernel(MXFP8TransposedQuantKernel):
                         logical_smem,
                         task_group,
                         self.a_scale_tile_rows,
+                        self.k,
                     )
             else:
                 local_task = task_group - self.a_task_groups
@@ -848,6 +851,7 @@ class MXFP8OrientedDualQuantKernel(MXFP8TransposedQuantKernel):
                         logical_smem,
                         local_task,
                         self.b_scale_tile_rows,
+                        self.k,
                     )
 
     @cute.jit
@@ -890,6 +894,180 @@ class MXFP8OrientedDualQuantKernel(MXFP8TransposedQuantKernel):
             )
         # A later grid-stride item may enter the SMEM transpose branch.
         cute.arch.sync_threads()
+
+
+class MXFP8BackwardQuadQuantKernel(MXFP8OrientedDualQuantKernel):
+    """Quantize all four backward GEMM operands in one persistent launch.
+
+    ``a``/``b`` form dX and reduce over ``k_ab``; ``c``/``d`` form dW and
+    reduce over ``k_cd``.  The physical sources are respectively G, W, G and
+    X, exposed through row, transpose, transpose and transpose CuTe layouts.
+    The three transposed schedules intentionally share one configuration so a
+    CTA can reuse one SMEM tile and one uniform persistent work queue.
+    """
+
+    def __init__(
+        self,
+        a_rows: int,
+        b_rows: int,
+        k_ab: int,
+        c_rows: int,
+        d_rows: int,
+        k_cd: int,
+        row_config: MXFP8QuantConfig,
+        transposed_config: MXFP8QuantConfig,
+    ):
+        super().__init__(
+            a_rows,
+            b_rows,
+            k_ab,
+            row_config,
+            transposed_config,
+            "row",
+            "transpose",
+        )
+        if row_config.num_warps != transposed_config.num_warps:
+            raise ValueError("quad quantization requires one CTA warp count")
+        for rows in (c_rows, d_rows):
+            rejection = transposed_config.rejection(rows, k_cd)
+            if rejection is not None:
+                raise ValueError(f"illegal quad transposed quantizer: {rejection}")
+            if rows % transposed_config.transposed_tile_rows:
+                raise ValueError(
+                    "quad logical-transpose rows must contain full SMEM tiles"
+                )
+        self.k_cd = k_cd
+        self.c_rows = c_rows
+        self.d_rows = d_rows
+        self.c_scale_tile_rows = _native_scale_tile_rows(
+            transposed_config.scale_layout
+        )
+        self.d_scale_tile_rows = self.c_scale_tile_rows
+        self.ab_task_groups = self.task_groups
+        blocks_per_row = k_cd // SF_VEC_SIZE
+        self.c_task_groups = (
+            c_rows // transposed_config.transposed_tile_rows * blocks_per_row
+        )
+        self.d_task_groups = (
+            d_rows // transposed_config.transposed_tile_rows * blocks_per_row
+        )
+        self.task_groups = (
+            self.ab_task_groups + self.c_task_groups + self.d_task_groups
+        )
+        sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
+        self.grid_ctas = min(
+            self.task_groups,
+            sm_count
+            * max(row_config.persistent_waves, transposed_config.persistent_waves),
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        c: cute.Tensor,
+        d: cute.Tensor,
+        qa: cute.Tensor,
+        qb: cute.Tensor,
+        qc: cute.Tensor,
+        qd: cute.Tensor,
+        sa: cute.Tensor,
+        sb: cute.Tensor,
+        sc: cute.Tensor,
+        sd: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.quad_kernel(a, b, c, d, qa, qb, qc, qd, sa, sb, sc, sd).launch(
+            grid=(self.grid_ctas, 1, 1),
+            block=(self.config.num_warps * 32, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def quad_kernel(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        c: cute.Tensor,
+        d: cute.Tensor,
+        qa: cute.Tensor,
+        qb: cute.Tensor,
+        qc: cute.Tensor,
+        qd: cute.Tensor,
+        sa: cute.Tensor,
+        sb: cute.Tensor,
+        sc: cute.Tensor,
+        sd: cute.Tensor,
+    ):
+        cfg = self.config
+        physical_stride = cfg.transposed_tile_rows + cfg.transposed_smem_padding
+        physical_smem = cutlass.utils.SmemAllocator().allocate_tensor(
+            BFloat16,
+            cute.make_layout(
+                (SF_VEC_SIZE, physical_stride),
+                stride=(physical_stride, 1),
+            ),
+            byte_alignment=16,
+        )
+        logical_smem = cute.make_tensor(
+            physical_smem.iterator,
+            cute.make_layout(
+                (cfg.transposed_tile_rows, SF_VEC_SIZE),
+                stride=(1, physical_stride),
+            ),
+        )
+        block_idx, _, _ = cute.arch.block_idx()
+        for task_group in cutlass.range(
+            block_idx, self.task_groups, self.grid_ctas, unroll=1
+        ):
+            if task_group < self.a_task_groups:
+                self._quantize_row_cta(
+                    a,
+                    qa,
+                    sa,
+                    task_group,
+                    self.a_warp_tasks,
+                    self.a_scale_tile_rows,
+                )
+            elif task_group < self.ab_task_groups:
+                local_task = task_group - self.a_task_groups
+                self._quantize_transposed_cta(
+                    b,
+                    qb,
+                    sb,
+                    physical_smem,
+                    logical_smem,
+                    local_task,
+                    self.b_scale_tile_rows,
+                    self.k,
+                )
+            elif task_group < self.ab_task_groups + self.c_task_groups:
+                local_task = task_group - self.ab_task_groups
+                self._quantize_transposed_cta(
+                    c,
+                    qc,
+                    sc,
+                    physical_smem,
+                    logical_smem,
+                    local_task,
+                    self.c_scale_tile_rows,
+                    self.k_cd,
+                )
+            else:
+                local_task = (
+                    task_group - self.ab_task_groups - self.c_task_groups
+                )
+                self._quantize_transposed_cta(
+                    d,
+                    qd,
+                    sd,
+                    physical_smem,
+                    logical_smem,
+                    local_task,
+                    self.d_scale_tile_rows,
+                    self.k_cd,
+                )
 
 
 @lru_cache(maxsize=None)
@@ -1126,13 +1304,92 @@ def compile_mxfp8_oriented_dual_quant(
     )
 
 
+@lru_cache(maxsize=None)
+def compile_mxfp8_backward_quad_quant(
+    a_rows: int,
+    b_rows: int,
+    k_ab: int,
+    c_rows: int,
+    d_rows: int,
+    k_cd: int,
+    row_config: MXFP8QuantConfig,
+    transposed_config: MXFP8QuantConfig,
+):
+    """Compile one launch for all dX/dW dynamic quantized operands."""
+
+    kernel = MXFP8BackwardQuadQuantKernel(
+        a_rows,
+        b_rows,
+        k_ab,
+        c_rows,
+        d_rows,
+        k_cd,
+        row_config,
+        transposed_config,
+    )
+
+    def fake_source(rows: int, k: int, orientation: str):
+        stride = (k, 1) if orientation == "row" else (1, rows)
+        return cute.runtime.make_fake_tensor(
+            BFloat16,
+            (rows, k),
+            stride=stride,
+            assumed_align=16,
+        )
+
+    def fake_quantized(rows: int, k: int):
+        return cute.runtime.make_fake_tensor(
+            Float8E4M3FN,
+            (rows, k),
+            stride=(k, 1),
+            assumed_align=16,
+        )
+
+    a = fake_source(a_rows, k_ab, "row")
+    b = fake_source(b_rows, k_ab, "transpose")
+    c = fake_source(c_rows, k_cd, "transpose")
+    d = fake_source(d_rows, k_cd, "transpose")
+    qa = fake_quantized(a_rows, k_ab)
+    qb = fake_quantized(b_rows, k_ab)
+    qc = fake_quantized(c_rows, k_cd)
+    qd = fake_quantized(d_rows, k_cd)
+    sa = _fake_quant_scales(a_rows, k_ab, row_config.scale_layout)
+    sb = _fake_quant_scales(b_rows, k_ab, transposed_config.scale_layout)
+    sc = _fake_quant_scales(c_rows, k_cd, transposed_config.scale_layout)
+    sd = _fake_quant_scales(d_rows, k_cd, transposed_config.scale_layout)
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        kernel,
+        a,
+        b,
+        c,
+        d,
+        qa,
+        qb,
+        qc,
+        qd,
+        sa,
+        sb,
+        sc,
+        sd,
+        stream,
+        options=(
+            "--enable-tvm-ffi --opt-level 3 "
+            "--ptxas-options '-O3 -v --maxrregcount="
+            f"{max(row_config.maxrregcount, transposed_config.maxrregcount)}'"
+        ),
+    )
+
+
 __all__ = [
+    "MXFP8BackwardQuadQuantKernel",
     "MXFP8DualQuantKernel",
     "MXFP8QuantConfig",
     "MXFP8QuantKernel",
     "MXFP8TransposedQuantKernel",
     "MXFP8OrientedDualQuantKernel",
     "compile_mxfp8_dual_quant",
+    "compile_mxfp8_backward_quad_quant",
     "compile_mxfp8_oriented_dual_quant",
     "compile_mxfp8_quant",
     "compile_mxfp8_transposed_quant",

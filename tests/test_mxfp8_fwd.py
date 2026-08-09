@@ -86,6 +86,34 @@ class MXFP8ConfigTests(unittest.TestCase):
         self.assertEqual(three_role.num_threads, 416)
         self.assertIsNone(three_role.implementation_rejection(problem))
 
+    def test_compound_reuse_tile_enters_a_legal_wide_tma_basin(self) -> None:
+        problem = MXFP8Problem(512, 1536, 1536)
+        config = normalize_fwd_config(
+            cta_reuse_tile=(128, 256, 2, 1, 96, 160)
+        )
+        self.assertEqual((config.tile_m, config.tile_n), (128, 256))
+        self.assertEqual(config.mxfp8_stages, 1)
+        self.assertEqual(config.quant_load_bits, 128)
+        self.assertEqual(config.num_threads, 672)
+        self.assertIsNone(config.implementation_rejection(problem))
+        misaligned = normalize_fwd_config(config, quantizer_warps=2)
+        self.assertIn(
+            "complete warpgroups",
+            misaligned.implementation_rejection(problem),
+        )
+        overprovisioned = normalize_fwd_config(config, quantizer_warps=8)
+        self.assertIn(
+            "four quantizer warps",
+            overprovisioned.implementation_rejection(problem),
+        )
+        unsupported_n_atoms = normalize_fwd_config(
+            config, tile_m=64, tile_n=384
+        )
+        self.assertIn(
+            "1, 2, or 4 N atoms",
+            unsupported_n_atoms.implementation_rejection(problem),
+        )
+
     def test_tma_epilogue_rejects_ragged_output_tiles(self) -> None:
         config = normalize_fwd_config(
             tile_m=64, epilogue="tma", store_vec=4
@@ -423,7 +451,27 @@ class MXFP8CudaTests(unittest.TestCase):
                 )
                 compile_mxfp8_fwd(problem, config)(x, weight, actual)
                 torch.cuda.synchronize()
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_wide_cta_reuse_tile_matches_reference(self) -> None:
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("native kernel requires SM120/SM121")
+        problem = MXFP8Problem(256, 256, 256)
+        config = normalize_fwd_config(
+            cta_reuse_tile=(128, 256, 2, 1, 96, 160)
+        )
+        torch.manual_seed(127)
+        x = torch.randn(problem.m, problem.k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(
+            problem.n, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        out = torch.empty(
+            problem.m, problem.n, device="cuda", dtype=torch.bfloat16
+        )
+        compile_mxfp8_fwd(problem, config)(x, weight, out)
+        torch.cuda.synchronize()
+        expected = _reference_linear(x, weight)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

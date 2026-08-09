@@ -28,6 +28,7 @@ from rtx.kernels.mxfp8_fwd import (
 from rtx.kernels.mxfp8_reduce import compile_mxfp8_workspace_reduce
 from rtx.kernels.mxfp8_bwd import (
     DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+    DEFAULT_DUAL_DECOMPOSED_MXFP8_BWD_CONFIG,
     DEFAULT_FUSED_MXFP8_BWD_CONFIG,
     DEFAULT_MXFP8_BWD_CONFIG,
     DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG,
@@ -55,6 +56,8 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
         self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.dw.backend, "decomposed")
         self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.dx.quant_launches, "dual")
         self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.dw.quant_launches, "dual")
+        self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.quant_schedule, "quad")
+        self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.stream_schedule, "dual_stream")
         self.assertEqual(DEFAULT_FUSED_MXFP8_BWD_CONFIG.dx.backend, "fused")
         self.assertEqual(DEFAULT_FUSED_MXFP8_BWD_CONFIG.dw.backend, "fused")
 
@@ -120,7 +123,7 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
 
     def test_unimplemented_reduction_is_named_not_benchmarked_as_noop(self) -> None:
         candidate = update_bwd_config(
-            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            DEFAULT_DUAL_DECOMPOSED_MXFP8_BWD_CONFIG,
             {
                 "dw": {
                     "reduction": "split_fp32_workspace",
@@ -223,7 +226,7 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
     def test_interleaved_is_a_real_decomposed_only_schedule(self) -> None:
         problem = MXFP8Problem(512, 1536, 1536)
         candidate = update_bwd_config(
-            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            DEFAULT_DUAL_DECOMPOSED_MXFP8_BWD_CONFIG,
             {"execution_order": "interleaved"},
         )
         self.assertIsNone(candidate.implementation_rejection(problem))
@@ -237,6 +240,19 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
             {"stream_schedule": "dual_stream"},
         )
         self.assertIn("single-stream", dual_stream.implementation_rejection(problem))
+
+    def test_quad_quantization_is_a_real_shared_decomposed_schedule(self) -> None:
+        problem = MXFP8Problem(512, 1536, 1536)
+        candidate = update_bwd_config(
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            {"quant_schedule": "quad"},
+        )
+        self.assertIsNone(candidate.implementation_rejection(problem))
+        fused = update_bwd_config(
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+            {"quant_schedule": "quad"},
+        )
+        self.assertIn("decomposed", fused.implementation_rejection(problem))
 
     def test_oriented_fused_kernels_compile_without_materialized_transposes(self) -> None:
         problem = MXFP8Problem(128, 128, 128)
@@ -408,9 +424,43 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         weight = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         grad_output = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         config = update_bwd_config(
-            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            DEFAULT_DUAL_DECOMPOSED_MXFP8_BWD_CONFIG,
             {"execution_order": "interleaved"},
         )
+        self._assert_backward_close(config, grad_output, x, weight)
+
+    def test_quad_quantized_backward_matches_reference(self) -> None:
+        torch.manual_seed(33)
+        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        grad_output = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        config = update_bwd_config(
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            {"quant_schedule": "quad"},
+        )
+        self._assert_backward_close(config, grad_output, x, weight)
+
+    def test_wide_dw_cta_reuses_quantized_a_without_global_round_trip(self) -> None:
+        torch.manual_seed(37)
+        m, n, k = 512, 256, 256
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        grad_output = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+        base = normalize_fwd_config(
+            cta_reuse_tile=(128, 128, 2, 2, 232, 255)
+        )
+        wide_dw = normalize_fwd_config(
+            cta_reuse_tile=(128, 256, 2, 1, 96, 160)
+        )
+        config = update_bwd_config(
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+            {
+                "dx": {"fused": asdict(base)},
+                "dw": {"fused": asdict(wide_dw)},
+                "stream_schedule": "dual_stream",
+            },
+        )
+        self.assertIsNone(config.implementation_rejection(MXFP8Problem(m, n, k)))
         self._assert_backward_close(config, grad_output, x, weight)
 
     def test_fused_tma_and_split_reduction_runtime_matrix(self) -> None:

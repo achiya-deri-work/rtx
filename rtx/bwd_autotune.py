@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 7
+KERNEL_REVISION = 8
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -355,6 +355,9 @@ BWD_SEARCH_SPACE: dict[str, tuple[dict[str, object], ...]] = {
     "stream_schedule": tuple(
         {"stream_schedule": value} for value in ("single", "dual_stream")
     ),
+    "quant_schedule": tuple(
+        {"quant_schedule": value} for value in ("per_matmul", "quad")
+    ),
     **_matmul_axes("dx"),
     **_matmul_axes("dw"),
 }
@@ -407,6 +410,7 @@ def bwd_config_from_dict(value: Mapping[str, object]) -> MXFP8BwdConfig:
         dw=_matmul_from_dict(dict(value["dw"])),  # type: ignore[arg-type]
         execution_order=str(value.get("execution_order", "dx_first")),
         stream_schedule=str(value.get("stream_schedule", "single")),
+        quant_schedule=str(value.get("quant_schedule", "per_matmul")),
     ).normalized()
 
 
@@ -483,6 +487,7 @@ def update_bwd_config(
         dw=_update_matmul(config.dw, dict(updates.get("dw", {}))),  # type: ignore[arg-type]
         execution_order=str(updates.get("execution_order", config.execution_order)),
         stream_schedule=str(updates.get("stream_schedule", config.stream_schedule)),
+        quant_schedule=str(updates.get("quant_schedule", config.quant_schedule)),
     ).normalized()
 
 

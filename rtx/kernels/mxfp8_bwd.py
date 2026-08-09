@@ -269,6 +269,7 @@ class MXFP8BwdConfig:
     dw: MXFP8BwdMatmulConfig = field(default_factory=_default_dw_config)
     execution_order: str = "dx_first"
     stream_schedule: str = "single"
+    quant_schedule: str = "per_matmul"
 
     def normalized(self) -> "MXFP8BwdConfig":
         return replace(self, dx=self.dx.normalized(), dw=self.dw.normalized())
@@ -284,6 +285,8 @@ class MXFP8BwdConfig:
             return "execution_order must be dx_first, dw_first, or interleaved"
         if self.stream_schedule not in ("single", "dual_stream", "graph"):
             return "stream_schedule must be single, dual_stream, or graph"
+        if self.quant_schedule not in ("per_matmul", "quad"):
+            return "quant_schedule must be per_matmul or quad"
         if (self.dx.a_orientation, self.dx.b_orientation) != ("row", "transpose"):
             return "dX requires logical layouts A=row and B=transpose"
         if (self.dw.a_orientation, self.dw.b_orientation) != (
@@ -310,6 +313,16 @@ class MXFP8BwdConfig:
                 return "interleaved execution requires two decomposed matmuls"
         if self.stream_schedule == "graph":
             return f"stream schedule {self.stream_schedule!r} is not implemented yet"
+        if self.quant_schedule == "quad":
+            if self.dx.backend != "decomposed" or self.dw.backend != "decomposed":
+                return "quad quantization requires two decomposed matmuls"
+            if self.dx.quant_launches != "dual" or self.dw.quant_launches != "dual":
+                return "quad quantization requires dual per-matmul quantizer configs"
+            transposed = self.dx.resolved_quant_b()
+            if self.dw.quant_a != transposed or self.dw.resolved_quant_b() != transposed:
+                return "quad quantization requires one shared transposed schedule"
+            if self.dx.quant_a.num_warps != transposed.num_warps:
+                return "quad quantization requires one CTA warp count"
         reason = self.dx.implementation_rejection(
             MXFP8Problem(forward.m, forward.k, forward.n)
         )
@@ -330,7 +343,7 @@ DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG = replace(
     dw=replace(DEFAULT_FUSED_MXFP8_BWD_CONFIG.dw, backend="decomposed"),
 )
 
-DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG = replace(
+DEFAULT_DUAL_DECOMPOSED_MXFP8_BWD_CONFIG = replace(
     DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG,
     dx=replace(
         DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG.dx,
@@ -342,6 +355,12 @@ DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG = replace(
     ),
 )
 
+DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG = replace(
+    DEFAULT_DUAL_DECOMPOSED_MXFP8_BWD_CONFIG,
+    quant_schedule="quad",
+    stream_schedule="dual_stream",
+)
+
 # The fused families are searchable, but until their CTAs share quantized
 # operands the measured quantize-once implementation is the safe runtime seed.
 DEFAULT_MXFP8_BWD_CONFIG = DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG
@@ -350,6 +369,7 @@ DEFAULT_MXFP8_BWD_CONFIG = DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG
 __all__ = [
     "DEFAULT_MXFP8_BWD_CONFIG",
     "DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG",
+    "DEFAULT_DUAL_DECOMPOSED_MXFP8_BWD_CONFIG",
     "DEFAULT_FUSED_MXFP8_BWD_CONFIG",
     "DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG",
     "MXFP8BwdConfig",

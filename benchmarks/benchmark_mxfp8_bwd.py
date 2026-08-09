@@ -16,13 +16,14 @@ from rtx.bwd_experiments import BwdBenchmarkHarness
 from rtx.kernels.mxfp8 import normalize_fwd_config
 from rtx.kernels.mxfp8_bwd import (
     DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+    DEFAULT_DUAL_DECOMPOSED_MXFP8_BWD_CONFIG,
     DEFAULT_FUSED_MXFP8_BWD_CONFIG,
     DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG,
 )
 from rtx.prequant_experiments import BenchmarkProtocol, ShapeSpec
 
 
-def _split_for(k: int) -> tuple[int, int]:
+def _split_for(k: int) -> tuple[int, int] | None:
     choices = [
         (parts, tile)
         for parts in (2, 4, 8, 16, 32)
@@ -30,12 +31,12 @@ def _split_for(k: int) -> tuple[int, int]:
         if (parts - 1) * tile < k <= parts * tile
     ]
     if not choices:
-        raise ValueError(f"no represented split covers reduction length {k}")
+        return None
     # Prefer fewer partials, then the least overcoverage.
     return min(choices, key=lambda item: (item[0], item[0] * item[1] - k))
 
 
-def _configs(shape: ShapeSpec) -> dict[str, object]:
+def _configs(shape: ShapeSpec, *, reuse_sweep: bool = False) -> dict[str, object]:
     tma_three_role = normalize_fwd_config(
         load_engine="tma",
         schedule="three_role",
@@ -66,35 +67,42 @@ def _configs(shape: ShapeSpec) -> dict[str, object]:
             "dw": {"fused": asdict(tma_m64)},
         },
     )
-    parts, tile = _split_for(shape.m)
-    workspace = update_bwd_config(
-        fused_tma,
-        {
-            "dw": {
-                "reduction": "split_fp32_workspace",
-                "split_reduction": parts,
-                "reduction_tile": tile,
-                "workspace_epilogue": "tree",
-            }
-        },
+    tma_n256_reuse_a = normalize_fwd_config(
+        tma_three_role,
+        tile_n=256,
+        mxfp8_stages=1,
+        consumer_registers=96,
+        maxrregcount=160,
     )
-    atomic = update_bwd_config(
-        fused_tma,
-        {
-            "dw": {
-                "reduction": "split_fp32_atomic",
-                "split_reduction": parts,
-                "reduction_tile": tile,
-                "workspace_epilogue": "none",
-            }
-        },
+    tma_m256_reuse_b = normalize_fwd_config(
+        tma_three_role,
+        tile_m=256,
+        mxfp8_stages=1,
+        consumer_registers=96,
+        maxrregcount=160,
     )
-    return {
+    fused_tma_dw_n256 = update_bwd_config(
+        fused_tma,
+        {"dw": {"fused": asdict(tma_n256_reuse_a)}},
+    )
+    fused_tma_dw_m256 = update_bwd_config(
+        fused_tma,
+        {"dw": {"fused": asdict(tma_m256_reuse_b)}},
+    )
+    configs = {
         "decomposed_separate": DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG,
-        "decomposed_dual": DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+        "decomposed_dual": DEFAULT_DUAL_DECOMPOSED_MXFP8_BWD_CONFIG,
         "decomposed_dual_interleaved": update_bwd_config(
-            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
+            DEFAULT_DUAL_DECOMPOSED_MXFP8_BWD_CONFIG,
             {"execution_order": "interleaved"},
+        ),
+        "decomposed_quad_quant": update_bwd_config(
+            DEFAULT_DUAL_DECOMPOSED_MXFP8_BWD_CONFIG,
+            {"quant_schedule": "quad"},
+        ),
+        "decomposed_quad_quant_dual_stream": update_bwd_config(
+            DEFAULT_DUAL_DECOMPOSED_MXFP8_BWD_CONFIG,
+            {"quant_schedule": "quad", "stream_schedule": "dual_stream"},
         ),
         "fused_scalar": DEFAULT_FUSED_MXFP8_BWD_CONFIG,
         "fused_tma_three_role": fused_tma,
@@ -102,12 +110,88 @@ def _configs(shape: ShapeSpec) -> dict[str, object]:
         "fused_tma_m64_dual_stream": update_bwd_config(
             fused_tma_m64, {"stream_schedule": "dual_stream"}
         ),
-        "fused_tma_workspace": workspace,
-        "fused_tma_atomic": atomic,
+        "fused_tma_dw_n256_reuse_a": fused_tma_dw_n256,
+        "fused_tma_dw_n256_reuse_a_dual_stream": update_bwd_config(
+            fused_tma_dw_n256, {"stream_schedule": "dual_stream"}
+        ),
+        "fused_tma_dw_m256_reuse_b": fused_tma_dw_m256,
+        "fused_tma_dw_m256_reuse_b_dual_stream": update_bwd_config(
+            fused_tma_dw_m256, {"stream_schedule": "dual_stream"}
+        ),
         "fused_tma_dual_stream": update_bwd_config(
             fused_tma, {"stream_schedule": "dual_stream"}
         ),
     }
+    split = _split_for(shape.m)
+    if split is not None:
+        parts, tile = split
+        configs["fused_tma_workspace"] = update_bwd_config(
+            fused_tma,
+            {
+                "dw": {
+                    "reduction": "split_fp32_workspace",
+                    "split_reduction": parts,
+                    "reduction_tile": tile,
+                    "workspace_epilogue": "tree",
+                }
+            },
+        )
+        configs["fused_tma_atomic"] = update_bwd_config(
+            fused_tma,
+            {
+                "dw": {
+                    "reduction": "split_fp32_atomic",
+                    "split_reduction": parts,
+                    "reduction_tile": tile,
+                    "workspace_epilogue": "none",
+                }
+            },
+        )
+    if reuse_sweep:
+        resource_points = (
+            # quantizer warps, consumer registers, quantizer registers
+            (4, 96, 64),
+            (4, 96, 80),
+            (4, 96, 96),
+            (4, 112, 64),
+            (4, 112, 80),
+            (4, 112, 96),
+            (4, 128, 64),
+        )
+        for tile_m, tile_n, reuse in (
+            (128, 256, "a"),
+            (256, 128, "b"),
+        ):
+            for bf16_stages in (1, 2):
+                for (
+                    quantizer_warps,
+                    consumer_registers,
+                    quantizer_registers,
+                ) in resource_points:
+                    wide = normalize_fwd_config(
+                        tma_three_role,
+                        tile_m=tile_m,
+                        tile_n=tile_n,
+                        bf16_stages=bf16_stages,
+                        mxfp8_stages=1,
+                        quantizer_warps=quantizer_warps,
+                        consumer_registers=consumer_registers,
+                        quantizer_registers=quantizer_registers,
+                        maxrregcount=160,
+                    )
+                    candidate = update_bwd_config(
+                        fused_tma,
+                        {"dw": {"fused": asdict(wide)}},
+                    )
+                    name = (
+                        f"fused_tma_dw_reuse_{reuse}_bf16s{bf16_stages}_"
+                        f"q{quantizer_warps}_c{consumer_registers}_"
+                        f"qr{quantizer_registers}_dual_stream"
+                    )
+                    configs[name] = update_bwd_config(
+                        candidate, {"stream_schedule": "dual_stream"}
+                    )
+    return configs
 
 
 def main() -> None:
@@ -121,6 +205,11 @@ def main() -> None:
     parser.add_argument("--race-rounds", type=int, default=11)
     parser.add_argument("--target-batch-ms", type=float, default=30.0)
     parser.add_argument("--seed", type=int, default=20260809)
+    parser.add_argument(
+        "--reuse-sweep",
+        action="store_true",
+        help="sweep legal wide-CTA dW register/stage reuse basins",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
@@ -140,7 +229,7 @@ def main() -> None:
     harness = BwdBenchmarkHarness(
         shape, protocol, regime=args.regime, seed=args.seed
     )
-    configs = _configs(shape)
+    configs = _configs(shape, reuse_sweep=args.reuse_sweep)
     measurements: dict[str, object] = {}
     for index, (name, config) in enumerate(configs.items()):
         print(f"START {name} {bwd_config_id(config)}", flush=True)
@@ -173,6 +262,22 @@ def main() -> None:
             reference, config, seed=args.seed + 100 + index
         )
 
+    fused_races: dict[str, object] = {}
+    fused_reference_name = "fused_tma_dual_stream"
+    fused_reference = configs[fused_reference_name]
+    for index, (name, config) in enumerate(configs.items()):
+        if (
+            name == fused_reference_name
+            or "reuse_" not in name
+            or "dual_stream" not in name
+            or measurements[name].get("status") != "ok"
+        ):
+            continue
+        print(f"RACE  {fused_reference_name} vs {name}", flush=True)
+        fused_races[name] = harness.race(
+            fused_reference, config, seed=args.seed + 1000 + index
+        )
+
     payload = {
         "schema_version": 1,
         "type": "mxfp8_backward_family_benchmark",
@@ -193,6 +298,8 @@ def main() -> None:
         "measurements": measurements,
         "race_reference": reference_name,
         "races_vs_reference": races,
+        "fused_race_reference": fused_reference_name,
+        "fused_races_vs_reference": fused_races,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

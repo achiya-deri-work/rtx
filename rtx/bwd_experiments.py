@@ -225,7 +225,21 @@ class BwdBenchmarkHarness:
         component_calls = max(1, min(calls, 1024))
         component_samples = max(3, min(samples, 5))
         operations: dict[str, Callable[[], None]] = {}
-        if prepared.config.dx.backend == "fused":
+        if prepared.config.quant_schedule == "quad":
+            operations.update(
+                {
+                    "quad_quant": lambda: runner.quantize_quad(
+                        self.grad_output, self.x, self.weight
+                    ),
+                    "dx_gemm_hot_materialized": lambda: runner.dx.matmul(
+                        prepared.grad_x
+                    ),
+                    "dw_gemm_hot_materialized": lambda: runner.dw.matmul(
+                        prepared.grad_weight
+                    ),
+                }
+            )
+        elif prepared.config.dx.backend == "fused":
             operations["dx_fused_quant_mma"] = lambda: runner.dx(
                 self.grad_output, self.weight.T, prepared.grad_x
             )
@@ -240,7 +254,9 @@ class BwdBenchmarkHarness:
                     ),
                 }
             )
-        if prepared.config.dw.backend == "fused":
+        if prepared.config.quant_schedule == "quad":
+            pass
+        elif prepared.config.dw.backend == "fused":
             operations["dw_fused_quant_mma"] = lambda: runner.dw(
                 self.grad_output.T, self.x.T, prepared.grad_weight
             )
