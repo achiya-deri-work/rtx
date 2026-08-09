@@ -32,7 +32,14 @@ from .autotune import (
     default_cache_dir,
 )
 from .fp8_bwd import _build_bwd_runner
-from .kernels.mxfp8 import MXFP8Problem
+from .kernels.mxfp8 import (
+    DEFAULT_MXFP8_FWD_CONFIG,
+    FWD_SEARCH_SPACE,
+    MXFP8FwdConfig,
+    MXFP8Problem,
+    fwd_config_from_dict,
+    normalize_fwd_config,
+)
 from .kernels.mxfp8_bwd import (
     DEFAULT_MXFP8_BWD_CONFIG,
     MXFP8BwdConfig,
@@ -48,7 +55,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 3
+KERNEL_REVISION = 4
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -116,6 +123,9 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
         return {prefix: dict(value)}
 
     axes: dict[str, tuple[dict[str, object], ...]] = {
+        f"{prefix}_backend": tuple(
+            wrap({"backend": value}) for value in ("fused", "decomposed")
+        ),
         f"{prefix}_quant_launches": tuple(
             wrap({"quant_launches": value}) for value in ("dual", "separate")
         ),
@@ -290,6 +300,18 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
                 ),
             )
         ),
+        f"{prefix}_reduction_epilogue_launch": tuple(
+            wrap(
+                {
+                    "reduction_threads": threads,
+                    "reduction_vector": vector,
+                    "reduction_waves": waves,
+                }
+            )
+            for threads in (64, 128, 256, 512, 1024)
+            for vector in (1, 2, 4, 8)
+            for waves in (1, 2, 3, 4, 6, 8)
+        ),
         f"{prefix}_tile_scheduler": tuple(
             wrap(value)
             for value in (
@@ -322,6 +344,17 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
             )
         ),
     }
+    # Backward's fused family is the dynamic-forward implementation itself,
+    # specialized only by the two logical GMEM layouts. Keep its entire real
+    # code-generation space available independently for dX and dW.
+    axes.update(
+        {
+            f"{prefix}_fused_{coordinate}": tuple(
+                wrap({"fused": {coordinate: value}}) for value in variants
+            )
+            for coordinate, variants in FWD_SEARCH_SPACE.items()
+        }
+    )
     transposed_tiles = tuple(
         {
             "transposed_tile_rows": rows,
@@ -361,9 +394,17 @@ BWD_COORDINATE_ORDER = tuple(BWD_SEARCH_SPACE)
 
 def _matmul_from_dict(value: Mapping[str, object]) -> MXFP8BwdMatmulConfig:
     quant_b_value = value.get("quant_b")
+    fused_value = value.get("fused")
     return MXFP8BwdMatmulConfig(
         a_orientation=str(value.get("a_orientation", "row")),
         b_orientation=str(value.get("b_orientation", "transpose")),
+        # Revision <=3 records described only the decomposed implementation.
+        backend=str(value.get("backend", "decomposed")),
+        fused=(
+            DEFAULT_MXFP8_FWD_CONFIG
+            if fused_value is None
+            else fwd_config_from_dict(dict(fused_value))  # type: ignore[arg-type]
+        ),
         quant_launches=str(value.get("quant_launches", "separate")),
         quant_a=MXFP8QuantConfig(**dict(value["quant_a"])),  # type: ignore[arg-type]
         quant_b=(
@@ -376,6 +417,9 @@ def _matmul_from_dict(value: Mapping[str, object]) -> MXFP8BwdMatmulConfig:
         split_reduction=int(value.get("split_reduction", 1)),
         reduction_tile=int(value.get("reduction_tile", 0)),
         workspace_epilogue=str(value.get("workspace_epilogue", "none")),
+        reduction_threads=int(value.get("reduction_threads", 256)),
+        reduction_vector=int(value.get("reduction_vector", 4)),
+        reduction_waves=int(value.get("reduction_waves", 1)),
         tile_scheduler=str(value.get("tile_scheduler", "static")),
         persistent_waves=int(value.get("persistent_waves", 1)),
         tiles_per_cta=int(value.get("tiles_per_cta", 1)),
@@ -404,6 +448,7 @@ def _update_matmul(
     qa = asdict(config.quant_a)
     qb = asdict(config.resolved_quant_b())
     gemm = asdict(config.gemm)
+    fused_updates = dict(updates.get("fused", {}))  # type: ignore[arg-type]
     qa_updates = dict(updates.get("quant_a", {}))  # type: ignore[arg-type]
     qb_updates = dict(updates.get("quant_b", {}))  # type: ignore[arg-type]
     qa.update(qa_updates)
@@ -429,6 +474,12 @@ def _update_matmul(
     return MXFP8BwdMatmulConfig(
         a_orientation=config.a_orientation,
         b_orientation=config.b_orientation,
+        backend=str(updates.get("backend", config.backend)),
+        fused=(
+            normalize_fwd_config(config.fused, **fused_updates)
+            if fused_updates
+            else config.fused
+        ),
         quant_launches=next_launches,
         quant_a=MXFP8QuantConfig(**qa),
         quant_b=MXFP8QuantConfig(**qb),
@@ -439,6 +490,13 @@ def _update_matmul(
         workspace_epilogue=str(
             updates.get("workspace_epilogue", config.workspace_epilogue)
         ),
+        reduction_threads=int(
+            updates.get("reduction_threads", config.reduction_threads)
+        ),
+        reduction_vector=int(
+            updates.get("reduction_vector", config.reduction_vector)
+        ),
+        reduction_waves=int(updates.get("reduction_waves", config.reduction_waves)),
         tile_scheduler=str(updates.get("tile_scheduler", config.tile_scheduler)),
         persistent_waves=int(updates.get("persistent_waves", config.persistent_waves)),
         tiles_per_cta=int(updates.get("tiles_per_cta", config.tiles_per_cta)),

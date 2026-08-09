@@ -12,6 +12,7 @@ import traceback
 import torch
 
 import rtx
+from rtx.bwd_autotune import update_bwd_config
 
 
 def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -26,7 +27,7 @@ def _dynamic_case(*, compiled: bool, training: bool) -> dict[str, object]:
         128,
         128,
         device="cuda",
-        backend="prequant",
+        backend="fused",
         autotune="off",
     )
     layer.train(training)
@@ -90,21 +91,52 @@ def _packed_inference_case(*, fully_prequantized: bool) -> dict[str, object]:
     }
 
 
-def _long_reduction_case(m: int) -> dict[str, object]:
+def _long_reduction_case(m: int, *, reduction: str) -> dict[str, object]:
     torch.manual_seed(307)
     n = k = 512
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
     grad_output = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+    config = rtx.DEFAULT_MXFP8_BWD_CONFIG
+    if reduction != "full_fp32":
+        choices = tuple(
+            (parts, reduction_tile)
+            for parts in (2, 4, 8, 16, 32)
+            for reduction_tile in (128, 256, 512, 1024, 2048, 4096)
+        )
+        split_count, tile = next(
+            (parts, reduction_tile)
+            for parts, reduction_tile in choices
+            if (parts - 1) * reduction_tile < m <= parts * reduction_tile
+        )
+        config = update_bwd_config(
+            config,
+            {
+                "dw": {
+                    "reduction": reduction,
+                    "split_reduction": split_count,
+                    "reduction_tile": tile,
+                    "workspace_epilogue": (
+                        "tree" if reduction == "split_fp32_workspace" else "none"
+                    ),
+                }
+            },
+        )
     _dx, actual_dw = rtx.mxfp8_linear_backward(
-        grad_output, x, weight, autotune="off"
+        grad_output, x, weight, config=config, autotune="off"
     )
     expected_dw = grad_output.float().T @ x.float()
     torch.cuda.synchronize()
     error = _relative_error(actual_dw, expected_dw)
     if error >= 0.07:
         raise AssertionError(f"long-reduction dW relative error exceeds 7%: {error}")
-    return {"m": m, "n": n, "k": k, "dw_relative_l2": error}
+    return {
+        "m": m,
+        "n": n,
+        "k": k,
+        "reduction": reduction,
+        "dw_relative_l2": error,
+    }
 
 
 def _multiple_stream_case() -> dict[str, object]:
@@ -174,8 +206,16 @@ def main() -> None:
         "fully_prequantized": lambda: _packed_inference_case(
             fully_prequantized=True
         ),
-        "long_sequence_dw": lambda: _long_reduction_case(
-            1024 if args.quick else args.long_m
+        "long_sequence_dw_full": lambda: _long_reduction_case(
+            1024 if args.quick else args.long_m, reduction="full_fp32"
+        ),
+        "long_sequence_dw_workspace": lambda: _long_reduction_case(
+            1024 if args.quick else args.long_m,
+            reduction="split_fp32_workspace",
+        ),
+        "long_sequence_dw_atomic": lambda: _long_reduction_case(
+            1024 if args.quick else args.long_m,
+            reduction="split_fp32_atomic",
         ),
         "multiple_streams": _multiple_stream_case,
         "variable_shapes_bounded_cache": _variable_shape_cache_case,

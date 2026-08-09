@@ -20,7 +20,14 @@ from rtx.bwd_autotune import (
 from rtx.bwd_experiments import BwdBenchmarkHarness
 from rtx.fp8_bwd import mxfp8_linear_backward
 from rtx.kernels.mxfp8 import MXFP8Problem
+from rtx.kernels.mxfp8_fwd import (
+    compile_mxfp8_atomic_split_fwd,
+    compile_mxfp8_fwd,
+    compile_mxfp8_split_fwd,
+)
+from rtx.kernels.mxfp8_reduce import compile_mxfp8_workspace_reduce
 from rtx.kernels.mxfp8_bwd import (
+    DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
     DEFAULT_MXFP8_BWD_CONFIG,
 )
 from rtx.kernels.mxfp8_quant import (
@@ -42,6 +49,8 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
         self.assertIsNone(
             DEFAULT_MXFP8_BWD_CONFIG.implementation_rejection(problem)
         )
+        self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.dx.backend, "fused")
+        self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.dw.backend, "fused")
 
     def test_forward_scales_are_not_admitted_as_backward_scales(self) -> None:
         problem = MXFP8Problem(510, 1536, 1536)
@@ -68,10 +77,36 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
 
     def test_every_search_coordinate_changes_the_config(self) -> None:
         for name, variants in BWD_SEARCH_SPACE.items():
+            # Some forward coordinates are intentionally conditional (for
+            # example quantizer_warps becomes active after entering the
+            # three-role schedule). They must have a reachable changing value,
+            # not necessarily change the baseline in isolation.
+            bases = [
+                DEFAULT_MXFP8_BWD_CONFIG,
+                update_bwd_config(
+                    DEFAULT_MXFP8_BWD_CONFIG,
+                    {
+                        "dx": {
+                            "fused": {
+                                "bf16_pipeline": (
+                                    "tma", "three_role", 32, "none", 2
+                                )
+                            }
+                        },
+                        "dw": {
+                            "fused": {
+                                "bf16_pipeline": (
+                                    "tma", "three_role", 32, "none", 2
+                                )
+                            }
+                        },
+                    },
+                ),
+            ]
             self.assertTrue(
                 any(
-                    update_bwd_config(DEFAULT_MXFP8_BWD_CONFIG, variant)
-                    != DEFAULT_MXFP8_BWD_CONFIG
+                    update_bwd_config(base, variant) != base
+                    for base in bases
                     for variant in variants
                 ),
                 name,
@@ -79,7 +114,7 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
 
     def test_unimplemented_reduction_is_named_not_benchmarked_as_noop(self) -> None:
         candidate = update_bwd_config(
-            DEFAULT_MXFP8_BWD_CONFIG,
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
             {
                 "dw": {
                     "reduction": "split_fp32_workspace",
@@ -111,7 +146,7 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
 
     def test_mixed_dual_coordinate_preserves_specialized_schedules(self) -> None:
         candidate = update_bwd_config(
-            DEFAULT_MXFP8_BWD_CONFIG,
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
             {"dx": {"quant_launches": "dual"}},
         )
         self.assertEqual(candidate.dx.quant_launches, "dual")
@@ -123,7 +158,7 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
     def test_mixed_dual_b_coordinate_remains_fused(self) -> None:
         tuner = object.__new__(BwdCoordinateDescentTuner)
         dual = update_bwd_config(
-            DEFAULT_MXFP8_BWD_CONFIG,
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
             {"dx": {"quant_launches": "dual"}},
         )
         candidate = tuner._candidate(
@@ -146,6 +181,78 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
         reason = invalid.rejection(MXFP8Problem(512, 1536, 1536))
         self.assertIsNotNone(reason)
         self.assertIn("full reduction", reason)
+
+    def test_fused_workspace_reduction_is_executable(self) -> None:
+        candidate = update_bwd_config(
+            DEFAULT_MXFP8_BWD_CONFIG,
+            {
+                "dw": {
+                    "reduction": "split_fp32_workspace",
+                    "split_reduction": 4,
+                    "reduction_tile": 128,
+                    "workspace_epilogue": "tree",
+                }
+            },
+        )
+        self.assertIsNone(
+            candidate.implementation_rejection(MXFP8Problem(512, 1536, 1536))
+        )
+
+    def test_fused_atomic_reduction_is_executable(self) -> None:
+        candidate = update_bwd_config(
+            DEFAULT_MXFP8_BWD_CONFIG,
+            {
+                "dw": {
+                    "reduction": "split_fp32_atomic",
+                    "split_reduction": 4,
+                    "reduction_tile": 128,
+                    "workspace_epilogue": "none",
+                }
+            },
+        )
+        self.assertIsNone(
+            candidate.implementation_rejection(MXFP8Problem(512, 1536, 1536))
+        )
+
+    def test_oriented_fused_kernels_compile_without_materialized_transposes(self) -> None:
+        problem = MXFP8Problem(128, 128, 128)
+        compile_mxfp8_fwd(
+            problem,
+            DEFAULT_MXFP8_BWD_CONFIG.dx.fused,
+            a_orientation="row",
+            b_orientation="transpose",
+        )
+        compile_mxfp8_fwd(
+            problem,
+            DEFAULT_MXFP8_BWD_CONFIG.dw.fused,
+            a_orientation="transpose",
+            b_orientation="transpose",
+        )
+        compile_mxfp8_split_fwd(
+            MXFP8Problem(128, 128, 512),
+            DEFAULT_MXFP8_BWD_CONFIG.dw.fused,
+            a_orientation="transpose",
+            b_orientation="transpose",
+            split_reduction=4,
+            reduction_tile=128,
+        )
+        compile_mxfp8_atomic_split_fwd(
+            MXFP8Problem(128, 128, 512),
+            DEFAULT_MXFP8_BWD_CONFIG.dw.fused,
+            a_orientation="transpose",
+            b_orientation="transpose",
+            split_reduction=4,
+            reduction_tile=128,
+        )
+        compile_mxfp8_workspace_reduce(
+            128,
+            128,
+            1,
+            algorithm="serial",
+            threads=256,
+            vector=4,
+            persistent_waves=1,
+        )
 
 
 @unittest.skipUnless(_has_sm120(), "requires an SM120/SM121 CUDA GPU")
@@ -193,9 +300,9 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         weight = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         grad_output = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         config = replace(
-            DEFAULT_MXFP8_BWD_CONFIG,
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
             dw=replace(
-                DEFAULT_MXFP8_BWD_CONFIG.dw,
+                DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG.dw,
                 quant_launches="dual",
             ),
         )
@@ -219,7 +326,7 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         weight = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         grad_output = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         config = update_bwd_config(
-            DEFAULT_MXFP8_BWD_CONFIG,
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
             {"dx": {"quant_launches": "dual"}},
         )
         self.assertIsNone(
@@ -268,7 +375,7 @@ class TestMXFP8BwdCuda(unittest.TestCase):
             ShapeSpec(128, 128, 128), protocol, seed=17
         )
         dual = update_bwd_config(
-            DEFAULT_MXFP8_BWD_CONFIG,
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG,
             {
                 "dx": {"quant_launches": "dual"},
                 "dw": {"quant_launches": "dual"},
@@ -280,7 +387,7 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         self.assertEqual(measurement["status"], "ok")
         self.assertEqual(len(measurement["timings_ms"]), 3)
         self.assertIn("dx_quant", measurement["components"])
-        race = harness.race(DEFAULT_MXFP8_BWD_CONFIG, dual, seed=18)
+        race = harness.race(DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG, dual, seed=18)
         self.assertEqual(race["status"], "ok")
         self.assertEqual(len(race["incumbent_timings_ms"]), 3)
 

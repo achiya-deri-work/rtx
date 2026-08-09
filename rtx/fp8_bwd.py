@@ -25,6 +25,28 @@ def compile_mxfp8_gemm(*args, **kwargs):
     return load_kernel_symbol("mxfp8_gemm", "compile_mxfp8_gemm")(*args, **kwargs)
 
 
+def compile_mxfp8_fwd(*args, **kwargs):
+    return load_kernel_symbol("mxfp8_fwd", "compile_mxfp8_fwd")(*args, **kwargs)
+
+
+def compile_mxfp8_split_fwd(*args, **kwargs):
+    return load_kernel_symbol("mxfp8_fwd", "compile_mxfp8_split_fwd")(
+        *args, **kwargs
+    )
+
+
+def compile_mxfp8_atomic_split_fwd(*args, **kwargs):
+    return load_kernel_symbol("mxfp8_fwd", "compile_mxfp8_atomic_split_fwd")(
+        *args, **kwargs
+    )
+
+
+def compile_mxfp8_workspace_reduce(*args, **kwargs):
+    return load_kernel_symbol("mxfp8_reduce", "compile_mxfp8_workspace_reduce")(
+        *args, **kwargs
+    )
+
+
 def compile_mxfp8_quant(*args, **kwargs):
     return load_kernel_symbol("mxfp8_quant", "compile_mxfp8_quant")(*args, **kwargs)
 
@@ -112,10 +134,65 @@ class _MatmulRunner:
 
 
 @dataclass(slots=True)
+class _FusedMatmulRunner:
+    """One-launch dynamic MXFP8 matmul with logical source orientations."""
+
+    launcher: object
+
+    def __call__(
+        self,
+        source_a: torch.Tensor,
+        source_b: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        self.launcher(source_a, source_b, out)
+
+
+@dataclass(slots=True)
+class _SplitFusedMatmulRunner:
+    """Fused quantize/MMA split partials followed by one FP32 reduction."""
+
+    partial: object
+    reducer: object
+    workspace: torch.Tensor
+
+    def __call__(
+        self,
+        source_a: torch.Tensor,
+        source_b: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        self.partial(source_a, source_b, self.workspace)
+        self.reducer(self.workspace, out)
+
+
+@dataclass(slots=True)
+class _AtomicSplitFusedMatmulRunner:
+    """Zero, atomically accumulate FP32 split partials, then cast once."""
+
+    partial: object
+    converter: object
+    accumulator: torch.Tensor
+
+    def __call__(
+        self,
+        source_a: torch.Tensor,
+        source_b: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        self.accumulator.zero_()
+        self.partial(source_a, source_b, self.accumulator)
+        self.converter(self.accumulator, out)
+
+
+@dataclass(slots=True)
 class _BwdRunner:
     execution_order: str
-    dx: _MatmulRunner
-    dw: _MatmulRunner
+    dx: _MatmulRunner | _FusedMatmulRunner | _SplitFusedMatmulRunner | _AtomicSplitFusedMatmulRunner
+    dw: _MatmulRunner | _FusedMatmulRunner | _SplitFusedMatmulRunner | _AtomicSplitFusedMatmulRunner
+    stream_schedule: str = "single"
+    dx_stream: torch.cuda.Stream | None = None
+    dw_stream: torch.cuda.Stream | None = None
 
     def __call__(
         self,
@@ -125,6 +202,18 @@ class _BwdRunner:
         grad_x: torch.Tensor,
         grad_weight: torch.Tensor,
     ) -> None:
+        if self.stream_schedule == "dual_stream":
+            assert self.dx_stream is not None and self.dw_stream is not None
+            caller = torch.cuda.current_stream(grad_output.device)
+            self.dx_stream.wait_stream(caller)
+            self.dw_stream.wait_stream(caller)
+            with torch.cuda.stream(self.dx_stream):
+                self.dx(grad_output, weight.T, grad_x)
+            with torch.cuda.stream(self.dw_stream):
+                self.dw(grad_output.T, x.T, grad_weight)
+            caller.wait_stream(self.dx_stream)
+            caller.wait_stream(self.dw_stream)
+            return
         if self.execution_order == "dx_first":
             self.dx(grad_output, weight.T, grad_x)
             self.dw(grad_output.T, x.T, grad_weight)
@@ -138,7 +227,69 @@ def _build_matmul_runner(
     problem: MXFP8Problem,
     config: MXFP8BwdMatmulConfig,
     device: torch.device,
-) -> _MatmulRunner:
+) -> _MatmulRunner | _FusedMatmulRunner | _SplitFusedMatmulRunner | _AtomicSplitFusedMatmulRunner:
+    if config.backend == "fused":
+        if config.reduction == "split_fp32_workspace":
+            workspace = torch.empty(
+                config.split_reduction * problem.m * problem.n,
+                dtype=torch.float32,
+                device=device,
+            )
+            return _SplitFusedMatmulRunner(
+                compile_mxfp8_split_fwd(
+                    problem,
+                    config.fused,
+                    a_orientation=config.a_orientation,
+                    b_orientation=config.b_orientation,
+                    split_reduction=config.split_reduction,
+                    reduction_tile=config.reduction_tile,
+                ),
+                compile_mxfp8_workspace_reduce(
+                    problem.m,
+                    problem.n,
+                    config.split_reduction,
+                    algorithm=config.workspace_epilogue,
+                    threads=config.reduction_threads,
+                    vector=config.reduction_vector,
+                    persistent_waves=config.reduction_waves,
+                ),
+                workspace,
+            )
+        if config.reduction == "split_fp32_atomic":
+            accumulator = torch.empty(
+                problem.m,
+                problem.n,
+                dtype=torch.float32,
+                device=device,
+            )
+            return _AtomicSplitFusedMatmulRunner(
+                compile_mxfp8_atomic_split_fwd(
+                    problem,
+                    config.fused,
+                    a_orientation=config.a_orientation,
+                    b_orientation=config.b_orientation,
+                    split_reduction=config.split_reduction,
+                    reduction_tile=config.reduction_tile,
+                ),
+                compile_mxfp8_workspace_reduce(
+                    problem.m,
+                    problem.n,
+                    1,
+                    algorithm="serial",
+                    threads=config.reduction_threads,
+                    vector=config.reduction_vector,
+                    persistent_waves=config.reduction_waves,
+                ),
+                accumulator,
+            )
+        return _FusedMatmulRunner(
+            compile_mxfp8_fwd(
+                problem,
+                config.fused,
+                a_orientation=config.a_orientation,
+                b_orientation=config.b_orientation,
+            )
+        )
     a_shape = (problem.m, problem.k)
     b_shape = (problem.n, problem.k)
     quantized_a = torch.empty(a_shape, dtype=torch.float8_e4m3fn, device=device)
@@ -204,7 +355,18 @@ def _build_bwd_runner(
         config=config.dw,
         device=device,
     )
-    return _BwdRunner(config.execution_order, dx, dw)
+    dx_stream = dw_stream = None
+    if config.stream_schedule == "dual_stream":
+        dx_stream = torch.cuda.Stream(device=device)
+        dw_stream = torch.cuda.Stream(device=device)
+    return _BwdRunner(
+        config.execution_order,
+        dx,
+        dw,
+        config.stream_schedule,
+        dx_stream,
+        dw_stream,
+    )
 
 
 _CONFIGS: dict[str, MXFP8BwdConfig] = {}

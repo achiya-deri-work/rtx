@@ -7,7 +7,8 @@ current implementation contains:
 
 - fused BF16 input/weight quantization and MXFP8 forward GEMM;
 - materialized dynamic MXFP8 quantization plus GEMM;
-- MXFP8 backward for `dX` and the FP32-accumulating long-reduction `dW`;
+- fused dynamic MXFP8 backward for `dX` and the FP32-accumulating `dW`,
+  including logical-transpose TMA transport and split-FP32 workspace reduction;
 - PyTorch custom-op and `nn.Module` frontends;
 - persistent random, gradient-boosted cost-model, bandit, and local search;
 - backend-neutral conditional spaces, staged tasks, and resumable ask/tell

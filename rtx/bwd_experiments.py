@@ -224,20 +224,37 @@ class BwdBenchmarkHarness:
         runner = prepared.runner
         component_calls = max(1, min(calls, 1024))
         component_samples = max(3, min(samples, 5))
-        operations = {
-            "dx_quant": lambda: runner.dx.quantize(
-                self.grad_output, self.weight.T
-            ),
-            "dx_gemm_hot_materialized": lambda: runner.dx.matmul(
-                prepared.grad_x
-            ),
-            "dw_quant": lambda: runner.dw.quantize(
-                self.grad_output.T, self.x.T
-            ),
-            "dw_gemm_hot_materialized": lambda: runner.dw.matmul(
-                prepared.grad_weight
-            ),
-        }
+        operations: dict[str, Callable[[], None]] = {}
+        if prepared.config.dx.backend == "fused":
+            operations["dx_fused_quant_mma"] = lambda: runner.dx(
+                self.grad_output, self.weight.T, prepared.grad_x
+            )
+        else:
+            operations.update(
+                {
+                    "dx_quant": lambda: runner.dx.quantize(
+                        self.grad_output, self.weight.T
+                    ),
+                    "dx_gemm_hot_materialized": lambda: runner.dx.matmul(
+                        prepared.grad_x
+                    ),
+                }
+            )
+        if prepared.config.dw.backend == "fused":
+            operations["dw_fused_quant_mma"] = lambda: runner.dw(
+                self.grad_output.T, self.x.T, prepared.grad_weight
+            )
+        else:
+            operations.update(
+                {
+                    "dw_quant": lambda: runner.dw.quantize(
+                        self.grad_output.T, self.x.T
+                    ),
+                    "dw_gemm_hot_materialized": lambda: runner.dw.matmul(
+                        prepared.grad_weight
+                    ),
+                }
+            )
         result: dict[str, object] = {}
         for name, operation in operations.items():
             timings = [

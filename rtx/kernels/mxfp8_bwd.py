@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
-from .mxfp8 import MXFP8Problem
+from .mxfp8 import DEFAULT_MXFP8_FWD_CONFIG, MXFP8FwdConfig, MXFP8Problem
 from ..configs import MXFP8GemmConfig, MXFP8QuantConfig
 
 
@@ -20,6 +20,10 @@ class MXFP8BwdMatmulConfig:
 
     a_orientation: str = "row"
     b_orientation: str = "transpose"
+    # ``fused`` runs the same BF16->E4M3/E8M0->MMA pipeline as dynamic
+    # forward. ``decomposed`` remains as a measured reference and fallback.
+    backend: str = "fused"
+    fused: MXFP8FwdConfig = DEFAULT_MXFP8_FWD_CONFIG
     quant_launches: str = "separate"
     quant_a: MXFP8QuantConfig = MXFP8QuantConfig(
         load_bits=32,
@@ -42,6 +46,9 @@ class MXFP8BwdMatmulConfig:
     split_reduction: int = 1
     reduction_tile: int = 0
     workspace_epilogue: str = "none"
+    reduction_threads: int = 256
+    reduction_vector: int = 4
+    reduction_waves: int = 1
     tile_scheduler: str = "static"
     persistent_waves: int = 1
     tiles_per_cta: int = 1
@@ -60,6 +67,74 @@ class MXFP8BwdMatmulConfig:
             return "A orientation must be row or transpose"
         if self.b_orientation not in ("row", "transpose"):
             return "B orientation must be row or transpose"
+        if self.backend not in ("fused", "decomposed"):
+            return "backend must be fused or decomposed"
+        if self.backend == "fused":
+            if self.reduction not in (
+                "full_fp32",
+                "split_fp32_workspace",
+                "split_fp32_atomic",
+                "cluster_fp32",
+            ):
+                return "unknown reduction strategy"
+            if self.split_reduction not in (1, 2, 4, 8, 16, 32):
+                return "split_reduction must be 1, 2, 4, 8, 16, or 32"
+            if self.reduction_tile not in (0, 128, 256, 512, 1024, 2048, 4096):
+                return "unsupported reduction tile"
+            if self.workspace_epilogue not in (
+                "none",
+                "serial",
+                "tree",
+                "persistent_tree",
+            ):
+                return "unknown workspace epilogue"
+            if self.reduction_threads not in (64, 128, 256, 512, 1024):
+                return "reduction_threads must be 64, 128, 256, 512, or 1024"
+            if self.reduction_vector not in (1, 2, 4, 8):
+                return "reduction_vector must be 1, 2, 4, or 8"
+            if self.reduction_waves not in (1, 2, 3, 4, 6, 8):
+                return "reduction_waves must be 1, 2, 3, 4, 6, or 8"
+            if self.reduction == "full_fp32" and (
+                self.split_reduction != 1
+                or self.reduction_tile != 0
+                or self.workspace_epilogue != "none"
+            ):
+                return "full reduction has no split/workspace coordinates"
+            if self.reduction in ("split_fp32_workspace", "split_fp32_atomic"):
+                if (
+                    self.reduction == "split_fp32_workspace"
+                    and self.workspace_epilogue == "none"
+                ):
+                    return "split workspace reduction requires an epilogue"
+                if (
+                    self.reduction == "split_fp32_atomic"
+                    and self.workspace_epilogue != "none"
+                ):
+                    return "atomic split reduction does not use a workspace epilogue"
+                if not (
+                    (self.split_reduction - 1) * self.reduction_tile < problem.k
+                    <= self.split_reduction * self.reduction_tile
+                ):
+                    return "split count/tile must cover K without an empty partition"
+                if self.reduction_tile % self.fused.bf16_tile_k:
+                    return "reduction tile must be divisible by the BF16 transport tile"
+                if self.fused.epilogue != "direct":
+                    return "split partials require fused.epilogue='direct'"
+                if self.fused.persistent:
+                    return "split partial GEMM cannot also be persistent"
+            reason = self.fused.oriented_implementation_rejection(
+                problem, self.a_orientation, self.b_orientation
+            )
+            if reason is not None:
+                return f"fused kernel: {reason}"
+            if self.reduction == "cluster_fp32":
+                return f"fused {self.reduction!r} reduction is not implemented yet"
+            if self.tile_scheduler != "static":
+                return (
+                    "use fused.persistent/reuse for fused backward scheduling; "
+                    "legacy decomposed tile_scheduler coordinates are inactive"
+                )
+            return None
         if self.quant_launches not in ("dual", "separate"):
             return "quant_launches must be dual or separate"
         quant_b = self.resolved_quant_b()
@@ -151,6 +226,8 @@ class MXFP8BwdMatmulConfig:
         reason = self.rejection(problem)
         if reason is not None:
             return reason
+        if self.backend == "fused":
+            return None
         if self.reduction != "full_fp32":
             return f"reduction family {self.reduction!r} is not implemented yet"
         if self.tile_scheduler != "static":
@@ -228,7 +305,7 @@ class MXFP8BwdConfig:
             return reason
         if self.execution_order == "interleaved":
             return "interleaved dX/dW execution is not implemented yet"
-        if self.stream_schedule != "single":
+        if self.stream_schedule == "graph":
             return f"stream schedule {self.stream_schedule!r} is not implemented yet"
         reason = self.dx.implementation_rejection(
             MXFP8Problem(forward.m, forward.k, forward.n)
@@ -244,8 +321,16 @@ class MXFP8BwdConfig:
 DEFAULT_MXFP8_BWD_CONFIG = MXFP8BwdConfig()
 
 
+DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG = replace(
+    DEFAULT_MXFP8_BWD_CONFIG,
+    dx=replace(DEFAULT_MXFP8_BWD_CONFIG.dx, backend="decomposed"),
+    dw=replace(DEFAULT_MXFP8_BWD_CONFIG.dw, backend="decomposed"),
+)
+
+
 __all__ = [
     "DEFAULT_MXFP8_BWD_CONFIG",
+    "DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG",
     "MXFP8BwdConfig",
     "MXFP8BwdMatmulConfig",
 ]

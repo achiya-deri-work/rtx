@@ -504,8 +504,19 @@ kernel, SMEM transpose copy, or BF16 orientation workspace.
 
 Each oriented operand is dynamically quantized to E4M3 with its own E8M0
 scales. Forward scales are not reused because the backward reduction axes are
-different. The baseline dW GEMM performs the entire token reduction in FP32
-accumulators and converts only its final result to BF16.
+different. The default dX and dW paths instantiate the fused dynamic-forward
+CuTe kernel with different logical GMEM strides: quantized operands and scales
+live only in CTA SMEM and never make a global-memory round trip. Scalar,
+TMA/three-role, native scale layout, register, LDSM/S2R, epilogue, raster and
+forward-style persistent schedules are independently autotunable for dX and
+dW.
+
+The full dW family performs the entire token reduction in FP32 accumulators and
+converts only its final result to BF16. The executable split-workspace family
+assigns disjoint block-aligned token intervals to CTAs, stores FP32 partials,
+and performs one serial, tree, or persistent-tree FP32 epilogue before the BF16
+conversion. Reduction split, tile, threads, vector width, algorithm, and
+persistent waves are tuning coordinates.
 
 The executable dual quantizer also accepts mixed source orientations with
 independent schedules. dX can therefore quantize row-major `dY` and logical
@@ -514,8 +525,8 @@ share vector width, arithmetic, tile, or register choices. dW similarly emits
 both logical-transpose operands in one launch. Separate launches remain an
 autotuned option because fusion can lose on some shapes.
 
-`rtx.bwd_autotune` times the whole backward, including logical-layout
-quantization, four quantized operands, dX, and dW. Its persistent device/shape database saves
+`rtx.bwd_autotune` times the whole backward, including fused logical-layout
+quantization, dX, and dW. Its persistent device/shape database saves
 successful measurements, named legality/implementation rejections, raw timing
 samples, compilation time, correctness results, sessions, and the selected
 winner. The search keeps dX and dW schedules independent and includes:
@@ -530,10 +541,11 @@ winner. The search keeps dX and dW schedules independent and includes:
 - persistent/multi-output tile scheduling, operand reuse/locality, dX/dW order,
   and stream scheduling.
 
-Families that are represented but do not generate distinct code yet are saved
-as `implementation_rejected`; they are never benchmarked as no-op knobs. The
-current executable baseline uses row-major and logical-transpose quantizers
-plus the MXFP8 GEMM. Tune directly with:
+The decomposed materialized-quantization backend remains in the space as an
+explicit measured reference. Split-FP32 atomic accumulation is also executable
+as a zero/atomic/cast alternative to the larger workspace. Cluster reduction
+and true K-interleaved dX/dW remain named `implementation_rejected` families;
+they are never benchmarked as no-op knobs. Tune directly with:
 
 ```python
 from rtx import CoordinateDescentPolicy, tune_mxfp8_backward

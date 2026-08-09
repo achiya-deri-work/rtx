@@ -115,16 +115,53 @@ def _make_scale_s2r_atom(dtype: type[cutlass.Numeric], bits: int):
 class MXFP8LinearFwdKernel:
     """One CTA computes one output tile using cooperative quantization/MMA."""
 
-    def __init__(self, problem: MXFP8Problem, config: MXFP8FwdConfig):
-        rejection = config.implementation_rejection(problem)
+    def __init__(
+        self,
+        problem: MXFP8Problem,
+        config: MXFP8FwdConfig,
+        *,
+        a_orientation: str = "row",
+        b_orientation: str = "row",
+        split_reduction: int = 1,
+        reduction_tile: int = 0,
+        atomic_output: bool = False,
+    ):
+        rejection = config.oriented_implementation_rejection(
+            problem, a_orientation, b_orientation
+        )
         if rejection is not None:
             raise ValueError(f"illegal MXFP8 forward configuration: {rejection}")
         self.problem = problem
         self.config = config
+        self.a_orientation = a_orientation
+        self.b_orientation = b_orientation
+        self.split_reduction = split_reduction
+        self.reduction_tile = reduction_tile
+        self.atomic_output = atomic_output
+        if split_reduction < 1:
+            raise ValueError("split_reduction must be positive")
+        if split_reduction == 1 and (reduction_tile != 0 or atomic_output):
+            raise ValueError("an unsplit kernel must use reduction_tile=0")
+        if split_reduction > 1:
+            if config.epilogue != "direct":
+                raise ValueError("split reduction requires the FP32 direct epilogue")
+            if config.persistent:
+                raise ValueError("split reduction persistence is tuned in its epilogue")
+            if reduction_tile <= 0 or reduction_tile % config.bf16_tile_k:
+                raise ValueError(
+                    "split reduction tile must be a positive BF16-tile multiple"
+                )
+            if not (
+                (split_reduction - 1) * reduction_tile < problem.k
+                <= split_reduction * reduction_tile
+            ):
+                raise ValueError(
+                    "split reduction count/tile must cover K without an empty slice"
+                )
         self.tile_shape_mnk = (config.tile_m, config.tile_n, config.tile_k)
         self.num_mma_warps = config.num_mma_warps
         self.threads_per_cta = config.num_threads
-        total_tiles = (
+        total_tiles = split_reduction * (
             (problem.m + config.tile_m - 1) // config.tile_m
         ) * ((problem.n + config.tile_n - 1) // config.tile_n)
         self.grid_ctas = total_tiles
@@ -149,7 +186,7 @@ class MXFP8LinearFwdKernel:
         self.b_dtype = Float8E4M3FN
         self.sf_dtype = Float8E8M0FNU
         self.acc_dtype = Float32
-        self.c_dtype = BFloat16
+        self.c_dtype = Float32 if split_reduction > 1 else BFloat16
         self.a_layout = utils.LayoutEnum.ROW_MAJOR
         self.b_layout = utils.LayoutEnum.ROW_MAJOR
 
@@ -237,7 +274,7 @@ class MXFP8LinearFwdKernel:
         )
         out_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
             swizzle_kinds["128b"],
-            BFloat16,
+            self.c_dtype,
         )
         self.out_smem_layout = cute.tile_to_shape(
             out_atom,
@@ -362,7 +399,7 @@ class MXFP8LinearFwdKernel:
                 ]
                 out: cute.struct.Align[
                     cute.struct.MemRange[
-                        BFloat16,
+                        self.c_dtype,
                         (
                             cute.cosize(self.out_smem_layout)
                             if cfg.epilogue == "tma"
@@ -399,7 +436,7 @@ class MXFP8LinearFwdKernel:
                 ]
                 out: cute.struct.Align[
                     cute.struct.MemRange[
-                        BFloat16,
+                        self.c_dtype,
                         (
                             cute.cosize(self.out_smem_layout)
                             if cfg.epilogue == "tma"
@@ -704,6 +741,12 @@ class MXFP8LinearFwdKernel:
                 work_linear = (
                     linear_tile * self.work_tiles_per_cta + work_slot
                 )
+            split_id = Int32(0)
+            if cutlass.const_expr(
+                self.split_reduction > 1 and not self.atomic_output
+            ):
+                split_id = work_linear // total_tiles
+                work_linear = work_linear % total_tiles
             # Grouped rasterization is bijective even for a partial final
             # group.  Reuse policies select the matching contiguous order.
             raster_n = cfg.raster == "n"
@@ -739,8 +782,18 @@ class MXFP8LinearFwdKernel:
             # partition_C gives an accumulator and a direct global view with the
             # same per-thread coordinate order.  The identity tensor supplies tail
             # predicates for non-multiple M/N dimensions.
+            out_matrix = out
+            if cutlass.const_expr(self.split_reduction > 1):
+                out_matrix = cute.make_tensor(
+                    out.iterator
+                    + split_id * self.problem.m * self.problem.n,
+                    cute.make_layout(
+                        (self.problem.m, self.problem.n),
+                        stride=(self.problem.n, 1),
+                    ),
+                )
             g_out_tile = cute.local_tile(
-                out,
+                out_matrix,
                 (cfg.tile_m, cfg.tile_n),
                 (block_m, block_n),
             )
@@ -829,8 +882,21 @@ class MXFP8LinearFwdKernel:
                 else:
                     cute.arch.setmaxregister_increase(cfg.consumer_registers)
     
-            for k_tile in range(num_k_tiles, unroll=cfg.k_unroll):
-                mma_tile_k = k_tile // loads_per_mma_tile
+            first_k_tile = Int32(0)
+            final_k_tile = Int32(num_k_tiles)
+            if cutlass.const_expr(self.split_reduction > 1):
+                reduction_tiles = self.reduction_tile // cfg.bf16_tile_k
+                first_k_tile = split_id * reduction_tiles
+                final_k_tile = cutlass.min(
+                    first_k_tile + reduction_tiles, num_k_tiles
+                )
+            for k_tile in cutlass.range(
+                first_k_tile,
+                final_k_tile,
+                unroll=cfg.k_unroll,
+            ):
+                local_k_tile = k_tile - first_k_tile
+                mma_tile_k = local_k_tile // loads_per_mma_tile
                 k_block_base = (k_tile % loads_per_mma_tile) * blocks_per_load
                 stage = Int32(mma_tile_k % cfg.mxfp8_stages)
                 bf16_stage = Int32(0)
@@ -1268,7 +1334,15 @@ class MXFP8LinearFwdKernel:
                     ):
                         coord = t_cc_out[elem]
                         if coord[0] < self.problem.m and coord[1] < self.problem.n:
-                            t_cg_out[elem] = BFloat16(accumulators[elem])
+                            if cutlass.const_expr(self.atomic_output):
+                                cute.arch.atomic_add(
+                                    t_cg_out.iterator + t_cg_out.layout(elem),
+                                    accumulators[elem],
+                                    sem="relaxed",
+                                    scope="gpu",
+                                )
+                            else:
+                                t_cg_out[elem] = self.c_dtype(accumulators[elem])
             elif cutlass.const_expr(cfg.epilogue == "tma"):
                 full_output_tile = (
                     (block_m + 1) * cfg.tile_m <= self.problem.m
@@ -1319,21 +1393,39 @@ class MXFP8LinearFwdKernel:
 def compile_mxfp8_fwd(
     problem: MXFP8Problem,
     config: MXFP8FwdConfig,
+    *,
+    a_orientation: str = "row",
+    b_orientation: str = "row",
 ):
-    """Compile and cache a shape/config-specialized TVM-FFI launcher."""
+    """Compile a fused GEMM over row-major or metadata-only transpose views."""
 
     problem.validate()
-    kernel = MXFP8LinearFwdKernel(problem, config)
+    kernel = MXFP8LinearFwdKernel(
+        problem,
+        config,
+        a_orientation=a_orientation,
+        b_orientation=b_orientation,
+    )
+    a_stride = (
+        (problem.k, 1)
+        if a_orientation == "row"
+        else (1, problem.m)
+    )
+    b_stride = (
+        (problem.k, 1)
+        if b_orientation == "row"
+        else (1, problem.n)
+    )
     x = cute.runtime.make_fake_tensor(
         BFloat16,
         (problem.m, problem.k),
-        stride=(problem.k, 1),
+        stride=a_stride,
         assumed_align=16,
     )
     weight = cute.runtime.make_fake_tensor(
         BFloat16,
         (problem.n, problem.k),
-        stride=(problem.k, 1),
+        stride=b_stride,
         assumed_align=16,
     )
     out = cute.runtime.make_fake_tensor(
@@ -1356,4 +1448,125 @@ def compile_mxfp8_fwd(
     )
 
 
-__all__ = ["MXFP8LinearFwdKernel", "compile_mxfp8_fwd"]
+@lru_cache(maxsize=None)
+def compile_mxfp8_split_fwd(
+    problem: MXFP8Problem,
+    config: MXFP8FwdConfig,
+    *,
+    a_orientation: str,
+    b_orientation: str,
+    split_reduction: int,
+    reduction_tile: int,
+):
+    """Compile fused dynamic quantization into FP32 split-K partials.
+
+    The launcher writes a flat ``[split, M, N]`` workspace. Every slice owns a
+    disjoint, block-aligned interval of the original reduction dimension, and
+    accumulation remains FP32 from tensor-core issue through the workspace.
+    """
+
+    problem.validate()
+    kernel = MXFP8LinearFwdKernel(
+        problem,
+        config,
+        a_orientation=a_orientation,
+        b_orientation=b_orientation,
+        split_reduction=split_reduction,
+        reduction_tile=reduction_tile,
+    )
+    a_stride = (problem.k, 1) if a_orientation == "row" else (1, problem.m)
+    b_stride = (problem.k, 1) if b_orientation == "row" else (1, problem.n)
+    x = cute.runtime.make_fake_tensor(
+        BFloat16,
+        (problem.m, problem.k),
+        stride=a_stride,
+        assumed_align=16,
+    )
+    weight = cute.runtime.make_fake_tensor(
+        BFloat16,
+        (problem.n, problem.k),
+        stride=b_stride,
+        assumed_align=16,
+    )
+    workspace = cute.runtime.make_fake_tensor(
+        Float32,
+        (split_reduction * problem.m * problem.n,),
+        stride=(1,),
+        assumed_align=16,
+    )
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        kernel,
+        x,
+        weight,
+        workspace,
+        stream,
+        options=(
+            "--enable-tvm-ffi --opt-level 3 "
+            f"--ptxas-options '-O3 -v --maxrregcount={config.maxrregcount}'"
+        ),
+    )
+
+
+@lru_cache(maxsize=None)
+def compile_mxfp8_atomic_split_fwd(
+    problem: MXFP8Problem,
+    config: MXFP8FwdConfig,
+    *,
+    a_orientation: str,
+    b_orientation: str,
+    split_reduction: int,
+    reduction_tile: int,
+):
+    """Compile fused split-K partials which atomically accumulate in FP32."""
+
+    problem.validate()
+    kernel = MXFP8LinearFwdKernel(
+        problem,
+        config,
+        a_orientation=a_orientation,
+        b_orientation=b_orientation,
+        split_reduction=split_reduction,
+        reduction_tile=reduction_tile,
+        atomic_output=True,
+    )
+    a_stride = (problem.k, 1) if a_orientation == "row" else (1, problem.m)
+    b_stride = (problem.k, 1) if b_orientation == "row" else (1, problem.n)
+    x = cute.runtime.make_fake_tensor(
+        BFloat16,
+        (problem.m, problem.k),
+        stride=a_stride,
+        assumed_align=16,
+    )
+    weight = cute.runtime.make_fake_tensor(
+        BFloat16,
+        (problem.n, problem.k),
+        stride=b_stride,
+        assumed_align=16,
+    )
+    accumulator = cute.runtime.make_fake_tensor(
+        Float32,
+        (problem.m, problem.n),
+        stride=(problem.n, 1),
+        assumed_align=16,
+    )
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        kernel,
+        x,
+        weight,
+        accumulator,
+        stream,
+        options=(
+            "--enable-tvm-ffi --opt-level 3 "
+            f"--ptxas-options '-O3 -v --maxrregcount={config.maxrregcount}'"
+        ),
+    )
+
+
+__all__ = [
+    "MXFP8LinearFwdKernel",
+    "compile_mxfp8_fwd",
+    "compile_mxfp8_atomic_split_fwd",
+    "compile_mxfp8_split_fwd",
+]

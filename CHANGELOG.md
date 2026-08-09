@@ -3,6 +3,19 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.10.0
+
+- Make fused dynamic quantization/MMA the default MXFP8 backward backend by
+  compiling the forward-class CuTe kernel over row-major or metadata-only
+  logical-transpose tensor layouts. dX and dW now expose the complete dynamic
+  forward schedule independently without materializing E4M3 operands or E8M0
+  scales in global memory.
+- Add executable split-K dW with FP32 partial workspaces and serial, tree, or
+  persistent-tree FP32 epilogues, an FP32 atomic alternative, and dual-stream
+  dX/dW execution.
+- Preserve the decomposed quantize-plus-GEMM implementation as an explicitly
+  selectable benchmark baseline and advance the backward kernel revision.
+
 ## 0.9.0
 
 - Add dispersion-gated adaptive timing: stable screens stop after 3 samples,

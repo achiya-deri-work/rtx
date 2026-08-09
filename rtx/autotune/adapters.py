@@ -641,7 +641,22 @@ def make_mxfp8_bwd_adapter(
         reason = config.implementation_rejection(problem)  # type: ignore[attr-defined]
         if reason is None:
             for name, matmul in (("dX", config.dx), ("dW", config.dw)):  # type: ignore[attr-defined]
-                reason = _gemm_smem_rejection(matmul.gemm, device)
+                if matmul.backend == "fused":
+                    profile = _device_dict(device)
+                    smem_limit = int(
+                        profile_value(profile, "shared_memory_per_block_optin", 0)
+                        or profile_value(profile, "shared_memory_per_block", 0)
+                        or 0
+                    )
+                    required = _fused_smem_bytes(matmul.fused)
+                    reason = (
+                        f"fused kernel requires {required} bytes of CTA SMEM, "
+                        f"device limit is {smem_limit}"
+                        if smem_limit and required > smem_limit
+                        else None
+                    )
+                else:
+                    reason = _gemm_smem_rejection(matmul.gemm, device)
                 if reason is not None:
                     reason = f"{name}: {reason}"
                     break
@@ -652,24 +667,103 @@ def make_mxfp8_bwd_adapter(
         dw_matmul = config.dw  # type: ignore[attr-defined]
         dx_problem = MXFP8Problem(problem.m, problem.k, problem.n)
         dw_problem = MXFP8Problem(problem.n, problem.k, problem.m)
-        values = _prefix(
-            _gemm_features(
-                dx_problem, dx_matmul.gemm, device, materialized_quant=True
-            ),
-            "dx_",
-        )
-        values.update(
-            _prefix(
-                _gemm_features(
-                    dw_problem, dw_matmul.gemm, device, materialized_quant=True
-                ),
-                "dw_",
-            )
-        )
+        values: dict[str, float] = {}
         for name, matmul, matmul_problem in (
             ("dx", dx_matmul, dx_problem),
             ("dw", dw_matmul, dw_problem),
         ):
+            if matmul.backend == "fused":
+                fused = matmul.fused
+                profile = _device_dict(device)
+                natural_ctas = (
+                    (matmul_problem.m + fused.tile_m - 1) // fused.tile_m
+                ) * ((matmul_problem.n + fused.tile_n - 1) // fused.tile_n)
+                grid_ctas = natural_ctas
+                if fused.persistent:
+                    sm_count = max(
+                        1,
+                        int(profile_value(profile, "multiprocessor_count", 1) or 1),
+                    )
+                    grid_ctas = min(
+                        natural_ctas, sm_count * fused.persistent_waves
+                    )
+                    while grid_ctas > 1 and natural_ctas % grid_ctas:
+                        grid_ctas -= 1
+                matmul_values = geometry_features(
+                    m=matmul_problem.m,
+                    n=matmul_problem.n,
+                    k=matmul_problem.k,
+                    tile_m=fused.tile_m,
+                    tile_n=fused.tile_n,
+                    tile_k=fused.tile_k,
+                    profile=profile,
+                    grid_ctas=grid_ctas,
+                )
+                matmul_values.update(
+                    traffic_features(
+                        m=matmul_problem.m,
+                        n=matmul_problem.n,
+                        k=matmul_problem.k,
+                        tile_m=fused.tile_m,
+                        tile_n=fused.tile_n,
+                        input_element_bytes=2,
+                        output_element_bytes=2,
+                        profile=profile,
+                        materialized_quant=False,
+                    )
+                )
+                matmul_values.update(
+                    backend_fused=1.0,
+                    total_kernel_launches=(
+                        2.0
+                        if matmul.reduction == "split_fp32_workspace"
+                        else (
+                            3.0
+                            if matmul.reduction == "split_fp32_atomic"
+                            else 1.0
+                        )
+                    ),
+                    quantized_materialization_bytes=0.0,
+                    work_tiles_per_cta=natural_ctas / max(1, grid_ctas),
+                    pipeline_buffer_bytes=float(_fused_smem_bytes(fused)),
+                )
+                values.update(_prefix(matmul_values, f"{name}_"))
+                values[f"{name}_split_reduction"] = float(
+                    matmul.split_reduction
+                )
+                values[f"{name}_reduction_tile"] = float(matmul.reduction_tile)
+                values[f"{name}_workspace_fp32_bytes"] = float(
+                    matmul_problem.m
+                    * matmul_problem.n
+                    * (
+                        matmul.split_reduction
+                        if matmul.reduction == "split_fp32_workspace"
+                        else (1 if matmul.reduction == "split_fp32_atomic" else 0)
+                    )
+                    * 4
+                )
+                values[f"{name}_reduction_threads"] = float(
+                    matmul.reduction_threads
+                )
+                values[f"{name}_reduction_vector"] = float(
+                    matmul.reduction_vector
+                )
+                values[f"{name}_reduction_waves"] = float(
+                    matmul.reduction_waves
+                )
+                continue
+
+            values.update(
+                _prefix(
+                    _gemm_features(
+                        matmul_problem,
+                        matmul.gemm,
+                        device,
+                        materialized_quant=True,
+                    ),
+                    f"{name}_",
+                )
+            )
             quant_b = matmul.resolved_quant_b()
             values.update(
                 _prefix(
@@ -697,6 +791,10 @@ def make_mxfp8_bwd_adapter(
             )
             values[f"{name}_quant_launch_count"] = (
                 1.0 if matmul.quant_launches == "dual" else 2.0
+            )
+            values[f"{name}_backend_fused"] = 0.0
+            values[f"{name}_total_kernel_launches"] = (
+                values[f"{name}_quant_launch_count"] + 1.0
             )
             values[f"{name}_split_reduction"] = float(matmul.split_reduction)
             values[f"{name}_reduction_tile"] = float(matmul.reduction_tile)

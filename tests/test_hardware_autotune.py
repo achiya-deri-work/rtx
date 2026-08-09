@@ -21,6 +21,7 @@ from rtx.autotune.hardware import (
 )
 from rtx.kernels.mxfp8 import DEFAULT_MXFP8_FWD_CONFIG, MXFP8Problem
 from rtx.kernels.mxfp8_bwd import DEFAULT_MXFP8_BWD_CONFIG
+from rtx.kernels.mxfp8_bwd import DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG
 
 
 @dataclass(frozen=True)
@@ -32,7 +33,7 @@ class _CompileConfig:
 class HardwareAutotuneTests(unittest.TestCase):
     def test_backward_adapter_rejects_runtime_smem_overhead_before_launch(self) -> None:
         raw_limit = _gemm_launch_smem_bytes(
-            DEFAULT_MXFP8_BWD_CONFIG.dx.gemm
+            DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG.dx.gemm
         ) - 1024
         adapter = make_mxfp8_bwd_adapter(
             MXFP8Problem(512, 1536, 1536),
@@ -43,7 +44,7 @@ class HardwareAutotuneTests(unittest.TestCase):
                 }
             },
         )
-        rejection = adapter.rejection(DEFAULT_MXFP8_BWD_CONFIG)
+        rejection = adapter.rejection(DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG)
         self.assertIsNotNone(rejection)
         self.assertIn("runtime overhead", rejection[1])
 

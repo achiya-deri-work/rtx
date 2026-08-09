@@ -394,6 +394,39 @@ class MXFP8FwdConfig:
             return "not implemented by cooperative kernel: " + ", ".join(unsupported)
         return None
 
+    def oriented_implementation_rejection(
+        self,
+        problem: MXFP8Problem,
+        a_orientation: str = "row",
+        b_orientation: str = "row",
+    ) -> str | None:
+        """Validate the fused kernel for physical row or logical-transpose views.
+
+        A transpose is represented only by the GMEM tensor layout ``(1, rows)``.
+        TMA can move that physical layout into the ordinary row/K SMEM tile, so
+        quantization and MMA remain identical to forward.  ``cp.async`` and
+        vector scalar loads, on the other hand, require adjacent logical-K
+        values and therefore are not legal for a transposed source.
+        """
+
+        reason = self.implementation_rejection(problem)
+        if reason is not None:
+            return reason
+        if a_orientation not in ("row", "transpose"):
+            return "A orientation must be row or transpose"
+        if b_orientation not in ("row", "transpose"):
+            return "B orientation must be row or transpose"
+        transposed = a_orientation == "transpose" or b_orientation == "transpose"
+        if transposed and self.load_engine == "cpasync":
+            return "logical-transpose operands require scalar or TMA transport"
+        if (
+            transposed
+            and self.load_engine == "scalar"
+            and self.quant_load_bits != 16
+        ):
+            return "logical-transpose scalar transport requires 16-bit loads"
+        return None
+
 
 DEFAULT_MXFP8_FWD_CONFIG = MXFP8FwdConfig()
 MXFP8_FWD_KERNEL_REVISION = 13
