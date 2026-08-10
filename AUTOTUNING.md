@@ -14,8 +14,8 @@ Persistent inference uses separate families:
 - `mxfp8_fully_prequant_fwd` measures GEMM only and treats both packing steps
   as untimed AOT work.
 - `nvfp4_dynamic_fwd` jointly measures BF16-to-E2M1 block quantization for X/W
-  and the native packed GEMM; dual versus independent quantizer launches are a
-  real coordinate;
+  and the native packed GEMM; dual, independent, and two-stream concurrent
+  quantizer launches are real coordinates;
 - `nvfp4_weight_prequant_fwd` measures X quantization plus GEMM; and
 - `nvfp4_fully_prequant_fwd` measures the packed GEMM only.
 
@@ -24,7 +24,26 @@ relying on rejection or hoping the learned model ignores no-op coordinates.
 The dynamic NVFP4 family retains the complete active quantizer, GEMM, launch,
 register, TMA/epilogue, persistence/locality, and L2 policy space. Its
 revision-2 block-only kernels remove unit outer-scale pointers and arithmetic
-from both the quantizer and GEMM ABIs.
+from both the quantizer and GEMM ABIs. Revision 3 adds native K=64/128/256
+geometry, exact-E4M3-LUT and approximate reciprocal paths, leader-broadcast
+scale computation, tensor-core-native physical scale emission with TMA scale
+transport, concurrent quantizer launches, component timings, and balanced
+SM-count GEMM grids.
+
+Balanced persistence separates the maximum work tiles per CTA from the launch
+grid. Given `T` output tiles, cap `C`, SM count `S`, and requested waves `W`,
+the grid is `max(ceil(T/C), min(T, S*W))`; work is assigned in grid-strided
+order. This avoids pathological tail waves such as 144 output tiles scheduled
+as 72 CTAs on a 70-SM GPU. A one-wave, cap-four schedule instead launches 70
+CTAs and was the decisive M=1536 NVFP4 improvement. It is still a tuning
+coordinate: the long-M study selected a different schedule.
+
+The search includes a complete materialized implementation anchor based on a
+previous verified basin plus the balanced grid. This is a proposal seed, not a
+winner or legality rule. All fields remain mutable and the anchor must pass the
+same compile, correctness, timing, confirmation, and paired-race protocol as
+any other candidate. In the bounded M=1536 study it was reached on trial three
+and reduced the screened median from 61.47 to 36.02 us.
 
 The MXFP8 frontend has three selection modes:
 

@@ -8,6 +8,10 @@ context identity. Add a newly versioned file instead.
 
 | Manifest | Purpose | Contexts |
 | --- | --- | ---: |
+| `nvfp4_dynamic_persistent_shapes_v1.json` | Bounded revision-3 anchor/generalization study at M=128/512/8192 | 3 |
+| `nvfp4_dynamic_balanced_iteration_v5.json` | Corrected cap-four balanced-grid confirmation at M=N=K=1536 | 1 |
+| `nvfp4_dynamic_balanced_iteration_v4.json` | Immutable cap-two anchor control which preserves the 72-CTA tail | 1 |
+| `nvfp4_dynamic_balanced_iteration_v3.json` | Immutable unanchored revision-3 search-policy control | 1 |
 | `nvfp4_dynamic_block_iteration_v2_128.json` | Bounded 128-trial joint dynamic block-quantizer/native-GEMM study | 2 |
 | `nvfp4_dynamic_components_iteration_v1.json` | Bounded packed-GEMM and dynamic-X component study | 4 |
 | `nvfp4_inference_states_v1.json` | NVFP4 dynamic-X/AOT-W and fully packed inference tuning | 16 |

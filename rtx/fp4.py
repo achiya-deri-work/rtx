@@ -133,8 +133,8 @@ class NVFP4ForwardConfig:
         return fused.implementation_rejection(problem)
 
     def materialized_rejection(self, problem: NVFP4Problem) -> str | None:
-        if self.quant_launches not in ("dual", "independent"):
-            return "quant_launches must be dual or independent"
+        if self.quant_launches not in ("dual", "independent", "concurrent"):
+            return "quant_launches must be dual, independent, or concurrent"
         for rows in (problem.m, problem.n):
             reason = self.quant.rejection(rows, problem.k)
             if reason is not None:
@@ -415,6 +415,19 @@ def _packed_fp4_view(tensor: torch.Tensor) -> torch.Tensor:
     return tensor if tensor.dtype is dtype else tensor.view(dtype)
 
 
+def _empty_nvfp4_scales(
+    rows: int,
+    k: int,
+    config: NVFP4QuantConfig,
+    device: torch.device,
+) -> torch.Tensor:
+    if config.scale_layout == "row_major":
+        shape = (rows, k // 16)
+    else:
+        shape = (rows // 128, k // 128, 1024)
+    return torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
+
+
 @dataclass(slots=True)
 class _DynamicRunner:
     quant_launches: str
@@ -428,6 +441,7 @@ class _DynamicRunner:
     qx_packed: torch.Tensor
     qw_packed: torch.Tensor
     l2_fetch_granularity: int | None = None
+    quant_stream: torch.cuda.Stream | None = None
 
     def __call__(
         self,
@@ -445,6 +459,14 @@ class _DynamicRunner:
             self.quant_x(
                 x, weight, self.qx, self.qw, self.sx, self.sw, x_scale, weight_scale
             )
+        elif self.quant_launches == "concurrent":
+            assert self.quant_w is not None and self.quant_stream is not None
+            caller = torch.cuda.current_stream(x.device)
+            self.quant_stream.wait_stream(caller)
+            self.quant_x(x, self.qx, self.sx, x_scale)
+            with torch.cuda.stream(self.quant_stream):
+                self.quant_w(weight, self.qw, self.sw, weight_scale)
+            caller.wait_stream(self.quant_stream)
         else:
             self.quant_x(x, self.qx, self.sx, x_scale)
             assert self.quant_w is not None
@@ -477,6 +499,7 @@ class _BlockDynamicRunner:
     qx_packed: torch.Tensor
     qw_packed: torch.Tensor
     l2_fetch_granularity: int | None = None
+    quant_stream: torch.cuda.Stream | None = None
 
     def __call__(
         self, x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor
@@ -486,6 +509,14 @@ class _BlockDynamicRunner:
         _ensure_l2_fetch_granularity(self.l2_fetch_granularity)
         if self.quant_launches == "dual":
             self.quant_x(x, weight, self.qx, self.qw, self.sx, self.sw)
+        elif self.quant_launches == "concurrent":
+            assert self.quant_w is not None and self.quant_stream is not None
+            caller = torch.cuda.current_stream(x.device)
+            self.quant_stream.wait_stream(caller)
+            self.quant_x(x, self.qx, self.sx)
+            with torch.cuda.stream(self.quant_stream):
+                self.quant_w(weight, self.qw, self.sw)
+            caller.wait_stream(self.quant_stream)
         else:
             self.quant_x(x, self.qx, self.sx)
             assert self.quant_w is not None
@@ -615,12 +646,8 @@ def _make_dynamic_runner(
 ) -> _DynamicRunner:
     qx = torch.empty((problem.m, problem.k // 2), dtype=torch.uint8, device=device)
     qw = torch.empty((problem.n, problem.k // 2), dtype=torch.uint8, device=device)
-    sx = torch.empty(
-        (problem.m, problem.k // 16), dtype=torch.float8_e4m3fn, device=device
-    )
-    sw = torch.empty(
-        (problem.n, problem.k // 16), dtype=torch.float8_e4m3fn, device=device
-    )
+    sx = _empty_nvfp4_scales(problem.m, problem.k, config.quant, device)
+    sw = _empty_nvfp4_scales(problem.n, problem.k, config.quant, device)
     if config.quant_launches == "dual":
         quant_x = compile_nvfp4_dual_quant(
             problem.m, problem.n, problem.k, config.quant
@@ -629,6 +656,11 @@ def _make_dynamic_runner(
     else:
         quant_x = compile_nvfp4_quant(problem.m, problem.k, config.quant)
         quant_w = compile_nvfp4_quant(problem.n, problem.k, config.quant)
+    quant_stream = (
+        torch.cuda.Stream(device=device)
+        if config.quant_launches == "concurrent"
+        else None
+    )
     return _DynamicRunner(
         config.quant_launches,
         quant_x,
@@ -641,6 +673,7 @@ def _make_dynamic_runner(
         _packed_fp4_view(qx),
         _packed_fp4_view(qw),
         config.l2_fetch_granularity,
+        quant_stream,
     )
 
 
@@ -651,12 +684,8 @@ def _make_block_dynamic_runner(
 ) -> _BlockDynamicRunner:
     qx = torch.empty((problem.m, problem.k // 2), dtype=torch.uint8, device=device)
     qw = torch.empty((problem.n, problem.k // 2), dtype=torch.uint8, device=device)
-    sx = torch.empty(
-        (problem.m, problem.k // 16), dtype=torch.float8_e4m3fn, device=device
-    )
-    sw = torch.empty(
-        (problem.n, problem.k // 16), dtype=torch.float8_e4m3fn, device=device
-    )
+    sx = _empty_nvfp4_scales(problem.m, problem.k, config.quant, device)
+    sw = _empty_nvfp4_scales(problem.n, problem.k, config.quant, device)
     if config.quant_launches == "dual":
         quant_x = compile_nvfp4_block_dual_quant(
             problem.m, problem.n, problem.k, config.quant
@@ -665,6 +694,11 @@ def _make_block_dynamic_runner(
     else:
         quant_x = compile_nvfp4_block_quant(problem.m, problem.k, config.quant)
         quant_w = compile_nvfp4_block_quant(problem.n, problem.k, config.quant)
+    quant_stream = (
+        torch.cuda.Stream(device=device)
+        if config.quant_launches == "concurrent"
+        else None
+    )
     return _BlockDynamicRunner(
         config.quant_launches,
         quant_x,
@@ -677,6 +711,7 @@ def _make_block_dynamic_runner(
         _packed_fp4_view(qx),
         _packed_fp4_view(qw),
         config.l2_fetch_granularity,
+        quant_stream,
     )
 
 

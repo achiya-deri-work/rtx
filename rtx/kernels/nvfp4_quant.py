@@ -110,6 +110,45 @@ class NVFP4QuantKernel:
         )
 
     @cute.jit
+    def _block_reciprocal(
+        self,
+        block_scale: Float8E4M3FN,
+        tensor_scale: Float32,
+    ):
+        if cutlass.const_expr(self.config.scale_reciprocal == "e4m3_lut"):
+            # E4M3 normal values are (1 + mantissa/8) * 2**(exponent-7).
+            # Reconstruct the correctly rounded reciprocal from the encoded
+            # exponent and an eight-entry mantissa LUT. Block-only execution
+            # folds the final division by tensor_scale=1 out of device IR.
+            reciprocal = nvvm.inline_ptx_hl(
+                "{.reg .u32 code, exp, mant; "
+                ".reg .b32 exp_scale, mrec; .reg .f32 tmp; .reg .pred p; "
+                "mov.b32 code, {$r0}; "
+                "shr.u32 exp, code, 3; and.b32 exp, exp, 15; "
+                "sub.u32 exp, 134, exp; shl.b32 exp_scale, exp, 23; "
+                "and.b32 mant, code, 7; mov.b32 mrec, 0f3f800000; "
+                "setp.eq.u32 p, mant, 1; selp.b32 mrec, 0f3f638e39, mrec, p; "
+                "setp.eq.u32 p, mant, 2; selp.b32 mrec, 0f3f4ccccd, mrec, p; "
+                "setp.eq.u32 p, mant, 3; selp.b32 mrec, 0f3f3a2e8c, mrec, p; "
+                "setp.eq.u32 p, mant, 4; selp.b32 mrec, 0f3f2aaaab, mrec, p; "
+                "setp.eq.u32 p, mant, 5; selp.b32 mrec, 0f3f1d89d9, mrec, p; "
+                "setp.eq.u32 p, mant, 6; selp.b32 mrec, 0f3f124925, mrec, p; "
+                "setp.eq.u32 p, mant, 7; selp.b32 mrec, 0f3f088889, mrec, p; "
+                "mul.rn.f32 {$w0}, exp_scale, mrec;}",
+                write_only_types=[Float32],
+                read_only_args=[Int32(block_scale.bitcast(Uint8))],
+            )
+            return reciprocal / tensor_scale
+        if cutlass.const_expr(self.config.scale_reciprocal == "rcp_approx"):
+            denominator = tensor_scale * Float32(block_scale)
+            return nvvm.inline_ptx_hl(
+                "rcp.approx.f32 {$w0}, {$r0};",
+                write_only_types=[Float32],
+                read_only_args=[denominator],
+            )
+        return (Float32(1.0) / tensor_scale) / Float32(block_scale)
+
+    @cute.jit
     def _quantize_task(
         self,
         src: cute.Tensor,
@@ -156,12 +195,35 @@ class NVFP4QuantKernel:
             cfg.threads_per_scale,
             cute.arch.lane_idx(),
         )
-        raw_block_scale = block_amax / (Float32(F4_MAX) * tensor_scale)
-        block_scale = self._e4m3_scale(raw_block_scale)
-        # Preserve TorchAO/MSLK's operation order. At FP4 thresholds,
-        # ``1 / (global * block)`` and ``(1 / global) / block`` can round to
-        # different E2M1 values even though they are algebraically identical.
-        reciprocal = (Float32(1.0) / tensor_scale) / Float32(block_scale)
+        if cutlass.const_expr(cfg.scale_compute == "leader_broadcast"):
+            block_scale_bits = Int32(0)
+            reciprocal = Float32(0.0)
+            if lane_in_scale == 0:
+                raw_block_scale = block_amax / (
+                    Float32(F4_MAX) * tensor_scale
+                )
+                leader_scale = self._e4m3_scale(raw_block_scale)
+                block_scale_bits = Int32(leader_scale.bitcast(Uint8))
+                reciprocal = self._block_reciprocal(
+                    leader_scale, tensor_scale
+                )
+            group_base = cute.arch.lane_idx() & Int32(
+                ~(cfg.threads_per_scale - 1)
+            )
+            block_scale_bits = cute.arch.shuffle_sync(
+                block_scale_bits, group_base
+            )
+            reciprocal = cute.arch.shuffle_sync(reciprocal, group_base)
+            block_scale = Uint8(block_scale_bits).bitcast(Float8E4M3FN)
+        else:
+            raw_block_scale = block_amax / (
+                Float32(F4_MAX) * tensor_scale
+            )
+            block_scale = self._e4m3_scale(raw_block_scale)
+            # Preserve TorchAO/MSLK's operation order. At FP4 thresholds,
+            # ``1 / (global * block)`` and ``(1 / global) / block`` can round
+            # to different E2M1 values despite being algebraically identical.
+            reciprocal = self._block_reciprocal(block_scale, tensor_scale)
         packed_row = quantized_packed[row, None]
         for pair in cutlass.range_constexpr((cfg.values_per_lane + 1) // 2):
             value0_idx = pair * 2
@@ -187,7 +249,17 @@ class NVFP4QuantKernel:
             else:
                 packed_row[(k_base + value0_idx) // 2] = Uint8(packed)
         if lane_in_scale == 0:
-            scales[row, scale_block] = block_scale
+            if cutlass.const_expr(cfg.scale_layout == "row_major"):
+                scales[row, scale_block] = block_scale
+            else:
+                scale_in_tile = scale_block % 8
+                physical = (
+                    (row % 32) * 16
+                    + ((row // 32) % 4) * 4
+                    + scale_in_tile % 4
+                    + (scale_in_tile // 4) * 512
+                )
+                scales[row // 128, scale_block // 8, physical] = block_scale
 
     @cute.kernel
     def kernel(
@@ -472,11 +544,18 @@ def _fake_packed(rows: int, k: int):
     )
 
 
-def _fake_scales(rows: int, k: int):
+def _fake_scales(rows: int, k: int, scale_layout: str = "row_major"):
+    if scale_layout == "row_major":
+        return cute.runtime.make_fake_tensor(
+            Float8E4M3FN,
+            (rows, k // NVFP4_SF_VEC_SIZE),
+            stride=(k // NVFP4_SF_VEC_SIZE, 1),
+            assumed_align=16,
+        )
     return cute.runtime.make_fake_tensor(
         Float8E4M3FN,
-        (rows, k // NVFP4_SF_VEC_SIZE),
-        stride=(k // NVFP4_SF_VEC_SIZE, 1),
+        (rows // 128, k // 128, 1024),
+        stride=(k // 128 * 1024, 1024, 1),
         assumed_align=16,
     )
 
@@ -499,7 +578,7 @@ def compile_nvfp4_quant(
         kernel,
         _fake_bf16(rows, k),
         _fake_packed(rows, k),
-        _fake_scales(rows, k),
+        _fake_scales(rows, k, config.scale_layout),
         _fake_tensor_scale(),
         stream,
         options=(
@@ -524,8 +603,8 @@ def compile_nvfp4_dual_quant(
         _fake_bf16(weight_rows, k),
         _fake_packed(x_rows, k),
         _fake_packed(weight_rows, k),
-        _fake_scales(x_rows, k),
-        _fake_scales(weight_rows, k),
+        _fake_scales(x_rows, k, config.scale_layout),
+        _fake_scales(weight_rows, k, config.scale_layout),
         _fake_tensor_scale(),
         _fake_tensor_scale(),
         stream,
@@ -548,7 +627,7 @@ def compile_nvfp4_block_quant(
         kernel,
         _fake_bf16(rows, k),
         _fake_packed(rows, k),
-        _fake_scales(rows, k),
+        _fake_scales(rows, k, config.scale_layout),
         stream,
         options=(
             "--enable-tvm-ffi --opt-level 3 "
@@ -572,8 +651,8 @@ def compile_nvfp4_block_dual_quant(
         _fake_bf16(weight_rows, k),
         _fake_packed(x_rows, k),
         _fake_packed(weight_rows, k),
-        _fake_scales(x_rows, k),
-        _fake_scales(weight_rows, k),
+        _fake_scales(x_rows, k, config.scale_layout),
+        _fake_scales(weight_rows, k, config.scale_layout),
         stream,
         options=(
             "--enable-tvm-ffi --opt-level 3 "

@@ -175,6 +175,19 @@ def _gemm_features(
     grid_ctas = (
         total_work_ctas + config.tiles_per_cta - 1
     ) // config.tiles_per_cta
+    if config.persistent_waves:
+        sm_count = max(
+            1, int(profile_value(profile, "multiprocessor_count", 1) or 1)
+        )
+        grid_ctas = max(
+            grid_ctas,
+            min(total_work_ctas, sm_count * config.persistent_waves),
+        )
+    work_tiles_per_cta = (
+        (total_work_ctas + grid_ctas - 1) // grid_ctas
+        if config.persistent_waves
+        else config.tiles_per_cta
+    )
     same_a_edges = sum(
         1
         for edge in range(1, natural_ctas)
@@ -230,7 +243,9 @@ def _gemm_features(
         tile_flops=float(2 * config.tile_m * config.tile_n * problem.k),
         mma_k_tiles_per_cta=float((problem.k + config.tile_k - 1) // config.tile_k),
         mma_warp_issues_per_k_tile=float(config.num_mma_warps),
-        work_tiles_per_cta=float(config.tiles_per_cta),
+        work_tiles_per_cta=float(work_tiles_per_cta),
+        persistent_waves=float(config.persistent_waves),
+        balanced_persistent_grid=float(bool(config.persistent_waves)),
         epilogue_stages=float(config.epilogue_stages),
         epilogue_smem_bytes=float(
             config.epilogue_stages * config.tile_m * config.tile_n * 2
@@ -238,14 +253,13 @@ def _gemm_features(
             else 0
         ),
         epilogue_async_overlap_tiles=float(
-            min(config.epilogue_stages, config.tiles_per_cta)
+            min(config.epilogue_stages, work_tiles_per_cta)
             if config.epilogue == "tma"
             else 0
         ),
         split_work_ctas=float(total_work_ctas),
         final_cta_active_fraction=(
-            (total_work_ctas - (grid_ctas - 1) * config.tiles_per_cta)
-            / config.tiles_per_cta
+            total_work_ctas / (grid_ctas * work_tiles_per_cta)
         ),
         same_a_locality=float(
             config.tile_locality in ("same_a", "serpentine_a")
@@ -1066,8 +1080,14 @@ def make_nvfp4_dynamic_adapter(
         qw = problem.n * problem.k / 2 + problem.n * (problem.k // 16)
         values.update(
             operand_state_dynamic=1.0,
+            native_scale_transport=(
+                1.0 if quant.scale_layout == "mma128" else 0.0
+            ),
             quant_launch_count=(
                 1.0 if config.quant_launches == "dual" else 2.0  # type: ignore[attr-defined]
+            ),
+            quant_launch_concurrency=(
+                2.0 if config.quant_launches == "concurrent" else 1.0  # type: ignore[attr-defined]
             ),
             total_kernel_launches=(
                 2.0 if config.quant_launches == "dual" else 3.0  # type: ignore[attr-defined]

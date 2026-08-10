@@ -34,6 +34,7 @@ from .prequant_experiments import (
     CandidateCorrectnessError,
     PrequantBenchmarkHarness,
     ShapeSpec,
+    robust_summary,
 )
 
 
@@ -147,7 +148,72 @@ class NVFP4DynamicBenchmarkHarness(PrequantBenchmarkHarness):
                 _set_l2_fetch_granularity(previous_l2)
 
     def _measure_components(self, prepared, calls: int, samples: int):
-        return {}
+        runner = prepared.runner
+        component_calls = max(1, min(calls, 1024))
+        component_samples = max(3, min(samples, 5))
+        components: dict[str, list[float]] = {}
+        if runner.quant_launches == "dual":
+            components["dual_quant"] = [
+                self._time_callable(
+                    lambda index: runner.quant_x(
+                        *self._inputs[index % len(self._inputs)],
+                        runner.qx,
+                        runner.qw,
+                        runner.sx,
+                        runner.sw,
+                    ),
+                    component_calls,
+                )
+                for _ in range(component_samples)
+            ]
+        else:
+            components["x_quant"] = [
+                self._time_callable(
+                    lambda index: runner.quant_x(
+                        self._inputs[index % len(self._inputs)][0],
+                        runner.qx,
+                        runner.sx,
+                    ),
+                    component_calls,
+                )
+                for _ in range(component_samples)
+            ]
+            assert runner.quant_w is not None
+            components["w_quant"] = [
+                self._time_callable(
+                    lambda index: runner.quant_w(
+                        self._inputs[index % len(self._inputs)][1],
+                        runner.qw,
+                        runner.sw,
+                    ),
+                    component_calls,
+                )
+                for _ in range(component_samples)
+            ]
+        components["gemm_hot_materialized"] = [
+            self._time_callable(
+                lambda _index: runner.gemm(
+                    runner.qx_packed,
+                    runner.qw_packed,
+                    runner.sx,
+                    runner.sw,
+                    prepared.out,
+                ),
+                component_calls,
+            )
+            for _ in range(component_samples)
+        ]
+        return {
+            name: {
+                "timings_ms": timings,
+                "summary_ms": robust_summary(
+                    timings,
+                    seed=len(name) ^ calls,
+                    bootstrap_resamples=self.protocol.bootstrap_resamples,
+                ).as_dict(),
+            }
+            for name, timings in components.items()
+        }
 
 
 def _pair_key(x: torch.Tensor, weight: torch.Tensor) -> tuple[int, int]:

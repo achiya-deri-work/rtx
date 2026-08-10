@@ -1,0 +1,36 @@
+{
+  "schema_version": 2,
+  "name": "nvfp4_dynamic_persistent_shapes_v1",
+  "seed": 20260814,
+  "jobs": [
+    {
+      "family": "nvfp4_dynamic_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "small_m"},
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "long_m"}
+      ],
+      "regimes": ["hot"],
+      "promote": 4,
+      "tuning": {
+        "max_trials": 24,
+        "time_budget_s": 120.0,
+        "cost_model_trials": 8,
+        "model_warmup": 4,
+        "model_pool_size": 2048,
+        "local_beam_width": 6,
+        "confirmation_repeats": 1,
+        "confirm_initial": true,
+        "seed": 20260814
+      },
+      "protocol": {
+        "warmup_calls": 5,
+        "samples": 7,
+        "confirm_samples": 15,
+        "race_rounds": 15,
+        "target_batch_ms": 25.0,
+        "telemetry": true
+      }
+    }
+  ]
+}

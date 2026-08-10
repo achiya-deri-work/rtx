@@ -25,6 +25,10 @@ from rtx.configs.nvfp4 import (
     NVFP4WeightPrequantConfig,
     normalize_nvfp4_fwd_config,
 )
+from rtx.nvfp4_inference_autotune import (
+    NVFP4_DYNAMIC_SEARCH_SPACE,
+    update_dynamic_config,
+)
 
 
 def _has_sm12x() -> bool:
@@ -137,7 +141,7 @@ class NVFP4ConfigTests(unittest.TestCase):
             with self.subTest(family=family):
                 self.assertEqual(
                     _current_revision(family),
-                    2 if family == "nvfp4_dynamic_fwd" else 1,
+                    3 if family == "nvfp4_dynamic_fwd" else 1,
                 )
                 self.assertIsNone(
                     _config_rejection(
@@ -192,9 +196,117 @@ class NVFP4ConfigTests(unittest.TestCase):
             100_000,
         )
 
+    def test_dynamic_native_scale_and_k64_legality_is_static(self) -> None:
+        problem = NVFP4Problem(128, 128, 128)
+        base = NVFP4DynamicConfig()
+        invalid_k64 = replace(
+            base,
+            gemm=replace(base.gemm, tile_k=64, a_swizzle="64b"),
+        )
+        self.assertIn("K=64", invalid_k64.rejection(problem))
+        legal_k64 = replace(
+            base,
+            gemm=replace(
+                base.gemm,
+                tile_k=64,
+                a_swizzle="32b",
+                b_swizzle="32b",
+            ),
+        )
+        self.assertIsNone(legal_k64.rejection(problem))
+
+        native = replace(
+            base,
+            quant=replace(base.quant, scale_layout="mma128"),
+            gemm=replace(
+                base.gemm,
+                scale_layout="mma128",
+                scale_role="tma",
+            ),
+        )
+        self.assertIsNone(native.rejection(problem))
+        self.assertIn(
+            "selected together",
+            replace(native, quant=base.quant).rejection(problem),
+        )
+
+    def test_dynamic_implementation_anchor_models_balanced_sm_grid(self) -> None:
+        problem = NVFP4Problem(1536, 1536, 1536)
+
+        def evaluator(config):
+            return TrialOutcome("ok", median_ms=1.0)
+
+        adapter = make_nvfp4_dynamic_adapter(
+            problem,
+            evaluator,
+            device={"multiprocessor_count": 70},
+        )
+        anchor_update = NVFP4_DYNAMIC_SEARCH_SPACE[
+            "implementation_anchor"
+        ][0]
+        anchor = update_dynamic_config(
+            adapter.initial_config, anchor_update
+        )
+        self.assertIsNone(anchor.rejection(problem))
+        self.assertEqual(anchor.gemm.persistent_waves, 1)
+        self.assertEqual(anchor.gemm.tiles_per_cta, 4)
+        features = adapter.features(anchor)
+        self.assertEqual(features["derived.grid_ctas"], 70.0)
+        self.assertEqual(features["derived.work_tiles_per_cta"], 3.0)
+        self.assertEqual(features["derived.balanced_persistent_grid"], 1.0)
+
+        concurrent = replace(anchor, quant_launches="concurrent")
+        concurrent_features = adapter.features(concurrent)
+        self.assertEqual(
+            concurrent_features["derived.quant_launch_concurrency"], 2.0
+        )
+
 
 @unittest.skipUnless(_has_sm12x(), "requires an SM120/SM121 CUDA GPU")
 class NVFP4CudaTests(unittest.TestCase):
+    def test_materialized_native_scales_and_balanced_grid_execute(self) -> None:
+        from rtx.nvfp4_inference_experiments import (
+            NVFP4DynamicBenchmarkHarness,
+        )
+        from rtx.prequant_experiments import BenchmarkProtocol, ShapeSpec
+
+        protocol = BenchmarkProtocol(
+            warmup_calls=1,
+            samples=3,
+            confirm_samples=3,
+            race_rounds=3,
+            target_batch_ms=1.0,
+            max_calls_per_sample=16,
+            correctness_rtol=0,
+            correctness_atol=0,
+            telemetry=False,
+        )
+        problem = NVFP4Problem(128, 512, 128)
+        harness = NVFP4DynamicBenchmarkHarness(
+            ShapeSpec(128, 512, 128), "hot", protocol, seed=1918
+        )
+        anchor = update_dynamic_config(
+            NVFP4DynamicConfig(),
+            NVFP4_DYNAMIC_SEARCH_SPACE["implementation_anchor"][0],
+        )
+        native = replace(
+            NVFP4DynamicConfig(),
+            quant=replace(
+                NVFP4DynamicConfig().quant, scale_layout="mma128"
+            ),
+            gemm=replace(
+                NVFP4DynamicConfig().gemm,
+                scale_layout="mma128",
+                scale_role="tma",
+            ),
+        )
+        for name, config in (("balanced", anchor), ("native_scales", native)):
+            with self.subTest(schedule=name):
+                self.assertIsNone(config.rejection(problem))
+                result = harness.measure(config, samples=3, seed=1918)
+                self.assertEqual(result["status"], "ok")
+                self.assertEqual(result["max_abs_error"], 0.0)
+
     def test_calibrated_inference_harnesses_execute(self) -> None:
         from rtx.nvfp4_inference_experiments import (
             NVFP4FullyPrequantBenchmarkHarness,

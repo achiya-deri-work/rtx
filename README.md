@@ -215,10 +215,15 @@ coordinate and can be varied independently of the CTA schedule. Set
 the fastest policy when values stay inside the E4M3 scale exponent range;
 current scaling remains the tensorwide numerical reference for extreme/tiny ranges.
 For dynamic BF16 operands, `backend="auto"` selects a pointer-free three-kernel
-block path (dual or independent X/W quantizers plus native NVFP4 GEMM) for
+block path (dual, independent, or concurrent X/W quantizers plus native NVFP4 GEMM) for
 block-only execution. Its quantizer launch topology,
-vector/reduction/register schedule, GEMM TMA/mainloop/epilogue schedule, and L2
-fetch policy form the `nvfp4_dynamic_fwd` autotuning family. `backend="fused"`
+vector/reduction/register/scale-math schedule, native or row-major scale
+transport, GEMM SMEM/RMEM geometry, TMA/mainloop/epilogue schedule, balanced
+SM-count persistence, locality, and L2 fetch policy form the
+`nvfp4_dynamic_fwd` autotuning family. A compound materialized implementation
+anchor is measured early, then remains fully mutable; it prevents a learned
+search from spending its entire budget in the older non-persistent basin.
+`backend="fused"`
 remains available for delayed telemetry and controlled fused-kernel studies.
 An explicit `NVFP4FwdConfig(tensor_scale_mode="exact")` retains the exact
 TorchAO tensorwise FP32 scale for controlled studies; power-of-two is the
@@ -227,6 +232,15 @@ its selected policy during inference; AOT-weight dynamic-X inference supports
 current or block-only X scaling (regional prequantized-W epilogues are not yet
 implemented), and fully packed inference uses the tensor
 scale stored in TorchAO's `NVFP4Tensor`.
+
+On the 70-SM RTX 5070 Ti used for the revision-3 study, verified hot-input
+block-only winners beat the compiled MXFP8 frontend at every sampled
+`N=K=1536` shape: 20.34 vs 24.05 us at M=128 (1.182x), 20.90 vs 24.79 us at
+M=512 (1.186x), 36.30 vs 40.97 us at M=1536 (1.129x), and 154.51 vs 170.02 us
+at M=8192 (1.100x). The NVFP4 output had cosine similarity about 0.991 and
+normalized RMSE about 0.134 against FP32. These are device/shape-specific
+measurements, not portable defaults; runtime winners remain keyed by the exact
+hardware/software fingerprint and shape.
 
 All four NVFP4 runtime paths support
 `torch.compile(fullgraph=True, dynamic=False)`. Current/JIT scale arithmetic is

@@ -52,6 +52,26 @@ class _UnitOutputScaleLauncher:
         return self.compiled(qx, qw, sx, sw, out, out)
 
 
+def _fake_nvfp4_scales(
+    rows: int,
+    k: int,
+    config: NVFP4GemmConfig,
+):
+    if config.scale_layout == "row_major":
+        return cute.runtime.make_fake_tensor(
+            Float8E4M3FN,
+            (rows, k // NVFP4_SF_VEC_SIZE),
+            stride=(k // NVFP4_SF_VEC_SIZE, 1),
+            assumed_align=16,
+        )
+    return cute.runtime.make_fake_tensor(
+        Float8E4M3FN,
+        (rows // 128, k // 128, 1024),
+        stride=(k // 128 * 1024, 1024, 1),
+        assumed_align=16,
+    )
+
+
 @lru_cache(maxsize=None)
 def compile_nvfp4_gemm(
     problem: NVFP4Problem,
@@ -72,18 +92,8 @@ def compile_nvfp4_gemm(
         stride=(problem.k, 1),
         assumed_align=16,
     )
-    sx = cute.runtime.make_fake_tensor(
-        Float8E4M3FN,
-        (problem.m, problem.k // NVFP4_SF_VEC_SIZE),
-        stride=(problem.k // NVFP4_SF_VEC_SIZE, 1),
-        assumed_align=16,
-    )
-    sw = cute.runtime.make_fake_tensor(
-        Float8E4M3FN,
-        (problem.n, problem.k // NVFP4_SF_VEC_SIZE),
-        stride=(problem.k // NVFP4_SF_VEC_SIZE, 1),
-        assumed_align=16,
-    )
+    sx = _fake_nvfp4_scales(problem.m, problem.k, config)
+    sw = _fake_nvfp4_scales(problem.n, problem.k, config)
     out = cute.runtime.make_fake_tensor(
         BFloat16,
         (problem.m, problem.n),
@@ -133,18 +143,8 @@ def compile_nvfp4_block_gemm(
         stride=(problem.k, 1),
         assumed_align=16,
     )
-    sx = cute.runtime.make_fake_tensor(
-        Float8E4M3FN,
-        (problem.m, problem.k // NVFP4_SF_VEC_SIZE),
-        stride=(problem.k // NVFP4_SF_VEC_SIZE, 1),
-        assumed_align=16,
-    )
-    sw = cute.runtime.make_fake_tensor(
-        Float8E4M3FN,
-        (problem.n, problem.k // NVFP4_SF_VEC_SIZE),
-        stride=(problem.k // NVFP4_SF_VEC_SIZE, 1),
-        assumed_align=16,
-    )
+    sx = _fake_nvfp4_scales(problem.m, problem.k, config)
+    sw = _fake_nvfp4_scales(problem.n, problem.k, config)
     out = cute.runtime.make_fake_tensor(
         BFloat16,
         (problem.m, problem.n),

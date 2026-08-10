@@ -49,6 +49,11 @@ def main() -> None:
     parser.add_argument(
         "--scaling", choices=("block", "current", "regional"), default="block"
     )
+    parser.add_argument(
+        "--nv-backend",
+        choices=("auto", "fused", "materialized"),
+        default="auto",
+    )
     args = parser.parse_args()
     torch.manual_seed(20260810)
     x = torch.randn(args.m, args.k, device="cuda", dtype=torch.bfloat16)
@@ -58,7 +63,9 @@ def main() -> None:
         return rtx.mxfp8_linear(a, b, backend="auto", autotune="cache")
 
     def nv(a, b):
-        return rtx.nvfp4_linear(a, b, scaling=args.scaling, backend="auto")
+        return rtx.nvfp4_linear(
+            a, b, scaling=args.scaling, backend=args.nv_backend
+        )
 
     mx_compiled = torch.compile(mx, fullgraph=True, dynamic=False)
     nv_compiled = torch.compile(nv, fullgraph=True, dynamic=False)
@@ -86,6 +93,7 @@ def main() -> None:
     print(json.dumps({
         "shape": {"m": args.m, "n": args.n, "k": args.k},
         "scaling": args.scaling,
+        "nvfp4_backend": args.nv_backend,
         "mxfp8_ms": mx_ms,
         "nvfp4_ms": nv_ms,
         "nvfp4_speedup": mx_ms / nv_ms,

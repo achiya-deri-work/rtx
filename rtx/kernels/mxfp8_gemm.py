@@ -13,6 +13,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
+import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm120_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass import (
@@ -71,6 +72,8 @@ class MXFP8GemmKernel:
             raise ValueError("an unsplit GEMM must use reduction_tile=0")
         if atomic_output and cluster_output:
             raise ValueError("atomic and cluster outputs are mutually exclusive")
+        if config.persistent_waves and split_reduction > 1:
+            raise ValueError("balanced persistent grids currently require unsplit GEMM")
         if split_reduction > 1:
             if config.epilogue != "direct":
                 raise ValueError("split-K prequant GEMM requires direct FP32 output")
@@ -90,9 +93,22 @@ class MXFP8GemmKernel:
         self.n_tiles = (problem.n + config.tile_n - 1) // config.tile_n
         self.total_tiles = self.m_tiles * self.n_tiles
         self.total_work_tiles = self.total_tiles * split_reduction
-        self.grid_ctas = (
+        capped_grid = (
             self.total_work_tiles + config.tiles_per_cta - 1
         ) // config.tiles_per_cta
+        self.grid_ctas = capped_grid
+        if config.persistent_waves:
+            sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
+            wave_grid = min(
+                self.total_work_tiles,
+                sm_count * config.persistent_waves,
+            )
+            self.grid_ctas = max(capped_grid, wave_grid)
+        self.work_tiles_per_cta = (
+            (self.total_work_tiles + self.grid_ctas - 1) // self.grid_ctas
+            if config.persistent_waves
+            else config.tiles_per_cta
+        )
         self.num_k_tiles = (problem.k + config.tile_k - 1) // config.tile_k
         scale_threads = config.num_mma_warps * 32
         if config.scale_role == "producer":
@@ -737,8 +753,11 @@ class MXFP8GemmKernel:
 
         total_tiles = m_tiles * n_tiles
         total_work_tiles = total_tiles * self.split_reduction
-        for work_slot in cutlass.range_constexpr(cfg.tiles_per_cta):
-            raw_work_linear = cta_idx * cfg.tiles_per_cta + work_slot
+        for work_slot in cutlass.range_constexpr(self.work_tiles_per_cta):
+            if cutlass.const_expr(cfg.persistent_waves):
+                raw_work_linear = cta_idx + work_slot * self.grid_ctas
+            else:
+                raw_work_linear = cta_idx * cfg.tiles_per_cta + work_slot
             active_tile = raw_work_linear < total_work_tiles
             # A final partial CTA follows the full pipeline on the last valid
             # tile so every unrolled slot advances identical barrier phases.

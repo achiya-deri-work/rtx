@@ -26,6 +26,9 @@ class NVFP4QuantConfig:
     num_warps: int = 8
     persistent_waves: int = 4
     maxrregcount: int = 128
+    scale_reciprocal: str = "direct"
+    scale_compute: str = "redundant"
+    scale_layout: str = "row_major"
 
     @property
     def threads_per_scale(self) -> int:
@@ -55,6 +58,14 @@ class NVFP4QuantConfig:
             return "reduction must be shuffle or redux"
         if self.quant_math != "fp32":
             return "only the implemented FP32 NVFP4 quantization path is legal"
+        if self.scale_reciprocal not in ("direct", "e4m3_lut", "rcp_approx"):
+            return "scale_reciprocal must be direct, e4m3_lut, or rcp_approx"
+        if self.scale_compute not in ("redundant", "leader_broadcast"):
+            return "scale_compute must be redundant or leader_broadcast"
+        if self.scale_layout not in ("row_major", "mma128"):
+            return "scale_layout must be row_major or mma128"
+        if self.scale_layout == "mma128" and (rows % 128 or k % 128):
+            return "mma128 NVFP4 scales require rows and K divisible by 128"
         if self.num_warps not in (4, 8, 16):
             return "num_warps must be one of 4, 8, 16"
         if self.persistent_waves not in (1, 2, 3, 4, 6, 8):
@@ -222,6 +233,10 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
     def scale_vector_size(self) -> int:
         return NVFP4_SF_VEC_SIZE
 
+    @property
+    def native_mma_k(self) -> int:
+        return 64
+
     def rejection(self, problem: NVFP4Problem) -> str | None:
         try:
             problem.validate()
@@ -229,12 +244,19 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
             return str(exc)
         if self.tile_k % 64:
             return "NVFP4 tile K must be divisible by 64"
-        if self.scale_layout != "row_major":
-            return "the first NVFP4 GEMM revision accepts row-major scales"
+        if self.tile_k == 64 and (
+            self.a_swizzle not in ("none", "32b")
+            or self.b_swizzle not in ("none", "32b")
+        ):
+            return (
+                "NVFP4 K=64 GEMM requires none or 32-byte SMEM swizzles"
+            )
+        if self.scale_layout not in ("row_major", "mma128"):
+            return "NVFP4 GEMM scales must use row_major or mma128 layout"
         if (self.tile_k // NVFP4_SF_VEC_SIZE) % self.scale_load_vec:
             return "scale_load_vec must divide the NVFP4 K-tile scale count"
-        # The common checker conservatively models operands as bytes. Passing
-        # it therefore proves SMEM capacity for the half-width packed format.
+        # The common checker uses native_operand_bits and scale_vector_size,
+        # so its capacity model covers packed E2M1 and twice-dense E4M3 scales.
         return super().rejection(problem)  # type: ignore[arg-type]
 
 
@@ -299,8 +321,8 @@ class NVFP4DynamicConfig:
     l2_fetch_granularity: int | None = None
 
     def rejection(self, problem: NVFP4Problem) -> str | None:
-        if self.quant_launches not in ("dual", "independent"):
-            return "quant_launches must be dual or independent"
+        if self.quant_launches not in ("dual", "independent", "concurrent"):
+            return "quant_launches must be dual, independent, or concurrent"
         # The pointer-free block GEMM uses the packed E2M1 CTA value maps.
         # A 128-byte SMEM swizzle changes their top-level shape and CuTe rejects
         # the resulting TMA/CTA mapping before lowering.  This was confirmed by
@@ -308,6 +330,14 @@ class NVFP4DynamicConfig:
         # out of the compiler rather than learning the same failure per shape.
         if self.gemm.a_swizzle == "128b" or self.gemm.b_swizzle == "128b":
             return "dynamic NVFP4 block GEMM does not support 128-byte swizzles"
+        native_scales = self.quant.scale_layout == "mma128"
+        if native_scales != (
+            self.gemm.scale_layout == "mma128" and self.gemm.scale_role == "tma"
+        ):
+            return (
+                "dynamic NVFP4 quantizer and GEMM native scale transport "
+                "must be selected together"
+            )
         for label, rows in (("activation", problem.m), ("weight", problem.n)):
             reason = self.quant.rejection(rows, problem.k)
             if reason is not None:

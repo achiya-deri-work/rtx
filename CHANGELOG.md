@@ -3,6 +3,24 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.14.0
+
+- Add balanced SM-count persistent grids to the shared materialized GEMM,
+  decoupling the CTA launch count from the maximum output tiles per CTA and
+  using grid-strided work assignment. Preserve exact fixed-grid partial-CTA
+  coverage and expose the derived grid/work-slot quantities to cost models.
+- Expand revision-3 dynamic NVFP4 tuning with native K=64/128/256 geometry,
+  tensor-core-native scale emission and TMA scale transport, two-stream
+  quantization, reciprocal/scale-computation variants, and component timing.
+  Reject unsupported K=64 swizzles before compilation.
+- Seed tuning with a fully mutable compound materialized implementation
+  anchor. A bounded RTX 5070 Ti study recovered the 36-us M=N=K=1536 basin on
+  its third trial and verified per-shape NVFP4 wins over the compiled MXFP8
+  frontend at M=128, 512, 1536, and 8192 for N=K=1536.
+- Add reproducible bounded manifests, public frontend backend selection in the
+  comparison benchmark, and GPU regressions for balanced persistence and
+  native physical scale transport.
+
 ## 0.13.1
 
 - Lower dynamic fused, training, AOT-weight, and fully packed MXFP8 paths

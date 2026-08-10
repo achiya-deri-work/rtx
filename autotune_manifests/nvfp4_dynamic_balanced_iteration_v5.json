@@ -1,0 +1,34 @@
+{
+  "schema_version": 2,
+  "name": "nvfp4_dynamic_balanced_iteration_v5",
+  "seed": 20260813,
+  "jobs": [
+    {
+      "family": "nvfp4_dynamic_fwd",
+      "shapes": [
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"}
+      ],
+      "regimes": ["hot"],
+      "promote": 6,
+      "tuning": {
+        "max_trials": 32,
+        "time_budget_s": 180.0,
+        "cost_model_trials": 8,
+        "model_warmup": 4,
+        "model_pool_size": 2048,
+        "local_beam_width": 8,
+        "confirmation_repeats": 1,
+        "confirm_initial": true,
+        "seed": 20260813
+      },
+      "protocol": {
+        "warmup_calls": 5,
+        "samples": 7,
+        "confirm_samples": 15,
+        "race_rounds": 15,
+        "target_batch_ms": 25.0,
+        "telemetry": true
+      }
+    }
+  ]
+}

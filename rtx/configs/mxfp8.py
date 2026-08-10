@@ -131,6 +131,7 @@ class MXFP8GemmConfig:
     grid_swizzle: int = 2
     tiles_per_cta: int = 1
     tile_locality: str = "raster"
+    persistent_waves: int = 0
 
     @property
     def native_operand_bits(self) -> int:
@@ -139,6 +140,10 @@ class MXFP8GemmConfig:
     @property
     def scale_vector_size(self) -> int:
         return SF_VEC_SIZE
+
+    @property
+    def native_mma_k(self) -> int:
+        return 128
 
     @property
     def num_mma_warps(self) -> int:
@@ -155,8 +160,8 @@ class MXFP8GemmConfig:
             return str(exc)
         if (self.tile_m != 64 and self.tile_m % 128) or self.tile_n % 128:
             return "SM120 block-scale tiles require M=64 or M/N divisible by 128"
-        if self.tile_k % 128:
-            return "tile K must be divisible by 128"
+        if self.tile_k % self.native_mma_k:
+            return f"tile K must be divisible by {self.native_mma_k}"
         if self.tile_n != 64 * self.atom_layout_n:
             return "tile_n must equal 64 * atom_layout_n"
         if self.tile_m == 64 and self.atom_layout_m != 2:
@@ -181,7 +186,7 @@ class MXFP8GemmConfig:
             return "scale_schedule must be after_wait or before_wait"
         if self.scale_load_vec not in (1, 2, 4, 8):
             return "scale_load_vec must be x1, x2, x4, or x8"
-        if (self.tile_k // SF_VEC_SIZE) % self.scale_load_vec:
+        if (self.tile_k // self.scale_vector_size) % self.scale_load_vec:
             return "scale_load_vec must divide the K tile scale count"
         if self.scale_l2_prefetch not in ("none", "64b", "128b", "256b"):
             return "invalid scale L2 prefetch size"
@@ -247,11 +252,17 @@ class MXFP8GemmConfig:
             problem.m % self.tile_m or problem.n % self.tile_n
         ):
             return "TMA epilogue requires full M/N tiles"
-        q_bytes = self.stages * (self.tile_m + self.tile_n) * self.tile_k
+        q_bytes = (
+            self.stages
+            * (self.tile_m + self.tile_n)
+            * self.tile_k
+            * self.native_operand_bits
+            // 8
+        )
         scale_bytes = self.stages * (
             ((self.tile_m + 127) // 128) * 128
             + ((self.tile_n + 127) // 128) * 128
-        ) * (self.tile_k // SF_VEC_SIZE)
+        ) * (self.tile_k // self.scale_vector_size)
         out_bytes = (
             self.epilogue_stages * self.tile_m * self.tile_n * 2
             if self.epilogue == "tma"
@@ -272,6 +283,8 @@ class MXFP8GemmConfig:
             return "invalid raster/grid swizzle"
         if self.tiles_per_cta not in (1, 2, 4, 8):
             return "tiles_per_cta must be 1, 2, 4, or 8"
+        if self.persistent_waves not in (0, 1, 2, 3, 4):
+            return "persistent_waves must be zero or one to four waves"
         output_tiles = (
             (problem.m + self.tile_m - 1) // self.tile_m
         ) * ((problem.n + self.tile_n - 1) // self.tile_n)
