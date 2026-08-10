@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 import torch
 import rtx.fp8_bwd as fp8_bwd
 
+from rtx import MXFP8Linear
 from rtx.bwd_autotune import (
     BWD_SEARCH_SPACE,
     BwdCoordinateDescentTuner,
@@ -513,6 +514,45 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
 
 @unittest.skipUnless(_has_sm120(), "requires an SM120/SM121 CUDA GPU")
 class TestMXFP8BwdCuda(unittest.TestCase):
+    def test_training_frontends_use_direct_fullgraph_lowerings(self) -> None:
+        for seed, backend in enumerate(("fused", "prequant"), start=1901):
+            with self.subTest(backend=backend):
+                torch.manual_seed(seed)
+                layer = MXFP8Linear(
+                    128,
+                    128,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    backend=backend,
+                    autotune="off",
+                ).train()
+                eager_x = torch.randn(
+                    128,
+                    128,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    requires_grad=True,
+                )
+                expected = layer(eager_x)
+                expected.sum().backward()
+                expected_x_grad = eager_x.grad.detach().clone()
+                expected_weight_grad = layer.weight.grad.detach().clone()
+                layer.weight.grad = None
+
+                compiled = torch.compile(layer, fullgraph=True, dynamic=False)
+                compiled_x = eager_x.detach().clone().requires_grad_(True)
+                actual = compiled(compiled_x)
+                actual.sum().backward()
+                torch.cuda.synchronize()
+
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    compiled_x.grad, expected_x_grad, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    layer.weight.grad, expected_weight_grad, rtol=0, atol=0
+                )
+
     @staticmethod
     def _assert_backward_close(
         config, grad_output: torch.Tensor, x: torch.Tensor, weight: torch.Tensor

@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from rtx import MXFP8Linear, mxfp8_linear
+from rtx import MXFP8Linear, mxfp8_linear, quantize_mxfp8
 from rtx.kernels.mxfp8 import MXFP8FwdConfig, MXFP8Problem, normalize_fwd_config
 from rtx.kernels.mxfp8_fwd import compile_mxfp8_fwd
 
@@ -253,6 +253,66 @@ class MXFP8ConfigTests(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class MXFP8CudaTests(unittest.TestCase):
+    def test_fused_frontend_uses_direct_fullgraph_lowering(self) -> None:
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("native kernel requires SM120/SM121")
+        import rtx.fp8 as fp8_frontend
+
+        torch.manual_seed(121)
+        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        layer = MXFP8Linear(
+            128,
+            128,
+            device="cuda",
+            dtype=torch.bfloat16,
+            config=normalize_fwd_config(tile_m=64, maxrregcount=191),
+            backend="fused",
+            autotune="off",
+        ).eval().requires_grad_(False)
+        expected = layer(x)
+        compiled = torch.compile(layer, fullgraph=True, dynamic=False)
+        actual = compiled(x)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        launchers = tuple(fp8_frontend._INDUCTOR_FUSED_LAUNCHERS.values())
+        self.assertTrue(launchers)
+        self.assertTrue(any(len(launcher.runners) for launcher in launchers))
+
+    def test_packed_inference_states_use_direct_fullgraph_lowerings(self) -> None:
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("native kernel requires SM120/SM121")
+        torch.manual_seed(1201)
+        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        dynamic = MXFP8Linear(
+            128,
+            128,
+            device="cuda",
+            dtype=torch.bfloat16,
+            autotune="off",
+        ).eval().requires_grad_(False)
+        packed = dynamic.to_quantized_weight().eval()
+
+        expected_dynamic_x = packed(x)
+        compiled_dynamic_x = torch.compile(
+            packed, fullgraph=True, dynamic=False
+        )
+        actual_dynamic_x = compiled_dynamic_x(x)
+
+        packed_x = quantize_mxfp8(x)
+        expected_packed = packed(packed_x)
+        compiled_packed = torch.compile(
+            packed, fullgraph=True, dynamic=False
+        )
+        actual_packed = compiled_packed(packed_x)
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(
+            actual_dynamic_x, expected_dynamic_x, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            actual_packed, expected_packed, rtol=0, atol=0
+        )
+
     def test_prequant_frontend_is_fullgraph_compileable(self) -> None:
         if torch.cuda.get_device_capability()[0] != 12:
             self.skipTest("native kernel requires SM120/SM121")

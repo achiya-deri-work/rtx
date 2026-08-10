@@ -39,7 +39,15 @@ if TYPE_CHECKING:
     from .kernels.mxfp8_bwd import MXFP8BwdConfig
 
 WeightMode = Literal["dynamic", "prequantized"]
-ScalingMode = Literal["delayed", "current", "block"]
+ScalingMode = Literal["delayed", "current", "regional", "block"]
+
+
+def _effective_scale_region_rows(rows: int, requested: int) -> int:
+    """Resolve a row-region cap, falling back to one region for ragged shapes."""
+
+    if requested <= 0 or rows <= requested or rows % requested:
+        return 0
+    return requested
 
 
 def compile_nvfp4_quant(*args, **kwargs):
@@ -87,9 +95,20 @@ class NVFP4ForwardConfig:
     quant_launches: str = "dual"
     fused: NVFP4FwdConfig | None = None
     l2_fetch_granularity: int | None = None
+    x_scale_region_rows: int = 0
+    weight_scale_region_rows: int = 0
 
     def rejection(self, problem: NVFP4Problem) -> str | None:
         fused = self.fused or _fallback_fused_config(problem)
+        fused = replace(
+            fused,
+            x_scale_region_rows=_effective_scale_region_rows(
+                problem.m, self.x_scale_region_rows
+            ),
+            weight_scale_region_rows=_effective_scale_region_rows(
+                problem.n, self.weight_scale_region_rows
+            ),
+        )
         return fused.implementation_rejection(problem)
 
     def materialized_rejection(self, problem: NVFP4Problem) -> str | None:
@@ -122,6 +141,24 @@ def _intern_forward_config(config: NVFP4ForwardConfig) -> str:
 _DEFAULT_NVFP4_FORWARD_KEY = _intern_forward_config(DEFAULT_NVFP4_FORWARD_CONFIG)
 
 
+@torch.compiler.assume_constant_result
+def _functional_forward_config_key(
+    fused: NVFP4FwdConfig | None,
+    region_rows: int,
+) -> str:
+    """Intern functional policy without constructing dataclasses in FX."""
+
+    if fused is None and region_rows == 0:
+        return _DEFAULT_NVFP4_FORWARD_KEY
+    return _intern_forward_config(
+        NVFP4ForwardConfig(
+            fused=fused,
+            x_scale_region_rows=region_rows,
+            weight_scale_region_rows=region_rows,
+        )
+    )
+
+
 def _current_tensor_scale(tensor: torch.Tensor) -> torch.Tensor:
     """Return the exact TorchAO two-level decode scale without a host sync."""
 
@@ -132,16 +169,20 @@ def _current_tensor_scale(tensor: torch.Tensor) -> torch.Tensor:
     return torch.where(amax > 0.0, scale, torch.ones_like(scale)).reshape(1)
 
 
-def _power2_tensor_scale_pack(tensor: torch.Tensor) -> torch.Tensor:
-    """Current amax scale and exact reciprocals consumed by fused NVFP4."""
-
-    amax = torch.amax(torch.abs(tensor.detach().float()))
+def _power2_scale_pack_from_amax(amax: torch.Tensor) -> torch.Tensor:
     target = amax / 2688.0
     safe_target = torch.clamp_min(target, torch.finfo(torch.float32).tiny)
     scale = torch.exp2(torch.ceil(torch.log2(safe_target)))
     scale = torch.where(amax > 0.0, scale, torch.ones_like(scale))
     inverse = torch.reciprocal(scale)
-    return torch.stack((scale, inverse, inverse / 6.0))
+    return torch.stack((scale, inverse, inverse / 6.0), dim=-1).reshape(-1)
+
+
+def _power2_tensor_scale_pack(tensor: torch.Tensor) -> torch.Tensor:
+    """Current amax scale and exact reciprocals consumed by fused NVFP4."""
+
+    amax = torch.amax(torch.abs(tensor.detach().float()))
+    return _power2_scale_pack_from_amax(amax)
 
 
 def _exact_tensor_scale_pack(tensor: torch.Tensor) -> torch.Tensor:
@@ -150,6 +191,40 @@ def _exact_tensor_scale_pack(tensor: torch.Tensor) -> torch.Tensor:
     scale = _current_tensor_scale(tensor)
     inverse = torch.reciprocal(scale)
     return torch.cat((scale, inverse, inverse / 6.0))
+
+
+def _regional_tensor_scale_pack(
+    tensor: torch.Tensor,
+    region_rows: int,
+    mode: str,
+) -> torch.Tensor:
+    """Return adjacent ``(scale, inverse, inverse/6)`` packs per row region.
+
+    The reduction and scale math deliberately remain ordinary Torch tensor
+    expressions so ``torch.compile`` can generate the producer kernel.  The
+    registered CuTe op only launches the fused quantize/GEMM consumer.
+    """
+
+    rows, k = tensor.shape
+    if region_rows <= 0 or rows % region_rows:
+        raise ValueError(
+            f"regional NVFP4 scaling requires rows divisible by region_rows; "
+            f"got rows={rows}, region_rows={region_rows}"
+        )
+    amax = torch.amax(
+        torch.abs(tensor.detach().float()).reshape(
+            rows // region_rows, region_rows * k
+        ),
+        dim=1,
+    )
+    if mode == "power2":
+        return _power2_scale_pack_from_amax(amax)
+    if mode == "exact":
+        scale = amax / 2688.0
+        scale = torch.where(amax > 0.0, scale, torch.ones_like(scale))
+        inverse = torch.reciprocal(scale)
+        return torch.stack((scale, inverse, inverse / 6.0), dim=-1).reshape(-1)
+    raise ValueError(f"unknown NVFP4 tensor scale mode {mode!r}")
 
 
 def _tensor_scale_pack(tensor: torch.Tensor, mode: str) -> torch.Tensor:
@@ -274,6 +349,15 @@ def _resolved_fused_config(
                 else _runtime_fused_config(
                     problem, device, collect_amax=collect_amax
                 )
+            )
+            selected = replace(
+                selected,
+                x_scale_region_rows=_effective_scale_region_rows(
+                    problem.m, public_config.x_scale_region_rows
+                ),
+                weight_scale_region_rows=_effective_scale_region_rows(
+                    problem.n, public_config.weight_scale_region_rows
+                ),
             )
             _FUSED_CONFIG_SELECTIONS[key] = selected
     return selected
@@ -634,13 +718,28 @@ def _launch_nvfp4_forward_scaled(
         x.device,
         collect_amax=False,
     )
-    if (
-        x_scale.dtype is not torch.float32
-        or weight_scale.dtype is not torch.float32
-        or x_scale.numel() != 3
-        or weight_scale.numel() != 3
-    ):
-        raise TypeError("fused NVFP4 tensor scales must be three-value FP32 packs")
+    expected_x_scales = (
+        3 * (problem.m // fused_config.x_scale_region_rows)
+        if fused_config.x_scale_region_rows
+        else 3
+    )
+    expected_weight_scales = (
+        3 * (problem.n // fused_config.weight_scale_region_rows)
+        if fused_config.weight_scale_region_rows
+        else 3
+    )
+    if x_scale.dtype is not torch.float32 or weight_scale.dtype is not torch.float32:
+        raise TypeError("fused NVFP4 scale packs must use FP32")
+    if x_scale.numel() != expected_x_scales:
+        raise ValueError(
+            f"fused NVFP4 X scale pack has {x_scale.numel()} values, "
+            f"expected {expected_x_scales}"
+        )
+    if weight_scale.numel() != expected_weight_scales:
+        raise ValueError(
+            f"fused NVFP4 weight scale pack has {weight_scale.numel()} values, "
+            f"expected {expected_weight_scales}"
+        )
     cache_key = (
         x.device.index,
         stream.cuda_stream,
@@ -1187,6 +1286,29 @@ class _InductorNVFP4CurrentLauncher:
             x.device,
             collect_amax=False,
         )
+        rejection = fused_config.implementation_rejection(problem)
+        if rejection is not None:
+            raise RuntimeError(f"NVFP4 configuration cannot run: {rejection}")
+        expected_x_scales = (
+            3 * (problem.m // fused_config.x_scale_region_rows)
+            if fused_config.x_scale_region_rows
+            else 3
+        )
+        expected_weight_scales = (
+            3 * (problem.n // fused_config.weight_scale_region_rows)
+            if fused_config.weight_scale_region_rows
+            else 3
+        )
+        if x_scale.numel() != expected_x_scales:
+            raise RuntimeError(
+                f"compiled NVFP4 X scale ABI expected {expected_x_scales} "
+                f"values, got {x_scale.numel()}"
+            )
+        if weight_scale.numel() != expected_weight_scales:
+            raise RuntimeError(
+                f"compiled NVFP4 weight scale ABI expected "
+                f"{expected_weight_scales} values, got {weight_scale.numel()}"
+            )
         key = (
             x.device.index,
             stream_id,
@@ -1603,12 +1725,17 @@ def nvfp4_linear(
     *,
     forward_config: NVFP4FwdConfig | None = None,
     backward_config: "MXFP8BwdConfig | None" = None,
-    scaling: Literal["current", "block"] = "current",
+    scaling: Literal["current", "regional", "block"] = "current",
+    scale_region_rows: int = 1,
 ) -> torch.Tensor:
     """Apply NVFP4 forward and MXFP8 backward to BF16 or packed operands."""
 
-    if scaling not in ("current", "block"):
-        raise ValueError("functional NVFP4 scaling must be current or block")
+    if scaling not in ("current", "regional", "block"):
+        raise ValueError(
+            "functional NVFP4 scaling must be current, regional, or block"
+        )
+    if scale_region_rows <= 0:
+        raise ValueError("scale_region_rows must be positive")
 
     if isinstance(weight, NVFP4Tensor):
         validate_nvfp4_tensor(weight)
@@ -1654,6 +1781,11 @@ def nvfp4_linear(
             raise RuntimeError("prequantized NVFP4 weights are inference-only")
         leading = x.shape[:-1]
         x_2d = x.reshape(-1, k)
+        if scaling == "regional":
+            raise NotImplementedError(
+                "regional outer scaling currently requires dynamic BF16 X and W; "
+                "the prequantized-W epilogue still consumes one output scale"
+            )
         x_scale = (
             x_2d.new_ones(1, dtype=torch.float32)
             if scaling == "block"
@@ -1690,10 +1822,10 @@ def nvfp4_linear(
             f"in_features mismatch: activation K={x.shape[-1]}, "
             f"weight K={weight.shape[1]}"
         )
-    forward_key = (
-        _DEFAULT_NVFP4_FORWARD_KEY
-        if forward_config is None
-        else _intern_forward_config(NVFP4ForwardConfig(fused=forward_config))
+    region_rows = scale_region_rows if scaling == "regional" else 0
+    forward_key = _functional_forward_config_key(
+        forward_config,
+        region_rows,
     )
     tensor_scale_mode = (
         "power2" if forward_config is None else forward_config.tensor_scale_mode
@@ -1719,6 +1851,8 @@ def nvfp4_linear(
         forward_key=forward_key,
         backward_key=backward_key,
         tensor_scale_mode=tensor_scale_mode,
+        x_scale_region_rows=region_rows,
+        weight_scale_region_rows=region_rows,
         fixed_scale_pack=fixed_scale_pack,
     )
 
@@ -1730,6 +1864,8 @@ def _nvfp4_dynamic_linear_with_keys(
     forward_key: str,
     backward_key: str,
     tensor_scale_mode: str,
+    x_scale_region_rows: int = 0,
+    weight_scale_region_rows: int = 0,
     fixed_scale_pack: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compiler-visible current scaling around launch-only NVFP4 operators."""
@@ -1741,8 +1877,26 @@ def _nvfp4_dynamic_linear_with_keys(
     # Inductor owns their fusion and schedules only the final CuTe launch as an
     # external kernel; none of this eager tensor work is hidden in registration.
     if fixed_scale_pack is None:
-        x_scale = _tensor_scale_pack(x_2d, tensor_scale_mode)
-        weight_scale = _tensor_scale_pack(weight, tensor_scale_mode)
+        effective_x_rows = _effective_scale_region_rows(
+            x_2d.shape[0], x_scale_region_rows
+        )
+        effective_weight_rows = _effective_scale_region_rows(
+            weight.shape[0], weight_scale_region_rows
+        )
+        x_scale = (
+            _regional_tensor_scale_pack(
+                x_2d, effective_x_rows, tensor_scale_mode
+            )
+            if effective_x_rows
+            else _tensor_scale_pack(x_2d, tensor_scale_mode)
+        )
+        weight_scale = (
+            _regional_tensor_scale_pack(
+                weight, effective_weight_rows, tensor_scale_mode
+            )
+            if effective_weight_rows
+            else _tensor_scale_pack(weight, tensor_scale_mode)
+        )
     else:
         if fixed_scale_pack.dtype is not torch.float32:
             raise TypeError("block-only NVFP4 scale pack must use FP32")
@@ -1774,6 +1928,7 @@ class NVFP4Linear(nn.Module):
         "_forward_config_key",
         "_backward_config_key",
         "_tensor_scale_mode",
+        "scale_region_rows",
     ]
 
     def __init__(
@@ -1787,6 +1942,7 @@ class NVFP4Linear(nn.Module):
         forward_config: NVFP4FwdConfig | None = None,
         backward_config: "MXFP8BwdConfig | None" = None,
         scaling: ScalingMode = "delayed",
+        scale_region_rows: int = 1,
         packed_weight: NVFP4Tensor | None = None,
     ) -> None:
         super().__init__()
@@ -1798,13 +1954,26 @@ class NVFP4Linear(nn.Module):
             raise TypeError(f"NVFP4Linear parameters must be BF16, got {dtype}")
         self.in_features = int(in_features)
         self.out_features = int(out_features)
-        if scaling not in ("delayed", "current", "block"):
-            raise ValueError("NVFP4 scaling must be delayed, current, or block")
+        if scaling not in ("delayed", "current", "regional", "block"):
+            raise ValueError(
+                "NVFP4 scaling must be delayed, current, regional, or block"
+            )
+        if scale_region_rows <= 0:
+            raise ValueError("scale_region_rows must be positive")
         self.forward_config = forward_config
         self.backward_config = backward_config
         self.scaling = scaling
+        self.scale_region_rows = int(scale_region_rows)
         self._forward_config_key = _intern_forward_config(
-            NVFP4ForwardConfig(fused=forward_config)
+            NVFP4ForwardConfig(
+                fused=forward_config,
+                x_scale_region_rows=(
+                    self.scale_region_rows if scaling == "regional" else 0
+                ),
+                weight_scale_region_rows=(
+                    self.scale_region_rows if scaling == "regional" else 0
+                ),
+            )
         )
         self._tensor_scale_mode = (
             "power2" if forward_config is None else forward_config.tensor_scale_mode
@@ -2014,11 +2183,16 @@ class NVFP4Linear(nn.Module):
             backward_config=self.backward_config,
             forward_config=self.forward_config,
             scaling=self.scaling,
+            scale_region_rows=self.scale_region_rows,
             packed_weight=packed,
         )
 
     def forward(self, x: torch.Tensor | NVFP4Tensor) -> torch.Tensor:
         if self.weight_mode == "prequantized":
+            if self.scaling == "regional":
+                raise NotImplementedError(
+                    "regional outer scaling currently requires a dynamic BF16 weight"
+                )
             if isinstance(x, NVFP4Tensor):
                 validate_nvfp4_tensor(x)
                 m, k = nvfp4_matrix_shape(x)
@@ -2166,6 +2340,12 @@ class NVFP4Linear(nn.Module):
             forward_key=self._forward_config_key,
             backward_key=self._backward_config_key,
             tensor_scale_mode=self._tensor_scale_mode,
+            x_scale_region_rows=(
+                self.scale_region_rows if self.scaling == "regional" else 0
+            ),
+            weight_scale_region_rows=(
+                self.scale_region_rows if self.scaling == "regional" else 0
+            ),
             fixed_scale_pack=(
                 self._block_scale_pack if self.scaling == "block" else None
             ),

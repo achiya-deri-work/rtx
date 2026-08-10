@@ -965,14 +965,18 @@ class MXFP8LinearFwdKernel:
         if cutlass.const_expr(
             self.apply_output_scale and not self.config.collect_amax
         ):
-            x_tensor_scale_value = Float32(x_tensor_scale[0])
-            weight_tensor_scale_value = Float32(weight_tensor_scale[0])
+            if cutlass.const_expr(cfg.x_scale_region_rows == 0):
+                x_tensor_scale_value = Float32(x_tensor_scale[0])
+            if cutlass.const_expr(cfg.weight_scale_region_rows == 0):
+                weight_tensor_scale_value = Float32(weight_tensor_scale[0])
             output_scale = x_tensor_scale_value * weight_tensor_scale_value
             if cutlass.const_expr(
                 self.config.scale_reciprocal != "direct"
             ):
-                x_inv_tensor_scale = Float32(x_tensor_scale[1])
-                weight_inv_tensor_scale = Float32(weight_tensor_scale[1])
+                if cutlass.const_expr(cfg.x_scale_region_rows == 0):
+                    x_inv_tensor_scale = Float32(x_tensor_scale[1])
+                if cutlass.const_expr(cfg.weight_scale_region_rows == 0):
+                    weight_inv_tensor_scale = Float32(weight_tensor_scale[1])
             if cutlass.const_expr(
                 self.config.scale_reciprocal
                 in (
@@ -981,8 +985,10 @@ class MXFP8LinearFwdKernel:
                     "supplied_pow2_ptx_rcp",
                 )
             ):
-                x_quant_multiplier = Float32(x_tensor_scale[2])
-                weight_quant_multiplier = Float32(weight_tensor_scale[2])
+                if cutlass.const_expr(cfg.x_scale_region_rows == 0):
+                    x_quant_multiplier = Float32(x_tensor_scale[2])
+                if cutlass.const_expr(cfg.weight_scale_region_rows == 0):
+                    weight_quant_multiplier = Float32(weight_tensor_scale[2])
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -1376,6 +1382,49 @@ class MXFP8LinearFwdKernel:
                 block_m = offset // cols_in_group
                 block_n = (
                     group * cfg.grid_swizzle + offset % cols_in_group
+                )
+
+            # Regional outer scaling is selected only after the logical work
+            # tile is known.  This is required for rasterized and persistent
+            # schedules: physical CTA id is not an operand-row coordinate.
+            if cutlass.const_expr(
+                self.apply_output_scale
+                and not cfg.collect_amax
+                and (
+                    cfg.x_scale_region_rows != 0
+                    or cfg.weight_scale_region_rows != 0
+                )
+            ):
+                if cutlass.const_expr(cfg.x_scale_region_rows != 0):
+                    x_region = (
+                        block_m * cfg.tile_m // cfg.x_scale_region_rows
+                    )
+                    x_scale_base = x_region * 3
+                    x_tensor_scale_value = Float32(
+                        x_tensor_scale[x_scale_base]
+                    )
+                    x_inv_tensor_scale = Float32(
+                        x_tensor_scale[x_scale_base + 1]
+                    )
+                    x_quant_multiplier = Float32(
+                        x_tensor_scale[x_scale_base + 2]
+                    )
+                if cutlass.const_expr(cfg.weight_scale_region_rows != 0):
+                    weight_region = (
+                        block_n * cfg.tile_n // cfg.weight_scale_region_rows
+                    )
+                    weight_scale_base = weight_region * 3
+                    weight_tensor_scale_value = Float32(
+                        weight_tensor_scale[weight_scale_base]
+                    )
+                    weight_inv_tensor_scale = Float32(
+                        weight_tensor_scale[weight_scale_base + 1]
+                    )
+                    weight_quant_multiplier = Float32(
+                        weight_tensor_scale[weight_scale_base + 2]
+                    )
+                output_scale = (
+                    x_tensor_scale_value * weight_tensor_scale_value
                 )
 
             # partition_C gives an accumulator and a direct global view with the
@@ -1915,6 +1964,46 @@ class MXFP8LinearFwdKernel:
                             if is_a
                             else weight_tensor_scale_value
                         )
+                        inv_tensor_scale = (
+                            x_inv_tensor_scale
+                            if is_a
+                            else weight_inv_tensor_scale
+                        )
+                        quant_multiplier = (
+                            x_quant_multiplier
+                            if is_a
+                            else weight_quant_multiplier
+                        )
+                        if is_a:
+                            if cutlass.const_expr(cfg.x_scale_region_rows != 0):
+                                scale_pack_base = (
+                                    global_row // cfg.x_scale_region_rows
+                                ) * 3
+                                tensor_scale = Float32(
+                                    x_tensor_scale[scale_pack_base]
+                                )
+                                inv_tensor_scale = Float32(
+                                    x_tensor_scale[scale_pack_base + 1]
+                                )
+                                quant_multiplier = Float32(
+                                    x_tensor_scale[scale_pack_base + 2]
+                                )
+                        else:
+                            if cutlass.const_expr(
+                                cfg.weight_scale_region_rows != 0
+                            ):
+                                scale_pack_base = (
+                                    global_row // cfg.weight_scale_region_rows
+                                ) * 3
+                                tensor_scale = Float32(
+                                    weight_tensor_scale[scale_pack_base]
+                                )
+                                inv_tensor_scale = Float32(
+                                    weight_tensor_scale[scale_pack_base + 1]
+                                )
+                                quant_multiplier = Float32(
+                                    weight_tensor_scale[scale_pack_base + 2]
+                                )
                         scale_e8m0 = Float8E4M3FN(1.0)
                         inv_scale_fp32 = Float32(1.0)
                         if is_a:
@@ -1922,8 +2011,8 @@ class MXFP8LinearFwdKernel:
                                 self._nvfp4_scale_from_amax(
                                     amax,
                                     tensor_scale,
-                                    x_inv_tensor_scale,
-                                    x_quant_multiplier,
+                                    inv_tensor_scale,
+                                    quant_multiplier,
                                 )
                             )
                         else:
@@ -1931,8 +2020,8 @@ class MXFP8LinearFwdKernel:
                                 self._nvfp4_scale_from_amax(
                                     amax,
                                     tensor_scale,
-                                    weight_inv_tensor_scale,
-                                    weight_quant_multiplier,
+                                    inv_tensor_scale,
+                                    quant_multiplier,
                                 )
                             )
                     else:
@@ -2410,12 +2499,50 @@ class MXFP8LinearFwdKernel:
                                     coord[0] < self.problem.m
                                     and coord[1] < self.problem.n
                                 ):
+                                    element_output_scale = output_scale
+                                    if cutlass.const_expr(
+                                        self.nvfp4
+                                        and cfg.x_scale_region_rows != 0
+                                    ):
+                                        element_output_scale = Float32(
+                                            x_tensor_scale[
+                                                (coord[0] // cfg.x_scale_region_rows)
+                                                * 3
+                                            ]
+                                        )
+                                    if cutlass.const_expr(
+                                        self.nvfp4
+                                        and cfg.weight_scale_region_rows != 0
+                                    ):
+                                        weight_output_scale = Float32(
+                                            weight_tensor_scale[
+                                                (
+                                                    coord[1]
+                                                    // cfg.weight_scale_region_rows
+                                                )
+                                                * 3
+                                            ]
+                                        )
+                                        if cutlass.const_expr(
+                                            self.nvfp4
+                                            and cfg.x_scale_region_rows != 0
+                                        ):
+                                            element_output_scale = (
+                                                element_output_scale
+                                                * weight_output_scale
+                                            )
+                                        else:
+                                            element_output_scale = (
+                                                x_tensor_scale_value
+                                                * weight_output_scale
+                                            )
                                     t_cg_out[elem] = BFloat16(
                                         scratch[
                                             tidx * chunk_elements
                                             + elem
                                             - first_elem
                                         ]
+                                        * element_output_scale
                                     )
                         self._cluster_broadcast(
                             s_cluster_barrier,
@@ -2429,16 +2556,56 @@ class MXFP8LinearFwdKernel:
                     ):
                         coord = t_cc_out[elem]
                         if coord[0] < self.problem.m and coord[1] < self.problem.n:
+                            element_output_scale = output_scale
+                            if cutlass.const_expr(
+                                self.nvfp4 and cfg.x_scale_region_rows != 0
+                            ):
+                                element_output_scale = Float32(
+                                    x_tensor_scale[
+                                        (coord[0] // cfg.x_scale_region_rows) * 3
+                                    ]
+                                ) * weight_tensor_scale_value
+                            if cutlass.const_expr(
+                                self.nvfp4
+                                and cfg.weight_scale_region_rows != 0
+                            ):
+                                weight_output_scale = Float32(
+                                    weight_tensor_scale[
+                                        (
+                                            coord[1]
+                                            // cfg.weight_scale_region_rows
+                                        )
+                                        * 3
+                                    ]
+                                )
+                                if cutlass.const_expr(
+                                    self.nvfp4
+                                    and cfg.x_scale_region_rows != 0
+                                ):
+                                    element_output_scale = Float32(
+                                        x_tensor_scale[
+                                            (
+                                                coord[0]
+                                                // cfg.x_scale_region_rows
+                                            )
+                                            * 3
+                                        ]
+                                    ) * weight_output_scale
+                                else:
+                                    element_output_scale = (
+                                        x_tensor_scale_value
+                                        * weight_output_scale
+                                    )
                             if cutlass.const_expr(self.atomic_output):
                                 cute.arch.atomic_add(
                                     t_cg_out.iterator + t_cg_out.layout(elem),
-                                    accumulators[elem],
+                                    accumulators[elem] * element_output_scale,
                                     sem="relaxed",
                                     scope="gpu",
                                 )
                             else:
                                 t_cg_out[elem] = self.c_dtype(
-                                    accumulators[elem] * output_scale
+                                    accumulators[elem] * element_output_scale
                                 )
             elif cutlass.const_expr(cfg.epilogue == "tma"):
                 epilogue_stage = Int32(work_slot % cfg.epilogue_stages)

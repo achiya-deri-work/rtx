@@ -67,6 +67,9 @@ def main() -> None:
         "current_power2": rtx.NVFP4Linear(
             features, features, device="cuda", scaling="current"
         ),
+        "regional_rowwise": rtx.NVFP4Linear(
+            features, features, device="cuda", scaling="regional"
+        ),
         "block_only": rtx.NVFP4Linear(
             features, features, device="cuda", scaling="block"
         ),
@@ -116,6 +119,7 @@ def main() -> None:
         "delayed_power2",
         "delayed_exact",
         "current_power2",
+        "regional_rowwise",
         "block_only",
     ):
         result = summaries[name]

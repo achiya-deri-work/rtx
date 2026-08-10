@@ -54,6 +54,41 @@ class NVFP4ConfigTests(unittest.TestCase):
         self.assertEqual(config.amax_history_len, 16)
         self.assertEqual(config.amax_history_algo, "window_max")
 
+    def test_row_region_scale_legality_tracks_cta_tiles(self) -> None:
+        problem = NVFP4Problem(512, 512, 128)
+        regional = replace(
+            DEFAULT_NVFP4_FWD_CONFIG,
+            tile_k=128,
+            bf16_tile_k=128,
+            x_scale_region_rows=256,
+            weight_scale_region_rows=256,
+        )
+        self.assertIsNone(regional.implementation_rejection(problem))
+        self.assertIn(
+            "direct",
+            replace(regional, epilogue="tma").implementation_rejection(problem),
+        )
+        self.assertIn(
+            "distinct policies",
+            replace(regional, collect_amax=True).implementation_rejection(problem),
+        )
+        normalized = normalize_nvfp4_fwd_config(
+            regional, x_scale_region_rows=512, weight_scale_region_rows=256
+        )
+        self.assertEqual(normalized.x_scale_region_rows, 512)
+        self.assertEqual(normalized.weight_scale_region_rows, 256)
+
+    def test_row_region_scale_pack_is_region_major(self) -> None:
+        from rtx.fp4 import _regional_tensor_scale_pack
+
+        value = torch.ones(4, 8, dtype=torch.bfloat16)
+        value[2:].mul_(32.0)
+        pack = _regional_tensor_scale_pack(value, 2, "power2").reshape(2, 3)
+        self.assertEqual(tuple(pack.shape), (2, 3))
+        self.assertGreater(float(pack[1, 0]), float(pack[0, 0]))
+        torch.testing.assert_close(pack[:, 0] * pack[:, 1], torch.ones(2))
+        torch.testing.assert_close(pack[:, 2], pack[:, 1] / 6.0)
+
     def test_standalone_quantizer_exposes_one_lane_per_block(self) -> None:
         config = NVFP4QuantConfig(values_per_lane=16, load_bits=128)
         self.assertEqual(config.threads_per_scale, 1)
@@ -84,7 +119,7 @@ class NVFP4ConfigTests(unittest.TestCase):
     def test_runtime_promotion_understands_nvfp4_revision_and_schema(self) -> None:
         problem = NVFP4Problem(256, 1536, 1536)
         config = replace(DEFAULT_NVFP4_FWD_CONFIG, collect_amax=True)
-        self.assertEqual(_current_revision("nvfp4_fused_fwd"), 4)
+        self.assertEqual(_current_revision("nvfp4_fused_fwd"), 5)
         self.assertIsNone(
             _config_rejection(
                 "nvfp4_fused_fwd",
@@ -342,6 +377,74 @@ class NVFP4CudaTests(unittest.TestCase):
             modular = layer(x)
         torch.testing.assert_close(functional, modular, rtol=0, atol=0)
         self.assertTrue(bool(torch.isfinite(functional).all()))
+
+    def test_row_region_scaling_uses_independent_cta_scale_packs(self) -> None:
+        torch.manual_seed(1915)
+        x = torch.randn(512, 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(512, 128, device="cuda", dtype=torch.bfloat16)
+        x[256:].mul_(32.0)
+        weight[256:].mul_(16.0)
+        regional = rtx.nvfp4_linear(
+            x, weight, scaling="regional", scale_region_rows=256
+        )
+        current = rtx.nvfp4_linear(x, weight, scaling="current")
+        reference = x.float() @ weight.float().T
+        self.assertTrue(bool(torch.isfinite(regional).all()))
+        self.assertLess(
+            float((regional.float() - reference).abs().mean()),
+            float((current.float() - reference).abs().mean()) * 2.0,
+        )
+
+    def test_rowwise_scaling_preserves_heterogeneous_row_ranges(self) -> None:
+        torch.manual_seed(1917)
+        rows = 512
+        x = torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16)
+        dynamic_range = torch.exp2(
+            torch.linspace(-20, 20, rows, device="cuda")
+        ).to(torch.bfloat16)
+        x = x * dynamic_range[:, None]
+        weight = weight * dynamic_range[:, None]
+        current = rtx.nvfp4_linear(x, weight, scaling="current")
+        rowwise = rtx.nvfp4_linear(x, weight, scaling="regional")
+        reference = x.float() @ weight.float().T
+        denominator = reference.abs().clamp_min(1.0e-30)
+        current_relative = ((current.float() - reference).abs() / denominator).median()
+        rowwise_relative = ((rowwise.float() - reference).abs() / denominator).median()
+        self.assertLess(float(rowwise_relative), float(current_relative) * 0.25)
+
+    def test_row_region_scaling_is_fullgraph_compileable(self) -> None:
+        torch.manual_seed(1916)
+        layer = rtx.NVFP4Linear(
+            128,
+            512,
+            device="cuda",
+            scaling="regional",
+        ).eval()
+        compiled = torch.compile(
+            layer,
+            fullgraph=True,
+            dynamic=False,
+            options={"triton.cudagraphs": False},
+        )
+        x = torch.randn(512, 128, device="cuda", dtype=torch.bfloat16)
+        with torch.inference_mode():
+            out = compiled(x)
+        self.assertEqual(tuple(out.shape), (512, 512))
+        self.assertTrue(bool(torch.isfinite(out).all()))
+
+        def functional(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            return rtx.nvfp4_linear(a, b, scaling="regional")
+
+        compiled_functional = torch.compile(
+            functional,
+            fullgraph=True,
+            dynamic=False,
+            options={"triton.cudagraphs": False},
+        )
+        with torch.inference_mode():
+            functional_out = compiled_functional(x, layer.weight)
+        self.assertTrue(bool(torch.isfinite(functional_out).all()))
 
     def test_block_only_is_range_fast_path_not_extreme_range_reference(self) -> None:
         x = torch.full(

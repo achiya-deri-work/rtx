@@ -109,6 +109,13 @@ class NVFP4FwdConfig(MXFP8FwdConfig):
     b_swizzle: str = "128b"
     scale_reciprocal: str = "supplied_pow2_ptx_lut"
     tensor_scale_mode: str = "power2"
+    # Zero selects one tensor-wide outer FP32 scale.  Positive values select
+    # independently scaled contiguous row regions.  They are numerical-policy
+    # coordinates, not hidden schedule aliases: the frontend emits one
+    # three-value scale pack per region and the CTA selects its pack after
+    # raster/persistent work assignment.
+    x_scale_region_rows: int = 0
+    weight_scale_region_rows: int = 0
     collect_amax: bool = False
     telemetry_layout: str = "scalar_atomic"
     telemetry_ownership: str = "operand_owner"
@@ -146,6 +153,28 @@ class NVFP4FwdConfig(MXFP8FwdConfig):
             )
         if self.tensor_scale_mode not in ("power2", "exact"):
             return "NVFP4 tensor_scale_mode must be power2 or exact"
+        for name, rows, problem_rows in (
+            ("X", self.x_scale_region_rows, problem.m),
+            ("weight", self.weight_scale_region_rows, problem.n),
+        ):
+            if rows < 0:
+                return f"NVFP4 {name} scale-region rows cannot be negative"
+            if rows:
+                if self.collect_amax:
+                    return (
+                        "row-region JIT scaling and delayed amax are distinct "
+                        "policies"
+                    )
+                if problem_rows % rows:
+                    return (
+                        f"NVFP4 {name} rows must be divisible by its scale region; "
+                        f"got {problem_rows} and {rows}"
+                    )
+                if self.epilogue != "direct":
+                    return (
+                        "row-region JIT scaling currently requires the direct "
+                        "per-element epilogue"
+                    )
         if self.telemetry_layout not in ("per_cta", "scalar_atomic"):
             return "NVFP4 telemetry_layout must be per_cta or scalar_atomic"
         if self.telemetry_ownership not in ("all", "operand_owner"):
@@ -261,7 +290,7 @@ class NVFP4FullyPrequantConfig:
 DEFAULT_NVFP4_GEMM_CONFIG = NVFP4GemmConfig()
 DEFAULT_NVFP4_QUANT_CONFIG = NVFP4QuantConfig()
 DEFAULT_NVFP4_FWD_CONFIG = NVFP4FwdConfig()
-NVFP4_KERNEL_REVISION = 4
+NVFP4_KERNEL_REVISION = 5
 
 
 _NVFP4_EXCLUDED_COMPOUND_AXES = {
@@ -316,6 +345,12 @@ def normalize_nvfp4_fwd_config(
     tensor_scale_mode = updates.pop(
         "tensor_scale_mode", values.pop("tensor_scale_mode")
     )
+    x_scale_region_rows = updates.pop(
+        "x_scale_region_rows", values.pop("x_scale_region_rows")
+    )
+    weight_scale_region_rows = updates.pop(
+        "weight_scale_region_rows", values.pop("weight_scale_region_rows")
+    )
     collect_amax = updates.pop("collect_amax", values.pop("collect_amax"))
     telemetry_layout = updates.pop(
         "telemetry_layout", values.pop("telemetry_layout")
@@ -335,6 +370,8 @@ def normalize_nvfp4_fwd_config(
         **asdict(normalized),
         scale_reciprocal=str(scale_reciprocal),
         tensor_scale_mode=str(tensor_scale_mode),
+        x_scale_region_rows=int(x_scale_region_rows),
+        weight_scale_region_rows=int(weight_scale_region_rows),
         collect_amax=bool(collect_amax),
         telemetry_layout=str(telemetry_layout),
         telemetry_ownership=str(telemetry_ownership),

@@ -46,6 +46,11 @@ AutotuneMode = Literal["off", "cache", "coordinate"]
 MXFP8Backend = Literal["auto", "fused", "prequant"]
 WeightMode = Literal["dynamic", "prequantized"]
 
+# This revision is part of every compiler-visible forward token. Increment it
+# whenever lowering/ABI behavior changes so AOTInductor cannot revive a stale
+# generated wrapper whose graph otherwise has identical tensor guards.
+MXFP8_FRONTEND_REVISION = 2
+
 
 def compile_mxfp8_fwd(*args, **kwargs):
     return load_kernel_symbol("mxfp8_fwd", "compile_mxfp8_fwd")(*args, **kwargs)
@@ -194,6 +199,19 @@ class _InductorPrequantLauncherRegistry(dict[str, object]):
 
 
 _INDUCTOR_PREQUANT_LAUNCHERS = _InductorPrequantLauncherRegistry()
+
+
+class _InductorFusedLauncherRegistry(dict[str, object]):
+    def __missing__(self, config_key: str) -> object:
+        with _CONFIG_LOCK:
+            launcher = self.get(config_key)
+            if launcher is None:
+                launcher = _InductorFusedLauncher(config_key)
+                self[config_key] = launcher
+        return launcher
+
+
+_INDUCTOR_FUSED_LAUNCHERS = _InductorFusedLauncherRegistry()
 _CONFIG_LOCK = RLock()
 _CUDA_RUNTIME: object | None = None
 _CURRENT_L2_FETCH_GRANULARITY: int | None = None
@@ -267,13 +285,27 @@ class _WeightPrequantRunner:
         weight: MXFP8Tensor,
         out: torch.Tensor,
     ) -> None:
+        self.launch_raw(
+            x,
+            mxfp8_qdata_2d(weight),
+            mxfp8_scales_for_kernel(weight),
+            out,
+        )
+
+    def launch_raw(
+        self,
+        x: torch.Tensor,
+        weight_data: torch.Tensor,
+        weight_scales: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
         _ensure_l2_fetch_granularity(self.l2_fetch_granularity)
         self.quant_x(x, self.qx, self.sx)
         self.gemm(
             self.qx,
-            mxfp8_qdata_2d(weight),
+            weight_data,
             self.sx,
-            mxfp8_scales_for_kernel(weight),
+            weight_scales,
             out,
         )
 
@@ -302,7 +334,8 @@ class _PackedInferenceAutotuneRequest:
 
 @torch.compiler.assume_constant_result
 def _intern_config(config: MXFP8FwdConfig) -> str:
-    key = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
+    key = f"fwd-v{MXFP8_FRONTEND_REVISION}:{payload}"
     with _CONFIG_LOCK:
         _CONFIGS[key] = config
     return key
@@ -320,7 +353,10 @@ def _intern_fwd_autotune_request(
         "cache_dir": None if cache_dir is None else str(Path(cache_dir).expanduser()),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    key = "fwd-autotune:" + hashlib.sha256(encoded.encode()).hexdigest()[:24]
+    key = (
+        f"fwd-autotune:v{MXFP8_FRONTEND_REVISION}:"
+        + hashlib.sha256(encoded.encode()).hexdigest()[:24]
+    )
     with _CONFIG_LOCK:
         _FWD_AUTOTUNE_REQUESTS[key] = _FwdAutotuneRequest(
             mode, policy, payload["cache_dir"]
@@ -331,7 +367,8 @@ def _intern_fwd_autotune_request(
 @torch.compiler.assume_constant_result
 def _intern_prequant_config(config: MXFP8PrequantConfig) -> str:
     config = config.normalized()
-    key = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
+    key = f"prequant-v{MXFP8_FRONTEND_REVISION}:{payload}"
     with _CONFIG_LOCK:
         _PREQUANT_CONFIGS[key] = config
     return key
@@ -352,7 +389,10 @@ def _intern_prequant_autotune_request(
         "initial": asdict(initial),
     }
     digest = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    key = "autotune:" + hashlib.sha256(digest.encode()).hexdigest()[:24]
+    key = (
+        f"autotune:v{MXFP8_FRONTEND_REVISION}:"
+        + hashlib.sha256(digest.encode()).hexdigest()[:24]
+    )
     with _CONFIG_LOCK:
         _PREQUANT_AUTOTUNE_REQUESTS[key] = _PrequantAutotuneRequest(
             mode=mode,
@@ -376,7 +416,10 @@ def _intern_packed_inference_autotune_request(
         "cache_dir": None if cache_dir is None else str(Path(cache_dir).expanduser()),
     }
     digest = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    key = "packed-autotune:" + hashlib.sha256(digest.encode()).hexdigest()[:24]
+    key = (
+        f"packed-autotune:v{MXFP8_FRONTEND_REVISION}:"
+        + hashlib.sha256(digest.encode()).hexdigest()[:24]
+    )
     with _CONFIG_LOCK:
         _PACKED_INFERENCE_AUTOTUNE_REQUESTS[key] = (
             _PackedInferenceAutotuneRequest(
@@ -426,18 +469,16 @@ def _mxfp8_linear_fwd_op(
     return _launch_fused(x, weight, config_key)
 
 
-def _launch_fused(
+def _resolve_fused_launcher(
     x: torch.Tensor,
     weight: torch.Tensor,
     config_key: str,
-) -> torch.Tensor:
+) -> tuple[object, MXFP8Problem]:
     _check_inputs(x, weight)
-    x_c = x if x.is_contiguous() else x.contiguous()
-    weight_c = weight if weight.is_contiguous() else weight.contiguous()
     problem = MXFP8Problem(
-        m=int(x_c.shape[0]),
-        n=int(weight_c.shape[0]),
-        k=int(x_c.shape[1]),
+        m=int(x.shape[0]),
+        n=int(weight.shape[0]),
+        k=int(x.shape[1]),
     )
     request = _FWD_AUTOTUNE_REQUESTS.get(config_key)
     if request is not None:
@@ -451,8 +492,8 @@ def _launch_fused(
         selected_key = _FWD_AUTOTUNE_SELECTIONS.get(selection_key)
         if selected_key is None:
             selected = _resolve_fwd_config(
-                x_c,
-                weight_c,
+                x,
+                weight,
                 config=None,
                 autotune=request.mode,
                 tuning_policy=request.policy,
@@ -477,15 +518,82 @@ def _launch_fused(
             f"got compute capability {torch.cuda.get_device_capability(x.device)}"
         )
 
-    out = torch.empty(
-        (problem.m, problem.n), dtype=torch.bfloat16, device=x.device
-    )
-    launcher = compile_mxfp8_fwd(problem, config)
+    return compile_mxfp8_fwd(problem, config), problem
+
+
+def _launch_fused_out(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+    out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eager/out-variant path; the Inductor launcher skips all preparation."""
+
+    x_c = x if x.is_contiguous() else x.contiguous()
+    weight_c = weight if weight.is_contiguous() else weight.contiguous()
+    launcher, problem = _resolve_fused_launcher(x_c, weight_c, config_key)
+    if out.shape != (problem.m, problem.n) or out.dtype is not torch.bfloat16:
+        raise ValueError(
+            "MXFP8 output must be contiguous BF16 with shape "
+            f"({problem.m}, {problem.n}); got {tuple(out.shape)} {out.dtype}"
+        )
+    if not out.is_contiguous() or out.device != x.device:
+        raise ValueError("MXFP8 output must be contiguous and on the input device")
     launcher(x_c, weight_c, out)
+    return x_c, weight_c
+
+
+def _launch_fused(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+) -> torch.Tensor:
+    _check_inputs(x, weight)
+
+    out = torch.empty(
+        (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
+    )
+    x_c, weight_c = _launch_fused_out(x, weight, config_key, out)
     # TVM-FFI launches asynchronously.  Keep all inputs alive until the result
     # tensor is released, matching the existing project kernel convention.
     out._base_inputs = (x_c, weight_c)
     return out
+
+
+class _InductorFusedLauncher:
+    """Shape/config-bound fused launcher used by generated wrappers."""
+
+    def __init__(self, config_key: str) -> None:
+        self.config_key = config_key
+        self.runners: BoundedCache[tuple[object, ...], object] = BoundedCache(
+            runner_cache_limit("inductor_fused", 8)
+        )
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        out: torch.Tensor,
+    ) -> None:
+        stream_id = int(torch._C._cuda_getCurrentRawStream(x.device.index))
+        key = (
+            x.device.index,
+            stream_id,
+            int(x.shape[0]),
+            int(weight.shape[0]),
+            int(x.shape[1]),
+        )
+        launcher = self.runners.get(key)
+        if launcher is None:
+            with _CONFIG_LOCK:
+                launcher = self.runners.get(key)
+                if launcher is None:
+                    launcher, _problem = _resolve_fused_launcher(
+                        x, weight, self.config_key
+                    )
+                    self.runners[key] = launcher
+        launcher(x, weight, out)
 
 
 @_mxfp8_linear_fwd_op.register_fake
@@ -497,6 +605,81 @@ def _mxfp8_linear_fwd_fake(
     return torch.empty(
         (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
     )
+
+
+_FUSED_LIBRARY = torch.library.Library("rtx", "FRAGMENT")
+_FUSED_LIBRARY.define(
+    "mxfp8_linear_fwd_out("
+    "Tensor x, Tensor weight, str config_key, Tensor(a!) out) -> ()"
+)
+
+
+@torch.library.impl("rtx::mxfp8_linear_fwd_out", "cuda")
+def _mxfp8_linear_fwd_out_op(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+    out: torch.Tensor,
+) -> None:
+    x_c, weight_c = _launch_fused_out(x, weight, config_key, out)
+    out._base_inputs = (x_c, weight_c)
+
+
+@torch.library.register_fake("rtx::mxfp8_linear_fwd_out")
+def _mxfp8_linear_fwd_out_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+    out: torch.Tensor,
+) -> None:
+    return None
+
+
+register_out_variant(
+    torch.ops.rtx.mxfp8_linear_fwd.default,
+    torch.ops.rtx.mxfp8_linear_fwd_out.default,
+)
+
+
+def _register_fused_inductor_lowering() -> None:
+    from torch._inductor import ir
+    from torch._inductor.lowering import register_lowering
+
+    # Generated wrappers import torch already. Binding the immutable config
+    # key in this lookup removes the dispatcher and allocation-bearing Python
+    # custom-op implementation from the steady-state path.
+    torch._rtx_mxfp8_fused_launchers = _INDUCTOR_FUSED_LAUNCHERS
+
+    @register_lowering(
+        torch.ops.rtx.mxfp8_linear_fwd.default,
+        type_promotion_kind=None,
+    )
+    def lower_fused(x, weight, config_key):
+        inputs = [
+            ir.ExternKernel.require_contiguous(
+                ir.ExternKernel.realize_input(value)
+            )
+            for value in (x, weight)
+        ]
+        m = x.get_size()[0]
+        n = weight.get_size()[0]
+        return ir.TensorBox.create(
+            ir.ExternKernelOut(
+                layout=ir.FixedLayout(
+                    device=x.get_device(),
+                    dtype=torch.bfloat16,
+                    size=[m, n],
+                    stride=[n, 1],
+                ),
+                inputs=inputs,
+                python_kernel_name=(
+                    f"torch._rtx_mxfp8_fused_launchers[{config_key!r}]"
+                ),
+            )
+        )
+
+
+_register_fused_inductor_lowering()
 
 
 def _allocate_scales(
@@ -1073,6 +1256,307 @@ def _mxfp8_linear_prequantized_fake(
     return torch.empty((m, n), dtype=torch.bfloat16, device=x_data.device)
 
 
+class _InductorWeightPrequantLauncher:
+    """Launch-only dynamic-X/prequantized-W generated-wrapper entry."""
+
+    def __init__(
+        self,
+        config_key: str,
+        n: int,
+        k: int,
+        weight_scale_layout: str,
+    ) -> None:
+        self.config_key = config_key
+        self.n = n
+        self.k = k
+        self.weight_scale_layout = weight_scale_layout
+        self.runners: BoundedCache[tuple[object, ...], _WeightPrequantRunner] = (
+            BoundedCache(runner_cache_limit("inductor_weight_prequant", 8))
+        )
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight_data: torch.Tensor,
+        weight_scales: torch.Tensor,
+        *,
+        out: torch.Tensor,
+    ) -> None:
+        stream_id = int(torch._C._cuda_getCurrentRawStream(x.device.index))
+        key = (
+            x.device.index,
+            stream_id,
+            int(x.shape[0]),
+            int(x.shape[1]),
+            int(weight_data.shape[0]),
+        )
+        runner = self.runners.get(key)
+        if runner is None:
+            with _CONFIG_LOCK:
+                runner = self.runners.get(key)
+                if runner is None:
+                    weight = _packed_weight_from_tensors(
+                        weight_data,
+                        weight_scales,
+                        self.n,
+                        self.k,
+                        self.weight_scale_layout,
+                    )
+                    problem = MXFP8Problem(int(x.shape[0]), self.n, self.k)
+                    resolved_key = _resolve_packed_inference_request(
+                        problem,
+                        weight,
+                        x=None,
+                        config_key=self.config_key,
+                    )
+                    requested = _PREQUANT_CONFIGS[resolved_key]
+                    config = _packed_gemm_config(
+                        problem,
+                        requested.quant.scale_layout,
+                        self.weight_scale_layout,
+                        resolved_key,
+                    )
+                    rejection = config.quant.rejection(problem.m, problem.k)
+                    if rejection is not None:
+                        raise RuntimeError(
+                            f"activation quantizer cannot run: {rejection}"
+                        )
+                    runner = _WeightPrequantRunner(
+                        quant_x=compile_mxfp8_quant(
+                            problem.m, problem.k, config.quant
+                        ),
+                        gemm=compile_mxfp8_gemm(problem, config.gemm),
+                        qx=torch.empty_like(x, dtype=torch.float8_e4m3fn),
+                        sx=_allocate_scales(
+                            problem.m,
+                            problem.k,
+                            config.quant.scale_layout,
+                            x.device,
+                        ),
+                        l2_fetch_granularity=config.l2_fetch_granularity,
+                    )
+                    self.runners[key] = runner
+        runner.launch_raw(x, weight_data, weight_scales, out)
+
+
+class _InductorWeightPrequantRegistry(dict[tuple[object, ...], object]):
+    def __missing__(self, key: tuple[object, ...]) -> object:
+        config_key, n, k, weight_scale_layout = key
+        launcher = _InductorWeightPrequantLauncher(
+            str(config_key), int(n), int(k), str(weight_scale_layout)
+        )
+        with _CONFIG_LOCK:
+            existing = self.get(key)
+            if existing is not None:
+                return existing
+            self[key] = launcher
+        return launcher
+
+
+_INDUCTOR_WEIGHT_PREQUANT_LAUNCHERS = _InductorWeightPrequantRegistry()
+
+
+class _InductorFullyPrequantLauncher:
+    """Launch-only fully prequantized generated-wrapper entry."""
+
+    def __init__(
+        self,
+        config_key: str,
+        m: int,
+        n: int,
+        k: int,
+        x_scale_layout: str,
+        weight_scale_layout: str,
+    ) -> None:
+        self.config_key = config_key
+        self.problem = MXFP8Problem(m, n, k)
+        self.x_scale_layout = x_scale_layout
+        self.weight_scale_layout = weight_scale_layout
+        self.runners: BoundedCache[tuple[object, ...], tuple[object, int | None]] = (
+            BoundedCache(runner_cache_limit("inductor_fully_prequant", 8))
+        )
+
+    def __call__(
+        self,
+        x_data: torch.Tensor,
+        weight_data: torch.Tensor,
+        x_scales: torch.Tensor,
+        weight_scales: torch.Tensor,
+        *,
+        out: torch.Tensor,
+    ) -> None:
+        stream_id = int(
+            torch._C._cuda_getCurrentRawStream(x_data.device.index)
+        )
+        key = (x_data.device.index, stream_id)
+        cached = self.runners.get(key)
+        if cached is None:
+            with _CONFIG_LOCK:
+                cached = self.runners.get(key)
+                if cached is None:
+                    x = _packed_weight_from_tensors(
+                        x_data,
+                        x_scales,
+                        self.problem.m,
+                        self.problem.k,
+                        self.x_scale_layout,
+                    )
+                    weight = _packed_weight_from_tensors(
+                        weight_data,
+                        weight_scales,
+                        self.problem.n,
+                        self.problem.k,
+                        self.weight_scale_layout,
+                    )
+                    _validate_packed_linear_operands(x, weight)
+                    resolved_key = _resolve_packed_inference_request(
+                        self.problem,
+                        weight,
+                        x=x,
+                        config_key=self.config_key,
+                    )
+                    config = _packed_gemm_config(
+                        self.problem,
+                        self.x_scale_layout,
+                        self.weight_scale_layout,
+                        resolved_key,
+                    )
+                    cached = (
+                        compile_mxfp8_gemm(self.problem, config.gemm),
+                        config.l2_fetch_granularity,
+                    )
+                    self.runners[key] = cached
+        launcher, l2_fetch_granularity = cached
+        _ensure_l2_fetch_granularity(l2_fetch_granularity)
+        launcher(
+            x_data,
+            weight_data,
+            x_scales,
+            weight_scales,
+            out,
+        )
+
+
+class _InductorFullyPrequantRegistry(dict[tuple[object, ...], object]):
+    def __missing__(self, key: tuple[object, ...]) -> object:
+        config_key, m, n, k, x_scale_layout, weight_scale_layout = key
+        launcher = _InductorFullyPrequantLauncher(
+            str(config_key),
+            int(m),
+            int(n),
+            int(k),
+            str(x_scale_layout),
+            str(weight_scale_layout),
+        )
+        with _CONFIG_LOCK:
+            existing = self.get(key)
+            if existing is not None:
+                return existing
+            self[key] = launcher
+        return launcher
+
+
+_INDUCTOR_FULLY_PREQUANT_LAUNCHERS = _InductorFullyPrequantRegistry()
+
+
+def _register_packed_inductor_lowerings() -> None:
+    from torch._inductor import ir
+    from torch._inductor.lowering import register_lowering
+
+    torch._rtx_mxfp8_weight_prequant_launchers = (
+        _INDUCTOR_WEIGHT_PREQUANT_LAUNCHERS
+    )
+    torch._rtx_mxfp8_fully_prequant_launchers = (
+        _INDUCTOR_FULLY_PREQUANT_LAUNCHERS
+    )
+
+    @register_lowering(
+        torch.ops.rtx.mxfp8_linear_dynamic_x_prequant_w.default,
+        type_promotion_kind=None,
+    )
+    def lower_weight_prequant(
+        x,
+        weight_data,
+        weight_scales,
+        n,
+        k,
+        weight_scale_layout,
+        config_key,
+    ):
+        inputs = [
+            ir.ExternKernel.require_contiguous(
+                ir.ExternKernel.realize_input(value)
+            )
+            for value in (x, weight_data, weight_scales)
+        ]
+        m = x.get_size()[0]
+        launcher_key = (config_key, n, k, weight_scale_layout)
+        return ir.TensorBox.create(
+            ir.ExternKernelOut(
+                layout=ir.FixedLayout(
+                    device=x.get_device(),
+                    dtype=torch.bfloat16,
+                    size=[m, n],
+                    stride=[n, 1],
+                ),
+                inputs=inputs,
+                python_kernel_name=(
+                    "torch._rtx_mxfp8_weight_prequant_launchers"
+                    f"[{launcher_key!r}]"
+                ),
+            )
+        )
+
+    @register_lowering(
+        torch.ops.rtx.mxfp8_linear_prequantized.default,
+        type_promotion_kind=None,
+    )
+    def lower_fully_prequantized(
+        x_data,
+        weight_data,
+        x_scales,
+        weight_scales,
+        m,
+        n,
+        k,
+        x_scale_layout,
+        weight_scale_layout,
+        config_key,
+    ):
+        inputs = [
+            ir.ExternKernel.require_contiguous(
+                ir.ExternKernel.realize_input(value)
+            )
+            for value in (x_data, weight_data, x_scales, weight_scales)
+        ]
+        launcher_key = (
+            config_key,
+            m,
+            n,
+            k,
+            x_scale_layout,
+            weight_scale_layout,
+        )
+        return ir.TensorBox.create(
+            ir.ExternKernelOut(
+                layout=ir.FixedLayout(
+                    device=x_data.get_device(),
+                    dtype=torch.bfloat16,
+                    size=[m, n],
+                    stride=[n, 1],
+                ),
+                inputs=inputs,
+                python_kernel_name=(
+                    "torch._rtx_mxfp8_fully_prequant_launchers"
+                    f"[{launcher_key!r}]"
+                ),
+            )
+        )
+
+
+_register_packed_inductor_lowerings()
+
+
 def _run_weight_prequantized(
     x: torch.Tensor,
     weight: MXFP8Tensor,
@@ -1563,17 +2047,62 @@ def _clear_runtime_caches() -> dict[str, object]:
     before = {
         "prequant": _PREQUANT_RUNNERS.stats(),
         "weight_prequant": _WEIGHT_PREQUANT_RUNNERS.stats(),
-        "inductor_launchers": len(_INDUCTOR_PREQUANT_LAUNCHERS),
-        "inductor_runners": sum(
+        "inductor_prequant_launchers": len(_INDUCTOR_PREQUANT_LAUNCHERS),
+        "inductor_prequant_runners": sum(
             len(launcher.runners)
             for launcher in _INDUCTOR_PREQUANT_LAUNCHERS.values()
             if isinstance(launcher, _InductorPrequantLauncher)
         ),
+        "inductor_fused_launchers": len(_INDUCTOR_FUSED_LAUNCHERS),
+        "inductor_fused_runners": sum(
+            len(launcher.runners)
+            for launcher in _INDUCTOR_FUSED_LAUNCHERS.values()
+            if isinstance(launcher, _InductorFusedLauncher)
+        ),
+        "inductor_weight_prequant_launchers": len(
+            _INDUCTOR_WEIGHT_PREQUANT_LAUNCHERS
+        ),
+        "inductor_weight_prequant_runners": sum(
+            len(launcher.runners)
+            for launcher in _INDUCTOR_WEIGHT_PREQUANT_LAUNCHERS.values()
+            if isinstance(launcher, _InductorWeightPrequantLauncher)
+        ),
+        "inductor_fully_prequant_launchers": len(
+            _INDUCTOR_FULLY_PREQUANT_LAUNCHERS
+        ),
+        "inductor_fully_prequant_runners": sum(
+            len(launcher.runners)
+            for launcher in _INDUCTOR_FULLY_PREQUANT_LAUNCHERS.values()
+            if isinstance(launcher, _InductorFullyPrequantLauncher)
+        ),
     }
+    # Retain the original aggregate names for callers that inspect release
+    # telemetry while exposing per-family counts for the expanded frontend.
+    before["inductor_launchers"] = (
+        before["inductor_prequant_launchers"]
+        + before["inductor_fused_launchers"]
+        + before["inductor_weight_prequant_launchers"]
+        + before["inductor_fully_prequant_launchers"]
+    )
+    before["inductor_runners"] = (
+        before["inductor_prequant_runners"]
+        + before["inductor_fused_runners"]
+        + before["inductor_weight_prequant_runners"]
+        + before["inductor_fully_prequant_runners"]
+    )
     _PREQUANT_RUNNERS.clear()
     _WEIGHT_PREQUANT_RUNNERS.clear()
     for launcher in _INDUCTOR_PREQUANT_LAUNCHERS.values():
         if isinstance(launcher, _InductorPrequantLauncher):
+            launcher.runners.clear()
+    for launcher in _INDUCTOR_FUSED_LAUNCHERS.values():
+        if isinstance(launcher, _InductorFusedLauncher):
+            launcher.runners.clear()
+    for launcher in _INDUCTOR_WEIGHT_PREQUANT_LAUNCHERS.values():
+        if isinstance(launcher, _InductorWeightPrequantLauncher):
+            launcher.runners.clear()
+    for launcher in _INDUCTOR_FULLY_PREQUANT_LAUNCHERS.values():
+        if isinstance(launcher, _InductorFullyPrequantLauncher):
             launcher.runners.clear()
     _PACKED_INFERENCE_SELECTIONS.clear()
     _PREQUANT_AUTOTUNE_SELECTIONS.clear()

@@ -53,9 +53,25 @@ def compile_nvfp4_fwd(
         1 if config.telemetry_layout == "scalar_atomic" else kernel.grid_ctas
     )
     state_values = telemetry_slots * config.amax_history_len
-    scale_values = state_values if config.collect_amax else 3
-    tensor_scale = cute.runtime.make_fake_tensor(
-        Float32, (scale_values,), stride=(1,), assumed_align=4
+    x_scale_values = (
+        state_values
+        if config.collect_amax
+        else 3 * (problem.m // config.x_scale_region_rows)
+        if config.x_scale_region_rows
+        else 3
+    )
+    weight_scale_values = (
+        state_values
+        if config.collect_amax
+        else 3 * (problem.n // config.weight_scale_region_rows)
+        if config.weight_scale_region_rows
+        else 3
+    )
+    x_tensor_scale = cute.runtime.make_fake_tensor(
+        Float32, (x_scale_values,), stride=(1,), assumed_align=4
+    )
+    weight_tensor_scale = cute.runtime.make_fake_tensor(
+        Float32, (weight_scale_values,), stride=(1,), assumed_align=4
     )
     telemetry_values = state_values if config.collect_amax else 1
     amax = cute.runtime.make_fake_tensor(
@@ -67,8 +83,8 @@ def compile_nvfp4_fwd(
         x,
         weight,
         out,
-        tensor_scale,
-        tensor_scale,
+        x_tensor_scale,
+        weight_tensor_scale,
         amax,
         amax,
         stream,

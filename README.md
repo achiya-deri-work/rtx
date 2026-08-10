@@ -9,7 +9,8 @@ current implementation contains:
   persistent three-role TMA producer/quantizer/MMA schedules and staged async
   TMA epilogues;
 - fused BF16-to-NVFP4 training forward with packed E2M1 operands, E4M3
-  block scales, block-only/current/delayed FP32 tensor-scale policies,
+  block scales, block-only/current/row-region-JIT/delayed FP32 outer-scale
+  policies,
   rolling in-kernel amax telemetry, and a native K=64 block-scaled MMA;
   NVFP4 training reuses the MXFP8 backward kernels;
 - materialized dynamic MXFP8 quantization plus GEMM, including autotunable
@@ -29,7 +30,9 @@ current implementation contains:
   reduction,
   per-matmul, interleaved, asynchronous logical-transpose transport,
   wide-store, wide-CTA, and CTA-cluster reuse families;
-- PyTorch custom-op and `nn.Module` frontends;
+- PyTorch custom-op and `nn.Module` frontends, with allocation-free direct
+  Inductor lowerings for fused training/inference, materialized dynamic,
+  AOT-weight, and fully prequantized MXFP8 execution;
 - persistent random, gradient-boosted cost-model, bandit, and local search;
 - backend-neutral conditional spaces, staged tasks, and resumable ask/tell
   workers suitable for MoE and attention kernel projects;
@@ -195,15 +198,22 @@ forward prepares its power-of-two scale from the history inside each CTA,
 without a device-wide barrier or scale-preparation kernel.
 
 Set `scaling="current"` to recompute tensor scales just in time. Set
+`scaling="regional"` to compute independent JIT outer scales for contiguous
+X and W row regions (one row by default, matching rowwise scaling). These
+reductions remain visible to Inductor, while the fused CuTe kernel selects the
+correct scale pack after its
+raster/persistent work assignment. `scale_region_rows` is a numerical-policy
+coordinate and can be varied independently of the CTA schedule. Set
 `scaling="block"` to use an implicit global scale of one and rely only on the
 1x16 E4M3 block scales, eliminating both tensor-wide reductions. Block-only is
 the fastest policy when values stay inside the E4M3 scale exponent range;
-current scaling remains the numerical reference for extreme/tiny ranges.
+current scaling remains the tensorwide numerical reference for extreme/tiny ranges.
 An explicit `NVFP4FwdConfig(tensor_scale_mode="exact")` retains the exact
 TorchAO tensorwise FP32 scale for controlled studies; power-of-two is the
 default because its reciprocal is exact and cheaper. A dynamic module honors
 its selected policy during inference; AOT-weight dynamic-X inference supports
-current or block-only X scaling, and fully packed inference uses the tensor
+current or block-only X scaling (regional prequantized-W epilogues are not yet
+implemented), and fully packed inference uses the tensor
 scale stored in TorchAO's `NVFP4Tensor`.
 
 All four NVFP4 runtime paths support

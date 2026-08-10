@@ -1341,6 +1341,68 @@ def _mxfp8_linear_train_fake(
     )
 
 
+def _register_train_fwd_inductor_lowering() -> None:
+    from torch._inductor import ir
+    from torch._inductor.lowering import register_lowering
+
+    @register_lowering(
+        torch.ops.rtx.mxfp8_linear_train.default,
+        type_promotion_kind=None,
+    )
+    def lower_train_fwd(
+        x,
+        weight,
+        forward_config_key,
+        backward_config_key,
+    ):
+        # AOTAutograd has already captured backward_config_key in its backward
+        # graph. The forward executable only needs the two tensor operands and
+        # a family-specific, config-bound launch-only callable.
+        from . import fp8 as fp8_frontend
+
+        if (
+            forward_config_key in fp8_frontend._CONFIGS
+            or forward_config_key in fp8_frontend._FWD_AUTOTUNE_REQUESTS
+        ):
+            registry_name = "torch._rtx_mxfp8_fused_launchers"
+        elif (
+            forward_config_key in fp8_frontend._PREQUANT_CONFIGS
+            or forward_config_key
+            in fp8_frontend._PREQUANT_AUTOTUNE_REQUESTS
+        ):
+            registry_name = "torch._rtx_mxfp8_prequant_launchers"
+        else:
+            raise RuntimeError(
+                "unknown MXFP8 training-forward configuration family"
+            )
+
+        inputs = [
+            ir.ExternKernel.require_contiguous(
+                ir.ExternKernel.realize_input(value)
+            )
+            for value in (x, weight)
+        ]
+        m = x.get_size()[0]
+        n = weight.get_size()[0]
+        return ir.TensorBox.create(
+            ir.ExternKernelOut(
+                layout=ir.FixedLayout(
+                    device=x.get_device(),
+                    dtype=torch.bfloat16,
+                    size=[m, n],
+                    stride=[n, 1],
+                ),
+                inputs=inputs,
+                python_kernel_name=(
+                    f"{registry_name}[{forward_config_key!r}]"
+                ),
+            )
+        )
+
+
+_register_train_fwd_inductor_lowering()
+
+
 def _setup_train_context(ctx, inputs, output) -> None:
     x, weight, _forward_config_key, backward_config_key = inputs
     ctx.save_for_backward(x, weight)

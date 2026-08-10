@@ -3,6 +3,21 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.13.1
+
+- Lower dynamic fused, training, AOT-weight, and fully packed MXFP8 paths
+  directly through Inductor external kernels. Compiled execution now retains
+  the measured CuTe launch latency instead of paying opaque custom-op wrapper
+  overhead, while AOTAutograd still captures the registered MXFP8 backward.
+- Add opt-in row-region JIT outer scaling for dynamic NVFP4 X and W. The
+  compiler-visible reductions emit adjacent scale/inverse/multiplier packs;
+  rasterized and persistent CTAs select their packs from logical operand tile
+  coordinates before fused quantization and MMA.
+- Expose `scale_region_rows` on `nvfp4_linear` and `NVFP4Linear` with a
+  one-row default for the regional policy; preserve tensorwise current,
+  delayed-history, and block-only policies as independent comparisons, and
+  advance the NVFP4 fused-kernel revision.
+
 ## 0.12.1
 
 - Make current/JIT NVFP4 tensor-scale reductions compiler-visible. Inductor
