@@ -5,8 +5,10 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 import torch
+import rtx.fp8_bwd as fp8_bwd
 
 from rtx.bwd_autotune import (
     BWD_SEARCH_SPACE,
@@ -61,6 +63,75 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
         self.assertEqual(DEFAULT_MXFP8_BWD_CONFIG.stream_schedule, "dual_stream")
         self.assertEqual(DEFAULT_FUSED_MXFP8_BWD_CONFIG.dx.backend, "fused")
         self.assertEqual(DEFAULT_FUSED_MXFP8_BWD_CONFIG.dw.backend, "fused")
+
+    def test_partial_runner_builds_only_the_requested_gradient(self) -> None:
+        problem = MXFP8Problem(512, 1536, 1536)
+        sentinel = object()
+        with patch.object(
+            fp8_bwd, "_build_matmul_runner", return_value=sentinel
+        ) as build:
+            dx = fp8_bwd._build_partial_bwd_runner(
+                problem,
+                DEFAULT_MXFP8_BWD_CONFIG,
+                torch.device("cpu"),
+                "dx",
+            )
+            self.assertIs(dx, sentinel)
+            kwargs = build.call_args.kwargs
+            self.assertEqual(kwargs["problem"], MXFP8Problem(512, 1536, 1536))
+            self.assertIs(kwargs["config"], DEFAULT_MXFP8_BWD_CONFIG.dx)
+            self.assertTrue(kwargs["compile_quantizer"])
+            build.reset_mock()
+            dw = fp8_bwd._build_partial_bwd_runner(
+                problem,
+                DEFAULT_MXFP8_BWD_CONFIG,
+                torch.device("cpu"),
+                "dw",
+            )
+            self.assertIs(dw, sentinel)
+            kwargs = build.call_args.kwargs
+            self.assertEqual(kwargs["problem"], MXFP8Problem(1536, 1536, 512))
+            self.assertIs(kwargs["config"], DEFAULT_MXFP8_BWD_CONFIG.dw)
+            self.assertTrue(kwargs["compile_quantizer"])
+        with self.assertRaisesRegex(ValueError, "unknown backward gradient"):
+            fp8_bwd._build_partial_bwd_runner(
+                problem,
+                DEFAULT_MXFP8_BWD_CONFIG,
+                torch.device("cpu"),
+                "other",
+            )
+
+    def test_partial_launch_never_resolves_the_full_backward_runner(self) -> None:
+        grad = torch.empty(8, 16, dtype=torch.bfloat16)
+        x = torch.empty(8, 32, dtype=torch.bfloat16)
+        weight = torch.empty(16, 32, dtype=torch.bfloat16)
+        partial = Mock()
+        with (
+            patch.object(
+                fp8_bwd,
+                "_resolve_partial_bwd_runner",
+                return_value=(partial, grad, x, weight),
+            ) as resolve_partial,
+            patch.object(
+                fp8_bwd,
+                "_resolve_bwd_runner",
+                side_effect=AssertionError("full runner must not be built"),
+            ),
+        ):
+            dx = fp8_bwd._launch_dx(grad, x, weight, "config")
+            self.assertEqual(dx.shape, x.shape)
+            resolve_partial.assert_called_once_with(
+                grad, x, weight, "config", "dx"
+            )
+            partial.assert_called_once()
+            resolve_partial.reset_mock()
+            partial.reset_mock()
+            dw = fp8_bwd._launch_dw(grad, x, weight, "config")
+            self.assertEqual(dw.shape, weight.shape)
+            resolve_partial.assert_called_once_with(
+                grad, x, weight, "config", "dw"
+            )
+            partial.assert_called_once()
 
     def test_forward_scales_are_not_admitted_as_backward_scales(self) -> None:
         problem = MXFP8Problem(510, 1536, 1536)
@@ -880,17 +951,32 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
         grad_output = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
-        clustered = normalize_fwd_config(cluster_reuse_tile=("a", 2))
-        config = update_bwd_config(
-            DEFAULT_FUSED_MXFP8_BWD_CONFIG,
-            {
-                "dx": {"fused": asdict(clustered)},
-                "dw": {"fused": asdict(clustered)},
-                "stream_schedule": "dual_stream",
-            },
-        )
-        self.assertIsNone(config.implementation_rejection(MXFP8Problem(m, n, k)))
-        self._assert_backward_close(config, grad_output, x, weight)
+        transports = {
+            "tma": normalize_fwd_config(cluster_reuse_tile=("a", 2)),
+            "cpasync_ldmatrix": normalize_fwd_config(
+                cpasync_cluster_reuse_tile=(
+                    "a",
+                    2,
+                    4,
+                    "bf16x2",
+                    "bf16_bits",
+                )
+            ),
+        }
+        for name, clustered in transports.items():
+            config = update_bwd_config(
+                DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+                {
+                    "dx": {"fused": asdict(clustered)},
+                    "dw": {"fused": asdict(clustered)},
+                    "stream_schedule": "dual_stream",
+                },
+            )
+            with self.subTest(transport=name):
+                self.assertIsNone(
+                    config.implementation_rejection(MXFP8Problem(m, n, k))
+                )
+                self._assert_backward_close(config, grad_output, x, weight)
 
     def test_fused_tma_and_split_reduction_runtime_matrix(self) -> None:
         torch.manual_seed(29)

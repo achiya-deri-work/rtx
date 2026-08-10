@@ -367,8 +367,18 @@ class MXFP8FwdConfig:
                 return "clustered operand reuse requires at least two CTAs"
             if self.persistent:
                 return "clustered operand reuse is not combined with persistence yet"
-            if self.load_engine != "tma" or self.schedule != "three_role":
-                return "clustered operand reuse requires the three-role TMA schedule"
+            cluster_transport = (
+                (self.load_engine == "tma" and self.schedule == "three_role")
+                or (
+                    self.load_engine in ("scalar", "cpasync")
+                    and self.schedule == "cooperative"
+                )
+            )
+            if not cluster_transport:
+                return (
+                    "clustered operand reuse requires cooperative scalar/cp.async "
+                    "or the three-role TMA schedule"
+                )
             if self.mxfp8_stages != 1:
                 return "clustered operand reuse currently requires one MXFP8 stage"
             m_tiles = (problem.m + self.tile_m - 1) // self.tile_m
@@ -508,7 +518,7 @@ class MXFP8FwdConfig:
 
 
 DEFAULT_MXFP8_FWD_CONFIG = MXFP8FwdConfig()
-MXFP8_FWD_KERNEL_REVISION = 18
+MXFP8_FWD_KERNEL_REVISION = 19
 
 
 # Block coordinates supplement, rather than replace, their primitive fields.
@@ -546,6 +556,22 @@ CLUSTER_REUSE_COORDINATES: tuple[tuple[str, int], ...] = (
     ("b", 2),
     ("a", 4),
     ("b", 4),
+)
+
+# Couple DSMEM publication to the fastest staged logical-transpose transport.
+# The shared operand is loaded and quantized only by cluster rank zero; peers
+# receive its native E4M3/E8M0 bytes directly in their local SMEM stage.
+CPASYNC_CLUSTER_REUSE_COORDINATES: tuple[
+    tuple[str, int, int, str, str], ...
+] = (
+    *tuple(
+        (operand, cluster_size, bf16_stages, quant_math, quant_amax)
+        for operand in ("a", "b")
+        for cluster_size in (2, 4, 8)
+        for bf16_stages in (1, 2, 3, 4)
+        for quant_math in ("fp32", "bf16x2")
+        for quant_amax in ("fp32", "bf16_bits")
+    ),
 )
 
 BF16_PIPELINE_COORDINATES: tuple[tuple[str, str, int, str, int], ...] = (
@@ -599,6 +625,7 @@ FWD_SEARCH_SPACE: dict[str, tuple[object, ...]] = {
     "smem_rmem_tile": SMEM_RMEM_TILE_COORDINATES,
     "cta_reuse_tile": CTA_REUSE_TILE_COORDINATES,
     "cluster_reuse_tile": CLUSTER_REUSE_COORDINATES,
+    "cpasync_cluster_reuse_tile": CPASYNC_CLUSTER_REUSE_COORDINATES,
     "bf16_pipeline": BF16_PIPELINE_COORDINATES,
     "cpasync_ldmatrix_pipeline": CPASYNC_LDMATRIX_PIPELINE_COORDINATES,
     "persistent_tma_pipeline": PERSISTENT_TMA_PIPELINE_COORDINATES,
@@ -650,6 +677,7 @@ FWD_COORDINATE_ORDER: tuple[str, ...] = (
     "smem_rmem_tile",
     "cta_reuse_tile",
     "cluster_reuse_tile",
+    "cpasync_cluster_reuse_tile",
     "bf16_pipeline",
     "cpasync_ldmatrix_pipeline",
     "persistent_tma_pipeline",
@@ -710,6 +738,7 @@ def normalize_fwd_config(
         "smem_rmem_tile",
         "cta_reuse_tile",
         "cluster_reuse_tile",
+        "cpasync_cluster_reuse_tile",
         "bf16_pipeline",
         "cpasync_ldmatrix_pipeline",
         "persistent_tma_pipeline",
@@ -818,6 +847,40 @@ def normalize_fwd_config(
             quant_amax=quant_amax,
             cluster_reuse="none",
             cluster_size=1,
+        )
+
+    cpasync_cluster_reuse_tile = updates.pop(
+        "cpasync_cluster_reuse_tile", None
+    )
+    if cpasync_cluster_reuse_tile is not None:
+        (
+            cluster_reuse,
+            cluster_size,
+            bf16_stages,
+            quant_math,
+            quant_amax,
+        ) = cpasync_cluster_reuse_tile
+        updates.update(
+            cluster_reuse=cluster_reuse,
+            cluster_size=cluster_size,
+            load_engine="cpasync",
+            schedule="cooperative",
+            bf16_tile_k=32,
+            bf16_swizzle="none",
+            bf16_stages=bf16_stages,
+            mxfp8_stages=1,
+            producer_warps=0,
+            quant_vec=8,
+            quant_load_bits=128,
+            quant_math=quant_math,
+            quant_amax=quant_amax,
+            a_swizzle="none" if cluster_reuse == "a" else "128b",
+            b_swizzle="none" if cluster_reuse == "b" else "128b",
+            raster="n" if cluster_reuse == "a" else "m",
+            grid_swizzle=1,
+            persistent=False,
+            persistent_waves=1,
+            reuse="none",
         )
 
     persistent_tma_pipeline = updates.pop("persistent_tma_pipeline", None)

@@ -45,6 +45,15 @@ project follows semantic versioning while it is in active alpha development.
   cluster owner quantizes once and publishes packed native E4M3/E8M0 tiles to
   peer-local SMEM with DSMEM stores; keep it searchable after representative
   5070 Ti measurements showed the synchronization cost loses at M512.
+- Extend clustered operand reuse to the oriented cp.async/ldmatrix transport:
+  peer CTAs elide the shared BF16 load and quantization while the owner
+  publishes only the current native E4M3/E8M0 K slice. Keep the family as an
+  explicit autotuning coordinate rather than a default after 5070 Ti races
+  showed cluster synchronization losing at both M512 and M8192.
+- Specialize dX-only and dW-only autograd requests so each compiles and caches
+  only its selected backward matmul and quantizer instead of constructing the
+  full two-gradient runner. Cover eager and fullgraph partial-gradient paths in
+  the production matrix.
 - Add 8/16/32-bit quantized GMEM store schedules and a CuTe `CopyG2SOp`
   logical-transpose transport family. Promote the 128-row, four-value,
   32-bit-store register schedule for backward after paired races improved

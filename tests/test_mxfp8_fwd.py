@@ -138,6 +138,32 @@ class MXFP8ConfigTests(unittest.TestCase):
             illegal.implementation_rejection(problem),
         )
 
+    def test_cpasync_cluster_compound_skips_shared_operand_staging(self) -> None:
+        problem = MXFP8Problem(1024, 1024, 256)
+        for operand, raster in (("a", "n"), ("b", "m")):
+            for cluster_size in (2, 4, 8):
+                with self.subTest(operand=operand, cluster_size=cluster_size):
+                    config = normalize_fwd_config(
+                        cpasync_cluster_reuse_tile=(
+                            operand,
+                            cluster_size,
+                            4,
+                            "bf16x2",
+                            "bf16_bits",
+                        )
+                    )
+                    self.assertEqual(config.load_engine, "cpasync")
+                    self.assertEqual(config.schedule, "cooperative")
+                    self.assertEqual(config.quant_load_bits, 128)
+                    self.assertEqual(config.cluster_size, cluster_size)
+                    self.assertEqual(config.raster, raster)
+                    self.assertIsNone(config.implementation_rejection(problem))
+                    self.assertIsNone(
+                        config.oriented_implementation_rejection(
+                            problem, "transpose", "transpose"
+                        )
+                    )
+
     def test_tma_epilogue_rejects_ragged_output_tiles(self) -> None:
         config = normalize_fwd_config(
             tile_m=64, epilogue="tma", store_vec=4
@@ -202,6 +228,25 @@ class MXFP8ConfigTests(unittest.TestCase):
     def test_baseline_compiles_without_a_visible_gpu(self) -> None:
         compiled = compile_mxfp8_fwd(
             MXFP8Problem(128, 128, 128), MXFP8FwdConfig()
+        )
+        self.assertIsNotNone(compiled)
+
+    def test_oriented_cpasync_cluster_compiles_without_a_visible_gpu(self) -> None:
+        problem = MXFP8Problem(256, 256, 256)
+        config = normalize_fwd_config(
+            cpasync_cluster_reuse_tile=(
+                "a",
+                2,
+                4,
+                "bf16x2",
+                "bf16_bits",
+            )
+        )
+        compiled = compile_mxfp8_fwd(
+            problem,
+            config,
+            a_orientation="transpose",
+            b_orientation="transpose",
         )
         self.assertIsNotNone(compiled)
 
@@ -550,27 +595,49 @@ class MXFP8CudaTests(unittest.TestCase):
         weight = torch.randn(
             problem.n, problem.k, device="cuda", dtype=torch.bfloat16
         )
-        for operand, cluster_size in (("a", 2), ("b", 2), ("a", 4), ("b", 4)):
-            with self.subTest(operand=operand, cluster_size=cluster_size):
-                config = normalize_fwd_config(
-                    cluster_reuse_tile=(operand, cluster_size)
-                )
-                actual = torch.empty(
-                    problem.m,
-                    problem.n,
-                    device="cuda",
-                    dtype=torch.bfloat16,
-                )
-                expected = torch.empty_like(actual)
-                compile_mxfp8_fwd(problem, config)(x, weight, actual)
-                compile_mxfp8_fwd(
-                    problem,
-                    normalize_fwd_config(
-                        config, cluster_reuse="none", cluster_size=1
-                    ),
-                )(x, weight, expected)
-                torch.cuda.synchronize()
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for transport in ("tma", "cpasync"):
+            for operand, cluster_size in (
+                ("a", 2),
+                ("b", 2),
+                ("a", 4),
+                ("b", 4),
+            ):
+                with self.subTest(
+                    transport=transport,
+                    operand=operand,
+                    cluster_size=cluster_size,
+                ):
+                    config = normalize_fwd_config(
+                        **(
+                            {"cluster_reuse_tile": (operand, cluster_size)}
+                            if transport == "tma"
+                            else {
+                                "cpasync_cluster_reuse_tile": (
+                                    operand,
+                                    cluster_size,
+                                    4,
+                                    "bf16x2",
+                                    "bf16_bits",
+                                )
+                            }
+                        )
+                    )
+                    actual = torch.empty(
+                        problem.m,
+                        problem.n,
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                    )
+                    expected = torch.empty_like(actual)
+                    compile_mxfp8_fwd(problem, config)(x, weight, actual)
+                    compile_mxfp8_fwd(
+                        problem,
+                        normalize_fwd_config(
+                            config, cluster_reuse="none", cluster_size=1
+                        ),
+                    )(x, weight, expected)
+                    torch.cuda.synchronize()
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

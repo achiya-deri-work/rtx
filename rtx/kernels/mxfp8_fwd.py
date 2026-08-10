@@ -859,27 +859,9 @@ class MXFP8LinearFwdKernel:
 
         if cutlass.const_expr(cfg.cluster_reuse != "none"):
             if cutlass.const_expr(cfg.cluster_reuse == "a"):
-                cluster_q_items = cfg.tile_m * cfg.tile_k * cfg.mxfp8_stages
-                cluster_sf_items = (
-                    ((cfg.tile_m + 127) // 128)
-                    * 128
-                    * (cfg.tile_k // SF_VEC_SIZE)
-                    * cfg.mxfp8_stages
-                )
-                cluster_local_sf = cute.make_tensor(
-                    s_sfa.iterator, cute.make_layout(cluster_sf_items)
-                )
+                cluster_rows = cfg.tile_m
             else:
-                cluster_q_items = cfg.tile_n * cfg.tile_k * cfg.mxfp8_stages
-                cluster_sf_items = (
-                    ((cfg.tile_n + 127) // 128)
-                    * 128
-                    * (cfg.tile_k // SF_VEC_SIZE)
-                    * cfg.mxfp8_stages
-                )
-                cluster_local_sf = cute.make_tensor(
-                    s_sfb.iterator, cute.make_layout(cluster_sf_items)
-                )
+                cluster_rows = cfg.tile_n
 
         # MMA/register views are invariant across K tiles because shared memory
         # is reused after a CTA barrier.
@@ -1240,20 +1222,32 @@ class MXFP8LinearFwdKernel:
                     )
                     cp_async_thread_a = cp_async_tiled_copy_a.get_slice(tidx)
                     cp_async_thread_b = cp_async_tiled_copy_b.get_slice(tidx)
-                    cute.copy(
-                        cp_async_tiled_copy_a,
-                        cp_async_thread_a.partition_S(g_x_tile),
-                        cp_async_thread_a.partition_D(
-                            s_bf16_a[None, None, bf16_stage]
-                        ),
-                    )
-                    cute.copy(
-                        cp_async_tiled_copy_b,
-                        cp_async_thread_b.partition_S(g_weight_tile),
-                        cp_async_thread_b.partition_D(
-                            s_bf16_b[None, None, bf16_stage]
-                        ),
-                    )
+                    cluster_rank = Int32(0)
+                    if cutlass.const_expr(cfg.cluster_reuse != "none"):
+                        cluster_rank = cute.arch.block_idx_in_cluster()
+                    # Rank zero is the native-tile owner.  Peers do not fetch
+                    # the shared BF16 operand at all: after owner quantization,
+                    # its E4M3/E8M0 stage is pushed through DSMEM below.
+                    if cutlass.const_expr(cfg.cluster_reuse != "a") or (
+                        cluster_rank == 0
+                    ):
+                        cute.copy(
+                            cp_async_tiled_copy_a,
+                            cp_async_thread_a.partition_S(g_x_tile),
+                            cp_async_thread_a.partition_D(
+                                s_bf16_a[None, None, bf16_stage]
+                            ),
+                        )
+                    if cutlass.const_expr(cfg.cluster_reuse != "b") or (
+                        cluster_rank == 0
+                    ):
+                        cute.copy(
+                            cp_async_tiled_copy_b,
+                            cp_async_thread_b.partition_S(g_weight_tile),
+                            cp_async_thread_b.partition_D(
+                                s_bf16_b[None, None, bf16_stage]
+                            ),
+                        )
                     cute.arch.cp_async_commit_group()
                     cute.arch.cp_async_wait_group(0)
                     cute.arch.sync_threads()
@@ -1686,25 +1680,28 @@ class MXFP8LinearFwdKernel:
                                 )
                             for item in cutlass.range(
                                 tidx,
-                                cluster_q_items // 4,
+                                cluster_rows * cfg.bf16_tile_k // 4,
                                 cfg.num_threads,
                                 unroll=1,
                             ):
                                 q_base = item * 4
-                                q_row = q_base // cfg.tile_k
-                                q_k = q_base % cfg.tile_k
+                                q_row = q_base // cfg.bf16_tile_k
+                                q_k = (
+                                    k_block_base * SF_VEC_SIZE
+                                    + q_base % cfg.bf16_tile_k
+                                )
                                 if cutlass.const_expr(cfg.cluster_reuse == "a"):
-                                    q_offset = s_a.layout((q_row, q_k, 0))
-                                    q0 = s_a[q_row, q_k, 0]
-                                    q1 = s_a[q_row, q_k + 1, 0]
-                                    q2 = s_a[q_row, q_k + 2, 0]
-                                    q3 = s_a[q_row, q_k + 3, 0]
+                                    q_offset = s_a.layout((q_row, q_k, stage))
+                                    q0 = s_a[q_row, q_k, stage]
+                                    q1 = s_a[q_row, q_k + 1, stage]
+                                    q2 = s_a[q_row, q_k + 2, stage]
+                                    q3 = s_a[q_row, q_k + 3, stage]
                                 else:
-                                    q_offset = s_b.layout((q_row, q_k, 0))
-                                    q0 = s_b[q_row, q_k, 0]
-                                    q1 = s_b[q_row, q_k + 1, 0]
-                                    q2 = s_b[q_row, q_k + 2, 0]
-                                    q3 = s_b[q_row, q_k + 3, 0]
+                                    q_offset = s_b.layout((q_row, q_k, stage))
+                                    q0 = s_b[q_row, q_k, stage]
+                                    q1 = s_b[q_row, q_k + 1, stage]
+                                    q2 = s_b[q_row, q_k + 2, stage]
+                                    q3 = s_b[q_row, q_k + 3, stage]
                                 q_word = (
                                     Uint32(q0.bitcast(Uint8))
                                     | (Uint32(q1.bitcast(Uint8)) << 8)
@@ -1721,46 +1718,26 @@ class MXFP8LinearFwdKernel:
                                 )
                             for item in cutlass.range(
                                 tidx,
-                                cluster_sf_items // 4,
+                                cluster_rows * blocks_per_load,
                                 cfg.num_threads,
                                 unroll=1,
                             ):
-                                sf_base = item * 4
-                                sf_word = (
-                                    Uint32(
-                                        cluster_local_sf[sf_base].bitcast(Uint8)
-                                    )
-                                    | (
-                                        Uint32(
-                                            cluster_local_sf[
-                                                sf_base + 1
-                                            ].bitcast(Uint8)
-                                        )
-                                        << 8
-                                    )
-                                    | (
-                                        Uint32(
-                                            cluster_local_sf[
-                                                sf_base + 2
-                                            ].bitcast(Uint8)
-                                        )
-                                        << 16
-                                    )
-                                    | (
-                                        Uint32(
-                                            cluster_local_sf[
-                                                sf_base + 3
-                                            ].bitcast(Uint8)
-                                        )
-                                        << 24
-                                    )
-                                )
+                                sf_row = item // blocks_per_load
+                                sf_k = (
+                                    k_block_base + item % blocks_per_load
+                                ) * SF_VEC_SIZE
+                                if cutlass.const_expr(cfg.cluster_reuse == "a"):
+                                    sf_offset = s_sfa.layout((sf_row, sf_k, stage))
+                                    sf_value = s_sfa[sf_row, sf_k, stage]
+                                else:
+                                    sf_offset = s_sfb.layout((sf_row, sf_k, stage))
+                                    sf_value = s_sfb[sf_row, sf_k, stage]
                                 nvvm.inline_ptx_hl(
-                                    "st.shared::cluster.u32 [{$r0}], {$r1};",
+                                    "st.shared::cluster.u8 [{$r0}], {$r1};",
                                     write_only_types=[],
                                     read_only_args=[
-                                        Uint32((peer_sf_ptr + sf_base).toint()),
-                                        sf_word,
+                                        Uint32((peer_sf_ptr + sf_offset).toint()),
+                                        Uint32(sf_value.bitcast(Uint8)),
                                     ],
                                 )
                     cute.arch.cluster_arrive()

@@ -196,6 +196,52 @@ class HardwareAutotuneTests(unittest.TestCase):
             features["derived.dw_oriented_cpasync_ldmatrix_operands"], 2
         )
 
+    def test_backward_features_account_for_cpasync_cluster_load_elision(self) -> None:
+        problem = MXFP8Problem(512, 1536, 1536)
+        transport = normalize_fwd_config(
+            cpasync_cluster_reuse_tile=(
+                "a",
+                4,
+                4,
+                "bf16x2",
+                "bf16_bits",
+            )
+        )
+        candidate = update_bwd_config(
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+            {
+                "dx": {"fused": asdict(transport)},
+                "dw": {"fused": asdict(transport)},
+            },
+        )
+        adapter = make_mxfp8_bwd_adapter(
+            problem,
+            lambda _config: TrialOutcome("ok", median_ms=1.0),
+        )
+        features = adapter.features(candidate)
+        expected_saved = 36 * 128 * 1536 * 2
+        self.assertEqual(features["derived.dx_cluster_operand_reuse"], 1)
+        self.assertEqual(features["derived.dx_cluster_operand_reuse_a"], 1)
+        self.assertEqual(features["derived.dx_cluster_operand_reuse_size"], 4)
+        self.assertEqual(
+            features["derived.dx_cluster_operand_bf16_bytes_saved"],
+            expected_saved,
+        )
+        self.assertGreater(
+            features["derived.dx_cluster_dsmem_publication_bytes"], 0
+        )
+        self.assertEqual(
+            features["derived.dx_cluster_dsmem_publication_bytes"],
+            36 * (128 * 1536 + 128 * (1536 // 32)),
+        )
+        self.assertLess(
+            features["derived.dx_estimated_operand_read_bytes"],
+            features["derived.dx_x_bytes"]
+            * features["derived.dx_x_reuse_ctas"]
+            + features["derived.dx_weight_bytes"]
+            * features["derived.dx_weight_reuse_ctas"],
+        )
+
     def test_prequant_config_rejects_runtime_smem_reserve_statically(self) -> None:
         from rtx.configs import MXFP8GemmConfig
 
@@ -279,6 +325,25 @@ class HardwareAutotuneTests(unittest.TestCase):
         self.assertGreater(features["derived.smem_bytes_per_cta"], 0)
         self.assertGreater(features["derived.estimated_total_memory_bytes"], 0)
         self.assertGreater(features["derived.memory_roofline_ms"], 0)
+        clustered = normalize_fwd_config(
+            cpasync_cluster_reuse_tile=(
+                "a",
+                4,
+                4,
+                "bf16x2",
+                "bf16_bits",
+            )
+        )
+        clustered_features = adapter.features(clustered)
+        self.assertEqual(clustered_features["derived.cluster_operand_reuse"], 1)
+        self.assertEqual(
+            clustered_features["derived.cluster_operand_bf16_bytes_saved"],
+            36 * 128 * 1536 * 2,
+        )
+        self.assertLess(
+            clustered_features["derived.estimated_operand_read_bytes"],
+            features["derived.estimated_operand_read_bytes"],
+        )
 
     def test_feasibility_model_learns_compile_boundary(self) -> None:
         adapter = DiscreteKernelAdapter(

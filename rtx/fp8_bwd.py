@@ -558,6 +558,13 @@ _AUTOTUNE_SELECTIONS: dict[tuple[object, ...], str] = {}
 _RUNNERS: BoundedCache[tuple[object, ...], _BwdRunner] = BoundedCache(
     runner_cache_limit("backward", 8)
 )
+_MATMUL_RUNNERS: BoundedCache[
+    tuple[object, ...],
+    _MatmulRunner
+    | _FusedMatmulRunner
+    | _SplitFusedMatmulRunner
+    | _AtomicSplitFusedMatmulRunner,
+] = BoundedCache(runner_cache_limit("backward_matmul", 8))
 _LOCK = RLock()
 
 
@@ -644,14 +651,15 @@ def _launch_bwd(
     return grad_x, grad_weight
 
 
-def _resolve_bwd_runner(
+def _resolve_bwd_context(
     grad_output: torch.Tensor,
     x: torch.Tensor,
     weight: torch.Tensor,
     config_key: str,
 ) -> tuple[
     MXFP8Problem,
-    _BwdRunner,
+    str,
+    MXFP8BwdConfig,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -715,6 +723,24 @@ def _resolve_bwd_runner(
     grad_output_c = grad_output if grad_output.is_contiguous() else grad_output.contiguous()
     x_c = x if x.is_contiguous() else x.contiguous()
     weight_c = weight if weight.is_contiguous() else weight.contiguous()
+    return problem, config_key, config, grad_output_c, x_c, weight_c
+
+
+def _resolve_bwd_runner(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+) -> tuple[
+    MXFP8Problem,
+    _BwdRunner,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    problem, config_key, config, grad_output_c, x_c, weight_c = (
+        _resolve_bwd_context(grad_output, x, weight, config_key)
+    )
     stream = torch.cuda.current_stream(x.device)
     runner_key = (
         x.device.index,
@@ -734,17 +760,89 @@ def _resolve_bwd_runner(
     return problem, runner, grad_output_c, x_c, weight_c
 
 
+def _build_partial_bwd_runner(
+    problem: MXFP8Problem,
+    config: MXFP8BwdConfig,
+    device: torch.device,
+    gradient: str,
+) -> (
+    _MatmulRunner
+    | _FusedMatmulRunner
+    | _SplitFusedMatmulRunner
+    | _AtomicSplitFusedMatmulRunner
+):
+    """Build only the matmul needed by a partial autograd request."""
+
+    if gradient == "dx":
+        matmul_problem = MXFP8Problem(problem.m, problem.k, problem.n)
+        matmul_config = config.dx
+    elif gradient == "dw":
+        matmul_problem = MXFP8Problem(problem.n, problem.k, problem.m)
+        matmul_config = config.dw
+    else:  # internal invariant, kept explicit for direct tests and extensions
+        raise ValueError(f"unknown backward gradient {gradient!r}")
+    # A full backward quad schedule intentionally materializes four operands.
+    # A partial request instead compiles the selected matmul's own dual
+    # quantizer so the unused gradient creates no buffers or kernel launches.
+    return _build_matmul_runner(
+        problem=matmul_problem,
+        config=matmul_config,
+        device=device,
+        compile_quantizer=True,
+    )
+
+
+def _resolve_partial_bwd_runner(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+    gradient: str,
+) -> tuple[
+    _MatmulRunner
+    | _FusedMatmulRunner
+    | _SplitFusedMatmulRunner
+    | _AtomicSplitFusedMatmulRunner,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    problem, config_key, config, grad_output_c, x_c, weight_c = (
+        _resolve_bwd_context(grad_output, x, weight, config_key)
+    )
+    stream = torch.cuda.current_stream(x.device)
+    runner_key = (
+        gradient,
+        x.device.index,
+        int(stream.cuda_stream),
+        problem.m,
+        problem.n,
+        problem.k,
+        config_key,
+    )
+    runner = _MATMUL_RUNNERS.get(runner_key)
+    if runner is None:
+        with _LOCK:
+            runner = _MATMUL_RUNNERS.get(runner_key)
+            if runner is None:
+                runner = _build_partial_bwd_runner(
+                    problem, config, x.device, gradient
+                )
+                _MATMUL_RUNNERS[runner_key] = runner
+    return runner, grad_output_c, x_c, weight_c
+
+
 def _launch_dx(
     grad_output: torch.Tensor,
     x: torch.Tensor,
     weight: torch.Tensor,
     config_key: str,
 ) -> torch.Tensor:
-    _problem, runner, grad_output_c, x_c, weight_c = _resolve_bwd_runner(
-        grad_output, x, weight, config_key
+    runner, grad_output_c, x_c, weight_c = _resolve_partial_bwd_runner(
+        grad_output, x, weight, config_key, "dx"
     )
     grad_x = torch.empty_like(x_c)
-    runner.dx(grad_output_c, weight_c.T, grad_x)
+    runner(grad_output_c, weight_c.T, grad_x)
     grad_x._base_inputs = (grad_output_c, x_c, weight_c)
     return grad_x
 
@@ -755,18 +853,22 @@ def _launch_dw(
     weight: torch.Tensor,
     config_key: str,
 ) -> torch.Tensor:
-    _problem, runner, grad_output_c, x_c, weight_c = _resolve_bwd_runner(
-        grad_output, x, weight, config_key
+    runner, grad_output_c, x_c, weight_c = _resolve_partial_bwd_runner(
+        grad_output, x, weight, config_key, "dw"
     )
     grad_weight = torch.empty_like(weight_c)
-    runner.dw(grad_output_c.T, x_c.T, grad_weight)
+    runner(grad_output_c.T, x_c.T, grad_weight)
     grad_weight._base_inputs = (grad_output_c, x_c, weight_c)
     return grad_weight
 
 
 def _clear_runtime_caches() -> dict[str, object]:
-    before = {"backward": _RUNNERS.stats()}
+    before = {
+        "backward": _RUNNERS.stats(),
+        "backward_matmul": _MATMUL_RUNNERS.stats(),
+    }
     _RUNNERS.clear()
+    _MATMUL_RUNNERS.clear()
     _AUTOTUNE_SELECTIONS.clear()
     return before
 

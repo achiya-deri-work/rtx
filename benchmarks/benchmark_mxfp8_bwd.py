@@ -292,6 +292,29 @@ def _configs(shape: ShapeSpec, *, reuse_sweep: bool = False) -> dict[str, object
                 configs[
                     f"fused_tma_cluster_reuse_{operand}{cluster_size}_dual_stream"
                 ] = candidate
+            cpasync_clustered = normalize_fwd_config(
+                cpasync_ldmatrix,
+                cpasync_cluster_reuse_tile=(
+                    operand,
+                    cluster_size,
+                    4,
+                    "bf16x2",
+                    "bf16_bits",
+                ),
+            )
+            candidate = update_bwd_config(
+                DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+                {
+                    "dx": {"fused": asdict(cpasync_clustered)},
+                    "dw": {"fused": asdict(cpasync_clustered)},
+                    "stream_schedule": "dual_stream",
+                },
+            )
+            if candidate.implementation_rejection(problem) is None:
+                configs[
+                    "fused_cpasync_ldmatrix_cluster_reuse_"
+                    f"{operand}{cluster_size}_dual_stream"
+                ] = candidate
     split = _split_for(shape.m)
     if split is not None:
         parts, tile = split

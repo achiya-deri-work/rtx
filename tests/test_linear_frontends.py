@@ -47,6 +47,7 @@ class LinearFrontendContractTests(unittest.TestCase):
         self.assertIn("fp8_bwd", released)
         self.assertIn("prequant", released["fp8"])
         self.assertIn("backward", released["fp8_bwd"])
+        self.assertIn("backward_matmul", released["fp8_bwd"])
 
     def test_dynamic_module_defers_backward_cache_selection(self) -> None:
         cached = rtx.MXFP8Linear(128, 64, device="cpu", autotune="cache")

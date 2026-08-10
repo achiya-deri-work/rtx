@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -13,6 +14,7 @@ import torch
 
 import rtx
 from rtx.bwd_autotune import update_bwd_config
+from rtx.kernels.mxfp8 import normalize_fwd_config
 
 
 def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -67,6 +69,57 @@ def _dynamic_case(*, compiled: bool, training: bool) -> dict[str, object]:
     if max(thresholds) >= 0.07:
         raise AssertionError(f"relative error exceeds 7%: {result}")
     return result
+
+
+def _partial_training_case(
+    *, gradient: str, compiled: bool
+) -> dict[str, object]:
+    """Verify that autograd can request dX or dW independently."""
+
+    torch.manual_seed(173 + int(compiled) + (7 if gradient == "dw" else 0))
+    layer = rtx.MXFP8Linear(
+        128,
+        128,
+        device="cuda",
+        backend="fused",
+        autotune="off",
+    )
+    if gradient == "dx":
+        layer.weight.requires_grad_(False)
+    elif gradient != "dw":
+        raise ValueError(f"unknown partial gradient {gradient!r}")
+    x = torch.randn(
+        128,
+        128,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=gradient == "dx",
+    )
+    weight_reference = layer.weight.detach().float().clone()
+    function = (
+        torch.compile(layer, fullgraph=True, dynamic=False)
+        if compiled
+        else layer
+    )
+    actual = function(x)
+    grad = torch.randn_like(actual)
+    actual.backward(grad)
+    if gradient == "dx":
+        if x.grad is None or layer.weight.grad is not None:
+            raise AssertionError("dX-only autograd materialized the wrong gradients")
+        error = _relative_error(x.grad, grad.float() @ weight_reference)
+    else:
+        if x.grad is not None or layer.weight.grad is None:
+            raise AssertionError("dW-only autograd materialized the wrong gradients")
+        error = _relative_error(
+            layer.weight.grad, grad.float().T @ x.detach().float()
+        )
+    torch.cuda.synchronize()
+    if error >= 0.07:
+        raise AssertionError(
+            f"{gradient}-only relative error exceeds 7%: {error}"
+        )
+    return {"gradient": gradient, "relative_l2": error}
 
 
 def _packed_inference_case(*, fully_prequantized: bool) -> dict[str, object]:
@@ -162,6 +215,48 @@ def _long_reduction_case(
     }
 
 
+def _cpasync_cluster_backward_case() -> dict[str, object]:
+    """Exercise logical-transpose load elision plus DSMEM publication."""
+
+    torch.manual_seed(353)
+    m = n = k = 256
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    grad_output = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+    transport = normalize_fwd_config(
+        cpasync_cluster_reuse_tile=(
+            "a",
+            2,
+            4,
+            "bf16x2",
+            "bf16_bits",
+        )
+    )
+    config = update_bwd_config(
+        rtx.DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+        {
+            "dx": {"fused": asdict(transport)},
+            "dw": {"fused": asdict(transport)},
+            "stream_schedule": "dual_stream",
+        },
+    )
+    actual_dx, actual_dw = rtx.mxfp8_linear_backward(
+        grad_output, x, weight, config=config, autotune="off"
+    )
+    expected_dx = grad_output.float() @ weight.float()
+    expected_dw = grad_output.float().T @ x.float()
+    torch.cuda.synchronize()
+    errors = {
+        "dx_relative_l2": _relative_error(actual_dx, expected_dx),
+        "dw_relative_l2": _relative_error(actual_dw, expected_dw),
+    }
+    if max(errors.values()) >= 0.07:
+        raise AssertionError(
+            f"cp.async clustered backward relative error exceeds 7%: {errors}"
+        )
+    return errors
+
+
 def _multiple_stream_case() -> dict[str, object]:
     torch.manual_seed(401)
     layer = rtx.MXFP8Linear(
@@ -221,6 +316,18 @@ def main() -> None:
     cases = {
         "eager_dynamic_training": lambda: _dynamic_case(compiled=False, training=True),
         "compiled_dynamic_training": lambda: _dynamic_case(compiled=True, training=True),
+        "eager_dx_only_training": lambda: _partial_training_case(
+            gradient="dx", compiled=False
+        ),
+        "compiled_dx_only_training": lambda: _partial_training_case(
+            gradient="dx", compiled=True
+        ),
+        "eager_dw_only_training": lambda: _partial_training_case(
+            gradient="dw", compiled=False
+        ),
+        "compiled_dw_only_training": lambda: _partial_training_case(
+            gradient="dw", compiled=True
+        ),
         "eager_dynamic_inference": lambda: _dynamic_case(compiled=False, training=False),
         "compiled_dynamic_inference": lambda: _dynamic_case(compiled=True, training=False),
         "dynamic_x_prequantized_weight": lambda: _packed_inference_case(
@@ -229,6 +336,7 @@ def main() -> None:
         "fully_prequantized": lambda: _packed_inference_case(
             fully_prequantized=True
         ),
+        "oriented_cpasync_cluster_backward": _cpasync_cluster_backward_case,
         "long_sequence_dw_full": lambda: _long_reduction_case(
             1024 if args.quick else args.long_m, reduction="full_fp32"
         ),

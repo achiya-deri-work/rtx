@@ -337,6 +337,70 @@ def _prefix(values: Mapping[str, float], prefix: str) -> dict[str, float]:
     return {f"{prefix}{key}": value for key, value in values.items()}
 
 
+def _apply_fused_cluster_reuse_features(
+    values: dict[str, float],
+    *,
+    problem: MXFP8Problem,
+    config: MXFP8FwdConfig,
+    natural_output_ctas: int,
+    profile: Mapping[str, object] | None,
+) -> None:
+    """Account for native-tile DSMEM publication and GMEM load elision."""
+
+    cluster_size = config.cluster_size if config.cluster_reuse != "none" else 1
+    peer_ctas = natural_output_ctas * (cluster_size - 1) / cluster_size
+    reuse_rows = (
+        config.tile_m
+        if config.cluster_reuse == "a"
+        else config.tile_n if config.cluster_reuse == "b" else 0
+    )
+    # Cooperative scalar/cp.async peers never fetch or quantize the shared
+    # BF16 operand. TMA currently still stages BF16 in every CTA, although only
+    # rank zero performs quantization.
+    bf16_saved = (
+        peer_ctas * reuse_rows * problem.k * 2
+        if config.cluster_reuse != "none" and config.load_engine != "tma"
+        else 0.0
+    )
+    native_bytes = (
+        peer_ctas
+        * (
+            reuse_rows * problem.k
+            + reuse_rows * ((problem.k + 31) // 32)
+        )
+        if config.cluster_reuse != "none"
+        else 0.0
+    )
+    if bf16_saved:
+        values["estimated_operand_read_bytes"] = max(
+            0.0, values["estimated_operand_read_bytes"] - bf16_saved
+        )
+        values["estimated_total_memory_bytes"] = max(
+            1.0, values["estimated_total_memory_bytes"] - bf16_saved
+        )
+        values["arithmetic_intensity_flops_per_byte"] = (
+            values["nominal_flops"] / values["estimated_total_memory_bytes"]
+        )
+        bandwidth = float(
+            profile_value(profile, "measured_dram_bandwidth_gbps", 0)
+            or profile_value(profile, "theoretical_memory_bandwidth_gbps", 0)
+            or 0
+        )
+        if bandwidth:
+            values["memory_roofline_ms"] = values[
+                "estimated_total_memory_bytes"
+            ] / (bandwidth * 1.0e6)
+    values.update(
+        cluster_operand_reuse=float(config.cluster_reuse != "none"),
+        cluster_operand_reuse_a=float(config.cluster_reuse == "a"),
+        cluster_operand_reuse_b=float(config.cluster_reuse == "b"),
+        cluster_operand_reuse_size=float(cluster_size),
+        cluster_operand_bf16_bytes_saved=float(bf16_saved),
+        cluster_native_quant_bytes_saved=float(native_bytes),
+        cluster_dsmem_publication_bytes=float(native_bytes),
+    )
+
+
 def make_mxfp8_fwd_adapter(
     problem: MXFP8Problem,
     evaluator: Callable[[MXFP8FwdConfig], TrialOutcome],
@@ -429,6 +493,13 @@ def make_mxfp8_fwd_adapter(
                 profile=profile,
                 materialized_quant=False,
             )
+        )
+        _apply_fused_cluster_reuse_features(
+            values,
+            problem=problem,
+            config=config,
+            natural_output_ctas=natural_ctas,
+            profile=profile,
         )
         values.update(
             work_tiles_per_cta=natural_ctas / max(1, grid_ctas),
@@ -857,6 +928,13 @@ def make_mxfp8_bwd_adapter(
                     split_work_ctas=float(natural_ctas),
                     work_tiles_per_cta=natural_ctas / max(1, grid_ctas),
                     pipeline_buffer_bytes=float(_fused_smem_bytes(fused)),
+                )
+                _apply_fused_cluster_reuse_features(
+                    matmul_values,
+                    problem=matmul_problem,
+                    config=fused,
+                    natural_output_ctas=natural_output_ctas,
+                    profile=profile,
                 )
                 values.update(_prefix(matmul_values, f"{name}_"))
                 values[f"{name}_split_reduction"] = float(
