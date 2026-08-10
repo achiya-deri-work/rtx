@@ -108,6 +108,7 @@ class NVFP4FwdConfig(MXFP8FwdConfig):
     a_swizzle: str = "128b"
     b_swizzle: str = "128b"
     scale_reciprocal: str = "supplied_pow2_ptx_lut"
+    tensor_scale_mode: str = "power2"
     collect_amax: bool = False
 
     @property
@@ -139,6 +140,8 @@ class NVFP4FwdConfig(MXFP8FwdConfig):
                 "NVFP4 scale_reciprocal must be direct, supplied_exact, or "
                 "one of the supplied_pow2 variants"
             )
+        if self.tensor_scale_mode not in ("power2", "exact"):
+            return "NVFP4 tensor_scale_mode must be power2 or exact"
         if self.bf16_tile_k < 64:
             return "NVFP4 staged transport tiles must cover a complete K=64 MMA"
         return None
@@ -170,13 +173,19 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
     scale_load_vec: int = 4
     scale_layout: str = "row_major"
 
+    @property
+    def native_operand_bits(self) -> int:
+        return 4
+
+    @property
+    def scale_vector_size(self) -> int:
+        return NVFP4_SF_VEC_SIZE
+
     def rejection(self, problem: NVFP4Problem) -> str | None:
         try:
             problem.validate()
         except ValueError as exc:
             return str(exc)
-        if self.tile_m == 64:
-            return "64-row NVFP4 scale fragments are not implemented yet"
         if self.tile_k % 64:
             return "NVFP4 tile K must be divisible by 64"
         if self.scale_layout != "row_major":
@@ -188,10 +197,59 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
         return super().rejection(problem)  # type: ignore[arg-type]
 
 
+def _inference_l2_rejection(value: int | None) -> str | None:
+    if value not in (None, 0, 32, 64, 128):
+        return "L2 fetch granularity must be None, 0, 32, 64, or 128"
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class NVFP4WeightPrequantConfig:
+    """Per-call schedule for BF16 X and a TorchAO-packed NVFP4 W."""
+
+    quant_x: NVFP4QuantConfig = NVFP4QuantConfig()
+    gemm: NVFP4GemmConfig = NVFP4GemmConfig(
+        epilogue="direct", store_vec=1
+    )
+    l2_fetch_granularity: int | None = None
+
+    def rejection(self, problem: NVFP4Problem) -> str | None:
+        reason = self.quant_x.rejection(problem.m, problem.k)
+        if reason is not None:
+            return f"activation quantizer: {reason}"
+        reason = NVFP4QuantConfig().rejection(problem.n, problem.k)
+        if reason is not None:
+            return f"AOT weight packing: {reason}"
+        return (
+            _inference_l2_rejection(self.l2_fetch_granularity)
+            or self.gemm.rejection(problem)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class NVFP4FullyPrequantConfig:
+    """Per-call schedule when X and W are both TorchAO-packed NVFP4."""
+
+    gemm: NVFP4GemmConfig = NVFP4GemmConfig(
+        epilogue="direct", store_vec=1
+    )
+    l2_fetch_granularity: int | None = None
+
+    def rejection(self, problem: NVFP4Problem) -> str | None:
+        for label, rows in (("activation", problem.m), ("weight", problem.n)):
+            reason = NVFP4QuantConfig().rejection(rows, problem.k)
+            if reason is not None:
+                return f"AOT {label} packing: {reason}"
+        return (
+            _inference_l2_rejection(self.l2_fetch_granularity)
+            or self.gemm.rejection(problem)
+        )
+
+
 DEFAULT_NVFP4_GEMM_CONFIG = NVFP4GemmConfig()
 DEFAULT_NVFP4_QUANT_CONFIG = NVFP4QuantConfig()
 DEFAULT_NVFP4_FWD_CONFIG = NVFP4FwdConfig()
-NVFP4_KERNEL_REVISION = 2
+NVFP4_KERNEL_REVISION = 3
 
 
 _NVFP4_EXCLUDED_COMPOUND_AXES = {
@@ -217,6 +275,9 @@ NVFP4_FWD_SEARCH_SPACE.update(
         "supplied_pow2_ptx_lut",
         "supplied_pow2_ptx_rcp",
     ),
+    # Numerical scale policy is held fixed within one tuning context so exact
+    # output comparison does not conflate schedules with quantization policy.
+    tensor_scale_mode=("power2",),
     collect_amax=(True,),
 )
 
@@ -233,12 +294,16 @@ def normalize_nvfp4_fwd_config(
     scale_reciprocal = updates.pop(
         "scale_reciprocal", values.pop("scale_reciprocal")
     )
+    tensor_scale_mode = updates.pop(
+        "tensor_scale_mode", values.pop("tensor_scale_mode")
+    )
     collect_amax = updates.pop("collect_amax", values.pop("collect_amax"))
     common = MXFP8FwdConfig(**values)
     normalized = normalize_fwd_config(common, **updates)
     return NVFP4FwdConfig(
         **asdict(normalized),
         scale_reciprocal=str(scale_reciprocal),
+        tensor_scale_mode=str(tensor_scale_mode),
         collect_amax=bool(collect_amax),
     )
 
@@ -248,9 +313,11 @@ __all__ = [
     "DEFAULT_NVFP4_FWD_CONFIG",
     "DEFAULT_NVFP4_QUANT_CONFIG",
     "NVFP4GemmConfig",
+    "NVFP4FullyPrequantConfig",
     "NVFP4FwdConfig",
     "NVFP4Problem",
     "NVFP4QuantConfig",
+    "NVFP4WeightPrequantConfig",
     "NVFP4_KERNEL_REVISION",
     "NVFP4_FWD_SEARCH_SPACE",
     "normalize_nvfp4_fwd_config",

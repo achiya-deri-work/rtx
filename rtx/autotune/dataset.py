@@ -31,7 +31,9 @@ from .adapters import (
     make_mxfp8_fwd_adapter,
     make_mxfp8_prequant_adapter,
     make_mxfp8_weight_prequant_adapter,
+    make_nvfp4_fully_prequant_adapter,
     make_nvfp4_fwd_adapter,
+    make_nvfp4_weight_prequant_adapter,
 )
 from .bandit import DiscountedArmStatistics, contextual_ucb_scores
 from .core import KernelAdapter, canonical_json, stable_id
@@ -87,6 +89,10 @@ from ..prequant_experiments import (
 from ..inference_experiments import (
     FullyPrequantBenchmarkHarness,
     WeightPrequantBenchmarkHarness,
+)
+from ..nvfp4_inference_experiments import (
+    NVFP4FullyPrequantBenchmarkHarness,
+    NVFP4WeightPrequantBenchmarkHarness,
 )
 
 
@@ -1061,6 +1067,30 @@ def _fully_prequant_harness(
     )
 
 
+def _nvfp4_weight_prequant_harness(
+    campaign: "DatasetCampaign", job: DatasetJob, shape: ShapeSpec, regime: CacheRegime
+):
+    return NVFP4WeightPrequantBenchmarkHarness(
+        shape,
+        regime,
+        job.protocol,
+        device=campaign.device,
+        seed=_backend_seed(campaign, job, shape, regime),
+    )
+
+
+def _nvfp4_fully_prequant_harness(
+    campaign: "DatasetCampaign", job: DatasetJob, shape: ShapeSpec, regime: CacheRegime
+):
+    return NVFP4FullyPrequantBenchmarkHarness(
+        shape,
+        regime,
+        job.protocol,
+        device=campaign.device,
+        seed=_backend_seed(campaign, job, shape, regime),
+    )
+
+
 def _fused_adapter(
     campaign: "DatasetCampaign",
     job: DatasetJob,
@@ -1199,6 +1229,46 @@ def _fully_prequant_adapter(
     )
 
 
+def _nvfp4_weight_prequant_adapter(
+    campaign: "DatasetCampaign",
+    job: DatasetJob,
+    shape: ShapeSpec,
+    regime: CacheRegime,
+    harness,
+    tags: Mapping[str, object],
+) -> KernelAdapter:
+    evaluator = CalibratedPrequantEvaluator(
+        harness, samples=job.protocol.samples, seed=campaign.manifest.seed
+    )
+    return make_nvfp4_weight_prequant_adapter(
+        NVFP4Problem(shape.m, shape.n, shape.k),
+        evaluator,
+        device=campaign.hardware_profile,
+        regime=regime,
+        tags=tags,
+    )
+
+
+def _nvfp4_fully_prequant_adapter(
+    campaign: "DatasetCampaign",
+    job: DatasetJob,
+    shape: ShapeSpec,
+    regime: CacheRegime,
+    harness,
+    tags: Mapping[str, object],
+) -> KernelAdapter:
+    evaluator = CalibratedPrequantEvaluator(
+        harness, samples=job.protocol.samples, seed=campaign.manifest.seed
+    )
+    return make_nvfp4_fully_prequant_adapter(
+        NVFP4Problem(shape.m, shape.n, shape.k),
+        evaluator,
+        device=campaign.hardware_profile,
+        regime=regime,
+        tags=tags,
+    )
+
+
 register_dataset_backend(
     "mxfp8_fused_fwd", DatasetBackend(_fused_harness, _fused_adapter)
 )
@@ -1216,6 +1286,20 @@ register_dataset_backend(
 register_dataset_backend(
     "mxfp8_fully_prequant_fwd",
     DatasetBackend(_fully_prequant_harness, _fully_prequant_adapter),
+)
+register_dataset_backend(
+    "nvfp4_weight_prequant_fwd",
+    DatasetBackend(
+        _nvfp4_weight_prequant_harness,
+        _nvfp4_weight_prequant_adapter,
+    ),
+)
+register_dataset_backend(
+    "nvfp4_fully_prequant_fwd",
+    DatasetBackend(
+        _nvfp4_fully_prequant_harness,
+        _nvfp4_fully_prequant_adapter,
+    ),
 )
 register_dataset_backend("mxfp8_bwd", DatasetBackend(_bwd_harness, _bwd_adapter))
 
@@ -1532,6 +1616,10 @@ class DatasetCampaign:
                     if job.family == "mxfp8_weight_prequant_fwd"
                     else "x-{}_w-{}".format(*incumbent.operand_scale_layouts)
                     if job.family == "mxfp8_fully_prequant_fwd"
+                    else "w-row_major"
+                    if job.family == "nvfp4_weight_prequant_fwd"
+                    else "x-row_major_w-row_major"
+                    if job.family == "nvfp4_fully_prequant_fwd"
                     else "default"
                 ),
             ),
@@ -1599,8 +1687,10 @@ class DatasetCampaign:
             "nvfp4_fused_fwd": 1,
             "mxfp8_prequant_fwd": 2,
             "mxfp8_weight_prequant_fwd": 3,
-            "mxfp8_fully_prequant_fwd": 4,
-            "mxfp8_bwd": 5,
+            "nvfp4_weight_prequant_fwd": 4,
+            "mxfp8_fully_prequant_fwd": 5,
+            "nvfp4_fully_prequant_fwd": 6,
+            "mxfp8_bwd": 7,
         }
 
         def shape_priority(shape: ShapeSpec) -> int:

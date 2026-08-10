@@ -93,9 +93,18 @@ def _fused_smem_bytes(config: MXFP8FwdConfig) -> int:
 
 
 def _gemm_smem_bytes(config: object) -> int:
-    q_bytes = config.stages * (config.tile_m + config.tile_n) * config.tile_k
-    scale_bytes = _sm120_scale_bytes(
-        config.tile_m, config.tile_n, config.tile_k, config.stages
+    q_bytes = (
+        config.stages
+        * (config.tile_m + config.tile_n)
+        * config.tile_k
+        * config.native_operand_bits
+        // 8
+    )
+    scale_bytes = config.stages * (
+        ((config.tile_m + 127) // 128) * 128
+        + ((config.tile_n + 127) // 128) * 128
+    ) * (
+        config.tile_k // config.scale_vector_size
     )
     out_bytes = (
         config.epilogue_stages * config.tile_m * config.tile_n * 2
@@ -213,6 +222,8 @@ def _gemm_features(
             output_element_bytes=2,
             profile=profile,
             materialized_quant=materialized_quant,
+            quantized_element_bits=config.native_operand_bits,
+            scale_vector_size=config.scale_vector_size,
         )
     )
     geometry.update(
@@ -329,6 +340,45 @@ def _quant_features(
             grid_ctas=max(1, grid_ctas),
             threads_per_cta=threads,
             smem_bytes_per_cta=smem,
+            register_budget_per_cta=threads * config.maxrregcount,
+            register_limit_per_thread=config.maxrregcount,
+        )
+    )
+    return values
+
+
+def _nvfp4_quant_features(
+    rows: int,
+    k: int,
+    config: object,
+    device: DeviceFingerprint | Mapping[str, object] | None,
+) -> dict[str, float]:
+    profile = _device_dict(device)
+    sm_count = max(1, int(profile_value(profile, "multiprocessor_count", 1) or 1))
+    scale_blocks = rows * (k // 16)
+    task_groups = scale_blocks // config.blocks_per_warp
+    natural_ctas = (task_groups + config.num_warps - 1) // config.num_warps
+    grid_ctas = min(natural_ctas, sm_count * config.persistent_waves)
+    threads = config.num_warps * 32
+    values = {
+        "rows": float(rows),
+        "task_groups": float(task_groups),
+        "natural_ctas": float(natural_ctas),
+        "grid_ctas": float(grid_ctas),
+        "values_quantized": float(rows * k),
+        "scale_blocks": float(scale_blocks),
+        "values_per_lane": float(config.values_per_lane),
+        "threads_per_scale": float(config.threads_per_scale),
+        "blocks_per_warp": float(config.blocks_per_warp),
+        "packed_output_bytes": float(rows * k / 2),
+        "scale_output_bytes": float(scale_blocks),
+    }
+    values.update(
+        launch_resource_features(
+            profile=profile,
+            grid_ctas=max(1, grid_ctas),
+            threads_per_cta=threads,
+            smem_bytes_per_cta=0,
             register_budget_per_cta=threads * config.maxrregcount,
             register_limit_per_thread=config.maxrregcount,
         )
@@ -842,6 +892,165 @@ def make_mxfp8_fully_prequant_adapter(
     )
 
 
+def make_nvfp4_weight_prequant_adapter(
+    problem,
+    evaluator: Callable[[object], TrialOutcome],
+    *,
+    initial: object | None = None,
+    axes: Mapping[str, Iterable[Mapping[str, object]]] | None = None,
+    device: DeviceFingerprint | Mapping[str, object] | None = None,
+    regime: str = "hot",
+    tags: Mapping[str, object] | None = None,
+) -> DiscreteKernelAdapter[object]:
+    """Tune BF16-X quantization plus GEMM with an AOT NVFP4 weight."""
+
+    from ..configs.nvfp4 import NVFP4WeightPrequantConfig
+    from ..nvfp4_inference_autotune import (
+        NVFP4_INFERENCE_KERNEL_REVISION,
+        NVFP4_WEIGHT_PREQUANT_SEARCH_SPACE,
+        update_weight_prequant_config,
+        weight_prequant_config_from_dict,
+        weight_prequant_config_id,
+        weight_prequant_config_to_dict,
+    )
+
+    initial_config = NVFP4WeightPrequantConfig() if initial is None else initial
+    selected_axes = NVFP4_WEIGHT_PREQUANT_SEARCH_SPACE if axes is None else axes
+    axis_values = {name: tuple(values) for name, values in selected_axes.items()}
+    unknown = set(axis_values).difference(NVFP4_WEIGHT_PREQUANT_SEARCH_SPACE)
+    if unknown:
+        raise ValueError(f"unknown NVFP4 AOT-weight tuning axes: {sorted(unknown)}")
+
+    def rejection(config: object) -> tuple[str, str] | None:
+        reason = config.rejection(problem)  # type: ignore[attr-defined]
+        if reason is None:
+            reason = _gemm_smem_rejection(config.gemm, device)  # type: ignore[attr-defined]
+        return None if reason is None else ("implementation_rejected", reason)
+
+    def derived(config: object) -> Mapping[str, float]:
+        gemm = config.gemm  # type: ignore[attr-defined]
+        quant_x = config.quant_x  # type: ignore[attr-defined]
+        values = _gemm_features(problem, gemm, device, materialized_quant=True)
+        values.update(
+            _prefix(
+                _nvfp4_quant_features(problem.m, problem.k, quant_x, device),
+                "quant_x_",
+            )
+        )
+        x_bf16 = 2 * problem.m * problem.k
+        qx = problem.m * problem.k / 2 + problem.m * (problem.k // 16)
+        qw = problem.n * problem.k / 2 + problem.n * (problem.k // 16)
+        out = 2 * problem.m * problem.n
+        values.update(
+            operand_state_weight_prequantized=1.0,
+            quant_launch_count=1.0,
+            total_kernel_launches=2.0,
+            untimed_weight_packing=1.0,
+            estimated_total_memory_bytes=float(x_bf16 + 2 * qx + qw + out),
+            quantized_materialization_bytes=float(qx),
+        )
+        return values
+
+    state_tags = {**dict(tags or {}), "operand_state": "weight_prequantized"}
+    return DiscreteKernelAdapter(
+        context=_context(
+            "nvfp4_weight_prequant_fwd",
+            NVFP4_INFERENCE_KERNEL_REVISION,
+            problem,
+            device,
+            regime,
+            state_tags,
+        ),
+        initial_config=initial_config,
+        axes=axis_values,
+        config_id_fn=weight_prequant_config_id,
+        serialize_fn=weight_prequant_config_to_dict,
+        deserialize_fn=weight_prequant_config_from_dict,
+        update_fn=lambda config, _coordinate, value: update_weight_prequant_config(
+            config, value
+        ),
+        evaluator=evaluator,
+        rejection_fn=rejection,
+        extra_features_fn=derived,
+    )
+
+
+def make_nvfp4_fully_prequant_adapter(
+    problem,
+    evaluator: Callable[[object], TrialOutcome],
+    *,
+    initial: object | None = None,
+    axes: Mapping[str, Iterable[Mapping[str, object]]] | None = None,
+    device: DeviceFingerprint | Mapping[str, object] | None = None,
+    regime: str = "hot",
+    tags: Mapping[str, object] | None = None,
+) -> DiscreteKernelAdapter[object]:
+    """Tune GEMM-only execution for two TorchAO-packed NVFP4 operands."""
+
+    from ..configs.nvfp4 import NVFP4FullyPrequantConfig
+    from ..nvfp4_inference_autotune import (
+        NVFP4_FULLY_PREQUANT_SEARCH_SPACE,
+        NVFP4_INFERENCE_KERNEL_REVISION,
+        fully_prequant_config_from_dict,
+        fully_prequant_config_id,
+        fully_prequant_config_to_dict,
+        update_fully_prequant_config,
+    )
+
+    initial_config = NVFP4FullyPrequantConfig() if initial is None else initial
+    selected_axes = NVFP4_FULLY_PREQUANT_SEARCH_SPACE if axes is None else axes
+    axis_values = {name: tuple(values) for name, values in selected_axes.items()}
+    unknown = set(axis_values).difference(NVFP4_FULLY_PREQUANT_SEARCH_SPACE)
+    if unknown:
+        raise ValueError(f"unknown NVFP4 fully-packed tuning axes: {sorted(unknown)}")
+
+    def rejection(config: object) -> tuple[str, str] | None:
+        reason = config.rejection(problem)  # type: ignore[attr-defined]
+        if reason is None:
+            reason = _gemm_smem_rejection(config.gemm, device)  # type: ignore[attr-defined]
+        return None if reason is None else ("implementation_rejected", reason)
+
+    def derived(config: object) -> Mapping[str, float]:
+        gemm = config.gemm  # type: ignore[attr-defined]
+        values = _gemm_features(problem, gemm, device, materialized_quant=True)
+        qx = problem.m * problem.k / 2 + problem.m * (problem.k // 16)
+        qw = problem.n * problem.k / 2 + problem.n * (problem.k // 16)
+        out = 2 * problem.m * problem.n
+        values.update(
+            operand_state_fully_prequantized=1.0,
+            quant_launch_count=0.0,
+            total_kernel_launches=1.0,
+            untimed_activation_packing=1.0,
+            untimed_weight_packing=1.0,
+            estimated_total_memory_bytes=float(qx + qw + out),
+            quantized_materialization_bytes=0.0,
+        )
+        return values
+
+    state_tags = {**dict(tags or {}), "operand_state": "fully_prequantized"}
+    return DiscreteKernelAdapter(
+        context=_context(
+            "nvfp4_fully_prequant_fwd",
+            NVFP4_INFERENCE_KERNEL_REVISION,
+            problem,
+            device,
+            regime,
+            state_tags,
+        ),
+        initial_config=initial_config,
+        axes=axis_values,
+        config_id_fn=fully_prequant_config_id,
+        serialize_fn=fully_prequant_config_to_dict,
+        deserialize_fn=fully_prequant_config_from_dict,
+        update_fn=lambda config, _coordinate, value: update_fully_prequant_config(
+            config, value
+        ),
+        evaluator=evaluator,
+        rejection_fn=rejection,
+        extra_features_fn=derived,
+    )
+
+
 def make_mxfp8_bwd_adapter(
     problem: MXFP8Problem,
     evaluator: Callable[[object], TrialOutcome],
@@ -1291,4 +1500,6 @@ __all__ = [
     "make_nvfp4_fwd_adapter",
     "make_mxfp8_prequant_adapter",
     "make_mxfp8_weight_prequant_adapter",
+    "make_nvfp4_fully_prequant_adapter",
+    "make_nvfp4_weight_prequant_adapter",
 ]

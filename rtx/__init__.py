@@ -26,7 +26,9 @@ _LAZY_EXPORTS = {
     "MXFP8Problem": ("kernels.mxfp8", "MXFP8Problem"),
     "NVFP4FwdConfig": ("configs", "NVFP4FwdConfig"),
     "NVFP4GemmConfig": ("configs", "NVFP4GemmConfig"),
+    "NVFP4FullyPrequantConfig": ("configs", "NVFP4FullyPrequantConfig"),
     "NVFP4QuantConfig": ("configs", "NVFP4QuantConfig"),
+    "NVFP4WeightPrequantConfig": ("configs", "NVFP4WeightPrequantConfig"),
     "NVFP4Problem": ("configs", "NVFP4Problem"),
     "DEFAULT_MXFP8_BWD_CONFIG": ("fp8_bwd", "DEFAULT_MXFP8_BWD_CONFIG"),
     "DEFAULT_FUSED_MXFP8_BWD_CONFIG": (

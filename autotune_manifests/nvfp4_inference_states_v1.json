@@ -1,0 +1,67 @@
+{
+  "schema_version": 2,
+  "name": "nvfp4_inference_states_v1",
+  "seed": 20260810,
+  "jobs": [
+    {
+      "family": "nvfp4_weight_prequant_fwd",
+      "shapes": [
+        {"m": 64, "n": 128, "k": 64, "name": "native_minimum"},
+        {"m": 128, "n": 1536, "k": 1536, "name": "one_m_tile"},
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 4,
+      "tuning": {
+        "max_trials": 192,
+        "time_budget_s": 1800.0,
+        "cost_model_trials": 128,
+        "model_warmup": 24,
+        "model_pool_size": 8192,
+        "local_beam_width": 4,
+        "confirmation_repeats": 1,
+        "confirm_initial": true,
+        "seed": 20260810
+      },
+      "protocol": {
+        "warmup_calls": 5,
+        "samples": 7,
+        "confirm_samples": 15,
+        "race_rounds": 15,
+        "target_batch_ms": 50.0,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "nvfp4_fully_prequant_fwd",
+      "shapes": [
+        {"m": 64, "n": 128, "k": 64, "name": "native_minimum"},
+        {"m": 128, "n": 1536, "k": 1536, "name": "one_m_tile"},
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 4,
+      "tuning": {
+        "max_trials": 192,
+        "time_budget_s": 1800.0,
+        "cost_model_trials": 128,
+        "model_warmup": 24,
+        "model_pool_size": 8192,
+        "local_beam_width": 4,
+        "confirmation_repeats": 1,
+        "confirm_initial": true,
+        "seed": 20260810
+      },
+      "protocol": {
+        "warmup_calls": 5,
+        "samples": 7,
+        "confirm_samples": 15,
+        "race_rounds": 15,
+        "target_batch_ms": 50.0,
+        "telemetry": true
+      }
+    }
+  ]
+}

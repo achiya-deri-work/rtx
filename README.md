@@ -185,12 +185,16 @@ master weight.
 
 Both formats implement all three state boundaries. Dynamic NVFP4 training uses
 delayed tensorwise scaling by default: the first call bootstraps from current
-amax, then each fused forward emits per-CTA X/W amax state. The following
-forward reduces that tiny L2-resident state and prepares its power-of-two scale
-inside the CTA, so steady-state delayed scaling remains a single launch without
-a device-wide barrier. Set `scaling="current"` to recompute tensor scales just
-in time instead. Dynamic inference always uses current scaling; AOT-weight and
-fully packed inference use the tensor scale stored in TorchAO's `NVFP4Tensor`.
+amax, then each fused forward emits per-CTA X/W amax into the alternate half of
+a non-aliasing double buffer. The following forward reduces that tiny
+L2-resident state and prepares its power-of-two scale inside the CTA, so
+steady-state delayed scaling remains a single launch without a device-wide
+barrier. Set `scaling="current"` to recompute tensor scales just in time instead.
+An explicit `NVFP4FwdConfig(tensor_scale_mode="exact")` retains the exact
+TorchAO tensorwise FP32 scale for controlled studies; power-of-two is the
+default because its reciprocal is exact and cheaper. Dynamic inference always
+uses current scaling; AOT-weight and fully packed inference use the tensor
+scale stored in TorchAO's `NVFP4Tensor`.
 
 The historical MXFP8 backend name `prequant` means *materialized dynamic*: it
 quantizes both BF16 operands into global memory on every call before launching
@@ -233,10 +237,11 @@ rtx-autotune run autotune_manifests/cross_device_dataset_v2.json \
   --calibration hardware_calibration.json
 ```
 
-The same campaign engine accepts `nvfp4_fused_fwd` jobs. Those measurements
-include the fused per-CTA telemetry and next-generation scale reduction, so
-promoted winners represent the actual single-launch training-forward path
-rather than a GEMM-only proxy.
+The same campaign engine accepts `nvfp4_fused_fwd`,
+`nvfp4_weight_prequant_fwd`, and `nvfp4_fully_prequant_fwd` jobs. Training
+measurements include fused per-CTA telemetry and next-generation scale
+reduction, while inference families exclude one-time AOT operand packing and
+remove inactive quantizer coordinates.
 
 New campaigns can exercise the same portable lease/worker boundary used by
 external projects while retaining the existing residual stores and campaign
@@ -551,10 +556,11 @@ count:
 ```
 
 Supported families are `mxfp8_fused_fwd`, `mxfp8_prequant_fwd`,
-`mxfp8_weight_prequant_fwd`, `mxfp8_fully_prequant_fwd`, and `mxfp8_bwd`.
-The two persistent inference families never time their AOT packing work and do
-not expose inactive quantizer coordinates. Additional kernel families can
-register a `DatasetBackend` with
+`mxfp8_weight_prequant_fwd`, `mxfp8_fully_prequant_fwd`, `mxfp8_bwd`,
+`nvfp4_fused_fwd`, `nvfp4_weight_prequant_fwd`, and
+`nvfp4_fully_prequant_fwd`. Persistent inference families never time their AOT
+packing work and do not expose inactive quantizer coordinates. Additional
+kernel families can register a `DatasetBackend` with
 `rtx.autotune.register_dataset_backend`; campaign orchestration, persistence,
 verification, and export do not need to change.
 

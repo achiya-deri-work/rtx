@@ -7,7 +7,9 @@ from .adapters import (
     make_mxfp8_fwd_adapter,
     make_mxfp8_prequant_adapter,
     make_mxfp8_weight_prequant_adapter,
+    make_nvfp4_fully_prequant_adapter,
     make_nvfp4_fwd_adapter,
+    make_nvfp4_weight_prequant_adapter,
 )
 from .bandit import (
     AdaptiveBanditScheduler,
@@ -255,6 +257,8 @@ __all__ = [
     "make_mxfp8_fully_prequant_adapter",
     "make_mxfp8_fwd_adapter",
     "make_nvfp4_fwd_adapter",
+    "make_nvfp4_fully_prequant_adapter",
+    "make_nvfp4_weight_prequant_adapter",
     "make_mxfp8_prequant_adapter",
     "make_mxfp8_weight_prequant_adapter",
     "make_hybrid_autotuner",

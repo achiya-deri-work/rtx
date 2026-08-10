@@ -445,6 +445,9 @@ class DatasetTests(unittest.TestCase):
             DatasetManifest.load(
                 root / "autotune_manifests" / "inference_states_pilot_v1.json"
             ),
+            DatasetManifest.load(
+                root / "autotune_manifests" / "nvfp4_inference_states_v1.json"
+            ),
         )
         jobs = {
             job.family: job for manifest in manifests for job in manifest.jobs
@@ -454,6 +457,8 @@ class DatasetTests(unittest.TestCase):
             "mxfp8_prequant_fwd",
             "mxfp8_weight_prequant_fwd",
             "mxfp8_fully_prequant_fwd",
+            "nvfp4_weight_prequant_fwd",
+            "nvfp4_fully_prequant_fwd",
             "mxfp8_bwd",
         }
         self.assertTrue(expected.issubset(jobs))

@@ -506,6 +506,8 @@ def traffic_features(
     output_element_bytes: int,
     profile: Mapping[str, object] | None,
     materialized_quant: bool,
+    quantized_element_bits: int = 8,
+    scale_vector_size: int = 32,
 ) -> dict[str, float]:
     m_tiles = _ceil_div(m, tile_m)
     n_tiles = _ceil_div(n, tile_n)
@@ -513,8 +515,12 @@ def traffic_features(
     w_bytes = n * k * input_element_bytes
     out_bytes = m * n * output_element_bytes
     if materialized_quant:
-        operand_read_bytes = m * k + n * k
-        quant_write_bytes = m * k + n * k + (m + n) * _ceil_div(k, 32)
+        operand_read_bytes = (
+            (m * k + n * k) * quantized_element_bits / 8
+        )
+        quant_write_bytes = operand_read_bytes + (m + n) * _ceil_div(
+            k, scale_vector_size
+        )
         estimated_dram_bytes = x_bytes + w_bytes + quant_write_bytes + operand_read_bytes + out_bytes
     else:
         quant_write_bytes = 0

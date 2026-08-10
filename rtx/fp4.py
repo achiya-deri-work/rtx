@@ -79,6 +79,7 @@ class NVFP4ForwardConfig:
     gemm: NVFP4GemmConfig = DEFAULT_NVFP4_GEMM_CONFIG
     quant_launches: str = "dual"
     fused: NVFP4FwdConfig | None = None
+    l2_fetch_granularity: int | None = None
 
     def rejection(self, problem: NVFP4Problem) -> str | None:
         fused = self.fused or _fallback_fused_config(problem)
@@ -91,12 +92,15 @@ class NVFP4ForwardConfig:
             reason = self.quant.rejection(rows, problem.k)
             if reason is not None:
                 return reason
+        if self.l2_fetch_granularity not in (None, 0, 32, 64, 128):
+            return "L2 fetch granularity must be None, 0, 32, 64, or 128"
         return self.gemm.rejection(problem)
 
 
 DEFAULT_NVFP4_FORWARD_CONFIG = NVFP4ForwardConfig()
 _FORWARD_CONFIGS: dict[str, NVFP4ForwardConfig] = {}
 _CONFIG_LOCK = RLock()
+_INFERENCE_CONFIG_SELECTIONS: dict[tuple[object, ...], str] = {}
 
 
 @torch.compiler.assume_constant_result
@@ -132,6 +136,22 @@ def _power2_tensor_scale_pack(tensor: torch.Tensor) -> torch.Tensor:
     return torch.stack((scale, inverse, inverse / 6.0))
 
 
+def _exact_tensor_scale_pack(tensor: torch.Tensor) -> torch.Tensor:
+    """Exact current TorchAO tensor scale and its supplied reciprocals."""
+
+    scale = _current_tensor_scale(tensor)
+    inverse = torch.reciprocal(scale)
+    return torch.cat((scale, inverse, inverse / 6.0))
+
+
+def _tensor_scale_pack(tensor: torch.Tensor, mode: str) -> torch.Tensor:
+    if mode == "power2":
+        return _power2_tensor_scale_pack(tensor)
+    if mode == "exact":
+        return _exact_tensor_scale_pack(tensor)
+    raise ValueError(f"unknown NVFP4 tensor scale mode {mode!r}")
+
+
 def _delayed_amax_state(tensor: torch.Tensor, slots: int) -> torch.Tensor:
     """Bootstrap per-CTA delayed telemetry without a host synchronization."""
 
@@ -149,6 +169,23 @@ def _fallback_fused_config(
     config = replace(DEFAULT_NVFP4_FWD_CONFIG, collect_amax=collect_amax)
     if problem.k % 256:
         config = replace(config, tile_k=128, bf16_tile_k=128)
+    if (
+        problem.m % config.tile_m
+        or problem.n % config.tile_n
+        or problem.k % config.bf16_tile_k
+    ):
+        # Vector loads require full tiles. Scalar BF16 loads retain predicates
+        # for ragged M/N and for the native K=64 tail of a 128-wide CTA tile.
+        config = replace(config, quant_load_bits=16)
+    if problem.m <= 64:
+        config = replace(
+            config,
+            tile_m=64,
+            atom_layout_m=2,
+            num_mma_warps=4,
+            quantizer_warps=4,
+            num_threads=128,
+        )
     if problem.m >= 512 and problem.m % 256 == 0:
         config = replace(
             config,
@@ -216,6 +253,7 @@ class _DynamicRunner:
     qw: torch.Tensor
     sx: torch.Tensor
     sw: torch.Tensor
+    l2_fetch_granularity: int | None = None
 
     def __call__(
         self,
@@ -225,6 +263,9 @@ class _DynamicRunner:
         weight_scale: torch.Tensor,
         out: torch.Tensor,
     ) -> torch.Tensor:
+        from .fp8 import _ensure_l2_fetch_granularity
+
+        _ensure_l2_fetch_granularity(self.l2_fetch_granularity)
         x_scale = x_scale.reshape(1)
         weight_scale = weight_scale.reshape(1)
         if self.quant_launches == "dual":
@@ -303,6 +344,7 @@ class _DynamicXRunner:
     gemm: object
     qx: torch.Tensor
     sx: torch.Tensor
+    l2_fetch_granularity: int | None = None
 
     def __call__(
         self,
@@ -313,6 +355,9 @@ class _DynamicXRunner:
         weight_scale: torch.Tensor,
         out: torch.Tensor,
     ) -> torch.Tensor:
+        from .fp8 import _ensure_l2_fetch_granularity
+
+        _ensure_l2_fetch_granularity(self.l2_fetch_granularity)
         x_scale = x_scale.reshape(1)
         weight_scale = weight_scale.reshape(1)
         self.quant_x(x, self.qx, self.sx, x_scale)
@@ -363,6 +408,7 @@ def _make_dynamic_runner(
         qw,
         sx,
         sw,
+        config.l2_fetch_granularity,
     )
 
 
@@ -380,6 +426,7 @@ def _make_dynamic_x_runner(
         compile_nvfp4_gemm(problem, config.gemm),
         qx,
         sx,
+        config.l2_fetch_granularity,
     )
 
 
@@ -388,6 +435,70 @@ def _resolve_forward_config(key: str) -> NVFP4ForwardConfig:
         return _FORWARD_CONFIGS[key]
     except KeyError as exc:
         raise RuntimeError("unknown NVFP4 forward configuration key") from exc
+
+
+def _packed_inference_config_key(
+    problem: NVFP4Problem,
+    device: torch.device,
+    *,
+    fully_prequantized: bool,
+) -> str:
+    """Resolve an installed state-specific winner once per device and shape."""
+
+    state = "fully_prequantized" if fully_prequantized else "weight_prequantized"
+    selection_key = (
+        state,
+        device.index,
+        problem.m,
+        problem.n,
+        problem.k,
+    )
+    selected_key = _INFERENCE_CONFIG_SELECTIONS.get(selection_key)
+    if selected_key is not None:
+        return selected_key
+    from .autotune.winners import load_runtime_winner, runtime_winner_key
+    from .nvfp4_inference_autotune import (
+        fully_prequant_config_from_dict,
+        weight_prequant_config_from_dict,
+    )
+
+    if fully_prequantized:
+        family = "nvfp4_fully_prequant_fwd"
+        variant = "x-row_major_w-row_major"
+        selected = load_runtime_winner(
+            runtime_winner_key(family, problem, device=device, variant=variant),
+            fully_prequant_config_from_dict,
+            rejection=lambda value: value.rejection(problem),
+        )
+        config = (
+            DEFAULT_NVFP4_FORWARD_CONFIG
+            if selected is None
+            else NVFP4ForwardConfig(
+                gemm=selected.gemm,
+                l2_fetch_granularity=selected.l2_fetch_granularity,
+            )
+        )
+    else:
+        family = "nvfp4_weight_prequant_fwd"
+        variant = "w-row_major"
+        selected = load_runtime_winner(
+            runtime_winner_key(family, problem, device=device, variant=variant),
+            weight_prequant_config_from_dict,
+            rejection=lambda value: value.rejection(problem),
+        )
+        config = (
+            DEFAULT_NVFP4_FORWARD_CONFIG
+            if selected is None
+            else NVFP4ForwardConfig(
+                quant=selected.quant_x,
+                gemm=selected.gemm,
+                quant_launches="independent",
+                l2_fetch_granularity=selected.l2_fetch_granularity,
+            )
+        )
+    selected_key = _intern_forward_config(config)
+    _INFERENCE_CONFIG_SELECTIONS[selection_key] = selected_key
+    return selected_key
 
 
 def _check_sm12x(device: torch.device) -> None:
@@ -425,11 +536,17 @@ def _launch_nvfp4_forward(
     forward_config_key: str,
 ) -> torch.Tensor:
     _check_nvfp4_inputs(x, weight)
+    public_config = _resolve_forward_config(forward_config_key)
+    scale_mode = (
+        public_config.fused.tensor_scale_mode
+        if public_config.fused is not None
+        else "power2"
+    )
     return _launch_nvfp4_forward_scaled(
         x,
         weight,
-        _power2_tensor_scale_pack(x),
-        _power2_tensor_scale_pack(weight),
+        _tensor_scale_pack(x, scale_mode),
+        _tensor_scale_pack(weight, scale_mode),
         forward_config_key,
     )
 
@@ -486,11 +603,36 @@ def _launch_nvfp4_forward_delayed(
     weight_amax_state: torch.Tensor,
     forward_config_key: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    next_x_amax_state = torch.empty_like(x_amax_state)
+    next_weight_amax_state = torch.empty_like(weight_amax_state)
+    out = _launch_nvfp4_forward_delayed_out(
+        x,
+        weight,
+        x_amax_state,
+        weight_amax_state,
+        next_x_amax_state,
+        next_weight_amax_state,
+        forward_config_key,
+    )
+    return out, next_x_amax_state, next_weight_amax_state
+
+
+def _launch_nvfp4_forward_delayed_out(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_amax_state: torch.Tensor,
+    weight_amax_state: torch.Tensor,
+    next_x_amax_state: torch.Tensor,
+    next_weight_amax_state: torch.Tensor,
+    forward_config_key: str,
+) -> torch.Tensor:
     _check_nvfp4_inputs(x, weight)
     _check_sm12x(x.device)
     for name, value in (
         ("x_amax_state", x_amax_state),
         ("weight_amax_state", weight_amax_state),
+        ("next_x_amax_state", next_x_amax_state),
+        ("next_weight_amax_state", next_weight_amax_state),
     ):
         if value.dtype is not torch.float32:
             raise TypeError(f"{name} must use FP32")
@@ -524,14 +666,18 @@ def _launch_nvfp4_forward_delayed(
     for name, value in (
         ("x_amax_state", x_amax_state),
         ("weight_amax_state", weight_amax_state),
+        ("next_x_amax_state", next_x_amax_state),
+        ("next_weight_amax_state", next_weight_amax_state),
     ):
         if value.numel() != runner.grid_ctas:
             raise ValueError(
                 f"{name} has {value.numel()} slots, expected {runner.grid_ctas}"
             )
     out = torch.empty((problem.m, problem.n), dtype=torch.bfloat16, device=x.device)
-    next_x_amax_state = torch.empty_like(x_amax_state)
-    next_weight_amax_state = torch.empty_like(weight_amax_state)
+    if next_x_amax_state.data_ptr() == x_amax_state.data_ptr():
+        raise ValueError("delayed x amax generations must not alias")
+    if next_weight_amax_state.data_ptr() == weight_amax_state.data_ptr():
+        raise ValueError("delayed weight amax generations must not alias")
     runner(
         x_c,
         weight_c,
@@ -550,7 +696,7 @@ def _launch_nvfp4_forward_delayed(
         next_weight_amax_state,
         runner,
     )
-    return out, next_x_amax_state, next_weight_amax_state
+    return out
 
 
 def quantize_nvfp4(
@@ -720,6 +866,9 @@ def _nvfp4_linear_prequantized_op(
     if rejection is not None:
         raise RuntimeError(f"NVFP4 GEMM cannot run this problem: {rejection}")
     _check_sm12x(x_data.device)
+    from .fp8 import _ensure_l2_fetch_granularity
+
+    _ensure_l2_fetch_granularity(config.l2_fetch_granularity)
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x_data.device)
     output_scale = x_tensor_scale.reshape(1) * weight_tensor_scale.reshape(1)
     compile_nvfp4_gemm(problem, config.gemm)(
@@ -826,7 +975,7 @@ torch.library.register_autograd(
 
 @torch.library.custom_op(
     "rtx::nvfp4_linear_train_delayed",
-    mutates_args=(),
+    mutates_args=("next_x_amax_state", "next_weight_amax_state"),
     device_types="cuda",
 )
 def _nvfp4_linear_train_delayed_op(
@@ -834,14 +983,18 @@ def _nvfp4_linear_train_delayed_op(
     weight: torch.Tensor,
     x_amax_state: torch.Tensor,
     weight_amax_state: torch.Tensor,
+    next_x_amax_state: torch.Tensor,
+    next_weight_amax_state: torch.Tensor,
     forward_config_key: str,
     backward_config_key: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _launch_nvfp4_forward_delayed(
+) -> torch.Tensor:
+    return _launch_nvfp4_forward_delayed_out(
         x,
         weight,
         x_amax_state,
         weight_amax_state,
+        next_x_amax_state,
+        next_weight_amax_state,
         forward_config_key,
     )
 
@@ -852,30 +1005,139 @@ def _nvfp4_linear_train_delayed_fake(
     weight: torch.Tensor,
     x_amax_state: torch.Tensor,
     weight_amax_state: torch.Tensor,
+    next_x_amax_state: torch.Tensor,
+    next_weight_amax_state: torch.Tensor,
     forward_config_key: str,
     backward_config_key: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return (
-        torch.empty(
-            (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
-        ),
-        torch.empty_like(x_amax_state),
-        torch.empty_like(weight_amax_state),
+) -> torch.Tensor:
+    return torch.empty(
+        (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
     )
 
 
-def _setup_nvfp4_delayed_context(ctx, inputs, output) -> None:
-    x, weight, _x_scale, _weight_scale, _forward_key, backward_config_key = inputs
-    ctx.save_for_backward(x, weight)
-    ctx.backward_config_key = backward_config_key
-    ctx.mark_non_differentiable(output[1], output[2])
+class _InductorNVFP4DelayedLauncher:
+    """Shape-bound delayed launcher used directly by generated wrappers."""
+
+    def __init__(self, forward_config_key: str) -> None:
+        self.forward_config_key = forward_config_key
+        self.runners: BoundedCache[tuple[object, ...], _FusedDynamicRunner] = (
+            BoundedCache(runner_cache_limit("inductor_delayed", 8, namespace="NVFP4"))
+        )
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        x_amax_state: torch.Tensor,
+        weight_amax_state: torch.Tensor,
+        next_x_amax_state: torch.Tensor,
+        next_weight_amax_state: torch.Tensor,
+        *,
+        out: torch.Tensor,
+    ) -> None:
+        problem = NVFP4Problem(
+            int(x.shape[0]), int(weight.shape[0]), int(x.shape[1])
+        )
+        stream_id = int(torch._C._cuda_getCurrentRawStream(x.device.index))
+        public_config = _resolve_forward_config(self.forward_config_key)
+        fused_config = (
+            replace(public_config.fused, collect_amax=True)
+            if public_config.fused is not None
+            else _runtime_fused_config(problem, x.device, collect_amax=True)
+        )
+        key = (
+            x.device.index,
+            stream_id,
+            problem.m,
+            problem.n,
+            problem.k,
+            fused_config,
+        )
+        runner = self.runners.get(key)
+        if runner is None:
+            runner = _make_fused_dynamic_runner(problem, fused_config)
+            self.runners[key] = runner
+        runner(
+            x,
+            weight,
+            x_amax_state,
+            weight_amax_state,
+            out,
+            next_x_amax_state,
+            next_weight_amax_state,
+        )
+
+
+class _InductorNVFP4DelayedRegistry(dict[str, object]):
+    def __missing__(self, config_key: str) -> object:
+        with _CONFIG_LOCK:
+            launcher = self.get(config_key)
+            if launcher is None:
+                launcher = _InductorNVFP4DelayedLauncher(config_key)
+                self[config_key] = launcher
+        return launcher
+
+
+_INDUCTOR_DELAYED_LAUNCHERS = _InductorNVFP4DelayedRegistry()
+
+
+def _register_delayed_inductor_lowering() -> None:
+    from torch._inductor import ir
+    from torch._inductor.lowering import register_lowering
+
+    torch._rtx_nvfp4_delayed_launchers = _INDUCTOR_DELAYED_LAUNCHERS
+
+    @register_lowering(
+        torch.ops.rtx.nvfp4_linear_train_delayed.default,
+        type_promotion_kind=None,
+    )
+    def lower_delayed(
+        x,
+        weight,
+        x_amax_state,
+        weight_amax_state,
+        next_x_amax_state,
+        next_weight_amax_state,
+        forward_config_key,
+        backward_config_key,
+    ):
+        inputs = [
+            ir.ExternKernel.require_contiguous(ir.ExternKernel.realize_input(value))
+            for value in (
+                x,
+                weight,
+                x_amax_state,
+                weight_amax_state,
+                next_x_amax_state,
+                next_weight_amax_state,
+            )
+        ]
+        m = x.get_size()[0]
+        n = weight.get_size()[0]
+        name = (
+            "torch._rtx_nvfp4_delayed_launchers"
+            f"[{forward_config_key!r}]"
+        )
+        return ir.TensorBox.create(
+            ir.ExternKernelOut(
+                layout=ir.FixedLayout(
+                    device=x.get_device(),
+                    dtype=torch.bfloat16,
+                    size=[m, n],
+                    stride=[n, 1],
+                ),
+                inputs=inputs,
+                python_kernel_name=name,
+            )
+        )
+
+
+_register_delayed_inductor_lowering()
 
 
 def _nvfp4_delayed_backward(
     ctx,
     grad_output: torch.Tensor,
-    grad_x_scale: torch.Tensor | None,
-    grad_weight_scale: torch.Tensor | None,
 ):
     from .fp8_bwd import (
         _mxfp8_linear_bwd_op,
@@ -898,14 +1160,46 @@ def _nvfp4_delayed_backward(
         grad_weight = _mxfp8_linear_dw_op(
             grad_output, x, weight, ctx.backward_config_key
         )
-    return grad_x, grad_weight, None, None, None, None
+    return grad_x, grad_weight, None, None, None, None, None, None
 
 
-torch.library.register_autograd(
-    "rtx::nvfp4_linear_train_delayed",
-    _nvfp4_delayed_backward,
-    setup_context=_setup_nvfp4_delayed_context,
-)
+class _NVFP4DelayedAutograd(torch.autograd.Function):
+    """Autograd shell around the state-mutating delayed forward operator.
+
+    ``torch.library`` intentionally rejects registered backward formulas on
+    mutating schemas.  The shell keeps the device operation explicit for
+    Dynamo/functionalization while AOTAutograd can still capture the MXFP8
+    backward as part of the compiled training graph.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        x_amax_state: torch.Tensor,
+        weight_amax_state: torch.Tensor,
+        next_x_amax_state: torch.Tensor,
+        next_weight_amax_state: torch.Tensor,
+        forward_config_key: str,
+        backward_config_key: str,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(x, weight)
+        ctx.backward_config_key = backward_config_key
+        return _nvfp4_linear_train_delayed_op(
+            x,
+            weight,
+            x_amax_state,
+            weight_amax_state,
+            next_x_amax_state,
+            next_weight_amax_state,
+            forward_config_key,
+            backward_config_key,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return _nvfp4_delayed_backward(ctx, grad_output)
 
 
 def nvfp4_linear(
@@ -938,7 +1232,11 @@ def nvfp4_linear(
                 k,
                 nvfp4_scale_layout(x),
                 weight_layout,
-                _DEFAULT_NVFP4_FORWARD_KEY,
+                _packed_inference_config_key(
+                    NVFP4Problem(m, n, k),
+                    weight.device,
+                    fully_prequantized=True,
+                ),
             )
             return out.reshape(*x.shape[:-1], n)
         if x.ndim < 1 or x.shape[-1] != k:
@@ -961,7 +1259,11 @@ def nvfp4_linear(
             n,
             k,
             weight_layout,
-            _DEFAULT_NVFP4_FORWARD_KEY,
+            _packed_inference_config_key(
+                NVFP4Problem(int(x_2d.shape[0]), n, k),
+                weight.device,
+                fully_prequantized=False,
+            ),
         )
         return out.reshape(*leading, n)
     if isinstance(x, NVFP4Tensor):
@@ -982,10 +1284,13 @@ def nvfp4_linear(
         NVFP4ForwardConfig(fused=forward_config)
     )
     if torch.is_grad_enabled() and (x_2d.requires_grad or weight.requires_grad):
-        from .fp8_bwd import DEFAULT_MXFP8_BWD_CONFIG, _intern_bwd_config
+        from .fp8 import _autotune_mode, _backward_config_key
+        from .fp8_bwd import _intern_bwd_config
 
-        backward_key = _intern_bwd_config(
-            backward_config or DEFAULT_MXFP8_BWD_CONFIG
+        backward_key = (
+            _intern_bwd_config(backward_config)
+            if backward_config is not None
+            else _backward_config_key(_autotune_mode(None), None, None)
         )
         out = _nvfp4_linear_train_op(
             x_2d, weight, forward_key, backward_key
@@ -1035,6 +1340,14 @@ class NVFP4Linear(nn.Module):
         self._forward_config_key = _intern_forward_config(
             NVFP4ForwardConfig(fused=forward_config)
         )
+        from .fp8 import _autotune_mode, _backward_config_key
+        from .fp8_bwd import _intern_bwd_config
+
+        self._backward_config_key = (
+            _intern_bwd_config(backward_config)
+            if backward_config is not None
+            else _backward_config_key(_autotune_mode(None), None, None)
+        )
         self.weight_mode: WeightMode = (
             "prequantized" if packed_weight is not None else "dynamic"
         )
@@ -1052,6 +1365,16 @@ class NVFP4Linear(nn.Module):
             )
             self.register_buffer(
                 "_weight_amax_state",
+                torch.empty(0, dtype=torch.float32, device=device),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_next_x_amax_state",
+                torch.empty(0, dtype=torch.float32, device=device),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_next_weight_amax_state",
                 torch.empty(0, dtype=torch.float32, device=device),
                 persistent=False,
             )
@@ -1104,7 +1427,35 @@ class NVFP4Linear(nn.Module):
                 "a prequantized NVFP4Linear is inference-only; keep a dynamic "
                 "BF16-master module for training"
             )
-        return super().train(mode)
+        entering_training = mode and not self.training
+        result = super().train(mode)
+        if self.weight_mode == "dynamic" and entering_training:
+            self.reset_delayed_scales()
+        return result
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        if self.weight_mode == "dynamic":
+            # Delayed telemetry is deliberately absent from state_dict. A
+            # restored master weight must bootstrap fresh amax state.
+            self.reset_delayed_scales()
 
     def half(self):
         if self.weight_mode == "prequantized":
@@ -1142,6 +1493,8 @@ class NVFP4Linear(nn.Module):
             device=self._x_amax_state.device,
         )
         self._weight_amax_state = torch.empty_like(self._x_amax_state)
+        self._next_x_amax_state = torch.empty_like(self._x_amax_state)
+        self._next_weight_amax_state = torch.empty_like(self._x_amax_state)
         self._delayed_initialized = False
         self._delayed_problem = None
 
@@ -1208,6 +1561,7 @@ class NVFP4Linear(nn.Module):
             delayed_problem = (
                 x_2d.device.type,
                 x_2d.device.index,
+                torch.cuda.current_stream(x_2d.device).cuda_stream,
                 int(x_2d.shape[0]),
                 int(self.weight.shape[0]),
                 int(x_2d.shape[1]),
@@ -1236,25 +1590,32 @@ class NVFP4Linear(nn.Module):
                     self._weight_amax_state = _delayed_amax_state(
                         self.weight, slots
                     )
+                    self._next_x_amax_state = torch.empty_like(
+                        self._x_amax_state
+                    )
+                    self._next_weight_amax_state = torch.empty_like(
+                        self._weight_amax_state
+                    )
                 self._delayed_initialized = True
                 self._delayed_problem = delayed_problem
-            from .fp8_bwd import DEFAULT_MXFP8_BWD_CONFIG, _intern_bwd_config
-
-            backward_key = _intern_bwd_config(
-                self.backward_config or DEFAULT_MXFP8_BWD_CONFIG
+            out = _NVFP4DelayedAutograd.apply(
+                x_2d,
+                self.weight,
+                self._x_amax_state,
+                self._weight_amax_state,
+                self._next_x_amax_state,
+                self._next_weight_amax_state,
+                self._forward_config_key,
+                self._backward_config_key,
             )
-            out, next_x_scale, next_weight_scale = (
-                _nvfp4_linear_train_delayed_op(
-                    x_2d,
-                    self.weight,
-                    self._x_amax_state,
-                    self._weight_amax_state,
-                    self._forward_config_key,
-                    backward_key,
-                )
+            self._x_amax_state, self._next_x_amax_state = (
+                self._next_x_amax_state,
+                self._x_amax_state,
             )
-            self._x_amax_state = next_x_scale
-            self._weight_amax_state = next_weight_scale
+            self._weight_amax_state, self._next_weight_amax_state = (
+                self._next_weight_amax_state,
+                self._weight_amax_state,
+            )
             return out.reshape(*leading_shape, self.out_features)
         return nvfp4_linear(
             x,
@@ -1279,6 +1640,7 @@ def _clear_runtime_caches() -> dict[str, object]:
     _FUSED_DYNAMIC_RUNNERS.clear()
     _DYNAMIC_RUNNERS.clear()
     _DYNAMIC_X_RUNNERS.clear()
+    _INFERENCE_CONFIG_SELECTIONS.clear()
     return before
 
 

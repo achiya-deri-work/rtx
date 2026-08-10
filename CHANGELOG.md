@@ -3,6 +3,27 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.12.0
+
+- Add independent, composable autotuning families for NVFP4 dynamic-X/AOT-W
+  and fully prequantized inference, including state-aware traffic/resource
+  features, calibrated harnesses, promotion, runtime winner lookup, and a
+  balanced portable campaign manifest.
+- Support native 64-row NVFP4 GEMM tiles, K=64, and predicated ragged fused
+  shapes. Generalize shared resource models to use the true four-bit operand
+  width and 16-value NVFP4 scale vectors.
+- Add selectable exact or power-of-two tensorwise scaling while retaining
+  delayed power-of-two scaling as the training default. Validate delayed
+  convergence, one-generation recovery, zero/tiny inputs, and current-scale
+  TorchAO packing equivalence.
+- Harden delayed scale state with non-aliasing double buffers, stream-aware
+  rebootstrap, train/load-state resets, and a direct Inductor lowering for the
+  stateful forward launch. Resolve the same installed MXFP8 backward winner
+  for both public linear frontends and verify bit-identical gradients.
+- Add paired eager/compiled end-to-end training and controlled convergence
+  tools. Make their timing safe for the backward runner's private CUDA
+  streams and include explicit gradient checks and optional profiler output.
+
 ## 0.11.0
 
 - Implement native SM120/SM121 NVFP4 forward execution for

@@ -837,7 +837,14 @@ class MXFP8LinearFwdKernel:
 
     @cute.jit
     def _nvfp4_tensor_scale_from_amax(self, amax: Float32):
-        """Prepare a delayed power-of-two tensor scale without division."""
+        """Prepare the configured delayed tensor scale inside each CTA."""
+
+        if cutlass.const_expr(self.config.tensor_scale_mode == "exact"):
+            scale = amax * Float32(1.0 / 2688.0)
+            if amax == Float32(0.0):
+                scale = Float32(1.0)
+            inverse = Float32(1.0) / scale
+            return scale, inverse, inverse * Float32(1.0 / 6.0)
 
         target = cute.arch.fmax(
             amax * Float32(1.0 / 2688.0),

@@ -133,6 +133,14 @@ class MXFP8GemmConfig:
     tile_locality: str = "raster"
 
     @property
+    def native_operand_bits(self) -> int:
+        return 8
+
+    @property
+    def scale_vector_size(self) -> int:
+        return SF_VEC_SIZE
+
+    @property
     def num_mma_warps(self) -> int:
         return self.atom_layout_m * self.atom_layout_n
 

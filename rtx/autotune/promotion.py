@@ -20,6 +20,10 @@ _SHAPE = re.compile(r"^m(?P<m>\d+)_n(?P<n>\d+)_k(?P<k>\d+)$")
 
 
 def _variant(family: str, config: Mapping[str, object]) -> str:
+    if family == "nvfp4_weight_prequant_fwd":
+        return "w-row_major"
+    if family == "nvfp4_fully_prequant_fwd":
+        return "x-row_major_w-row_major"
     if family not in ("mxfp8_weight_prequant_fwd", "mxfp8_fully_prequant_fwd"):
         return "default"
     gemm = config.get("gemm")
@@ -57,6 +61,10 @@ def _current_revision(family: str) -> int:
         from ..inference_autotune import INFERENCE_KERNEL_REVISION
 
         return INFERENCE_KERNEL_REVISION
+    if family in ("nvfp4_weight_prequant_fwd", "nvfp4_fully_prequant_fwd"):
+        from ..nvfp4_inference_autotune import NVFP4_INFERENCE_KERNEL_REVISION
+
+        return NVFP4_INFERENCE_KERNEL_REVISION
     raise ValueError(f"unsupported runtime winner family {family!r}")
 
 
@@ -94,6 +102,20 @@ def _config_rejection(
             from ..inference_autotune import fully_prequant_config_from_dict
 
             return fully_prequant_config_from_dict(config).rejection(problem)
+        if family in (
+            "nvfp4_weight_prequant_fwd",
+            "nvfp4_fully_prequant_fwd",
+        ):
+            from ..configs.nvfp4 import NVFP4Problem
+            from ..nvfp4_inference_autotune import (
+                fully_prequant_config_from_dict,
+                weight_prequant_config_from_dict,
+            )
+
+            nv_problem = NVFP4Problem(problem.m, problem.n, problem.k)
+            if family == "nvfp4_weight_prequant_fwd":
+                return weight_prequant_config_from_dict(config).rejection(nv_problem)
+            return fully_prequant_config_from_dict(config).rejection(nv_problem)
     except (KeyError, TypeError, ValueError) as exc:
         return f"cannot deserialize current config schema: {exc}"
     return f"unsupported runtime winner family {family!r}"

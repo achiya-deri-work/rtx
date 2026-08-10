@@ -7,6 +7,8 @@ repository root so imports and output paths are predictable.
 | --- | --- |
 | `benchmark_mxfp8_frontend.py` | End-to-end `torch.compile` MXFP8 frontend benchmark |
 | `benchmark_nvfp4_training.py` | Paired full delayed-scale NVFP4 training-forward versus fused MXFP8 performance gate |
+| `benchmark_nvfp4_end_to_end.py` | Paired forward-plus-MXFP8-backward layer benchmark |
+| `validate_nvfp4_convergence.py` | Controlled BF16/current/delayed/exact scale-policy convergence study |
 | `benchmark_mxfp8_prequant.py` | Dynamic BF16 quantization plus native-scale MXFP8 GEMM, with mainloop/epilogue stage and persistent-locality controls |
 | `benchmark_torchao_fp8_rowwise.py` | TorchAO rowwise FP8 comparison baseline |
 | `validate_mxfp8_production.py` | Eager/compiled, training/inference, stream, cache, and long-dW readiness matrix |
@@ -52,6 +54,11 @@ python benchmarks/benchmark_nvfp4_training.py \
 ```
 
 The command exits nonzero if either default training shape is below 1.5x.
+
+The end-to-end benchmark supports eager and `--compile` runs. It verifies that
+both frontends produce bit-identical MXFP8 dX/dW and uses device-wide fences so
+dual-stream backward work cannot escape the measurement. Add `--profile` for a
+per-kernel CPU/CUDA breakdown while investigating launch overhead.
 
 Use `benchmark_mxfp8_bwd.py --reuse-sweep` for paired races across the legal
 128x256 and 256x128 dW reuse basins, BF16 stage counts, and register budgets.
