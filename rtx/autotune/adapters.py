@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Callable, Iterable, Mapping
 
 from .core import DiscreteKernelAdapter, KernelContext
@@ -64,10 +65,11 @@ def _sm120_scale_bytes(tile_m: int, tile_n: int, tile_k: int, stages: int) -> in
 def _fused_smem_bytes(config: MXFP8FwdConfig) -> int:
     operands = config.mxfp8_stages * (
         config.tile_m + config.tile_n
-    ) * config.tile_k
-    scales = _sm120_scale_bytes(
-        config.tile_m, config.tile_n, config.tile_k, config.mxfp8_stages
-    )
+    ) * config.tile_k * config.native_operand_bits // 8
+    scales = config.mxfp8_stages * (
+        ((config.tile_m + 127) // 128) * 128
+        + ((config.tile_n + 127) // 128) * 128
+    ) * (config.tile_k // config.scale_vector_size)
     bf16 = 0
     if config.load_engine in ("cpasync", "tma"):
         bf16 = (
@@ -86,7 +88,8 @@ def _fused_smem_bytes(config: MXFP8FwdConfig) -> int:
         if config.load_engine != "scalar"
         else 0
     )
-    return operands + scales + bf16 + epilogue + reserve
+    delayed_scale = 32 if getattr(config, "collect_amax", False) else 0
+    return operands + scales + bf16 + epilogue + delayed_scale + reserve
 
 
 def _gemm_smem_bytes(config: object) -> int:
@@ -362,12 +365,15 @@ def _apply_fused_cluster_reuse_features(
         if config.cluster_reuse != "none" and config.load_engine != "tma"
         else 0.0
     )
+    native_operand_bytes = (
+        reuse_rows * problem.k * config.native_operand_bits / 8
+    )
+    native_scale_bytes = reuse_rows * (
+        (problem.k + config.scale_vector_size - 1)
+        // config.scale_vector_size
+    )
     native_bytes = (
-        peer_ctas
-        * (
-            reuse_rows * problem.k
-            + reuse_rows * ((problem.k + 31) // 32)
-        )
+        peer_ctas * (native_operand_bytes + native_scale_bytes)
         if config.cluster_reuse != "none"
         else 0.0
     )
@@ -410,9 +416,14 @@ def make_mxfp8_fwd_adapter(
     device: DeviceFingerprint | Mapping[str, object] | None = None,
     regime: str = "hot",
     tags: Mapping[str, object] | None = None,
+    _family: str = "mxfp8_fused_fwd",
+    _revision: int = MXFP8_FWD_KERNEL_REVISION,
+    _allowed_axes: Mapping[str, Iterable[object]] = FWD_SEARCH_SPACE,
+    _normalizer: Callable[..., MXFP8FwdConfig] = normalize_fwd_config,
+    _deserialize: Callable[[dict[str, object]], MXFP8FwdConfig] = fwd_config_from_dict,
 ) -> DiscreteKernelAdapter[MXFP8FwdConfig]:
     axis_values = {name: tuple(values) for name, values in axes.items()}
-    unknown = set(axis_values).difference(FWD_SEARCH_SPACE)
+    unknown = set(axis_values).difference(_allowed_axes)
     if unknown:
         raise ValueError(f"unknown fused-forward tuning axes: {sorted(unknown)}")
 
@@ -525,13 +536,28 @@ def make_mxfp8_fwd_adapter(
                 (problem.k + config.tile_k - 1) // config.tile_k
             ),
             pipeline_buffer_bytes=float(_fused_smem_bytes(config)),
+            delayed_telemetry_slots=float(
+                grid_ctas if getattr(config, "collect_amax", False) else 0
+            ),
+            delayed_telemetry_state_bytes=float(
+                grid_ctas * 2 * 4
+                if getattr(config, "collect_amax", False)
+                else 0
+            ),
+            delayed_telemetry_l2_read_bytes=float(
+                grid_ctas * grid_ctas * 2 * 4
+                if getattr(config, "collect_amax", False)
+                else 0
+            ),
+            delayed_scale_prepare_launches=0.0,
+            total_kernel_launches=1.0,
         )
         return values
 
     return DiscreteKernelAdapter(
         context=_context(
-            "mxfp8_fused_fwd",
-            MXFP8_FWD_KERNEL_REVISION,
+            _family,
+            _revision,
             problem,
             device,
             regime,
@@ -541,13 +567,54 @@ def make_mxfp8_fwd_adapter(
         axes=axis_values,
         config_id_fn=fwd_config_id,
         serialize_fn=fwd_config_to_dict,
-        deserialize_fn=lambda value: fwd_config_from_dict(dict(value)),
-        update_fn=lambda config, coordinate, value: normalize_fwd_config(
+        deserialize_fn=lambda value: _deserialize(dict(value)),
+        update_fn=lambda config, coordinate, value: _normalizer(
             config, **{coordinate: value}
         ),
         evaluator=evaluator,
         rejection_fn=rejection,
         extra_features_fn=derived,
+    )
+
+
+def make_nvfp4_fwd_adapter(
+    problem,
+    evaluator: Callable[[object], TrialOutcome],
+    *,
+    initial=None,
+    axes=None,
+    device: DeviceFingerprint | Mapping[str, object] | None = None,
+    regime: str = "hot",
+    tags: Mapping[str, object] | None = None,
+):
+    from ..configs.nvfp4 import (
+        DEFAULT_NVFP4_FWD_CONFIG,
+        NVFP4_FWD_SEARCH_SPACE,
+        NVFP4_KERNEL_REVISION,
+        normalize_nvfp4_fwd_config,
+    )
+
+    selected_axes = NVFP4_FWD_SEARCH_SPACE if axes is None else axes
+    selected_initial = initial or replace(
+        DEFAULT_NVFP4_FWD_CONFIG, collect_amax=True
+    )
+
+    def deserialize(values: dict[str, object]):
+        return normalize_nvfp4_fwd_config(**values)
+
+    return make_mxfp8_fwd_adapter(
+        problem,
+        evaluator,
+        initial=selected_initial,
+        axes=selected_axes,
+        device=device,
+        regime=regime,
+        tags=tags,
+        _family="nvfp4_fused_fwd",
+        _revision=NVFP4_KERNEL_REVISION,
+        _allowed_axes=NVFP4_FWD_SEARCH_SPACE,
+        _normalizer=normalize_nvfp4_fwd_config,
+        _deserialize=deserialize,
     )
 
 
@@ -1221,6 +1288,7 @@ __all__ = [
     "make_mxfp8_bwd_adapter",
     "make_mxfp8_fully_prequant_adapter",
     "make_mxfp8_fwd_adapter",
+    "make_nvfp4_fwd_adapter",
     "make_mxfp8_prequant_adapter",
     "make_mxfp8_weight_prequant_adapter",
 ]

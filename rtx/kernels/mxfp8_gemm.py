@@ -17,6 +17,7 @@ import cutlass.utils.blackwell_helpers as sm120_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass import (
     BFloat16,
+    Float4E2M1FN,
     Float8E4M3FN,
     Float8E8M0FNU,
     Float32,
@@ -48,6 +49,11 @@ class MXFP8GemmKernel:
         atomic_output: bool = False,
         cluster_output: bool = False,
     ):
+        self.ab_dtype = Float8E4M3FN
+        self.sf_dtype = Float8E8M0FNU
+        self.sf_vec_size = SF_VEC_SIZE
+        self.use_mxf8f6f4 = True
+        self.apply_output_scale = False
         rejection = config.rejection(problem)
         if rejection is not None:
             raise ValueError(f"illegal prequantized MXFP8 GEMM: {rejection}")
@@ -153,12 +159,12 @@ class MXFP8GemmKernel:
 
     def _setup_static_layouts(self) -> None:
         cfg = self.config
-        mma_op = warp.MmaMXF8Op(Float8E4M3FN, Float32, Float8E8M0FNU)
+        mma_op = self._make_mma_op()
         self.tiled_mma = cute.make_tiled_mma(
             mma_op,
             cute.make_layout((cfg.atom_layout_m, cfg.atom_layout_n, 1)),
             permutation_mnk=sm120_utils.get_permutation_mnk(
-                self.tile_shape_mnk, SF_VEC_SIZE, True
+                self.tile_shape_mnk, self.sf_vec_size, self.use_mxf8f6f4
             ),
         )
         swizzles = {
@@ -169,14 +175,14 @@ class MXFP8GemmKernel:
         }
         self.a_layout = cute.tile_to_shape(
             cute.nvgpu.warpgroup.make_smem_layout_atom(
-                swizzles[cfg.a_swizzle], Float8E4M3FN
+                swizzles[cfg.a_swizzle], self.ab_dtype
             ),
             (cfg.tile_m, cfg.tile_k, cfg.stages),
             order=(0, 1, 2),
         )
         self.b_layout = cute.tile_to_shape(
             cute.nvgpu.warpgroup.make_smem_layout_atom(
-                swizzles[cfg.b_swizzle], Float8E4M3FN
+                swizzles[cfg.b_swizzle], self.ab_dtype
             ),
             (cfg.tile_n, cfg.tile_k, cfg.stages),
             order=(0, 1, 2),
@@ -188,14 +194,17 @@ class MXFP8GemmKernel:
         )
         if cfg.tile_m == 64:
             self.sfa_layout = _make_sm120_sfa_layout_64(
-                self.tiled_mma, cfg.tile_k, cfg.stages
+                self.tiled_mma,
+                cfg.tile_k,
+                self.sf_vec_size,
+                cfg.stages,
             )
         else:
             self.sfa_layout = blockscaled_utils.sm120_make_smem_layout_sfa(
-                self.tiled_mma, padded_tile, SF_VEC_SIZE, cfg.stages
+                self.tiled_mma, padded_tile, self.sf_vec_size, cfg.stages
             )
         self.sfb_layout = blockscaled_utils.sm120_make_smem_layout_sfb(
-            self.tiled_mma, padded_tile, SF_VEC_SIZE, cfg.stages
+            self.tiled_mma, padded_tile, self.sf_vec_size, cfg.stages
         )
         self.out_layout = cute.tile_to_shape(
             cute.nvgpu.warpgroup.make_smem_layout_atom(
@@ -205,6 +214,9 @@ class MXFP8GemmKernel:
             (cfg.tile_m, cfg.tile_n, cfg.epilogue_stages),
             order=(0, 1, 2),
         )
+
+    def _make_mma_op(self):
+        return warp.MmaMXF8Op(self.ab_dtype, Float32, self.sf_dtype)
 
     @cute.jit
     def _stage_scales(
@@ -240,7 +252,7 @@ class MXFP8GemmKernel:
             "cg": nvvm.LoadCacheModifier.CG,
             "cs": nvvm.LoadCacheModifier.CS,
         }[cfg.scale_cache]
-        scale_blocks_per_tile = cfg.tile_k // SF_VEC_SIZE
+        scale_blocks_per_tile = cfg.tile_k // self.sf_vec_size
         scale_chunks_per_row = scale_blocks_per_tile // cfg.scale_load_vec
         a_scale_count = cfg.tile_m * scale_chunks_per_row
         total_scale_count = (
@@ -265,16 +277,16 @@ class MXFP8GemmKernel:
             row_limit = self.problem.m if is_a else self.problem.n
             global_k_block = k_tile * scale_blocks_per_tile + k_block
             if cutlass.const_expr(cfg.scale_load_vec == 1):
-                scale = Uint8(0).bitcast(Float8E8M0FNU)
+                scale = Uint8(0).bitcast(self.sf_dtype)
                 if global_row < row_limit:
                     if is_a:
                         scale = sx[global_row, global_k_block]
                     else:
                         scale = sw[global_row, global_k_block]
                 if is_a:
-                    s_sfa[row, k_block * SF_VEC_SIZE, stage] = scale
+                    s_sfa[row, k_block * self.sf_vec_size, stage] = scale
                 else:
-                    s_sfb[row, k_block * SF_VEC_SIZE, stage] = scale
+                    s_sfb[row, k_block * self.sf_vec_size, stage] = scale
             else:
                 if is_a:
                     if global_row < row_limit:
@@ -286,20 +298,20 @@ class MXFP8GemmKernel:
                             prefetch=scale_prefetch,
                             evict=scale_evict,
                             cache_modifier=scale_cache,
-                        ).bitcast(Float8E8M0FNU)
+                        ).bitcast(self.sf_dtype)
                         for vec in cutlass.range_constexpr(cfg.scale_load_vec):
                             s_sfa[
                                 row,
-                                (k_block + vec) * SF_VEC_SIZE,
+                                (k_block + vec) * self.sf_vec_size,
                                 stage,
                             ] = loaded[vec]
                     else:
                         for vec in cutlass.range_constexpr(cfg.scale_load_vec):
                             s_sfa[
                                 row,
-                                (k_block + vec) * SF_VEC_SIZE,
+                                (k_block + vec) * self.sf_vec_size,
                                 stage,
-                            ] = Uint8(0).bitcast(Float8E8M0FNU)
+                            ] = Uint8(0).bitcast(self.sf_dtype)
                 else:
                     if global_row < row_limit:
                         src_row = sw[global_row, None]
@@ -310,20 +322,20 @@ class MXFP8GemmKernel:
                             prefetch=scale_prefetch,
                             evict=scale_evict,
                             cache_modifier=scale_cache,
-                        ).bitcast(Float8E8M0FNU)
+                        ).bitcast(self.sf_dtype)
                         for vec in cutlass.range_constexpr(cfg.scale_load_vec):
                             s_sfb[
                                 row,
-                                (k_block + vec) * SF_VEC_SIZE,
+                                (k_block + vec) * self.sf_vec_size,
                                 stage,
                             ] = loaded[vec]
                     else:
                         for vec in cutlass.range_constexpr(cfg.scale_load_vec):
                             s_sfb[
                                 row,
-                                (k_block + vec) * SF_VEC_SIZE,
+                                (k_block + vec) * self.sf_vec_size,
                                 stage,
-                            ] = Uint8(0).bitcast(Float8E8M0FNU)
+                            ] = Uint8(0).bitcast(self.sf_dtype)
 
     @cute.jit
     def __call__(
@@ -333,6 +345,7 @@ class MXFP8GemmKernel:
         sx: cute.Tensor,
         sw: cute.Tensor,
         out: cute.Tensor,
+        output_scale: cute.Tensor,
         stream: cuda.CUstream,
     ):
         self._setup_static_layouts()
@@ -352,9 +365,9 @@ class MXFP8GemmKernel:
         scale_a_tile_elems = (
             512
             if cfg.scale_layout == "mma64x128"
-            else cfg.tile_m * cfg.tile_k // SF_VEC_SIZE
+            else cfg.tile_m * cfg.tile_k // self.sf_vec_size
         )
-        scale_b_tile_elems = cfg.tile_n * cfg.tile_k // SF_VEC_SIZE
+        scale_b_tile_elems = cfg.tile_n * cfg.tile_k // self.sf_vec_size
         scale_a_flat_layout = cute.make_layout(
             (scale_a_tile_elems, cfg.stages),
             stride=(1, scale_a_tile_elems),
@@ -386,16 +399,16 @@ class MXFP8GemmKernel:
         @cute.struct
         class SharedStorage:
             a: cute.struct.Align[
-                cute.struct.MemRange[Float8E4M3FN, cute.cosize(self.a_layout)],
+                cute.struct.MemRange[self.ab_dtype, cute.cosize(self.a_layout)],
                 1024,
             ]
             b: cute.struct.Align[
-                cute.struct.MemRange[Float8E4M3FN, cute.cosize(self.b_layout)],
+                cute.struct.MemRange[self.ab_dtype, cute.cosize(self.b_layout)],
                 1024,
             ]
             sfa: cute.struct.Align[
                 cute.struct.MemRange[
-                    Float8E8M0FNU,
+                    self.sf_dtype,
                     scale_a_tile_elems * cfg.stages
                     if cfg.scale_layout == "mma64x128"
                     else cute.cosize(self.sfa_layout),
@@ -403,7 +416,7 @@ class MXFP8GemmKernel:
                 128,
             ]
             sfb: cute.struct.Align[
-                cute.struct.MemRange[Float8E8M0FNU, cute.cosize(self.sfb_layout)],
+                cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfb_layout)],
                 128,
             ]
             pipeline: cute.struct.Align[
@@ -446,7 +459,7 @@ class MXFP8GemmKernel:
                 (scale_b_tile_elems,),
             )
             launch = self.kernel(
-                qx, qw, sx, sw, out,
+                qx, qw, sx, sw, out, output_scale,
                 tma_x, tma_x_tensor, tma_w, tma_w_tensor,
                 tma_sx, tma_sx_tensor, tma_sw, tma_sw_tensor,
                 tma_out, tma_out_tensor, self.tiled_mma,
@@ -469,7 +482,7 @@ class MXFP8GemmKernel:
                 )
         else:
             launch = self.kernel(
-                qx, qw, sx, sw, out,
+                qx, qw, sx, sw, out, output_scale,
                 tma_x, tma_x_tensor, tma_w, tma_w_tensor,
                 tma_x, tma_x_tensor, tma_w, tma_w_tensor,
                 tma_out, tma_out_tensor, self.tiled_mma,
@@ -499,6 +512,7 @@ class MXFP8GemmKernel:
         sx: cute.Tensor,
         sw: cute.Tensor,
         out: cute.Tensor,
+        output_scale: cute.Tensor,
         tma_x: cute.CopyAtom,
         tma_x_tensor: cute.Tensor,
         tma_w: cute.CopyAtom,
@@ -538,18 +552,21 @@ class MXFP8GemmKernel:
             "cg": nvvm.LoadCacheModifier.CG,
             "cs": nvvm.LoadCacheModifier.CS,
         }[cfg.scale_cache]
+        global_output_scale = Float32(1.0)
+        if cutlass.const_expr(self.apply_output_scale):
+            global_output_scale = Float32(output_scale[0])
         sx_row_view = cute.make_tensor(
             sx.iterator,
             cute.make_layout(
-                (self.problem.m, self.problem.k // SF_VEC_SIZE),
-                stride=(self.problem.k // SF_VEC_SIZE, 1),
+                (self.problem.m, self.problem.k // self.sf_vec_size),
+                stride=(self.problem.k // self.sf_vec_size, 1),
             ),
         )
         sw_row_view = cute.make_tensor(
             sw.iterator,
             cute.make_layout(
-                (self.problem.n, self.problem.k // SF_VEC_SIZE),
-                stride=(self.problem.k // SF_VEC_SIZE, 1),
+                (self.problem.n, self.problem.k // self.sf_vec_size),
+                stride=(self.problem.k // self.sf_vec_size, 1),
             ),
         )
         tidx, _, _ = cute.arch.thread_idx()
@@ -613,9 +630,9 @@ class MXFP8GemmKernel:
         scale_a_tile_elems = (
             512
             if cfg.scale_layout == "mma64x128"
-            else cfg.tile_m * cfg.tile_k // SF_VEC_SIZE
+            else cfg.tile_m * cfg.tile_k // self.sf_vec_size
         )
-        scale_b_tile_elems = cfg.tile_n * cfg.tile_k // SF_VEC_SIZE
+        scale_b_tile_elems = cfg.tile_n * cfg.tile_k // self.sf_vec_size
         tsx_s, tsx_g = tx_s, tx_g
         tsw_s, tsw_g = tw_s, tw_g
         if cutlass.const_expr(cfg.scale_role == "tma"):
@@ -645,7 +662,15 @@ class MXFP8GemmKernel:
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, cfg.num_mma_warps
             ),
-            tx_count=(cfg.tile_m + cfg.tile_n) * cfg.tile_k
+            # TMA mbarriers count completed bytes. MXFP8's element count is
+            # already a byte count, but packed NVFP4 transfers two logical
+            # E2M1 values per byte.
+            tx_count=(
+                (cfg.tile_m + cfg.tile_n)
+                * cfg.tile_k
+                * self.ab_dtype.width
+                // 8
+            )
             + (
                 scale_a_tile_elems + scale_b_tile_elems
                 if cfg.scale_role == "tma"
@@ -670,13 +695,13 @@ class MXFP8GemmKernel:
 
         copy_a = cute.make_tiled_copy_A(
             _make_ldmatrix_atom(
-                Float8E4M3FN, False, cfg.a_ldmatrix_matrices
+                self.ab_dtype, False, cfg.a_ldmatrix_matrices
             ),
             tiled_mma,
         )
         copy_b = cute.make_tiled_copy_B(
             _make_ldmatrix_atom(
-                Float8E4M3FN, False, cfg.b_ldmatrix_matrices
+                self.ab_dtype, False, cfg.b_ldmatrix_matrices
             ),
             tiled_mma,
         )
@@ -688,7 +713,7 @@ class MXFP8GemmKernel:
         t_cr_b_copy = thr_copy_b.retile(t_cr_b)
 
         copy_sfa = cute.make_tiled_copy(
-            _make_scale_s2r_atom(Float8E8M0FNU, cfg.sfa_s2r_bits),
+            _make_scale_s2r_atom(self.sf_dtype, cfg.sfa_s2r_bits),
             sm120_utils.get_layoutSFA_TV(tiled_mma),
             (
                 cute.size(tiled_mma.permutation_mnk[0]),
@@ -696,7 +721,7 @@ class MXFP8GemmKernel:
             ),
         )
         copy_sfb = cute.make_tiled_copy(
-            _make_scale_s2r_atom(Float8E8M0FNU, cfg.sfb_s2r_bits),
+            _make_scale_s2r_atom(self.sf_dtype, cfg.sfb_s2r_bits),
             sm120_utils.get_layoutSFB_TV(tiled_mma),
             (
                 cute.size(tiled_mma.permutation_mnk[1]),
@@ -870,7 +895,13 @@ class MXFP8GemmKernel:
                 cute.arch.setmaxregister_increase(cfg.consumer_registers)
 
             num_k_tiles = cute.ceil_div(self.problem.k, cfg.tile_k)
-            scale_blocks_per_tile = cfg.tile_k // SF_VEC_SIZE
+            scale_blocks_per_tile = cfg.tile_k // self.sf_vec_size
+            # One MXFP8 instruction consumes one 32-value scale block, while
+            # one NVFP4 instruction consumes four 16-value scale blocks.  The
+            # MMA fragment's K mode is the authoritative instruction count;
+            # using the number of scale vectors only happened to be correct
+            # for MXFP8 and walks beyond NVFP4 fragments.
+            mma_k_blocks_per_tile = cute.size(t_cr_a, mode=[2])
             scale_chunks_per_row = scale_blocks_per_tile // cfg.scale_load_vec
             a_scale_count = cfg.tile_m * scale_chunks_per_row
             total_scale_count = (
@@ -973,16 +1004,16 @@ class MXFP8GemmKernel:
                             k_tile * scale_blocks_per_tile + k_block
                         )
                         if cutlass.const_expr(cfg.scale_load_vec == 1):
-                            scale = Uint8(0).bitcast(Float8E8M0FNU)
+                            scale = Uint8(0).bitcast(self.sf_dtype)
                             if global_row < row_limit:
                                 if is_a:
                                     scale = sx_row_view[global_row, global_k_block]
                                 else:
                                     scale = sw_row_view[global_row, global_k_block]
                             if is_a:
-                                s_sfa[row, k_block * SF_VEC_SIZE, stage] = scale
+                                s_sfa[row, k_block * self.sf_vec_size, stage] = scale
                             else:
-                                s_sfb[row, k_block * SF_VEC_SIZE, stage] = scale
+                                s_sfb[row, k_block * self.sf_vec_size, stage] = scale
                         else:
                             if is_a:
                                 if global_row < row_limit:
@@ -995,13 +1026,13 @@ class MXFP8GemmKernel:
                                         prefetch=scale_prefetch,
                                         evict=scale_evict,
                                         cache_modifier=scale_cache,
-                                    ).bitcast(Float8E8M0FNU)
+                                    ).bitcast(self.sf_dtype)
                                     for vec in cutlass.range_constexpr(
                                         cfg.scale_load_vec
                                     ):
                                         s_sfa[
                                             row,
-                                            (k_block + vec) * SF_VEC_SIZE,
+                                            (k_block + vec) * self.sf_vec_size,
                                             stage,
                                         ] = loaded[vec]
                                 else:
@@ -1010,9 +1041,9 @@ class MXFP8GemmKernel:
                                     ):
                                         s_sfa[
                                             row,
-                                            (k_block + vec) * SF_VEC_SIZE,
+                                            (k_block + vec) * self.sf_vec_size,
                                             stage,
-                                        ] = Uint8(0).bitcast(Float8E8M0FNU)
+                                        ] = Uint8(0).bitcast(self.sf_dtype)
                             else:
                                 if global_row < row_limit:
                                     src_row = sw_row_view[global_row, None]
@@ -1024,13 +1055,13 @@ class MXFP8GemmKernel:
                                         prefetch=scale_prefetch,
                                         evict=scale_evict,
                                         cache_modifier=scale_cache,
-                                    ).bitcast(Float8E8M0FNU)
+                                    ).bitcast(self.sf_dtype)
                                     for vec in cutlass.range_constexpr(
                                         cfg.scale_load_vec
                                     ):
                                         s_sfb[
                                             row,
-                                            (k_block + vec) * SF_VEC_SIZE,
+                                            (k_block + vec) * self.sf_vec_size,
                                             stage,
                                         ] = loaded[vec]
                                 else:
@@ -1039,9 +1070,9 @@ class MXFP8GemmKernel:
                                     ):
                                         s_sfb[
                                             row,
-                                            (k_block + vec) * SF_VEC_SIZE,
+                                            (k_block + vec) * self.sf_vec_size,
                                             stage,
-                                        ] = Uint8(0).bitcast(Float8E8M0FNU)
+                                        ] = Uint8(0).bitcast(self.sf_dtype)
                     if cutlass.const_expr(cfg.scale_role != "tma"):
                         self.scale_barrier.arrive_and_wait()
                     if cutlass.const_expr(
@@ -1050,7 +1081,7 @@ class MXFP8GemmKernel:
                     ):
                         ready = tma_pipeline.consumer_try_wait(consumer_state)
                         tma_pipeline.consumer_wait(consumer_state, ready)
-                    for k_block in cutlass.range_constexpr(scale_blocks_per_tile):
+                    for k_block in cutlass.range_constexpr(mma_k_blocks_per_tile):
                         cute.copy(
                             copy_a,
                             t_cs_a_copy[None, None, k_block, stage],
@@ -1175,7 +1206,7 @@ class MXFP8GemmKernel:
                                     and coord[1] < self.problem.n
                                 ):
                                     t_cg_out[elem] = BFloat16(
-                                        scratch[
+                                        global_output_scale * scratch[
                                             tidx * chunk_elements
                                             + elem
                                             - first_elem
@@ -1209,14 +1240,18 @@ class MXFP8GemmKernel:
                                 elif cutlass.const_expr(self.split_reduction > 1):
                                     t_cg_out[elem] = accumulators[elem]
                                 else:
-                                    t_cg_out[elem] = BFloat16(accumulators[elem])
+                                    t_cg_out[elem] = BFloat16(
+                                        global_output_scale * accumulators[elem]
+                                    )
             else:
                 if active_tile:
                     if warp_idx < cfg.num_mma_warps:
                         for elem in cutlass.range(
                             cute.size(r_out), unroll_full=True
                         ):
-                            r_out[elem] = BFloat16(t_rs_acc[elem])
+                            r_out[elem] = BFloat16(
+                                global_output_scale * t_rs_acc[elem]
+                            )
                         # Warp 0 cannot enter this barrier until its preceding
                         # TMA wait has completed, so it also guards reuse of the
                         # selected shared-memory stage by every MMA warp.
@@ -1257,6 +1292,18 @@ class MXFP8GemmKernel:
         if cutlass.const_expr(cfg.epilogue == "tma"):
             if warp_idx == 0:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
+
+
+class _UnitOutputScaleLauncher:
+    """Preserve the public five-tensor MXFP8 launcher signature."""
+
+    def __init__(self, compiled):
+        self.compiled = compiled
+
+    def __call__(self, qx, qw, sx, sw, out):
+        # The format-specialized branch removes this placeholder from MXFP8
+        # device IR. Reusing ``out`` avoids allocating a process-global scalar.
+        return self.compiled(qx, qw, sx, sw, out, out)
 
 
 @lru_cache(maxsize=None)
@@ -1348,12 +1395,13 @@ def compile_mxfp8_gemm(
             assumed_align=16,
         )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    return cute.compile(
+    compiled = cute.compile(
         kernel,
         qx,
         qw,
         sx,
         sw,
+        out,
         out,
         stream,
         options=(
@@ -1361,6 +1409,7 @@ def compile_mxfp8_gemm(
             f"--ptxas-options '-O3 -v --maxrregcount={config.maxrregcount}'"
         ),
     )
+    return _UnitOutputScaleLauncher(compiled)
 
 
 __all__ = ["MXFP8GemmConfig", "MXFP8GemmKernel", "compile_mxfp8_gemm"]

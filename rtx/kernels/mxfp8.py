@@ -137,6 +137,18 @@ class MXFP8FwdConfig:
     cluster_size: int = 1
 
     @property
+    def native_operand_bits(self) -> int:
+        """Physical SMEM width of one native tensor-core operand value."""
+
+        return 8
+
+    @property
+    def scale_vector_size(self) -> int:
+        """Number of native values decoded by one block-scale byte."""
+
+        return 32
+
+    @property
     def smem_rmem_tile(self) -> tuple[int, int, int, int, int]:
         """CTA SMEM tile followed by the per-warp RMEM M/N tile.
 
@@ -238,6 +250,8 @@ class MXFP8FwdConfig:
             self.mxfp8_stages
             * (self.tile_m + self.tile_n)
             * self.tile_k
+            * self.native_operand_bits
+            // 8
         )
         # SM120 scale blocks are physically padded to 128 rows/columns even
         # when the logical M tile is 64.
@@ -247,7 +261,7 @@ class MXFP8FwdConfig:
                 ((self.tile_m + 127) // 128) * 128
                 + ((self.tile_n + 127) // 128) * 128
             )
-            * (self.tile_k // 32)
+            * (self.tile_k // self.scale_vector_size)
         )
         bf16_stage_bytes = 0
         if self.load_engine in ("cpasync", "tma"):
@@ -460,7 +474,8 @@ class MXFP8FwdConfig:
         unsupported = [
             field.name
             for field in fields(self)
-            if field.name not in implemented
+            if hasattr(baseline, field.name)
+            and field.name not in implemented
             and getattr(self, field.name) != getattr(baseline, field.name)
         ]
         if unsupported:
@@ -518,7 +533,7 @@ class MXFP8FwdConfig:
 
 
 DEFAULT_MXFP8_FWD_CONFIG = MXFP8FwdConfig()
-MXFP8_FWD_KERNEL_REVISION = 19
+MXFP8_FWD_KERNEL_REVISION = 20
 
 
 # Block coordinates supplement, rather than replace, their primitive fields.

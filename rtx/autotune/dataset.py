@@ -31,6 +31,7 @@ from .adapters import (
     make_mxfp8_fwd_adapter,
     make_mxfp8_prequant_adapter,
     make_mxfp8_weight_prequant_adapter,
+    make_nvfp4_fwd_adapter,
 )
 from .bandit import DiscountedArmStatistics, contextual_ucb_scores
 from .core import KernelAdapter, canonical_json, stable_id
@@ -64,6 +65,11 @@ from ..kernels.mxfp8 import (
     MXFP8Problem,
 )
 from ..runtime import load_kernel_symbol
+from ..configs.nvfp4 import (
+    DEFAULT_NVFP4_FWD_CONFIG,
+    NVFP4FwdConfig,
+    NVFP4Problem,
+)
 from ..prequant_experiments import (
     BenchmarkProtocol,
     CacheRegime,
@@ -92,6 +98,16 @@ KernelFamily = str
 
 def compile_mxfp8_fwd(*args, **kwargs):
     return load_kernel_symbol("mxfp8_fwd", "compile_mxfp8_fwd")(*args, **kwargs)
+
+
+def compile_nvfp4_fwd(*args, **kwargs):
+    return load_kernel_symbol("nvfp4_fwd", "compile_nvfp4_fwd")(*args, **kwargs)
+
+
+def nvfp4_grid_ctas(*args, **kwargs):
+    return load_kernel_symbol("nvfp4_fwd", "nvfp4_grid_ctas")(
+        *args, **kwargs
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,6 +515,14 @@ class FusedFwdBenchmarkHarness:
         end.synchronize()
         return float(start.elapsed_time(end)) / calls
 
+    def _launch_prepared(
+        self,
+        prepared: _PreparedFused,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> None:
+        prepared.launcher(x, weight, prepared.out)
+
     def calibrate_calls(self, prepared: _PreparedFused) -> tuple[int, float]:
         pilot = self._time_batch(prepared, self.protocol.min_calls_per_sample, 0)
         calls = math.ceil(self.protocol.target_batch_ms / max(pilot, 1e-6))
@@ -542,7 +566,7 @@ class FusedFwdBenchmarkHarness:
             }
         for index in range(self.protocol.warmup_calls):
             x, weight = self._inputs[index % len(self._inputs)]
-            prepared.launcher(x, weight, prepared.out)
+            self._launch_prepared(prepared, x, weight)
         torch.cuda.synchronize(self.device)
         calls, pilot = self.calibrate_calls(prepared)
         timings = collect_timing_samples(
@@ -625,6 +649,174 @@ class FusedFwdBenchmarkHarness:
             "rotation_buffers": len(self._inputs),
             "sampling": self.protocol.race_sampling_metadata(a_times, b_times),
         }
+
+
+@dataclass(slots=True)
+class _PreparedNVFP4:
+    config: NVFP4FwdConfig
+    launcher: object
+    out: torch.Tensor
+    x_amax_state: torch.Tensor
+    weight_amax_state: torch.Tensor
+    next_x_amax_state: torch.Tensor
+    next_weight_amax_state: torch.Tensor
+    compile_ms: float
+    max_abs_error: float
+    compiled_resources: Mapping[str, object]
+
+
+def _nvfp4_scale_pack(tensor: torch.Tensor) -> torch.Tensor:
+    amax = tensor.float().abs().amax()
+    target = torch.clamp_min(
+        amax / 2688.0, torch.finfo(torch.float32).tiny
+    )
+    scale = torch.exp2(torch.ceil(torch.log2(target)))
+    scale = torch.where(amax > 0, scale, torch.ones_like(scale))
+    inverse = scale.reciprocal()
+    return torch.stack((scale, inverse, inverse / 6.0))
+
+
+def _nvfp4_amax_state(tensor: torch.Tensor, slots: int) -> torch.Tensor:
+    return tensor.float().abs().amax().reshape(1).expand(slots).clone()
+
+
+class NVFP4FwdBenchmarkHarness(FusedFwdBenchmarkHarness):
+    """Training-forward harness with fused per-CTA delayed-scale telemetry."""
+
+    def __init__(
+        self,
+        shape: ShapeSpec,
+        regime: CacheRegime,
+        protocol: BenchmarkProtocol,
+        *,
+        device: torch.device | str = "cuda",
+        seed: int = 0,
+    ) -> None:
+        self.shape = shape
+        self.problem = NVFP4Problem(shape.m, shape.n, shape.k)
+        self.regime = regime
+        self.protocol = protocol
+        self.device = torch.device(device)
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(seed)
+        self.x = torch.randn(
+            shape.m,
+            shape.k,
+            dtype=torch.bfloat16,
+            device=self.device,
+            generator=generator,
+        )
+        self.weight = torch.randn(
+            shape.n,
+            shape.k,
+            dtype=torch.bfloat16,
+            device=self.device,
+            generator=generator,
+        )
+        self._inputs = self._make_input_ring()
+        baseline_config = replace(DEFAULT_NVFP4_FWD_CONFIG, collect_amax=False)
+        if shape.k % 256:
+            baseline_config = replace(
+                baseline_config, tile_k=128, bf16_tile_k=128
+            )
+        baseline = compile_nvfp4_fwd(self.problem, baseline_config)
+        expected = torch.empty(
+            (shape.m, shape.n), dtype=torch.bfloat16, device=self.device
+        )
+        sx = _nvfp4_scale_pack(self.x)
+        sw = _nvfp4_scale_pack(self.weight)
+        baseline(self.x, self.weight, expected, sx, sw, sx[:1], sw[:1])
+        torch.cuda.synchronize(self.device)
+        self._expected = expected.clone()
+
+    def prepare(self, config: NVFP4FwdConfig) -> _PreparedNVFP4:
+        reason = config.implementation_rejection(self.problem)
+        if reason is not None:
+            raise RuntimeError(reason)
+        started = time.monotonic()
+        try:
+            launcher = compile_nvfp4_fwd(self.problem, config)
+        except Exception as exc:
+            raise FusedCandidateCompileError(f"{type(exc).__name__}: {exc}") from exc
+        compile_ms = (time.monotonic() - started) * 1000
+        out = torch.empty_like(self._expected)
+        grid_ctas = nvfp4_grid_ctas(self.problem, config)
+        x_amax_state = _nvfp4_amax_state(self.x, grid_ctas)
+        weight_amax_state = _nvfp4_amax_state(self.weight, grid_ctas)
+        next_x_amax_state = torch.empty_like(x_amax_state)
+        next_weight_amax_state = torch.empty_like(weight_amax_state)
+        prepared = _PreparedNVFP4(
+            config,
+            launcher,
+            out,
+            x_amax_state,
+            weight_amax_state,
+            next_x_amax_state,
+            next_weight_amax_state,
+            compile_ms,
+            0.0,
+            compiled_resource_metadata(launcher),
+        )
+        self._launch_one(prepared, self.x, self.weight)
+        torch.cuda.synchronize(self.device)
+        max_error = float((out.float() - self._expected.float()).abs().max())
+        if not torch.allclose(
+            out,
+            self._expected,
+            rtol=self.protocol.correctness_rtol,
+            atol=self.protocol.correctness_atol,
+            equal_nan=True,
+        ):
+            raise FusedCandidateCorrectnessError(
+                f"candidate differs from baseline (max abs {max_error})"
+            )
+        prepared.max_abs_error = max_error
+        return prepared
+
+    @staticmethod
+    def _launch_one(
+        prepared: _PreparedNVFP4,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> None:
+        prepared.launcher(
+            x,
+            weight,
+            prepared.out,
+            prepared.x_amax_state,
+            prepared.weight_amax_state,
+            prepared.next_x_amax_state,
+            prepared.next_weight_amax_state,
+        )
+        prepared.x_amax_state, prepared.next_x_amax_state = (
+            prepared.next_x_amax_state,
+            prepared.x_amax_state,
+        )
+        prepared.weight_amax_state, prepared.next_weight_amax_state = (
+            prepared.next_weight_amax_state,
+            prepared.weight_amax_state,
+        )
+
+    def _launch_prepared(
+        self,
+        prepared: _PreparedNVFP4,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> None:
+        self._launch_one(prepared, x, weight)
+
+    def _time_batch(
+        self, prepared: _PreparedNVFP4, calls: int, offset: int
+    ) -> float:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for call in range(calls):
+            x, weight = self._inputs[(offset + call) % len(self._inputs)]
+            self._launch_one(prepared, x, weight)
+        end.record()
+        end.synchronize()
+        return float(start.elapsed_time(end)) / calls
 
 
 def _source_snapshot() -> dict[str, object]:
@@ -809,6 +1001,18 @@ def _fused_harness(
     )
 
 
+def _nvfp4_fused_harness(
+    campaign: "DatasetCampaign", job: DatasetJob, shape: ShapeSpec, regime: CacheRegime
+):
+    return NVFP4FwdBenchmarkHarness(
+        shape,
+        regime,
+        job.protocol,
+        device=campaign.device,
+        seed=_backend_seed(campaign, job, shape, regime),
+    )
+
+
 def _prequant_harness(
     campaign: "DatasetCampaign", job: DatasetJob, shape: ShapeSpec, regime: CacheRegime
 ):
@@ -871,6 +1075,43 @@ def _fused_adapter(
     return make_mxfp8_fwd_adapter(
         shape.problem,
         evaluator,
+        device=campaign.hardware_profile,
+        regime=regime,
+        tags=tags,
+    )
+
+
+def _nvfp4_fused_adapter(
+    campaign: "DatasetCampaign",
+    job: DatasetJob,
+    shape: ShapeSpec,
+    regime: CacheRegime,
+    harness,
+    tags: Mapping[str, object],
+) -> KernelAdapter:
+    evaluator = CalibratedPrequantEvaluator(
+        harness, samples=job.protocol.samples, seed=campaign.manifest.seed
+    )
+    problem = NVFP4Problem(shape.m, shape.n, shape.k)
+    initial = replace(
+        DEFAULT_NVFP4_FWD_CONFIG,
+        collect_amax=True,
+        tile_k=128 if shape.k % 256 else DEFAULT_NVFP4_FWD_CONFIG.tile_k,
+        bf16_tile_k=(
+            128 if shape.k % 256 else DEFAULT_NVFP4_FWD_CONFIG.bf16_tile_k
+        ),
+    )
+    if shape.m >= 512 and shape.m % 256 == 0:
+        from ..fp4 import _fallback_fused_config
+
+        initial = replace(
+            _fallback_fused_config(problem, collect_amax=True),
+            collect_amax=True,
+        )
+    return make_nvfp4_fwd_adapter(
+        problem,
+        evaluator,
+        initial=initial,
         device=campaign.hardware_profile,
         regime=regime,
         tags=tags,
@@ -960,6 +1201,10 @@ def _fully_prequant_adapter(
 
 register_dataset_backend(
     "mxfp8_fused_fwd", DatasetBackend(_fused_harness, _fused_adapter)
+)
+register_dataset_backend(
+    "nvfp4_fused_fwd",
+    DatasetBackend(_nvfp4_fused_harness, _nvfp4_fused_adapter),
 )
 register_dataset_backend(
     "mxfp8_prequant_fwd", DatasetBackend(_prequant_harness, _prequant_adapter)
@@ -1351,10 +1596,11 @@ class DatasetCampaign:
 
         family_order = {
             "mxfp8_fused_fwd": 0,
-            "mxfp8_prequant_fwd": 1,
-            "mxfp8_weight_prequant_fwd": 2,
-            "mxfp8_fully_prequant_fwd": 3,
-            "mxfp8_bwd": 4,
+            "nvfp4_fused_fwd": 1,
+            "mxfp8_prequant_fwd": 2,
+            "mxfp8_weight_prequant_fwd": 3,
+            "mxfp8_fully_prequant_fwd": 4,
+            "mxfp8_bwd": 5,
         }
 
         def shape_priority(shape: ShapeSpec) -> int:
@@ -2770,6 +3016,7 @@ __all__ = [
     "DatasetJob",
     "DatasetManifest",
     "FusedFwdBenchmarkHarness",
+    "NVFP4FwdBenchmarkHarness",
     "FATAL_DEVICE_CONTEXT_EXIT_CODE",
     "export_bundle",
     "export_csv",

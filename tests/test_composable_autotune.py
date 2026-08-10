@@ -39,6 +39,8 @@ from rtx.autotune import (
     make_hybrid_ask_tell_runner,
     save_runtime_winner,
 )
+from rtx.autotune.adapters import make_nvfp4_fwd_adapter
+from rtx.configs.nvfp4 import NVFP4Problem
 from rtx.autotune.core import Proposal, evaluate_proposal
 from rtx.kernels.mxfp8 import MXFP8Problem
 
@@ -538,6 +540,9 @@ class ComposableAutotuneTests(unittest.TestCase):
         evaluator = lambda _config: TrialOutcome("ok", median_ms=1.0)
         adapters = (
             make_mxfp8_fwd_adapter(problem, evaluator),
+            make_nvfp4_fwd_adapter(
+                NVFP4Problem(problem.m, problem.n, problem.k), evaluator
+            ),
             make_mxfp8_prequant_adapter(problem, evaluator),
             make_mxfp8_weight_prequant_adapter(problem, evaluator),
             make_mxfp8_fully_prequant_adapter(problem, evaluator),
@@ -547,6 +552,7 @@ class ComposableAutotuneTests(unittest.TestCase):
             {adapter.context.family for adapter in adapters},
             {
                 "mxfp8_fused_fwd",
+                "nvfp4_fused_fwd",
                 "mxfp8_prequant_fwd",
                 "mxfp8_weight_prequant_fwd",
                 "mxfp8_fully_prequant_fwd",

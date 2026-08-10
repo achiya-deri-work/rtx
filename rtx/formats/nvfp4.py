@@ -1,4 +1,4 @@
-"""TorchAO-backed NVFP4 operand helpers for the future RTX kernel."""
+"""TorchAO-backed NVFP4 operand helpers for native RTX kernels."""
 
 from __future__ import annotations
 

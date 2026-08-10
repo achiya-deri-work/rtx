@@ -3,6 +3,27 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.11.0
+
+- Implement native SM120/SM121 NVFP4 forward execution for
+  `rtx.NVFP4Linear`: fused BF16 quantization and E2M1 block-scaled MMA for
+  training, standalone TorchAO-compatible packing, dynamic-X/prequantized-W
+  inference, and fully prequantized inference. Training continues to use the
+  MXFP8 backward kernels.
+- Make delayed power-of-two tensorwise scaling the module training default.
+  Each fused CTA consumes the previous generation's tiny per-CTA amax state,
+  prepares scales cooperatively, and emits the next state in the same kernel;
+  retain current/JIT scaling as an explicit policy and bootstrap or rebootstrap
+  safely on the first call and after shape changes.
+- Generalize the fused forward and prequantized GEMM machinery across MXFP8 and
+  NVFP4 physical operand widths, scale-vector sizes, MMA atoms, and output
+  scaling while preserving the established MXFP8 launcher contracts and
+  metadata-only backward transpose layouts.
+- Add a fully composable `nvfp4_fused_fwd` autotuning family, delayed-telemetry
+  traffic/resource features, promotion and runtime-winner support, a balanced
+  16-context campaign, and a paired release benchmark that requires at least
+  1.5x the tuned MXFP8 training-forward speed on its default shapes.
+
 ## 0.10.0
 
 - Add fused dynamic quantization/MMA MXFP8 backward by compiling the

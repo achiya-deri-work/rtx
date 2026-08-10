@@ -41,6 +41,10 @@ def _current_revision(family: str) -> int:
         from ..kernels.mxfp8 import MXFP8_FWD_KERNEL_REVISION
 
         return MXFP8_FWD_KERNEL_REVISION
+    if family == "nvfp4_fused_fwd":
+        from ..configs.nvfp4 import NVFP4_KERNEL_REVISION
+
+        return NVFP4_KERNEL_REVISION
     if family == "mxfp8_prequant_fwd":
         from ..prequant_autotune import KERNEL_REVISION
 
@@ -64,6 +68,16 @@ def _config_rejection(
             from ..kernels.mxfp8 import fwd_config_from_dict
 
             return fwd_config_from_dict(config).implementation_rejection(problem)
+        if family == "nvfp4_fused_fwd":
+            from ..configs.nvfp4 import (
+                NVFP4Problem,
+                normalize_nvfp4_fwd_config,
+            )
+
+            nv_problem = NVFP4Problem(problem.m, problem.n, problem.k)
+            return normalize_nvfp4_fwd_config(
+                **dict(config)
+            ).implementation_rejection(nv_problem)
         if family == "mxfp8_prequant_fwd":
             from ..prequant_autotune import prequant_config_from_dict
 

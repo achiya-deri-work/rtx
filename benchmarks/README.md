@@ -6,6 +6,7 @@ repository root so imports and output paths are predictable.
 | Script | Purpose |
 | --- | --- |
 | `benchmark_mxfp8_frontend.py` | End-to-end `torch.compile` MXFP8 frontend benchmark |
+| `benchmark_nvfp4_training.py` | Paired full delayed-scale NVFP4 training-forward versus fused MXFP8 performance gate |
 | `benchmark_mxfp8_prequant.py` | Dynamic BF16 quantization plus native-scale MXFP8 GEMM, with mainloop/epilogue stage and persistent-locality controls |
 | `benchmark_torchao_fp8_rowwise.py` | TorchAO rowwise FP8 comparison baseline |
 | `validate_mxfp8_production.py` | Eager/compiled, training/inference, stream, cache, and long-dW readiness matrix |
@@ -40,6 +41,17 @@ python benchmarks/validate_mxfp8_production.py \
 
 `--quick` retains every category but reduces the long-reduction check from
 M=8192 to M=1024.
+
+Gate the complete single-launch NVFP4 delayed-training forward against verified
+MXFP8 runtime winners with paired AB/BA rounds:
+
+```bash
+python benchmarks/benchmark_nvfp4_training.py \
+  --winner-root /path/to/audited-bundle/shard-000-of-001 \
+  --output autotune_reports/nvfp4_training_gate.json
+```
+
+The command exits nonzero if either default training shape is below 1.5x.
 
 Use `benchmark_mxfp8_bwd.py --reuse-sweep` for paired races across the legal
 128x256 and 256x128 dW reuse basins, BF16 stage counts, and register budgets.

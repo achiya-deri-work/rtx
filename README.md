@@ -8,6 +8,10 @@ current implementation contains:
 - fused BF16 input/weight quantization and MXFP8 forward GEMM, including
   persistent three-role TMA producer/quantizer/MMA schedules and staged async
   TMA epilogues;
+- fused BF16-to-NVFP4 training forward with packed E2M1 operands, E4M3
+  block scales, delayed power-of-two FP32 tensor scales, in-kernel amax
+  telemetry, and a native K=64 block-scaled MMA; NVFP4 training reuses the
+  MXFP8 backward kernels;
 - materialized dynamic MXFP8 quantization plus GEMM, including autotunable
   one-to-four-stage mainloops and epilogues, locality scheduling, and up to
   eight output tiles per persistent CTA;
@@ -123,6 +127,11 @@ layer = rtx.MXFP8Linear(
     1536, 1536, bias=False, device="cuda", dtype=torch.bfloat16
 )
 y2 = layer(x)
+
+nv_layer = rtx.NVFP4Linear(
+    1536, 1536, bias=False, device="cuda", dtype=torch.bfloat16
+)
+nv_y = nv_layer(x)  # NVFP4 forward, MXFP8 backward
 ```
 
 Shape/stream-specific dynamic runners retain quantized workspaces for reuse.
@@ -174,9 +183,14 @@ TorchAO's packed qdata, E4M3 block scale, and optional FP32
 Packed module weights remain persistent raw buffers and do not retain a BF16
 master weight.
 
-MXFP8 implements all three state boundaries. `NVFP4Linear` and
-`NVFP4Tensor` expose the same dispatcher/fake/module contract, but execution
-still raises clearly until the NVFP4 quantizer and GEMM are implemented.
+Both formats implement all three state boundaries. Dynamic NVFP4 training uses
+delayed tensorwise scaling by default: the first call bootstraps from current
+amax, then each fused forward emits per-CTA X/W amax state. The following
+forward reduces that tiny L2-resident state and prepares its power-of-two scale
+inside the CTA, so steady-state delayed scaling remains a single launch without
+a device-wide barrier. Set `scaling="current"` to recompute tensor scales just
+in time instead. Dynamic inference always uses current scaling; AOT-weight and
+fully packed inference use the tensor scale stored in TorchAO's `NVFP4Tensor`.
 
 The historical MXFP8 backend name `prequant` means *materialized dynamic*: it
 quantizes both BF16 operands into global memory on every call before launching
@@ -184,7 +198,7 @@ the GEMM. It is an implementation strategy for the first row above, not an AOT
 weight state.
 
 See `rtx/fp8.py` and `rtx/fp8_bwd.py` for backend, configuration, and explicit
-backward controls.
+backward controls, and `rtx/fp4.py` for NVFP4 scaling and packing policies.
 
 ## One-command dataset campaign
 
@@ -218,6 +232,11 @@ rtx-autotune run autotune_manifests/cross_device_dataset_v2.json \
   --format both \
   --calibration hardware_calibration.json
 ```
+
+The same campaign engine accepts `nvfp4_fused_fwd` jobs. Those measurements
+include the fused per-CTA telemetry and next-generation scale reduction, so
+promoted winners represent the actual single-launch training-forward path
+rather than a GEMM-only proxy.
 
 New campaigns can exercise the same portable lease/worker boundary used by
 external projects while retaining the existing residual stores and campaign

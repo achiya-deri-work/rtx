@@ -100,11 +100,16 @@ class BoundedCache(MutableMapping[KeyT, ValueT], Generic[KeyT, ValueT]):
             }
 
 
-def runner_cache_limit(kind: str, default: int = 8) -> int:
+def runner_cache_limit(
+    kind: str, default: int = 8, *, namespace: str = "MXFP8"
+) -> int:
     """Resolve a per-runner cache limit with one global fallback."""
 
-    specific = f"RTX_MXFP8_{kind.upper()}_CACHE_ENTRIES"
-    raw = os.getenv(specific, os.getenv("RTX_MXFP8_RUNNER_CACHE_ENTRIES", str(default)))
+    specific = f"RTX_{namespace}_{kind.upper()}_CACHE_ENTRIES"
+    raw = os.getenv(
+        specific,
+        os.getenv(f"RTX_{namespace}_RUNNER_CACHE_ENTRIES", str(default)),
+    )
     try:
         value = int(raw)
     except ValueError as exc:
@@ -149,7 +154,7 @@ def clear_runtime_caches(*, synchronize: bool = True, device=None) -> dict[str, 
         if torch.cuda.is_available():
             torch.cuda.synchronize(device)
     released: dict[str, object] = {}
-    for module_name in ("fp8", "fp8_bwd"):
+    for module_name in ("fp8", "fp8_bwd", "fp4"):
         module = import_module(f".{module_name}", __package__)
         clear = getattr(module, "_clear_runtime_caches", None)
         if clear is not None:

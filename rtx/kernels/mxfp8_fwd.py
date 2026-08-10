@@ -16,6 +16,8 @@ import os
 import math
 from functools import lru_cache
 
+import torch
+
 os.environ.setdefault("CUTE_DSL_ARCH", "sm_120a")
 os.environ.setdefault("QUACK_ARCH", "sm_120a")
 
@@ -29,6 +31,8 @@ import cutlass.utils.blackwell_helpers as sm120_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass import (
     BFloat16,
+    Float4E2M1FN,
+    Float4E2M1FNx2,
     Float8E4M3FN,
     Float8E8M0FNU,
     Float32,
@@ -70,6 +74,7 @@ def _make_ldmatrix_atom(
 def _make_sm120_sfa_layout_64(
     tiled_mma: cute.TiledMma,
     tile_k: int,
+    sf_vec_size: int,
     num_stages: int,
 ):
     """SM120 SFA layout for a logical 64-row tile in a padded 128-row block.
@@ -81,13 +86,13 @@ def _make_sm120_sfa_layout_64(
     the logical extent seen by fragment partitioning is genuinely 64.
     """
 
-    mma_nsf = tiled_mma.shape_mnk[2] // SF_VEC_SIZE
+    mma_nsf = tiled_mma.shape_mnk[2] // sf_vec_size
     mn_shape = ((32, 2), 1)
     mn_stride = ((16, 4), 512)
     k_shape = (
-        (SF_VEC_SIZE, mma_nsf),
+        (sf_vec_size, mma_nsf),
         4 // mma_nsf,
-        tile_k // SF_VEC_SIZE // 4,
+        tile_k // sf_vec_size // 4,
     )
     k_stride = ((0, 1), mma_nsf, 512)
     layout = cute.make_layout(
@@ -127,6 +132,7 @@ class MXFP8LinearFwdKernel:
         reduction_tile: int = 0,
         atomic_output: bool = False,
         cluster_output: bool = False,
+        nvfp4: bool = False,
     ):
         rejection = config.oriented_implementation_rejection(
             problem, a_orientation, b_orientation
@@ -141,6 +147,7 @@ class MXFP8LinearFwdKernel:
         self.reduction_tile = reduction_tile
         self.atomic_output = atomic_output
         self.cluster_output = cluster_output
+        self.nvfp4 = nvfp4
         if split_reduction < 1:
             raise ValueError("split_reduction must be positive")
         if split_reduction == 1 and (
@@ -211,9 +218,11 @@ class MXFP8LinearFwdKernel:
             num_threads=self.num_mma_warps * 32,
         )
 
-        self.a_dtype = Float8E4M3FN
-        self.b_dtype = Float8E4M3FN
-        self.sf_dtype = Float8E8M0FNU
+        self.a_dtype = Float4E2M1FN if nvfp4 else Float8E4M3FN
+        self.b_dtype = Float4E2M1FN if nvfp4 else Float8E4M3FN
+        self.sf_dtype = Float8E4M3FN if nvfp4 else Float8E8M0FNU
+        self.sf_vec_size = 16 if nvfp4 else SF_VEC_SIZE
+        self.apply_output_scale = nvfp4
         self.acc_dtype = Float32
         self.c_dtype = (
             Float32 if split_reduction > 1 and not cluster_output else BFloat16
@@ -276,12 +285,19 @@ class MXFP8LinearFwdKernel:
 
     def _setup_static_layouts(self) -> None:
         cfg = self.config
-        mma_op = warp.MmaMXF8Op(self.a_dtype, self.acc_dtype, self.sf_dtype)
+        if cutlass.const_expr(self.nvfp4):
+            mma_op = warp.MmaMXF4NVF4Op(
+                self.a_dtype, self.acc_dtype, self.sf_dtype
+            )
+        else:
+            mma_op = warp.MmaMXF8Op(
+                self.a_dtype, self.acc_dtype, self.sf_dtype
+            )
         atom_layout = cute.make_layout(
             (cfg.atom_layout_m, cfg.atom_layout_n, 1)
         )
         permutation_mnk = sm120_utils.get_permutation_mnk(
-            self.tile_shape_mnk, SF_VEC_SIZE, True
+            self.tile_shape_mnk, self.sf_vec_size, not self.nvfp4
         )
         self.tiled_mma = cute.make_tiled_mma(
             mma_op, atom_layout, permutation_mnk=permutation_mnk
@@ -302,24 +318,50 @@ class MXFP8LinearFwdKernel:
         # Every choice is a legal K-major ldmatrix atom; unlike the previous
         # heuristic-only path, the bank-conflict swizzle is part of generated
         # shared-memory addressing and therefore a real tuning coordinate.
-        a_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            swizzle_kinds[cfg.a_swizzle],
-            self.a_dtype,
-        )
-        b_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            swizzle_kinds[cfg.b_swizzle],
-            self.b_dtype,
-        )
-        self.a_smem_layout = cute.tile_to_shape(
-            a_atom,
-            (cfg.tile_m, cfg.tile_k, cfg.mxfp8_stages),
-            order=(0, 1, 2),
-        )
-        self.b_smem_layout = cute.tile_to_shape(
-            b_atom,
-            (cfg.tile_n, cfg.tile_k, cfg.mxfp8_stages),
-            order=(0, 1, 2),
-        )
+        if cutlass.const_expr(self.nvfp4):
+            a_packed_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+                swizzle_kinds[cfg.a_swizzle], Float4E2M1FNx2
+            )
+            b_packed_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+                swizzle_kinds[cfg.b_swizzle], Float4E2M1FNx2
+            )
+            self.a_packed_layout = cute.tile_to_shape(
+                a_packed_atom,
+                (cfg.tile_m, cfg.tile_k // 2, cfg.mxfp8_stages),
+                order=(0, 1, 2),
+            )
+            self.b_packed_layout = cute.tile_to_shape(
+                b_packed_atom,
+                (cfg.tile_n, cfg.tile_k // 2, cfg.mxfp8_stages),
+                order=(0, 1, 2),
+            )
+            self.a_smem_layout = cute.recast_layout(
+                4, 8, self.a_packed_layout
+            )
+            self.b_smem_layout = cute.recast_layout(
+                4, 8, self.b_packed_layout
+            )
+            self.q_storage_dtype = Float4E2M1FNx2
+        else:
+            a_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+                swizzle_kinds[cfg.a_swizzle], self.a_dtype
+            )
+            b_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+                swizzle_kinds[cfg.b_swizzle], self.b_dtype
+            )
+            self.a_smem_layout = cute.tile_to_shape(
+                a_atom,
+                (cfg.tile_m, cfg.tile_k, cfg.mxfp8_stages),
+                order=(0, 1, 2),
+            )
+            self.b_smem_layout = cute.tile_to_shape(
+                b_atom,
+                (cfg.tile_n, cfg.tile_k, cfg.mxfp8_stages),
+                order=(0, 1, 2),
+            )
+            self.a_packed_layout = self.a_smem_layout
+            self.b_packed_layout = self.b_smem_layout
+            self.q_storage_dtype = self.a_dtype
         # The SM120 instruction addresses scales in indivisible 128-row/column
         # physical blocks.  A 64-row logical CTA therefore uses a padded SFA
         # allocation while the tiled MMA permutation and copy partitions retain
@@ -333,19 +375,20 @@ class MXFP8LinearFwdKernel:
             self.sfa_smem_layout = _make_sm120_sfa_layout_64(
                 self.tiled_mma,
                 cfg.tile_k,
+                self.sf_vec_size,
                 cfg.mxfp8_stages,
             )
         else:
             self.sfa_smem_layout = blockscaled_utils.sm120_make_smem_layout_sfa(
                 self.tiled_mma,
                 scale_layout_tile,
-                SF_VEC_SIZE,
+                self.sf_vec_size,
                 cfg.mxfp8_stages,
             )
         self.sfb_smem_layout = blockscaled_utils.sm120_make_smem_layout_sfb(
             self.tiled_mma,
             scale_layout_tile,
-            SF_VEC_SIZE,
+            self.sf_vec_size,
             cfg.mxfp8_stages,
         )
         # TMA follows the contiguous basis of each GMEM tensor.  A metadata-only
@@ -415,6 +458,10 @@ class MXFP8LinearFwdKernel:
         x: cute.Tensor,
         weight: cute.Tensor,
         out: cute.Tensor,
+        x_tensor_scale: cute.Tensor,
+        weight_tensor_scale: cute.Tensor,
+        x_amax_out: cute.Tensor,
+        weight_amax_out: cute.Tensor,
         stream: cuda.CUstream,
     ):
         # Layout/MMA objects are IR values and must be constructed while CuTe is
@@ -513,13 +560,15 @@ class MXFP8LinearFwdKernel:
                 ]
                 q_a: cute.struct.Align[
                     cute.struct.MemRange[
-                        self.a_dtype, cute.cosize(self.a_smem_layout)
+                        self.q_storage_dtype,
+                        cute.cosize(self.a_packed_layout),
                     ],
                     1024,
                 ]
                 q_b: cute.struct.Align[
                     cute.struct.MemRange[
-                        self.b_dtype, cute.cosize(self.b_smem_layout)
+                        self.q_storage_dtype,
+                        cute.cosize(self.b_packed_layout),
                     ],
                     1024,
                 ]
@@ -564,17 +613,26 @@ class MXFP8LinearFwdKernel:
                     ],
                     8,
                 ]
+                delayed_scale: cute.struct.Align[
+                    cute.struct.MemRange[
+                        Float32,
+                        6 if self.nvfp4 and cfg.collect_amax else 0,
+                    ],
+                    16,
+                ]
         @cute.struct
         class SharedStorageScalar:
                 q_a: cute.struct.Align[
                     cute.struct.MemRange[
-                        self.a_dtype, cute.cosize(self.a_smem_layout)
+                        self.q_storage_dtype,
+                        cute.cosize(self.a_packed_layout),
                     ],
                     1024,
                 ]
                 q_b: cute.struct.Align[
                     cute.struct.MemRange[
-                        self.b_dtype, cute.cosize(self.b_smem_layout)
+                        self.q_storage_dtype,
+                        cute.cosize(self.b_packed_layout),
                     ],
                     1024,
                 ]
@@ -607,6 +665,13 @@ class MXFP8LinearFwdKernel:
                     ],
                     8,
                 ]
+                delayed_scale: cute.struct.Align[
+                    cute.struct.MemRange[
+                        Float32,
+                        6 if self.nvfp4 and cfg.collect_amax else 0,
+                    ],
+                    16,
+                ]
 
         self.shared_storage = SharedStorageScalar
         if cutlass.const_expr(cfg.load_engine != "scalar"):
@@ -620,6 +685,10 @@ class MXFP8LinearFwdKernel:
             x,
             weight,
             out,
+            x_tensor_scale,
+            weight_tensor_scale,
+            x_amax_out,
+            weight_amax_out,
             tma_atom_x,
             tma_tensor_x,
             tma_atom_weight,
@@ -689,6 +758,104 @@ class MXFP8LinearFwdKernel:
         return scale_e8m0, inv_scale_fp32
 
     @cute.jit
+    def _nvfp4_scale_from_amax(
+        self,
+        amax: Float32,
+        tensor_scale: Float32,
+        inv_tensor_scale: Float32,
+        quant_multiplier: Float32,
+    ):
+        """Return TorchAO-compatible E4M3 block scale and FP4 reciprocal."""
+
+        if cutlass.const_expr(
+            self.config.scale_reciprocal
+            in (
+                "supplied_pow2",
+                "supplied_pow2_ptx_lut",
+                "supplied_pow2_ptx_rcp",
+            )
+        ):
+            raw_scale = nvvm.inline_ptx_hl(
+                "mul.rn.f32 {$w0}, {$r0}, {$r1};",
+                write_only_types=[Float32],
+                read_only_args=[amax, quant_multiplier],
+            )
+        else:
+            raw_scale = amax / (Float32(6.0) * tensor_scale)
+        raw_scale = cute.arch.fmax(raw_scale, Float32(0.015625), nan=True)
+        raw_scale = cute.arch.fmin(raw_scale, Float32(448.0), nan=True)
+        packed = nvvm.inline_ptx_hl(
+            "cvt.rn.satfinite.e4m3x2.f32 {$w0}, {$r0}, {$r0};",
+            write_only_types=[Int16],
+            read_only_args=[raw_scale],
+        )
+        scale = Uint8(packed & Int16(0xFF)).bitcast(Float8E4M3FN)
+        if cutlass.const_expr(
+            self.config.scale_reciprocal == "supplied_pow2_ptx_lut"
+        ):
+            # E4M3 normal values are (1 + mantissa/8) * 2**(exponent-7).
+            # Decode their reciprocal without an FP32 divide. Keeping the
+            # entire non-uniform lookup in one PTX region also avoids a CuTe
+            # staged-SSA issue observed with Python control flow around the
+            # selected reciprocal.
+            reciprocal = nvvm.inline_ptx_hl(
+                "{.reg .u32 code, exp, mant; "
+                ".reg .b32 exp_scale, mrec; .reg .f32 tmp; .reg .pred p; "
+                "mov.b32 code, {$r0}; "
+                "shr.u32 exp, code, 3; and.b32 exp, exp, 15; "
+                "sub.u32 exp, 134, exp; shl.b32 exp_scale, exp, 23; "
+                "and.b32 mant, code, 7; mov.b32 mrec, 0f3f800000; "
+                "setp.eq.u32 p, mant, 1; selp.b32 mrec, 0f3f638e39, mrec, p; "
+                "setp.eq.u32 p, mant, 2; selp.b32 mrec, 0f3f4ccccd, mrec, p; "
+                "setp.eq.u32 p, mant, 3; selp.b32 mrec, 0f3f3a2e8c, mrec, p; "
+                "setp.eq.u32 p, mant, 4; selp.b32 mrec, 0f3f2aaaab, mrec, p; "
+                "setp.eq.u32 p, mant, 5; selp.b32 mrec, 0f3f1d89d9, mrec, p; "
+                "setp.eq.u32 p, mant, 6; selp.b32 mrec, 0f3f124925, mrec, p; "
+                "setp.eq.u32 p, mant, 7; selp.b32 mrec, 0f3f088889, mrec, p; "
+                "mul.rn.f32 tmp, {$r1}, exp_scale; "
+                "mul.rn.f32 {$w0}, tmp, mrec;}",
+                write_only_types=[Float32],
+                read_only_args=[
+                    Int32(scale.bitcast(Uint8)),
+                    inv_tensor_scale,
+                ],
+            )
+        elif cutlass.const_expr(
+            self.config.scale_reciprocal == "supplied_pow2_ptx_rcp"
+        ):
+            reciprocal = nvvm.inline_ptx_hl(
+                "{.reg .f32 r; rcp.approx.f32 r, {$r1}; "
+                "mul.rn.f32 {$w0}, {$r0}, r;}",
+                write_only_types=[Float32],
+                read_only_args=[inv_tensor_scale, Float32(scale)],
+            )
+        elif cutlass.const_expr(self.config.scale_reciprocal != "direct"):
+            reciprocal = inv_tensor_scale / Float32(scale)
+        else:
+            reciprocal = (Float32(1.0) / tensor_scale) / Float32(scale)
+        return scale, reciprocal
+
+    @cute.jit
+    def _nvfp4_tensor_scale_from_amax(self, amax: Float32):
+        """Prepare a delayed power-of-two tensor scale without division."""
+
+        target = cute.arch.fmax(
+            amax * Float32(1.0 / 2688.0),
+            Float32(2.0**-126),
+            nan=True,
+        )
+        bits = target.bitcast(Int32)
+        exponent_bits = bits & Int32(0x7F800000)
+        if (bits & Int32(0x007FFFFF)) != 0:
+            exponent_bits += Int32(1 << 23)
+        scale = exponent_bits.bitcast(Float32)
+        if amax == Float32(0.0):
+            scale = Float32(1.0)
+        exponent = (scale.bitcast(Int32) >> Int32(23)) & Int32(0xFF)
+        inverse = ((Int32(254) - exponent) << Int32(23)).bitcast(Float32)
+        return scale, inverse, inverse * Float32(1.0 / 6.0)
+
+    @cute.jit
     def _warp_amax(
         self,
         value: Float32,
@@ -734,6 +901,10 @@ class MXFP8LinearFwdKernel:
         x: cute.Tensor,
         weight: cute.Tensor,
         out: cute.Tensor,
+        x_tensor_scale: cute.Tensor,
+        weight_tensor_scale: cute.Tensor,
+        x_amax_out: cute.Tensor,
+        weight_amax_out: cute.Tensor,
         tma_atom_x: cute.CopyAtom,
         tma_tensor_x: cute.Tensor,
         tma_atom_weight: cute.CopyAtom,
@@ -758,15 +929,119 @@ class MXFP8LinearFwdKernel:
         linear_tile, _, _ = cute.arch.block_idx()
         m_tiles = cute.ceil_div(self.problem.m, cfg.tile_m)
         n_tiles = cute.ceil_div(self.problem.n, cfg.tile_n)
+        output_scale = Float32(1.0)
+        x_tensor_scale_value = Float32(1.0)
+        weight_tensor_scale_value = Float32(1.0)
+        x_inv_tensor_scale = Float32(1.0)
+        weight_inv_tensor_scale = Float32(1.0)
+        x_quant_multiplier = Float32(1.0)
+        weight_quant_multiplier = Float32(1.0)
+        if cutlass.const_expr(
+            self.apply_output_scale and not self.config.collect_amax
+        ):
+            x_tensor_scale_value = Float32(x_tensor_scale[0])
+            weight_tensor_scale_value = Float32(weight_tensor_scale[0])
+            output_scale = x_tensor_scale_value * weight_tensor_scale_value
+            if cutlass.const_expr(
+                self.config.scale_reciprocal != "direct"
+            ):
+                x_inv_tensor_scale = Float32(x_tensor_scale[1])
+                weight_inv_tensor_scale = Float32(weight_tensor_scale[1])
+            if cutlass.const_expr(
+                self.config.scale_reciprocal
+                in (
+                    "supplied_pow2",
+                    "supplied_pow2_ptx_lut",
+                    "supplied_pow2_ptx_rcp",
+                )
+            ):
+                x_quant_multiplier = Float32(x_tensor_scale[2])
+                weight_quant_multiplier = Float32(weight_tensor_scale[2])
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
-        s_a = storage.q_a.get_tensor(
-            a_smem_layout.outer, swizzle=a_smem_layout.inner
-        )
-        s_b = storage.q_b.get_tensor(
-            b_smem_layout.outer, swizzle=b_smem_layout.inner
-        )
+        if cutlass.const_expr(
+            self.nvfp4 and self.config.collect_amax
+        ):
+            # Generation t consumes one raw-amax slot from every CTA in
+            # generation t-1. Warp zero performs the tiny L2-resident reduction
+            # cooperatively, then broadcasts the prepared power-of-two scale
+            # through SMEM. Each CTA owns one fresh output slot, so telemetry
+            # never needs a grid barrier or a separate reset/prepare launch.
+            prior_x_amax = Float32(0.0)
+            prior_weight_amax = Float32(0.0)
+            if warp_idx == 0:
+                for telemetry_idx in cutlass.range(
+                    lane_idx,
+                    self.grid_ctas,
+                    32,
+                    unroll=1,
+                ):
+                    prior_x_amax = cute.arch.fmax(
+                        prior_x_amax,
+                        Float32(x_tensor_scale[telemetry_idx]),
+                        nan=True,
+                    )
+                    prior_weight_amax = cute.arch.fmax(
+                        prior_weight_amax,
+                        Float32(weight_tensor_scale[telemetry_idx]),
+                        nan=True,
+                    )
+                prior_x_amax = nvvm.redux_sync(
+                    prior_x_amax.bitcast(Int32),
+                    nvvm.ReductionKind.UMAX,
+                    Int32(0xFFFFFFFF),
+                ).bitcast(Float32)
+                prior_weight_amax = nvvm.redux_sync(
+                    prior_weight_amax.bitcast(Int32),
+                    nvvm.ReductionKind.UMAX,
+                    Int32(0xFFFFFFFF),
+                ).bitcast(Float32)
+                if lane_idx == 0:
+                    x_scale, x_inverse, x_multiplier = (
+                        self._nvfp4_tensor_scale_from_amax(prior_x_amax)
+                    )
+                    weight_scale, weight_inverse, weight_multiplier = (
+                        self._nvfp4_tensor_scale_from_amax(
+                            prior_weight_amax
+                        )
+                    )
+                    storage.delayed_scale[0] = x_scale
+                    storage.delayed_scale[1] = x_inverse
+                    storage.delayed_scale[2] = x_multiplier
+                    storage.delayed_scale[3] = weight_scale
+                    storage.delayed_scale[4] = weight_inverse
+                    storage.delayed_scale[5] = weight_multiplier
+                    x_amax_out[linear_tile] = Float32(0.0)
+                    weight_amax_out[linear_tile] = Float32(0.0)
+            cute.arch.sync_threads()
+            x_tensor_scale_value = Float32(storage.delayed_scale[0])
+            weight_tensor_scale_value = Float32(storage.delayed_scale[3])
+            output_scale = x_tensor_scale_value * weight_tensor_scale_value
+            x_inv_tensor_scale = Float32(storage.delayed_scale[1])
+            weight_inv_tensor_scale = Float32(storage.delayed_scale[4])
+            x_quant_multiplier = Float32(storage.delayed_scale[2])
+            weight_quant_multiplier = Float32(storage.delayed_scale[5])
+        if cutlass.const_expr(self.nvfp4):
+            a_packed_layout = cute.recast_layout(8, 4, a_smem_layout)
+            b_packed_layout = cute.recast_layout(8, 4, b_smem_layout)
+            s_a_packed = storage.q_a.get_tensor(
+                a_packed_layout.outer, swizzle=a_packed_layout.inner
+            )
+            s_b_packed = storage.q_b.get_tensor(
+                b_packed_layout.outer, swizzle=b_packed_layout.inner
+            )
+            s_a_bytes = cute.recast_tensor(s_a_packed, Uint8)
+            s_b_bytes = cute.recast_tensor(s_b_packed, Uint8)
+            s_a = cute.recast_tensor(s_a_packed, Float4E2M1FN)
+            s_b = cute.recast_tensor(s_b_packed, Float4E2M1FN)
+        else:
+            s_a = storage.q_a.get_tensor(
+                a_smem_layout.outer, swizzle=a_smem_layout.inner
+            )
+            s_b = storage.q_b.get_tensor(
+                b_smem_layout.outer, swizzle=b_smem_layout.inner
+            )
         s_sfa = storage.scale_a.get_tensor(sfa_smem_layout)
         s_sfb = storage.scale_b.get_tensor(sfb_smem_layout)
         if cutlass.const_expr(self.cluster_output):
@@ -1131,8 +1406,15 @@ class MXFP8LinearFwdKernel:
                     ),
                 )
     
-            blocks_per_load = cfg.bf16_tile_k // SF_VEC_SIZE
+            blocks_per_load = cfg.bf16_tile_k // self.sf_vec_size
             loads_per_mma_tile = cfg.tile_k // cfg.bf16_tile_k
+            # Scale metadata and MMA fragments have the same K quantum for
+            # MXFP8 (32), but NVFP4 has four 16-value scale blocks per K=64
+            # tensor-core fragment. Keep these address spaces distinct so a
+            # 64-wide BF16 transport stage quantizes and consumes exactly one
+            # NVFP4 fragment instead of reading an uninitialized half-tile.
+            mma_instruction_k = 64 if self.nvfp4 else 32
+            mma_blocks_per_load = cfg.bf16_tile_k // mma_instruction_k
             a_scale_blocks = cfg.tile_m * blocks_per_load
             b_scale_blocks = cfg.tile_n * blocks_per_load
             if cutlass.const_expr(
@@ -1166,7 +1448,12 @@ class MXFP8LinearFwdKernel:
             ):
                 local_k_tile = k_tile - first_k_tile
                 mma_tile_k = local_k_tile // loads_per_mma_tile
-                k_block_base = (k_tile % loads_per_mma_tile) * blocks_per_load
+                scale_block_base = (
+                    k_tile % loads_per_mma_tile
+                ) * blocks_per_load
+                mma_block_base = (
+                    k_tile % loads_per_mma_tile
+                ) * mma_blocks_per_load
                 stage = Int32(mma_tile_k % cfg.mxfp8_stages)
                 bf16_stage = Int32(0)
                 if cutlass.const_expr(cfg.load_engine == "tma"):
@@ -1255,10 +1542,15 @@ class MXFP8LinearFwdKernel:
                 # subwarp owns one block and each lane loads ``quant_vec`` adjacent
                 # BF16 values, providing real vector/ILP variants while retaining
                 # one E8M0 scale per 32 values.
-                threads_per_scale = 32 // cfg.quant_vec
+                threads_per_scale = self.sf_vec_size // cfg.quant_vec
                 scale_in_warp = lane_idx // threads_per_scale
                 lane_in_scale = lane_idx % threads_per_scale
-                scale_groups = (a_scale_blocks + b_scale_blocks) // cfg.quant_vec
+                blocks_per_warp = 32 // threads_per_scale
+                scale_groups = (
+                    a_scale_blocks + b_scale_blocks
+                ) // blocks_per_warp
+                warp_amax_a = Float32(0.0)
+                warp_amax_b = Float32(0.0)
                 quant_warp_idx = warp_idx
                 quant_warp_count = self.num_mma_warps
                 if cutlass.const_expr(cfg.schedule == "warp_specialized"):
@@ -1281,7 +1573,7 @@ class MXFP8LinearFwdKernel:
                 if cutlass.const_expr(cfg.cluster_reuse != "none"):
                     cluster_rank = cute.arch.block_idx_in_cluster()
                     if cluster_rank != 0:
-                        a_task_groups = Int32(a_scale_blocks // cfg.quant_vec)
+                        a_task_groups = Int32(a_scale_blocks // blocks_per_warp)
                         if cutlass.const_expr(cfg.cluster_reuse == "a"):
                             first_task_group = a_task_groups + quant_warp_idx
                         else:
@@ -1292,11 +1584,11 @@ class MXFP8LinearFwdKernel:
                     quant_warp_count,
                     unroll=1,
                 ):
-                    task = task_group * cfg.quant_vec + scale_in_warp
+                    task = task_group * blocks_per_warp + scale_in_warp
                     # A's task count is a multiple of every represented
                     # quant_vec, making this branch warp-uniform.  That is
                     # required by the transposing ldmatrix collective.
-                    is_a = task_group * cfg.quant_vec < a_scale_blocks
+                    is_a = task_group * blocks_per_warp < a_scale_blocks
                     local_task = task if is_a else task - a_scale_blocks
                     row = local_task // blocks_per_load
                     scale_block = local_task % blocks_per_load
@@ -1319,7 +1611,7 @@ class MXFP8LinearFwdKernel:
                         for load_idx in cutlass.range_constexpr(load_count):
                             vec_base = load_idx * values_per_load
                             bf16_k_base = (
-                                scale_block * SF_VEC_SIZE
+                                scale_block * self.sf_vec_size
                                 + lane_in_scale * cfg.quant_vec
                                 + vec_base
                             )
@@ -1457,7 +1749,7 @@ class MXFP8LinearFwdKernel:
                                         ]
                     for vec in cutlass.range_constexpr(cfg.quant_vec):
                         bf16_k = (
-                            scale_block * SF_VEC_SIZE
+                            scale_block * self.sf_vec_size
                             + lane_in_scale * cfg.quant_vec
                             + vec
                         )
@@ -1467,7 +1759,7 @@ class MXFP8LinearFwdKernel:
                         # delivery rather than pretending each lane received
                         # eight consecutive K values.
                         ldmatrix_k = (
-                            scale_block * SF_VEC_SIZE
+                            scale_block * self.sf_vec_size
                             + (vec // 2) * 8
                             + lane_in_scale * 2
                             + vec % 2
@@ -1490,7 +1782,7 @@ class MXFP8LinearFwdKernel:
                         ):
                             if not is_a:
                                 bf16_k = ldmatrix_k
-                        local_k = k_block_base * SF_VEC_SIZE + bf16_k
+                        local_k = scale_block_base * self.sf_vec_size + bf16_k
                         bf16_ks[vec] = bf16_k
                         local_ks[vec] = local_k
                         global_k = k_tile * cfg.bf16_tile_k + bf16_k
@@ -1543,7 +1835,45 @@ class MXFP8LinearFwdKernel:
                         threads_per_scale,
                         lane_idx,
                     )
-                    scale_e8m0, inv_scale_fp32 = self._scale_from_amax(amax)
+                    if cutlass.const_expr(
+                        self.nvfp4 and self.config.collect_amax
+                    ):
+                        if is_a:
+                            warp_amax_a = cute.arch.fmax(
+                                warp_amax_a, amax, nan=True
+                            )
+                        else:
+                            warp_amax_b = cute.arch.fmax(
+                                warp_amax_b, amax, nan=True
+                            )
+                    if cutlass.const_expr(self.nvfp4):
+                        tensor_scale = (
+                            x_tensor_scale_value
+                            if is_a
+                            else weight_tensor_scale_value
+                        )
+                        scale_e8m0 = Float8E4M3FN(1.0)
+                        inv_scale_fp32 = Float32(1.0)
+                        if is_a:
+                            scale_e8m0, inv_scale_fp32 = (
+                                self._nvfp4_scale_from_amax(
+                                    amax,
+                                    tensor_scale,
+                                    x_inv_tensor_scale,
+                                    x_quant_multiplier,
+                                )
+                            )
+                        else:
+                            scale_e8m0, inv_scale_fp32 = (
+                                self._nvfp4_scale_from_amax(
+                                    amax,
+                                    tensor_scale,
+                                    weight_inv_tensor_scale,
+                                    weight_quant_multiplier,
+                                )
+                            )
+                    else:
+                        scale_e8m0, inv_scale_fp32 = self._scale_from_amax(amax)
                     # The converter consumes two distinct FP32 values per issue.
                     # PTX places operand 0 in the high byte and operand 1 in the
                     # low byte, so store the bytes back in that order.  quant_vec=1
@@ -1553,7 +1883,20 @@ class MXFP8LinearFwdKernel:
                     for pair in cutlass.range_constexpr(pair_count):
                         vec0 = pair * 2
                         vec1 = cutlass.min(vec0 + 1, cfg.quant_vec - 1)
-                        if cutlass.const_expr(cfg.quant_math == "bf16x2"):
+                        if cutlass.const_expr(self.nvfp4):
+                            packed = nvvm.inline_ptx_hl(
+                                "{.reg .b8 b; "
+                                "cvt.rn.satfinite.e2m1x2.f32 b, {$r1}, {$r0}; "
+                                "mov.b16 {$w0}, {b, 0};}",
+                                write_only_types=[Int16],
+                                read_only_args=[
+                                    values[vec0] * inv_scale_fp32,
+                                    values[vec1] * inv_scale_fp32,
+                                ],
+                            )
+                            quantized0 = Uint8(packed)
+                            quantized1 = Uint8(0)
+                        elif cutlass.const_expr(cfg.quant_math == "bf16x2"):
                             # Both the reciprocal and source values are exact
                             # BF16 powers/values. Pack two independent lanes,
                             # scale them with one native mul.bf16x2, then feed
@@ -1597,23 +1940,62 @@ class MXFP8LinearFwdKernel:
                                 Float8E4M3FN
                             )
     
-                        if is_a:
-                            s_a[row, local_ks[vec0], stage] = quantized0
-                            if vec1 != vec0:
-                                s_a[row, local_ks[vec1], stage] = quantized1
+                        if cutlass.const_expr(self.nvfp4):
+                            if is_a:
+                                s_a_bytes[
+                                    row, local_ks[vec0] // 2, stage
+                                ] = quantized0
+                            else:
+                                s_b_bytes[
+                                    row, local_ks[vec0] // 2, stage
+                                ] = quantized0
                         else:
-                            s_b[row, local_ks[vec0], stage] = quantized0
-                            if vec1 != vec0:
-                                s_b[row, local_ks[vec1], stage] = quantized1
+                            if is_a:
+                                s_a[row, local_ks[vec0], stage] = quantized0
+                                if vec1 != vec0:
+                                    s_a[row, local_ks[vec1], stage] = quantized1
+                            else:
+                                s_b[row, local_ks[vec0], stage] = quantized0
+                                if vec1 != vec0:
+                                    s_b[row, local_ks[vec1], stage] = quantized1
     
                     if lane_in_scale == 0:
                         scale_k = (
-                            k_block_base + scale_block
-                        ) * SF_VEC_SIZE
+                            scale_block_base + scale_block
+                        ) * self.sf_vec_size
                         if is_a:
                             s_sfa[row, scale_k, stage] = scale_e8m0
                         else:
                             s_sfb[row, scale_k, stage] = scale_e8m0
+
+                if cutlass.const_expr(
+                    self.nvfp4 and self.config.collect_amax
+                ):
+                    warp_amax_a = nvvm.redux_sync(
+                        warp_amax_a.bitcast(Int32),
+                        nvvm.ReductionKind.UMAX,
+                        Int32(0xFFFFFFFF),
+                    ).bitcast(Float32)
+                    warp_amax_b = nvvm.redux_sync(
+                        warp_amax_b.bitcast(Int32),
+                        nvvm.ReductionKind.UMAX,
+                        Int32(0xFFFFFFFF),
+                    ).bitcast(Float32)
+                    if lane_idx == 0:
+                        cute.arch.atomic_fmax(
+                            x_amax_out.iterator
+                            + x_amax_out.layout(linear_tile),
+                            warp_amax_a,
+                            sign_bit=False,
+                            scope="gpu",
+                        )
+                        cute.arch.atomic_fmax(
+                            weight_amax_out.iterator
+                            + weight_amax_out.layout(linear_tile),
+                            warp_amax_b,
+                            sign_bit=False,
+                            scope="gpu",
+                        )
     
                 if cutlass.const_expr(cfg.load_engine == "tma"):
                     is_tma_consumer = warp_idx < self.num_mma_warps
@@ -1665,57 +2047,120 @@ class MXFP8LinearFwdKernel:
                     if cluster_rank == 0:
                         for peer in cutlass.range_constexpr(1, cfg.cluster_size):
                             if cutlass.const_expr(cfg.cluster_reuse == "a"):
-                                peer_q_ptr = cute.arch.map_dsmem_ptr(
-                                    s_a.iterator, Int32(peer)
-                                )
+                                if cutlass.const_expr(self.nvfp4):
+                                    peer_q_ptr = cute.arch.map_dsmem_ptr(
+                                        s_a_bytes.iterator, Int32(peer)
+                                    )
+                                else:
+                                    peer_q_ptr = cute.arch.map_dsmem_ptr(
+                                        s_a.iterator, Int32(peer)
+                                    )
                                 peer_sf_ptr = cute.arch.map_dsmem_ptr(
                                     s_sfa.iterator, Int32(peer)
                                 )
                             else:
-                                peer_q_ptr = cute.arch.map_dsmem_ptr(
-                                    s_b.iterator, Int32(peer)
-                                )
+                                if cutlass.const_expr(self.nvfp4):
+                                    peer_q_ptr = cute.arch.map_dsmem_ptr(
+                                        s_b_bytes.iterator, Int32(peer)
+                                    )
+                                else:
+                                    peer_q_ptr = cute.arch.map_dsmem_ptr(
+                                        s_b.iterator, Int32(peer)
+                                    )
                                 peer_sf_ptr = cute.arch.map_dsmem_ptr(
                                     s_sfb.iterator, Int32(peer)
                                 )
-                            for item in cutlass.range(
-                                tidx,
-                                cluster_rows * cfg.bf16_tile_k // 4,
-                                cfg.num_threads,
-                                unroll=1,
-                            ):
-                                q_base = item * 4
-                                q_row = q_base // cfg.bf16_tile_k
-                                q_k = (
-                                    k_block_base * SF_VEC_SIZE
-                                    + q_base % cfg.bf16_tile_k
-                                )
-                                if cutlass.const_expr(cfg.cluster_reuse == "a"):
-                                    q_offset = s_a.layout((q_row, q_k, stage))
-                                    q0 = s_a[q_row, q_k, stage]
-                                    q1 = s_a[q_row, q_k + 1, stage]
-                                    q2 = s_a[q_row, q_k + 2, stage]
-                                    q3 = s_a[q_row, q_k + 3, stage]
-                                else:
-                                    q_offset = s_b.layout((q_row, q_k, stage))
-                                    q0 = s_b[q_row, q_k, stage]
-                                    q1 = s_b[q_row, q_k + 1, stage]
-                                    q2 = s_b[q_row, q_k + 2, stage]
-                                    q3 = s_b[q_row, q_k + 3, stage]
-                                q_word = (
-                                    Uint32(q0.bitcast(Uint8))
-                                    | (Uint32(q1.bitcast(Uint8)) << 8)
-                                    | (Uint32(q2.bitcast(Uint8)) << 16)
-                                    | (Uint32(q3.bitcast(Uint8)) << 24)
-                                )
-                                nvvm.inline_ptx_hl(
-                                    "st.shared::cluster.u32 [{$r0}], {$r1};",
-                                    write_only_types=[],
-                                    read_only_args=[
-                                        Uint32((peer_q_ptr + q_offset).toint()),
-                                        q_word,
-                                    ],
-                                )
+                            if cutlass.const_expr(self.nvfp4):
+                                packed_k = cfg.bf16_tile_k // 2
+                                for item in cutlass.range(
+                                    tidx,
+                                    cluster_rows * packed_k // 4,
+                                    cfg.num_threads,
+                                    unroll=1,
+                                ):
+                                    q_byte_base = item * 4
+                                    q_row = q_byte_base // packed_k
+                                    q_byte_k = (
+                                        scale_block_base * self.sf_vec_size // 2
+                                        + q_byte_base % packed_k
+                                    )
+                                    if cutlass.const_expr(
+                                        cfg.cluster_reuse == "a"
+                                    ):
+                                        q_offset = s_a_bytes.layout(
+                                            (q_row, q_byte_k, stage)
+                                        )
+                                        q0 = s_a_bytes[q_row, q_byte_k, stage]
+                                        q1 = s_a_bytes[q_row, q_byte_k + 1, stage]
+                                        q2 = s_a_bytes[q_row, q_byte_k + 2, stage]
+                                        q3 = s_a_bytes[q_row, q_byte_k + 3, stage]
+                                    else:
+                                        q_offset = s_b_bytes.layout(
+                                            (q_row, q_byte_k, stage)
+                                        )
+                                        q0 = s_b_bytes[q_row, q_byte_k, stage]
+                                        q1 = s_b_bytes[q_row, q_byte_k + 1, stage]
+                                        q2 = s_b_bytes[q_row, q_byte_k + 2, stage]
+                                        q3 = s_b_bytes[q_row, q_byte_k + 3, stage]
+                                    q_word = (
+                                        Uint32(q0)
+                                        | (Uint32(q1) << 8)
+                                        | (Uint32(q2) << 16)
+                                        | (Uint32(q3) << 24)
+                                    )
+                                    nvvm.inline_ptx_hl(
+                                        "st.shared::cluster.u32 [{$r0}], {$r1};",
+                                        write_only_types=[],
+                                        read_only_args=[
+                                            Uint32(
+                                                (peer_q_ptr + q_offset).toint()
+                                            ),
+                                            q_word,
+                                        ],
+                                    )
+                            else:
+                                for item in cutlass.range(
+                                    tidx,
+                                    cluster_rows * cfg.bf16_tile_k // 4,
+                                    cfg.num_threads,
+                                    unroll=1,
+                                ):
+                                    q_base = item * 4
+                                    q_row = q_base // cfg.bf16_tile_k
+                                    q_k = (
+                                        scale_block_base * self.sf_vec_size
+                                        + q_base % cfg.bf16_tile_k
+                                    )
+                                    if cutlass.const_expr(
+                                        cfg.cluster_reuse == "a"
+                                    ):
+                                        q_offset = s_a.layout((q_row, q_k, stage))
+                                        q0 = s_a[q_row, q_k, stage]
+                                        q1 = s_a[q_row, q_k + 1, stage]
+                                        q2 = s_a[q_row, q_k + 2, stage]
+                                        q3 = s_a[q_row, q_k + 3, stage]
+                                    else:
+                                        q_offset = s_b.layout((q_row, q_k, stage))
+                                        q0 = s_b[q_row, q_k, stage]
+                                        q1 = s_b[q_row, q_k + 1, stage]
+                                        q2 = s_b[q_row, q_k + 2, stage]
+                                        q3 = s_b[q_row, q_k + 3, stage]
+                                    q_word = (
+                                        Uint32(q0.bitcast(Uint8))
+                                        | (Uint32(q1.bitcast(Uint8)) << 8)
+                                        | (Uint32(q2.bitcast(Uint8)) << 16)
+                                        | (Uint32(q3.bitcast(Uint8)) << 24)
+                                    )
+                                    nvvm.inline_ptx_hl(
+                                        "st.shared::cluster.u32 [{$r0}], {$r1};",
+                                        write_only_types=[],
+                                        read_only_args=[
+                                            Uint32(
+                                                (peer_q_ptr + q_offset).toint()
+                                            ),
+                                            q_word,
+                                        ],
+                                    )
                             for item in cutlass.range(
                                 tidx,
                                 cluster_rows * blocks_per_load,
@@ -1724,8 +2169,8 @@ class MXFP8LinearFwdKernel:
                             ):
                                 sf_row = item // blocks_per_load
                                 sf_k = (
-                                    k_block_base + item % blocks_per_load
-                                ) * SF_VEC_SIZE
+                                    scale_block_base + item % blocks_per_load
+                                ) * self.sf_vec_size
                                 if cutlass.const_expr(cfg.cluster_reuse == "a"):
                                     sf_offset = s_sfa.layout((sf_row, sf_k, stage))
                                     sf_value = s_sfa[sf_row, sf_k, stage]
@@ -1747,8 +2192,8 @@ class MXFP8LinearFwdKernel:
                 if warp_idx < self.num_mma_warps:
                     for k_block in cutlass.range_constexpr(num_k_blocks):
                         if (
-                            k_block >= k_block_base
-                            and k_block < k_block_base + blocks_per_load
+                            k_block >= mma_block_base
+                            and k_block < mma_block_base + mma_blocks_per_load
                         ):
                             cute.copy(
                                 copy_a,
@@ -1924,7 +2369,9 @@ class MXFP8LinearFwdKernel:
                                     scope="gpu",
                                 )
                             else:
-                                t_cg_out[elem] = self.c_dtype(accumulators[elem])
+                                t_cg_out[elem] = self.c_dtype(
+                                    accumulators[elem] * output_scale
+                                )
             elif cutlass.const_expr(cfg.epilogue == "tma"):
                 epilogue_stage = Int32(work_slot % cfg.epilogue_stages)
                 full_output_tile = (
@@ -1936,7 +2383,9 @@ class MXFP8LinearFwdKernel:
                         for elem in cutlass.range(
                             cute.size(t_rs_r_out), unroll_full=True
                         ):
-                            t_rs_r_out[elem] = BFloat16(t_rs_r_acc[elem])
+                            t_rs_r_out[elem] = BFloat16(
+                                t_rs_r_acc[elem] * output_scale
+                            )
                         # Warp 0 reaches this only after its previous TMA wait;
                         # use that arrival to gate stage reuse by all MMA warps.
                         self.epilogue_sync_barrier.arrive_and_wait()
@@ -1971,7 +2420,9 @@ class MXFP8LinearFwdKernel:
                                 coord[0] < self.problem.m
                                 and coord[1] < self.problem.n
                             ):
-                                t_cg_out[elem] = BFloat16(accumulators[elem])
+                                t_cg_out[elem] = BFloat16(
+                                    accumulators[elem] * output_scale
+                                )
 
         if cutlass.const_expr(
             (self.split_reduction == 1 or cfg.persistent)
@@ -2025,6 +2476,33 @@ class MXFP8LinearFwdKernel:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
 
 
+class _UnitScaleLauncher:
+    """Preserve the established three-tensor MXFP8 launcher contract."""
+
+    def __init__(self, launcher):
+        self.launcher = launcher
+
+    def __call__(self, x, weight, destination):
+        # The common generated signature reserves four FP32 pointers for the
+        # NVFP4 tensor-scale/amax path.  MXFP8 never dereferences them, so use
+        # an allocation-free view of two adjacent BF16 storage elements.  Do
+        # not require a logically contiguous innermost dimension: backward
+        # intentionally presents transposed CuTe layouts without materializing
+        # a physical transpose.
+        placeholder = x.as_strided(
+            (2,), (1,), storage_offset=x.storage_offset()
+        ).view(torch.float32)
+        return self.launcher(
+            x,
+            weight,
+            destination,
+            placeholder,
+            placeholder,
+            placeholder,
+            placeholder,
+        )
+
+
 @lru_cache(maxsize=None)
 def compile_mxfp8_fwd(
     problem: MXFP8Problem,
@@ -2070,18 +2548,26 @@ def compile_mxfp8_fwd(
         stride=(problem.n, 1),
         assumed_align=16,
     )
+    tensor_scale = cute.runtime.make_fake_tensor(
+        Float32, (1,), stride=(1,), assumed_align=4
+    )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    return cute.compile(
+    launcher = cute.compile(
         kernel,
         x,
         weight,
         out,
+        tensor_scale,
+        tensor_scale,
+        tensor_scale,
+        tensor_scale,
         stream,
         options=(
             "--enable-tvm-ffi --opt-level 3 "
             f"--ptxas-options '-O3 -v --maxrregcount={config.maxrregcount}'"
         ),
     )
+    return _UnitScaleLauncher(launcher)
 
 
 @lru_cache(maxsize=None)
@@ -2130,18 +2616,26 @@ def compile_mxfp8_split_fwd(
         stride=(1,),
         assumed_align=16,
     )
+    tensor_scale = cute.runtime.make_fake_tensor(
+        Float32, (1,), stride=(1,), assumed_align=4
+    )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    return cute.compile(
+    launcher = cute.compile(
         kernel,
         x,
         weight,
         workspace,
+        tensor_scale,
+        tensor_scale,
+        tensor_scale,
+        tensor_scale,
         stream,
         options=(
             "--enable-tvm-ffi --opt-level 3 "
             f"--ptxas-options '-O3 -v --maxrregcount={config.maxrregcount}'"
         ),
     )
+    return _UnitScaleLauncher(launcher)
 
 
 @lru_cache(maxsize=None)
@@ -2186,18 +2680,26 @@ def compile_mxfp8_atomic_split_fwd(
         stride=(problem.n, 1),
         assumed_align=16,
     )
+    tensor_scale = cute.runtime.make_fake_tensor(
+        Float32, (1,), stride=(1,), assumed_align=4
+    )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    return cute.compile(
+    launcher = cute.compile(
         kernel,
         x,
         weight,
         accumulator,
+        tensor_scale,
+        tensor_scale,
+        tensor_scale,
+        tensor_scale,
         stream,
         options=(
             "--enable-tvm-ffi --opt-level 3 "
             f"--ptxas-options '-O3 -v --maxrregcount={config.maxrregcount}'"
         ),
     )
+    return _UnitScaleLauncher(launcher)
 
 
 @lru_cache(maxsize=None)
@@ -2242,18 +2744,26 @@ def compile_mxfp8_cluster_split_fwd(
         stride=(problem.n, 1),
         assumed_align=16,
     )
+    tensor_scale = cute.runtime.make_fake_tensor(
+        Float32, (1,), stride=(1,), assumed_align=4
+    )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    return cute.compile(
+    launcher = cute.compile(
         kernel,
         x,
         weight,
         out,
+        tensor_scale,
+        tensor_scale,
+        tensor_scale,
+        tensor_scale,
         stream,
         options=(
             "--enable-tvm-ffi --opt-level 3 "
             f"--ptxas-options '-O3 -v --maxrregcount={config.maxrregcount}'"
         ),
     )
+    return _UnitScaleLauncher(launcher)
 
 
 __all__ = [

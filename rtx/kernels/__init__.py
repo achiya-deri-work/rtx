@@ -4,7 +4,14 @@ from .mxfp8 import MXFP8FwdConfig, MXFP8Problem
 
 
 def __getattr__(name: str):
-    if name in ("MXFP8GemmConfig", "MXFP8QuantConfig"):
+    if name in (
+        "MXFP8GemmConfig",
+        "MXFP8QuantConfig",
+        "NVFP4GemmConfig",
+        "NVFP4FwdConfig",
+        "NVFP4Problem",
+        "NVFP4QuantConfig",
+    ):
         from .. import configs
 
         value = getattr(configs, name)
@@ -17,4 +24,8 @@ __all__ = [
     "MXFP8GemmConfig",
     "MXFP8Problem",
     "MXFP8QuantConfig",
+    "NVFP4GemmConfig",
+    "NVFP4FwdConfig",
+    "NVFP4Problem",
+    "NVFP4QuantConfig",
 ]
