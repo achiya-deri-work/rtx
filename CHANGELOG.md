@@ -3,6 +3,29 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.12.1
+
+- Make current/JIT NVFP4 tensor-scale reductions compiler-visible. Inductor
+  now fuses each amax, zero/tiny guard, power-of-two scale calculation, and
+  reciprocal pack before calling the fused CuTe forward directly.
+- Add direct Inductor launch paths for current-scale training/inference,
+  dynamic-X/prequantized-W inference, and fully prequantized inference. Packed
+  modules feed persistent raw TorchAO buffers directly without reconstructing
+  tensor wrappers or performing runtime-winner filesystem work in the graph;
+  fused schedule resolution is cached per device/shape/config rather than
+  repeated on every launch.
+- Add tagged allocation-free MXFP8 dX/dW out variants and expose gradient
+  copies and result allocations to AOTAutograd/Inductor's memory planner.
+  Atomic FP32 reduction workspaces now use stream-ordered CUDA memset rather
+  than an opaque eager `zero_` kernel.
+- Move every backward logical transpose from PyTorch `.T` dispatch into the
+  CuTe JIT entry layout. G, W, and X reach the kernels in their original
+  contiguous storage, with neither a GMEM/SMEM transpose nor a Torch metadata
+  operation inside the registered backward launch.
+- Verify `torch.compile(fullgraph=True, dynamic=False)` for current and delayed
+  NVFP4 training, dynamic-X/prequantized-W inference, and fully prequantized
+  inference on SM120.
+
 ## 0.12.0
 
 - Add independent, composable autotuning families for NVFP4 dynamic-X/AOT-W

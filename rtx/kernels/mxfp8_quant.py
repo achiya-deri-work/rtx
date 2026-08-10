@@ -520,6 +520,26 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
         )
 
     @cute.jit
+    def __call__(
+        self,
+        src: cute.Tensor,
+        quantized: cute.Tensor,
+        scales: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        # Runtime receives the original contiguous [K, rows] allocation. CuTe
+        # changes only its logical layout; Python never creates a .T tensor.
+        logical_src = cute.make_tensor(
+            src.iterator,
+            cute.make_layout((self.rows, self.k), stride=(1, self.rows)),
+        )
+        self.kernel(logical_src, quantized, scales).launch(
+            grid=(self.grid_ctas, 1, 1),
+            block=(self.config.num_warps * 32, 1, 1),
+            stream=stream,
+        )
+
+    @cute.jit
     def _store_transposed_scale(
         self,
         scales: cute.Tensor,
@@ -1073,6 +1093,16 @@ class MXFP8OrientedDualQuantKernel(MXFP8TransposedQuantKernel):
         sb: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        if cutlass.const_expr(self.a_orientation == "transpose"):
+            a = cute.make_tensor(
+                a.iterator,
+                cute.make_layout((self.a_rows, self.k), stride=(1, self.a_rows)),
+            )
+        if cutlass.const_expr(self.b_orientation == "transpose"):
+            b = cute.make_tensor(
+                b.iterator,
+                cute.make_layout((self.b_rows, self.k), stride=(1, self.b_rows)),
+            )
         self.oriented_kernel(a, b, qa, qb, sa, sb).launch(
             grid=(self.grid_ctas, 1, 1),
             block=(self.config.num_warps * 32, 1, 1),
@@ -1284,6 +1314,21 @@ class MXFP8BackwardQuadQuantKernel(MXFP8OrientedDualQuantKernel):
         sd: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        # b/c/d arrive as their original contiguous W/G/X tensors. Reinterpret
+        # their pointers as logical transposes inside CuTe, with no Torch view
+        # construction and no GMEM/SMEM transpose copy.
+        b = cute.make_tensor(
+            b.iterator,
+            cute.make_layout((self.b_rows, self.k), stride=(1, self.b_rows)),
+        )
+        c = cute.make_tensor(
+            c.iterator,
+            cute.make_layout((self.c_rows, self.k_cd), stride=(1, self.c_rows)),
+        )
+        d = cute.make_tensor(
+            d.iterator,
+            cute.make_layout((self.d_rows, self.k_cd), stride=(1, self.d_rows)),
+        )
         self.quad_kernel(a, b, c, d, qa, qb, qc, qd, sa, sb, sc, sd).launch(
             grid=(self.grid_ctas, 1, 1),
             block=(self.config.num_warps * 32, 1, 1),
@@ -1457,6 +1502,18 @@ class MXFP8SharedGBackwardQuadQuantKernel(MXFP8BackwardQuadQuantKernel):
         sd: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        b = cute.make_tensor(
+            b.iterator,
+            cute.make_layout((self.b_rows, self.k), stride=(1, self.b_rows)),
+        )
+        c = cute.make_tensor(
+            c.iterator,
+            cute.make_layout((self.c_rows, self.k_cd), stride=(1, self.c_rows)),
+        )
+        d = cute.make_tensor(
+            d.iterator,
+            cute.make_layout((self.d_rows, self.k_cd), stride=(1, self.d_rows)),
+        )
         self.shared_g_kernel(
             a, b, c, d, qa, qb, qc, qd, sa, sb, sc, sd
         ).launch(
@@ -1810,15 +1867,15 @@ def compile_mxfp8_transposed_quant(
 ):
     """Compile quantization from a CuTe logical transpose layout.
 
-    The runtime source must be a metadata-only view with logical shape
-    ``[rows, K]`` and stride ``(1, rows)``. No transpose storage is produced.
+    The runtime source is the original contiguous ``[K, rows]`` tensor. The
+    JIT entry creates its logical ``[rows, K]`` CuTe layout on-chip.
     """
 
     kernel = MXFP8TransposedQuantKernel(rows, k, config)
     src = cute.runtime.make_fake_tensor(
         BFloat16,
-        (rows, k),
-        stride=(1, rows),
+        (k, rows),
+        stride=(rows, 1),
         assumed_align=16,
     )
     quantized = cute.runtime.make_fake_tensor(
@@ -1865,10 +1922,11 @@ def compile_mxfp8_oriented_dual_quant(
     )
 
     def fake_source(rows: int, orientation: str):
-        stride = (k, 1) if orientation == "row" else (1, rows)
+        shape = (rows, k) if orientation == "row" else (k, rows)
+        stride = (k, 1) if orientation == "row" else (rows, 1)
         return cute.runtime.make_fake_tensor(
             BFloat16,
-            (rows, k),
+            shape,
             stride=stride,
             assumed_align=16,
         )
@@ -1941,10 +1999,11 @@ def compile_mxfp8_backward_quad_quant(
     )
 
     def fake_source(rows: int, k: int, orientation: str):
-        stride = (k, 1) if orientation == "row" else (1, rows)
+        shape = (rows, k) if orientation == "row" else (k, rows)
+        stride = (k, 1) if orientation == "row" else (rows, 1)
         return cute.runtime.make_fake_tensor(
             BFloat16,
-            (rows, k),
+            shape,
             stride=stride,
             assumed_align=16,
         )

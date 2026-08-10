@@ -128,16 +128,29 @@ class LinearFrontendContractTests(unittest.TestCase):
             weight = torch.empty(
                 64, 128, device="cuda", dtype=torch.bfloat16
             )
+            nvfp4_scale_pack = torch.ones(
+                3, device="cuda", dtype=torch.float32
+            )
             calls = (
                 (torch.ops.rtx.mxfp8_linear_fwd, (x, weight, "fake")),
                 (
                     torch.ops.rtx.mxfp8_linear_train,
                     (x, weight, "fake", "fake"),
                 ),
-                (torch.ops.rtx.nvfp4_linear_fwd, (x, weight, "fake")),
+                (
+                    torch.ops.rtx.nvfp4_linear_fwd,
+                    (x, weight, nvfp4_scale_pack, nvfp4_scale_pack, "fake"),
+                ),
                 (
                     torch.ops.rtx.nvfp4_linear_train,
-                    (x, weight, "fake", "fake"),
+                    (
+                        x,
+                        weight,
+                        nvfp4_scale_pack,
+                        nvfp4_scale_pack,
+                        "fake",
+                        "fake",
+                    ),
                 ),
             )
             for op, args in calls:
@@ -262,14 +275,13 @@ class LinearFrontendContractTests(unittest.TestCase):
             gx = torch.ones((), device="cuda", dtype=torch.float32)
             gw = torch.ones((), device="cuda", dtype=torch.float32)
             dynamic_x = torch.ops.rtx.nvfp4_linear_dynamic_x_prequant_w(
-                x, qw, sw, gw, 64, 128, "row_major", "fake"
+                x, qw, sw, gx, gw, 64, 128, "row_major", "fake"
             )
             packed = torch.ops.rtx.nvfp4_linear_prequantized(
                 qx,
                 qw,
                 sx,
                 sw,
-                gx,
                 gw,
                 32,
                 64,

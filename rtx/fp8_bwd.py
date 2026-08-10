@@ -81,6 +81,20 @@ if TYPE_CHECKING:
 AutotuneMode = Literal["off", "cache", "coordinate"]
 
 
+def _zero_tensor_async(tensor: torch.Tensor) -> None:
+    """Enqueue a raw-stream memset without creating an eager Torch op."""
+
+    from cuda.bindings import runtime
+
+    stream = int(torch._C._cuda_getCurrentRawStream(tensor.device.index))
+    result = runtime.cudaMemsetAsync(
+        int(tensor.data_ptr()), 0, int(tensor.nbytes), stream
+    )
+    status = result[0] if isinstance(result, tuple) else result
+    if status != runtime.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"cudaMemsetAsync failed with {status}")
+
+
 def _allocate_scales(
     rows: int,
     k: int,
@@ -135,7 +149,7 @@ class _MatmulRunner:
         target = out
         if self.workspace is not None:
             if self.zero_workspace:
-                self.workspace.zero_()
+                _zero_tensor_async(self.workspace)
             target = self.workspace
         self.gemm(
             self.quantized_a,
@@ -198,6 +212,7 @@ class _AtomicSplitFusedMatmulRunner:
     partial: object
     converter: object
     accumulator: torch.Tensor
+    accumulator_flat: torch.Tensor
 
     def __call__(
         self,
@@ -205,12 +220,9 @@ class _AtomicSplitFusedMatmulRunner:
         source_b: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
-        self.accumulator.zero_()
+        _zero_tensor_async(self.accumulator)
         self.partial(source_a, source_b, self.accumulator)
-        # The atomic partial kernel needs a matrix view, while the shared
-        # workspace reducer deliberately exposes its input as one contiguous
-        # vector.  This is a metadata-only view; no transpose or copy occurs.
-        self.converter(self.accumulator.reshape(-1), out)
+        self.converter(self.accumulator_flat, out)
 
 
 @dataclass(slots=True)
@@ -234,9 +246,9 @@ class _BwdRunner:
         assert isinstance(self.dw, _MatmulRunner)
         self.quad_quant(
             grad_output,
-            weight.T,
-            grad_output.T,
-            x.T,
+            weight,
+            grad_output,
+            x,
             self.dx.quantized_a,
             self.dx.quantized_b,
             self.dw.quantized_a,
@@ -284,9 +296,9 @@ class _BwdRunner:
             self.dx_stream.wait_stream(caller)
             self.dw_stream.wait_stream(caller)
             with torch.cuda.stream(self.dx_stream):
-                self.dx(grad_output, weight.T, grad_x)
+                self.dx(grad_output, weight, grad_x)
             with torch.cuda.stream(self.dw_stream):
-                self.dw(grad_output.T, x.T, grad_weight)
+                self.dw(grad_output, x, grad_weight)
             caller.wait_stream(self.dx_stream)
             caller.wait_stream(self.dw_stream)
             return
@@ -299,17 +311,17 @@ class _BwdRunner:
             # MXFP8BwdConfig.implementation_rejection.
             assert isinstance(self.dx, _MatmulRunner)
             assert isinstance(self.dw, _MatmulRunner)
-            self.dx.quantize(grad_output, weight.T)
-            self.dw.quantize(grad_output.T, x.T)
+            self.dx.quantize(grad_output, weight)
+            self.dw.quantize(grad_output, x)
             self.dx.matmul(grad_x)
             self.dw.matmul(grad_weight)
             return
         if self.execution_order == "dx_first":
-            self.dx(grad_output, weight.T, grad_x)
-            self.dw(grad_output.T, x.T, grad_weight)
+            self.dx(grad_output, weight, grad_x)
+            self.dw(grad_output, x, grad_weight)
         else:
-            self.dw(grad_output.T, x.T, grad_weight)
-            self.dx(grad_output, weight.T, grad_x)
+            self.dw(grad_output, x, grad_weight)
+            self.dx(grad_output, weight, grad_x)
 
 
 def _build_matmul_runner(
@@ -372,6 +384,9 @@ def _build_matmul_runner(
                     persistent_waves=config.reduction_waves,
                 ),
                 accumulator,
+                # Cold-path metadata view: the hot launcher performs no
+                # eager reshape between the atomic kernel and its converter.
+                accumulator.reshape(-1),
             )
         if config.reduction == "cluster_fp32":
             return _FusedMatmulRunner(
@@ -651,6 +666,28 @@ def _launch_bwd(
     return grad_x, grad_weight
 
 
+def _launch_bwd_out(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+    grad_x: torch.Tensor,
+    grad_weight: torch.Tensor,
+) -> None:
+    """Allocation-free full backward launch used by Inductor out variants."""
+
+    problem, runner, grad_output_c, x_c, weight_c = _resolve_bwd_runner(
+        grad_output, x, weight, config_key
+    )
+    if grad_x.shape != x_c.shape or grad_x.dtype != x_c.dtype:
+        raise ValueError("MXFP8 dX output has the wrong shape or dtype")
+    if grad_weight.shape != weight_c.shape or grad_weight.dtype != weight_c.dtype:
+        raise ValueError("MXFP8 dW output has the wrong shape or dtype")
+    if grad_x.device != x_c.device or grad_weight.device != x_c.device:
+        raise ValueError("MXFP8 backward outputs must share the input device")
+    runner(grad_output_c, x_c, weight_c, grad_x, grad_weight)
+
+
 def _resolve_bwd_context(
     grad_output: torch.Tensor,
     x: torch.Tensor,
@@ -842,9 +879,24 @@ def _launch_dx(
         grad_output, x, weight, config_key, "dx"
     )
     grad_x = torch.empty_like(x_c)
-    runner(grad_output_c, weight_c.T, grad_x)
+    runner(grad_output_c, weight_c, grad_x)
     grad_x._base_inputs = (grad_output_c, x_c, weight_c)
     return grad_x
+
+
+def _launch_dx_out(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+    grad_x: torch.Tensor,
+) -> None:
+    runner, grad_output_c, x_c, weight_c = _resolve_partial_bwd_runner(
+        grad_output, x, weight, config_key, "dx"
+    )
+    if grad_x.shape != x_c.shape or grad_x.dtype != x_c.dtype:
+        raise ValueError("MXFP8 dX output has the wrong shape or dtype")
+    runner(grad_output_c, weight_c, grad_x)
 
 
 def _launch_dw(
@@ -857,9 +909,24 @@ def _launch_dw(
         grad_output, x, weight, config_key, "dw"
     )
     grad_weight = torch.empty_like(weight_c)
-    runner(grad_output_c.T, x_c.T, grad_weight)
+    runner(grad_output_c, x_c, grad_weight)
     grad_weight._base_inputs = (grad_output_c, x_c, weight_c)
     return grad_weight
+
+
+def _launch_dw_out(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+    grad_weight: torch.Tensor,
+) -> None:
+    runner, grad_output_c, x_c, weight_c = _resolve_partial_bwd_runner(
+        grad_output, x, weight, config_key, "dw"
+    )
+    if grad_weight.shape != weight_c.shape or grad_weight.dtype != weight_c.dtype:
+        raise ValueError("MXFP8 dW output has the wrong shape or dtype")
+    runner(grad_output_c, x_c, grad_weight)
 
 
 def _clear_runtime_caches() -> dict[str, object]:
@@ -945,6 +1012,307 @@ def _mxfp8_linear_dw_fake(
     return torch.empty_like(weight)
 
 
+# Give Inductor allocation-free variants for every backward arity.  The
+# functional custom ops remain the eager API, while compiled graphs allocate
+# their result buffers in the memory planner and call these launch-only ops.
+_BWD_OUT_LIBRARY = torch.library.Library("rtx", "FRAGMENT")
+_BWD_OUT_LIBRARY.define(
+    "mxfp8_linear_bwd.out("
+    "Tensor grad_output, Tensor x, Tensor weight, str config_key, *, "
+    "Tensor(a!) grad_x, Tensor(b!) grad_weight) -> (Tensor(a!), Tensor(b!))",
+    tags=(torch.Tag.out,),
+)
+_BWD_OUT_LIBRARY.define(
+    "mxfp8_linear_dx.out("
+    "Tensor grad_output, Tensor x, Tensor weight, str config_key, *, "
+    "Tensor(a!) grad_x) -> Tensor(a!)",
+    tags=(torch.Tag.out,),
+)
+_BWD_OUT_LIBRARY.define(
+    "mxfp8_linear_dw.out("
+    "Tensor grad_output, Tensor x, Tensor weight, str config_key, *, "
+    "Tensor(a!) grad_weight) -> Tensor(a!)",
+    tags=(torch.Tag.out,),
+)
+
+
+@torch.library.impl("rtx::mxfp8_linear_bwd.out", "cuda")
+def _mxfp8_linear_bwd_out_op(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+    *,
+    grad_x: torch.Tensor,
+    grad_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _launch_bwd_out(
+        grad_output, x, weight, config_key, grad_x, grad_weight
+    )
+    return grad_x, grad_weight
+
+
+@torch.library.register_fake("rtx::mxfp8_linear_bwd.out")
+def _mxfp8_linear_bwd_out_fake(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+    *,
+    grad_x: torch.Tensor,
+    grad_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return grad_x, grad_weight
+
+
+@torch.library.impl("rtx::mxfp8_linear_dx.out", "cuda")
+def _mxfp8_linear_dx_out_op(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+    *,
+    grad_x: torch.Tensor,
+) -> torch.Tensor:
+    _launch_dx_out(grad_output, x, weight, config_key, grad_x)
+    return grad_x
+
+
+@torch.library.register_fake("rtx::mxfp8_linear_dx.out")
+def _mxfp8_linear_dx_out_fake(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+    *,
+    grad_x: torch.Tensor,
+) -> torch.Tensor:
+    return grad_x
+
+
+@torch.library.impl("rtx::mxfp8_linear_dw.out", "cuda")
+def _mxfp8_linear_dw_out_op(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+    *,
+    grad_weight: torch.Tensor,
+) -> torch.Tensor:
+    _launch_dw_out(grad_output, x, weight, config_key, grad_weight)
+    return grad_weight
+
+
+@torch.library.register_fake("rtx::mxfp8_linear_dw.out")
+def _mxfp8_linear_dw_out_fake(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+    *,
+    grad_weight: torch.Tensor,
+) -> torch.Tensor:
+    return grad_weight
+
+
+def _mxfp8_bwd_compiler_visible(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expose copies/allocations to AOTAutograd, then run launch-only code."""
+
+    grad_output_c = grad_output.contiguous()
+    x_c = x.contiguous()
+    weight_c = weight.contiguous()
+    grad_x = torch.empty_like(x_c)
+    grad_weight = torch.empty_like(weight_c)
+    torch.ops.rtx.mxfp8_linear_bwd.out(
+        grad_output_c,
+        x_c,
+        weight_c,
+        config_key,
+        grad_x=grad_x,
+        grad_weight=grad_weight,
+    )
+    return grad_x, grad_weight
+
+
+def _mxfp8_dx_compiler_visible(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+) -> torch.Tensor:
+    grad_output_c = grad_output.contiguous()
+    x_c = x.contiguous()
+    weight_c = weight.contiguous()
+    grad_x = torch.empty_like(x_c)
+    torch.ops.rtx.mxfp8_linear_dx.out(
+        grad_output_c, x_c, weight_c, config_key, grad_x=grad_x
+    )
+    return grad_x
+
+
+def _mxfp8_dw_compiler_visible(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+) -> torch.Tensor:
+    grad_output_c = grad_output.contiguous()
+    x_c = x.contiguous()
+    weight_c = weight.contiguous()
+    grad_weight = torch.empty_like(weight_c)
+    torch.ops.rtx.mxfp8_linear_dw.out(
+        grad_output_c,
+        x_c,
+        weight_c,
+        config_key,
+        grad_weight=grad_weight,
+    )
+    return grad_weight
+
+
+class _InductorMXFP8BwdLauncher:
+    """Direct generated-wrapper entry point for the shared dX+dW schedule."""
+
+    def __init__(self, config_key: str) -> None:
+        self.config_key = config_key
+
+    def __call__(
+        self,
+        grad_output: torch.Tensor,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        config_key: str,
+        *,
+        grad_x: torch.Tensor,
+        grad_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        _launch_bwd_out(
+            grad_output,
+            x,
+            weight,
+            self.config_key,
+            grad_x,
+            grad_weight,
+        )
+        return grad_x, grad_weight
+
+
+class _InductorMXFP8PartialLauncher:
+    def __init__(self, config_key: str, gradient: str) -> None:
+        self.config_key = config_key
+        self.gradient = gradient
+
+    def __call__(
+        self,
+        grad_output: torch.Tensor,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        config_key: str,
+        *,
+        out: torch.Tensor,
+    ) -> None:
+        if self.gradient == "dx":
+            _launch_dx_out(grad_output, x, weight, self.config_key, out)
+        else:
+            _launch_dw_out(grad_output, x, weight, self.config_key, out)
+
+
+class _InductorMXFP8BwdRegistry(dict[object, object]):
+    def __missing__(self, key: object) -> object:
+        if isinstance(key, tuple):
+            config_key, gradient = key
+            launcher = _InductorMXFP8PartialLauncher(config_key, gradient)
+        else:
+            launcher = _InductorMXFP8BwdLauncher(str(key))
+        with _LOCK:
+            existing = self.get(key)
+            if existing is not None:
+                return existing
+            self[key] = launcher
+        return launcher
+
+
+_INDUCTOR_BWD_LAUNCHERS = _InductorMXFP8BwdRegistry()
+
+
+def _register_bwd_inductor_lowerings() -> None:
+    from torch._inductor import ir
+    from torch._inductor.lowering import register_lowering
+
+    torch._rtx_mxfp8_bwd_launchers = _INDUCTOR_BWD_LAUNCHERS
+
+    @register_lowering(
+        torch.ops.rtx.mxfp8_linear_bwd.default,
+        type_promotion_kind=None,
+    )
+    def lower_bwd(grad_output, x, weight, config_key):
+        # Reuse Inductor's native multi-output allocation machinery, but point
+        # its generated call directly at our launch-only registry instead of
+        # taking another dispatcher/Python custom-op round trip.
+        raw_outputs = ir.FallbackKernel.create(
+            torch.ops.rtx.mxfp8_linear_bwd.default,
+            grad_output,
+            x,
+            weight,
+            config_key,
+        )
+        if not isinstance(raw_outputs, tuple) or len(raw_outputs) != 2:
+            raise RuntimeError("Inductor did not construct MXFP8 bwd out buffers")
+        packed = raw_outputs[0].inputs[0]
+        if not isinstance(packed, ir.ExternKernelMultiOut):
+            raise RuntimeError("MXFP8 bwd requires Inductor multi-out lowering")
+        packed.python_kernel_name = (
+            f"torch._rtx_mxfp8_bwd_launchers[{config_key!r}]"
+        )
+        return tuple(output.wrap_for_lowering() for output in raw_outputs)
+
+    def lower_partial(gradient, grad_output, x, weight, config_key):
+        inputs = [
+            ir.ExternKernel.require_contiguous(ir.ExternKernel.realize_input(value))
+            for value in (grad_output, x, weight)
+        ]
+        layout_source = x if gradient == "dx" else weight
+        size = layout_source.get_size()
+        return ir.TensorBox.create(
+            ir.ExternKernelOut(
+                layout=ir.FixedLayout(
+                    device=layout_source.get_device(),
+                    dtype=torch.bfloat16,
+                    size=size,
+                    stride=[size[1], 1],
+                ),
+                inputs=inputs,
+                constant_args=[config_key],
+                python_kernel_name=(
+                    "torch._rtx_mxfp8_bwd_launchers"
+                    f"[{(config_key, gradient)!r}]"
+                ),
+            )
+        )
+
+    @register_lowering(
+        torch.ops.rtx.mxfp8_linear_dx.default,
+        type_promotion_kind=None,
+    )
+    def lower_dx(grad_output, x, weight, config_key):
+        return lower_partial("dx", grad_output, x, weight, config_key)
+
+    @register_lowering(
+        torch.ops.rtx.mxfp8_linear_dw.default,
+        type_promotion_kind=None,
+    )
+    def lower_dw(grad_output, x, weight, config_key):
+        return lower_partial("dw", grad_output, x, weight, config_key)
+
+
+_register_bwd_inductor_lowerings()
+
+
 @torch.library.custom_op(
     "rtx::mxfp8_linear_train",
     mutates_args=(),
@@ -984,15 +1352,15 @@ def _train_backward(ctx, grad_output: torch.Tensor):
     need_x, need_weight = ctx.needs_input_grad[:2]
     grad_x = grad_weight = None
     if need_x and need_weight:
-        grad_x, grad_weight = _mxfp8_linear_bwd_op(
+        grad_x, grad_weight = _mxfp8_bwd_compiler_visible(
             grad_output, x, weight, ctx.backward_config_key
         )
     elif need_x:
-        grad_x = _mxfp8_linear_dx_op(
+        grad_x = _mxfp8_dx_compiler_visible(
             grad_output, x, weight, ctx.backward_config_key
         )
     elif need_weight:
-        grad_weight = _mxfp8_linear_dw_op(
+        grad_weight = _mxfp8_dw_compiler_visible(
             grad_output, x, weight, ctx.backward_config_key
         )
     return grad_x, grad_weight, None, None

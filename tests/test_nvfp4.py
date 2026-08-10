@@ -477,6 +477,73 @@ class NVFP4CudaTests(unittest.TestCase):
             atol=0,
         )
 
+    def test_current_training_is_fullgraph_compileable(self) -> None:
+        torch.manual_seed(1912)
+        layer = rtx.NVFP4Linear(
+            128, 128, device="cuda", scaling="current"
+        )
+        compiled = torch.compile(
+            layer,
+            fullgraph=True,
+            dynamic=False,
+            options={"triton.cudagraphs": False},
+        )
+        x = torch.randn(
+            128,
+            128,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        out = compiled(x)
+        out.float().square().mean().backward()
+        torch.cuda.synchronize()
+        self.assertTrue(bool(torch.isfinite(out).all()))
+        self.assertTrue(bool(torch.isfinite(x.grad).all()))
+        self.assertTrue(bool(torch.isfinite(layer.weight.grad).all()))
+
+        def functional(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            return rtx.nvfp4_linear(a, b)
+
+        compiled_functional = torch.compile(
+            functional,
+            fullgraph=True,
+            dynamic=False,
+            options={"triton.cudagraphs": False},
+        )
+        with torch.inference_mode():
+            functional_out = compiled_functional(x.detach(), layer.weight.detach())
+        self.assertTrue(bool(torch.isfinite(functional_out).all()))
+
+    def test_prequantized_inference_states_are_fullgraph_compileable(self) -> None:
+        torch.manual_seed(1913)
+        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        packed_x = rtx.quantize_nvfp4(x)
+        packed_weight = rtx.quantize_nvfp4(weight)
+        layer = rtx.NVFP4Linear(
+            128, 128, device="cuda", packed_weight=packed_weight
+        )
+        dynamic_x = torch.compile(
+            layer,
+            fullgraph=True,
+            dynamic=False,
+            options={"triton.cudagraphs": False},
+        )(x)
+
+        def fully_packed() -> torch.Tensor:
+            return rtx.nvfp4_linear(packed_x, packed_weight)
+
+        packed = torch.compile(
+            fully_packed,
+            fullgraph=True,
+            dynamic=False,
+            options={"triton.cudagraphs": False},
+        )()
+        torch.cuda.synchronize()
+        self.assertTrue(bool(torch.isfinite(dynamic_x).all()))
+        self.assertTrue(bool(torch.isfinite(packed).all()))
+
 
 if __name__ == "__main__":
     unittest.main()

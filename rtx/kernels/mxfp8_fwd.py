@@ -464,6 +464,25 @@ class MXFP8LinearFwdKernel:
         weight_amax_out: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        # Runtime receives original contiguous operands. Logical transpose is a
+        # CuTe layout over the same pointer, created before any TMA/cp.async
+        # descriptor; Python never constructs a torch.Tensor .T view.
+        if cutlass.const_expr(self.a_orientation == "transpose"):
+            x = cute.make_tensor(
+                x.iterator,
+                cute.make_layout(
+                    (self.problem.m, self.problem.k),
+                    stride=(1, self.problem.m),
+                ),
+            )
+        if cutlass.const_expr(self.b_orientation == "transpose"):
+            weight = cute.make_tensor(
+                weight.iterator,
+                cute.make_layout(
+                    (self.problem.n, self.problem.k),
+                    stride=(1, self.problem.n),
+                ),
+            )
         # Layout/MMA objects are IR values and must be constructed while CuTe is
         # tracing this JIT entry point (not in the plain-Python constructor).
         self._setup_static_layouts()
@@ -2527,25 +2546,27 @@ def compile_mxfp8_fwd(
         a_orientation=a_orientation,
         b_orientation=b_orientation,
     )
-    a_stride = (
-        (problem.k, 1)
+    a_shape = (
+        (problem.m, problem.k)
         if a_orientation == "row"
-        else (1, problem.m)
+        else (problem.k, problem.m)
     )
-    b_stride = (
-        (problem.k, 1)
+    b_shape = (
+        (problem.n, problem.k)
         if b_orientation == "row"
-        else (1, problem.n)
+        else (problem.k, problem.n)
     )
+    a_stride = (a_shape[1], 1)
+    b_stride = (b_shape[1], 1)
     x = cute.runtime.make_fake_tensor(
         BFloat16,
-        (problem.m, problem.k),
+        a_shape,
         stride=a_stride,
         assumed_align=16,
     )
     weight = cute.runtime.make_fake_tensor(
         BFloat16,
-        (problem.n, problem.k),
+        b_shape,
         stride=b_stride,
         assumed_align=16,
     )
@@ -2603,17 +2624,19 @@ def compile_mxfp8_split_fwd(
         split_reduction=split_reduction,
         reduction_tile=reduction_tile,
     )
-    a_stride = (problem.k, 1) if a_orientation == "row" else (1, problem.m)
-    b_stride = (problem.k, 1) if b_orientation == "row" else (1, problem.n)
+    a_shape = (problem.m, problem.k) if a_orientation == "row" else (problem.k, problem.m)
+    b_shape = (problem.n, problem.k) if b_orientation == "row" else (problem.k, problem.n)
+    a_stride = (a_shape[1], 1)
+    b_stride = (b_shape[1], 1)
     x = cute.runtime.make_fake_tensor(
         BFloat16,
-        (problem.m, problem.k),
+        a_shape,
         stride=a_stride,
         assumed_align=16,
     )
     weight = cute.runtime.make_fake_tensor(
         BFloat16,
-        (problem.n, problem.k),
+        b_shape,
         stride=b_stride,
         assumed_align=16,
     )
@@ -2667,17 +2690,19 @@ def compile_mxfp8_atomic_split_fwd(
         reduction_tile=reduction_tile,
         atomic_output=True,
     )
-    a_stride = (problem.k, 1) if a_orientation == "row" else (1, problem.m)
-    b_stride = (problem.k, 1) if b_orientation == "row" else (1, problem.n)
+    a_shape = (problem.m, problem.k) if a_orientation == "row" else (problem.k, problem.m)
+    b_shape = (problem.n, problem.k) if b_orientation == "row" else (problem.k, problem.n)
+    a_stride = (a_shape[1], 1)
+    b_stride = (b_shape[1], 1)
     x = cute.runtime.make_fake_tensor(
         BFloat16,
-        (problem.m, problem.k),
+        a_shape,
         stride=a_stride,
         assumed_align=16,
     )
     weight = cute.runtime.make_fake_tensor(
         BFloat16,
-        (problem.n, problem.k),
+        b_shape,
         stride=b_stride,
         assumed_align=16,
     )
@@ -2731,17 +2756,19 @@ def compile_mxfp8_cluster_split_fwd(
         reduction_tile=reduction_tile,
         cluster_output=True,
     )
-    a_stride = (problem.k, 1) if a_orientation == "row" else (1, problem.m)
-    b_stride = (problem.k, 1) if b_orientation == "row" else (1, problem.n)
+    a_shape = (problem.m, problem.k) if a_orientation == "row" else (problem.k, problem.m)
+    b_shape = (problem.n, problem.k) if b_orientation == "row" else (problem.k, problem.n)
+    a_stride = (a_shape[1], 1)
+    b_stride = (b_shape[1], 1)
     x = cute.runtime.make_fake_tensor(
         BFloat16,
-        (problem.m, problem.k),
+        a_shape,
         stride=a_stride,
         assumed_align=16,
     )
     weight = cute.runtime.make_fake_tensor(
         BFloat16,
-        (problem.n, problem.k),
+        b_shape,
         stride=b_stride,
         assumed_align=16,
     )

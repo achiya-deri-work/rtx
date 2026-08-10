@@ -560,7 +560,7 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         reference_q = torch.empty_like(quantized)
         reference_s = torch.empty_like(scales)
         compile_mxfp8_transposed_quant(rows, k, config)(
-            logical, quantized, scales
+            source, quantized, scales
         )
         compile_mxfp8_quant(rows, k, config)(
             logical.contiguous(), reference_q, reference_s
@@ -591,7 +591,7 @@ class TestMXFP8BwdCuda(unittest.TestCase):
             rows, k // 32, device="cuda", dtype=torch.float8_e8m0fnu
         )
         compile_mxfp8_transposed_quant(rows, k, baseline)(
-            logical, expected_q, expected_s
+            source, expected_q, expected_s
         )
         for store_bits in (8, 16, 32):
             config = replace(
@@ -603,7 +603,7 @@ class TestMXFP8BwdCuda(unittest.TestCase):
             actual_q = torch.empty_like(expected_q)
             actual_s = torch.empty_like(expected_s)
             compile_mxfp8_transposed_quant(rows, k, config)(
-                logical, actual_q, actual_s
+                source, actual_q, actual_s
             )
             torch.cuda.synchronize()
             with self.subTest(store_bits=store_bits):
@@ -642,7 +642,7 @@ class TestMXFP8BwdCuda(unittest.TestCase):
             dtype=torch.float8_e8m0fnu,
         )
         compile_mxfp8_transposed_quant(rows, k, scalar)(
-            logical, expected_q, expected_s
+            source, expected_q, expected_s
         )
         row = torch.arange(rows, device="cuda")[:, None]
         block = torch.arange(k // 32, device="cuda")[None, :]
@@ -660,7 +660,7 @@ class TestMXFP8BwdCuda(unittest.TestCase):
             actual_q = torch.empty_like(expected_q)
             actual_s = torch.empty_like(expected_s)
             compile_mxfp8_transposed_quant(rows, k, packed)(
-                logical, actual_q, actual_s
+                source, actual_q, actual_s
             )
             torch.cuda.synchronize()
             actual_used = actual_s[row // 128, block // 4, physical]
@@ -798,9 +798,9 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         grad_output = torch.randn(
             rows, rows, device="cuda", dtype=torch.bfloat16
         )
-        unrelated = torch.zeros_like(grad_output).T
-        weight_t = torch.randn_like(grad_output).T
-        x_t = torch.randn_like(grad_output).T
+        unrelated = torch.zeros_like(grad_output)
+        weight = torch.randn_like(grad_output)
+        x = torch.randn_like(grad_output)
 
         def q_buffer() -> torch.Tensor:
             return torch.empty(
@@ -826,9 +826,9 @@ class TestMXFP8BwdCuda(unittest.TestCase):
             shared_g=True,
         )(
             grad_output,
-            weight_t,
+            weight,
             unrelated,
-            x_t,
+            x,
             qa,
             qb,
             qc,
@@ -844,7 +844,7 @@ class TestMXFP8BwdCuda(unittest.TestCase):
             grad_output, expected_qa, expected_sa
         )
         compile_mxfp8_transposed_quant(rows, rows, schedule)(
-            grad_output.T, expected_qc, expected_sc
+            grad_output, expected_qc, expected_sc
         )
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(qa.view(torch.uint8), expected_qa.view(torch.uint8)))

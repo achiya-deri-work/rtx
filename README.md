@@ -196,6 +196,17 @@ default because its reciprocal is exact and cheaper. Dynamic inference always
 uses current scaling; AOT-weight and fully packed inference use the tensor
 scale stored in TorchAO's `NVFP4Tensor`.
 
+All four NVFP4 runtime paths support
+`torch.compile(fullgraph=True, dynamic=False)`. Current/JIT scale arithmetic is
+deliberately outside the registered CuTe launch, so Inductor emits one fused
+reduction/scale-pack kernel per dynamic operand and calls the forward launcher
+directly. Prequantized modules pass their persistent raw qdata/scales to their
+launchers without rebuilding a TorchAO wrapper. AOTAutograd likewise owns the
+MXFP8 dX/dW result allocations and calls allocation-free out variants; CuTe
+constructs logical transpose layouts from the original contiguous G/W/X
+pointers inside its JIT entry, never through eager `.T`, `contiguous`, or
+transpose-copy kernels.
+
 The historical MXFP8 backend name `prequant` means *materialized dynamic*: it
 quantizes both BF16 operands into global memory on every call before launching
 the GEMM. It is an implementation strategy for the first row above, not an AOT
