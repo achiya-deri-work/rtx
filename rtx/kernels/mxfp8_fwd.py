@@ -2035,7 +2035,32 @@ class MXFP8LinearFwdKernel:
                     for pair in cutlass.range_constexpr(pair_count):
                         vec0 = pair * 2
                         vec1 = cutlass.min(vec0 + 1, cfg.quant_vec - 1)
-                        if cutlass.const_expr(self.nvfp4):
+                        if cutlass.const_expr(
+                            self.nvfp4 and cfg.quant_math == "bf16x2"
+                        ):
+                            # CUDA 13.2 exposes the native packed BF16x2 ->
+                            # E2M1x2 converter.  E2M1 is much coarser than the
+                            # BF16 reciprocal rounding, so keep the entire
+                            # per-value path packed: one mul.bf16x2 followed
+                            # by one cvt.e2m1x2.bf16x2 for two distinct values.
+                            bits0 = bf16_values[vec0].bitcast(Uint16)
+                            bits1 = bf16_values[vec1].bitcast(Uint16)
+                            packed_values = Int32(bits0) | (Int32(bits1) << 16)
+                            inv_bits = BFloat16(inv_scale_fp32).bitcast(Uint16)
+                            packed_inv = Int32(inv_bits) | (Int32(inv_bits) << 16)
+                            scaled_bf16x2 = nvvm.mul_bf16x2(
+                                packed_values, packed_inv
+                            )
+                            packed = nvvm.inline_ptx_hl(
+                                "{.reg .b8 b; "
+                                "cvt.rn.satfinite.e2m1x2.bf16x2 b, {$r0}; "
+                                "mov.b16 {$w0}, {b, 0};}",
+                                write_only_types=[Int16],
+                                read_only_args=[scaled_bf16x2],
+                            )
+                            quantized0 = Uint8(packed)
+                            quantized1 = Uint8(0)
+                        elif cutlass.const_expr(self.nvfp4):
                             packed = nvvm.inline_ptx_hl(
                                 "{.reg .b8 b; "
                                 "cvt.rn.satfinite.e2m1x2.f32 b, {$r1}, {$r0}; "

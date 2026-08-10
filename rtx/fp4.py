@@ -14,8 +14,10 @@ from torch import nn
 from .configs import (
     DEFAULT_NVFP4_GEMM_CONFIG,
     DEFAULT_NVFP4_FWD_CONFIG,
+    DEFAULT_NVFP4_DYNAMIC_CONFIG,
     DEFAULT_NVFP4_QUANT_CONFIG,
     NVFP4FwdConfig,
+    NVFP4DynamicConfig,
     NVFP4GemmConfig,
     NVFP4Problem,
     NVFP4QuantConfig,
@@ -40,6 +42,7 @@ if TYPE_CHECKING:
 
 WeightMode = Literal["dynamic", "prequantized"]
 ScalingMode = Literal["delayed", "current", "regional", "block"]
+BackendMode = Literal["auto", "fused", "materialized"]
 
 
 def _effective_scale_region_rows(rows: int, requested: int) -> int:
@@ -62,8 +65,26 @@ def compile_nvfp4_dual_quant(*args, **kwargs):
     )
 
 
+def compile_nvfp4_block_quant(*args, **kwargs):
+    return load_kernel_symbol("nvfp4_quant", "compile_nvfp4_block_quant")(
+        *args, **kwargs
+    )
+
+
+def compile_nvfp4_block_dual_quant(*args, **kwargs):
+    return load_kernel_symbol("nvfp4_quant", "compile_nvfp4_block_dual_quant")(
+        *args, **kwargs
+    )
+
+
 def compile_nvfp4_gemm(*args, **kwargs):
     return load_kernel_symbol("nvfp4_gemm", "compile_nvfp4_gemm")(
+        *args, **kwargs
+    )
+
+
+def compile_nvfp4_block_gemm(*args, **kwargs):
+    return load_kernel_symbol("nvfp4_gemm", "compile_nvfp4_block_gemm")(
         *args, **kwargs
     )
 
@@ -122,11 +143,21 @@ class NVFP4ForwardConfig:
             return "L2 fetch granularity must be None, 0, 32, 64, or 128"
         return self.gemm.rejection(problem)
 
+    @classmethod
+    def from_materialized(cls, config: NVFP4DynamicConfig) -> "NVFP4ForwardConfig":
+        return cls(
+            quant=config.quant,
+            gemm=config.gemm,
+            quant_launches=config.quant_launches,
+            l2_fetch_granularity=config.l2_fetch_granularity,
+        )
+
 
 DEFAULT_NVFP4_FORWARD_CONFIG = NVFP4ForwardConfig()
 _FORWARD_CONFIGS: dict[str, NVFP4ForwardConfig] = {}
 _CONFIG_LOCK = RLock()
 _INFERENCE_CONFIG_SELECTIONS: dict[tuple[object, ...], str] = {}
+_DYNAMIC_CONFIG_SELECTIONS: dict[tuple[object, ...], str] = {}
 _FUSED_CONFIG_SELECTIONS: dict[tuple[object, ...], NVFP4FwdConfig] = {}
 
 
@@ -232,6 +263,20 @@ def _tensor_scale_pack(tensor: torch.Tensor, mode: str) -> torch.Tensor:
         return _power2_tensor_scale_pack(tensor)
     if mode == "exact":
         return _exact_tensor_scale_pack(tensor)
+    raise ValueError(f"unknown NVFP4 tensor scale mode {mode!r}")
+
+
+def _outer_tensor_scale(tensor: torch.Tensor, mode: str) -> torch.Tensor:
+    """Return the scalar outer decode scale consumed by materialized quant."""
+
+    if mode == "exact":
+        return _current_tensor_scale(tensor)
+    if mode == "power2":
+        amax = torch.amax(torch.abs(tensor.detach().float()))
+        target = amax / 2688.0
+        safe_target = torch.clamp_min(target, torch.finfo(torch.float32).tiny)
+        scale = torch.exp2(torch.ceil(torch.log2(safe_target)))
+        return torch.where(amax > 0.0, scale, torch.ones_like(scale)).reshape(1)
     raise ValueError(f"unknown NVFP4 tensor scale mode {mode!r}")
 
 
@@ -420,6 +465,46 @@ _DYNAMIC_RUNNERS: BoundedCache[tuple[object, ...], _DynamicRunner] = BoundedCach
 
 
 @dataclass(slots=True)
+class _BlockDynamicRunner:
+    quant_launches: str
+    quant_x: object
+    quant_w: object | None
+    gemm: object
+    qx: torch.Tensor
+    qw: torch.Tensor
+    sx: torch.Tensor
+    sw: torch.Tensor
+    qx_packed: torch.Tensor
+    qw_packed: torch.Tensor
+    l2_fetch_granularity: int | None = None
+
+    def __call__(
+        self, x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        from .fp8 import _ensure_l2_fetch_granularity
+
+        _ensure_l2_fetch_granularity(self.l2_fetch_granularity)
+        if self.quant_launches == "dual":
+            self.quant_x(x, weight, self.qx, self.qw, self.sx, self.sw)
+        else:
+            self.quant_x(x, self.qx, self.sx)
+            assert self.quant_w is not None
+            self.quant_w(weight, self.qw, self.sw)
+        self.gemm(
+            self.qx_packed,
+            self.qw_packed,
+            self.sx,
+            self.sw,
+            out,
+        )
+
+
+_BLOCK_DYNAMIC_RUNNERS: BoundedCache[
+    tuple[object, ...], _BlockDynamicRunner
+] = BoundedCache(runner_cache_limit("block_dynamic", 8, namespace="NVFP4"))
+
+
+@dataclass(slots=True)
 class _FusedDynamicRunner:
     launcher: object
     grid_ctas: int
@@ -559,6 +644,42 @@ def _make_dynamic_runner(
     )
 
 
+def _make_block_dynamic_runner(
+    problem: NVFP4Problem,
+    config: NVFP4ForwardConfig,
+    device: torch.device,
+) -> _BlockDynamicRunner:
+    qx = torch.empty((problem.m, problem.k // 2), dtype=torch.uint8, device=device)
+    qw = torch.empty((problem.n, problem.k // 2), dtype=torch.uint8, device=device)
+    sx = torch.empty(
+        (problem.m, problem.k // 16), dtype=torch.float8_e4m3fn, device=device
+    )
+    sw = torch.empty(
+        (problem.n, problem.k // 16), dtype=torch.float8_e4m3fn, device=device
+    )
+    if config.quant_launches == "dual":
+        quant_x = compile_nvfp4_block_dual_quant(
+            problem.m, problem.n, problem.k, config.quant
+        )
+        quant_w = None
+    else:
+        quant_x = compile_nvfp4_block_quant(problem.m, problem.k, config.quant)
+        quant_w = compile_nvfp4_block_quant(problem.n, problem.k, config.quant)
+    return _BlockDynamicRunner(
+        config.quant_launches,
+        quant_x,
+        quant_w,
+        compile_nvfp4_block_gemm(problem, config.gemm),
+        qx,
+        qw,
+        sx,
+        sw,
+        _packed_fp4_view(qx),
+        _packed_fp4_view(qw),
+        config.l2_fetch_granularity,
+    )
+
+
 def _make_dynamic_x_runner(
     problem: NVFP4Problem,
     config: NVFP4ForwardConfig,
@@ -666,6 +787,44 @@ def _packed_inference_config_key_from_dims(
     )
 
 
+def _materialized_dynamic_config_key(
+    problem: NVFP4Problem,
+    device: torch.device,
+) -> str:
+    """Resolve a verified joint quantize+GEMM winner for dynamic operands."""
+
+    selection_key = (device.index, problem.m, problem.n, problem.k)
+    selected_key = _DYNAMIC_CONFIG_SELECTIONS.get(selection_key)
+    if selected_key is not None:
+        return selected_key
+    from .autotune.winners import load_runtime_winner, runtime_winner_key
+    from .nvfp4_inference_autotune import dynamic_config_from_dict
+
+    selected = load_runtime_winner(
+        runtime_winner_key("nvfp4_dynamic_fwd", problem, device=device),
+        dynamic_config_from_dict,
+        rejection=lambda value: value.rejection(problem),
+    )
+    config = NVFP4ForwardConfig.from_materialized(
+        DEFAULT_NVFP4_DYNAMIC_CONFIG if selected is None else selected
+    )
+    selected_key = _intern_forward_config(config)
+    _DYNAMIC_CONFIG_SELECTIONS[selection_key] = selected_key
+    return selected_key
+
+
+@torch.compiler.assume_constant_result
+def _materialized_dynamic_config_key_from_dims(
+    m: int,
+    n: int,
+    k: int,
+    device: torch.device,
+) -> str:
+    return _materialized_dynamic_config_key(
+        NVFP4Problem(int(m), int(n), int(k)), device
+    )
+
+
 def _check_sm12x(device: torch.device) -> None:
     capability = torch.cuda.get_device_capability(device)
     if capability[0] != 12:
@@ -755,6 +914,97 @@ def _launch_nvfp4_forward_scaled(
     out = torch.empty((problem.m, problem.n), dtype=torch.bfloat16, device=x.device)
     runner(x_c, weight_c, x_scale, weight_scale, out, None, None)
     out._base_inputs = (x_c, weight_c, x_scale, weight_scale, runner)
+    return out
+
+
+def _launch_nvfp4_forward_materialized(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_scale: torch.Tensor,
+    forward_config_key: str,
+) -> torch.Tensor:
+    """Quantize both operands, then launch the native prequantized GEMM."""
+
+    _check_nvfp4_inputs(x, weight)
+    _check_sm12x(x.device)
+    x_c = x if x.is_contiguous() else x.contiguous()
+    weight_c = weight if weight.is_contiguous() else weight.contiguous()
+    for name, value in (
+        ("x_scale", x_scale),
+        ("weight_scale", weight_scale),
+        ("output_scale", output_scale),
+    ):
+        if value.dtype is not torch.float32 or value.numel() != 1:
+            raise TypeError(f"materialized NVFP4 {name} must be one FP32 value")
+        if value.device != x.device:
+            raise ValueError(f"materialized NVFP4 {name} must share the input device")
+    problem = NVFP4Problem(
+        int(x_c.shape[0]), int(weight_c.shape[0]), int(x_c.shape[1])
+    )
+    config = _resolve_forward_config(forward_config_key)
+    rejection = config.materialized_rejection(problem)
+    if rejection is not None:
+        raise RuntimeError(f"materialized NVFP4 cannot run this problem: {rejection}")
+    stream = torch.cuda.current_stream(x.device)
+    cache_key = (
+        x.device.index,
+        stream.cuda_stream,
+        problem.m,
+        problem.n,
+        problem.k,
+        config,
+    )
+    runner = _DYNAMIC_RUNNERS.get(cache_key)
+    if runner is None:
+        runner = _make_dynamic_runner(problem, config, x.device)
+        _DYNAMIC_RUNNERS[cache_key] = runner
+    out = torch.empty((problem.m, problem.n), dtype=torch.bfloat16, device=x.device)
+    runner(x_c, weight_c, x_scale, weight_scale, output_scale, out)
+    out._base_inputs = (
+        x_c,
+        weight_c,
+        x_scale,
+        weight_scale,
+        output_scale,
+        runner,
+    )
+    return out
+
+
+def _launch_nvfp4_forward_block(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    forward_config_key: str,
+) -> torch.Tensor:
+    _check_nvfp4_inputs(x, weight)
+    _check_sm12x(x.device)
+    x_c = x if x.is_contiguous() else x.contiguous()
+    weight_c = weight if weight.is_contiguous() else weight.contiguous()
+    problem = NVFP4Problem(
+        int(x_c.shape[0]), int(weight_c.shape[0]), int(x_c.shape[1])
+    )
+    config = _resolve_forward_config(forward_config_key)
+    rejection = config.materialized_rejection(problem)
+    if rejection is not None:
+        raise RuntimeError(f"block-only NVFP4 cannot run this problem: {rejection}")
+    stream = torch.cuda.current_stream(x.device)
+    cache_key = (
+        x.device.index,
+        stream.cuda_stream,
+        problem.m,
+        problem.n,
+        problem.k,
+        config,
+    )
+    runner = _BLOCK_DYNAMIC_RUNNERS.get(cache_key)
+    if runner is None:
+        runner = _make_block_dynamic_runner(problem, config, x.device)
+        _BLOCK_DYNAMIC_RUNNERS[cache_key] = runner
+    out = torch.empty((problem.m, problem.n), dtype=torch.bfloat16, device=x.device)
+    runner(x_c, weight_c, out)
+    out._base_inputs = (x_c, weight_c, runner)
     return out
 
 
@@ -926,6 +1176,67 @@ def _nvfp4_linear_fwd_fake(
     weight: torch.Tensor,
     x_scale: torch.Tensor,
     weight_scale: torch.Tensor,
+    forward_config_key: str,
+) -> torch.Tensor:
+    return torch.empty(
+        (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
+    )
+
+
+@torch.library.custom_op(
+    "rtx::nvfp4_linear_materialized_fwd",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _nvfp4_linear_materialized_fwd_op(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_scale: torch.Tensor,
+    forward_config_key: str,
+) -> torch.Tensor:
+    return _launch_nvfp4_forward_materialized(
+        x,
+        weight,
+        x_scale,
+        weight_scale,
+        output_scale,
+        forward_config_key,
+    )
+
+
+@_nvfp4_linear_materialized_fwd_op.register_fake
+def _nvfp4_linear_materialized_fwd_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_scale: torch.Tensor,
+    forward_config_key: str,
+) -> torch.Tensor:
+    return torch.empty(
+        (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
+    )
+
+
+@torch.library.custom_op(
+    "rtx::nvfp4_linear_block_fwd",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _nvfp4_linear_block_fwd_op(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    forward_config_key: str,
+) -> torch.Tensor:
+    return _launch_nvfp4_forward_block(x, weight, forward_config_key)
+
+
+@_nvfp4_linear_block_fwd_op.register_fake
+def _nvfp4_linear_block_fwd_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
     forward_config_key: str,
 ) -> torch.Tensor:
     return torch.empty(
@@ -1151,6 +1462,107 @@ torch.library.register_autograd(
 
 
 @torch.library.custom_op(
+    "rtx::nvfp4_linear_materialized_train",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _nvfp4_linear_materialized_train_op(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_scale: torch.Tensor,
+    forward_config_key: str,
+    backward_config_key: str,
+) -> torch.Tensor:
+    return _launch_nvfp4_forward_materialized(
+        x,
+        weight,
+        x_scale,
+        weight_scale,
+        output_scale,
+        forward_config_key,
+    )
+
+
+@_nvfp4_linear_materialized_train_op.register_fake
+def _nvfp4_linear_materialized_train_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_scale: torch.Tensor,
+    forward_config_key: str,
+    backward_config_key: str,
+) -> torch.Tensor:
+    return torch.empty(
+        (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
+    )
+
+
+def _setup_nvfp4_materialized_context(ctx, inputs, output) -> None:
+    x, weight, *_scales, _forward_config_key, backward_config_key = inputs
+    ctx.save_for_backward(x, weight)
+    ctx.backward_config_key = backward_config_key
+
+
+def _nvfp4_materialized_backward(ctx, grad_output: torch.Tensor):
+    gradients = _nvfp4_backward(ctx, grad_output)
+    return gradients[:2] + (None, None, None, None, None)
+
+
+torch.library.register_autograd(
+    "rtx::nvfp4_linear_materialized_train",
+    _nvfp4_materialized_backward,
+    setup_context=_setup_nvfp4_materialized_context,
+)
+
+
+@torch.library.custom_op(
+    "rtx::nvfp4_linear_block_train",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _nvfp4_linear_block_train_op(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    forward_config_key: str,
+    backward_config_key: str,
+) -> torch.Tensor:
+    return _launch_nvfp4_forward_block(x, weight, forward_config_key)
+
+
+@_nvfp4_linear_block_train_op.register_fake
+def _nvfp4_linear_block_train_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    forward_config_key: str,
+    backward_config_key: str,
+) -> torch.Tensor:
+    return torch.empty(
+        (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
+    )
+
+
+def _setup_nvfp4_block_context(ctx, inputs, output) -> None:
+    x, weight, _forward_config_key, backward_config_key = inputs
+    ctx.save_for_backward(x, weight)
+    ctx.backward_config_key = backward_config_key
+
+
+def _nvfp4_block_backward(ctx, grad_output: torch.Tensor):
+    gradients = _nvfp4_backward(ctx, grad_output)
+    return gradients[:2] + (None, None)
+
+
+torch.library.register_autograd(
+    "rtx::nvfp4_linear_block_train",
+    _nvfp4_block_backward,
+    setup_context=_setup_nvfp4_block_context,
+)
+
+
+@torch.library.custom_op(
     "rtx::nvfp4_linear_train_delayed",
     mutates_args=("next_x_amax_state", "next_weight_amax_state"),
     device_types="cuda",
@@ -1337,6 +1749,112 @@ class _InductorNVFP4CurrentRegistry(dict[str, object]):
 _INDUCTOR_CURRENT_LAUNCHERS = _InductorNVFP4CurrentRegistry()
 
 
+class _InductorNVFP4MaterializedLauncher:
+    """Direct quantize-both plus GEMM launcher used by generated wrappers."""
+
+    def __init__(self, forward_config_key: str) -> None:
+        self.forward_config_key = forward_config_key
+        self.runners: BoundedCache[tuple[object, ...], _DynamicRunner] = (
+            BoundedCache(
+                runner_cache_limit("inductor_materialized", 8, namespace="NVFP4")
+            )
+        )
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        x_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output_scale: torch.Tensor,
+        *,
+        out: torch.Tensor,
+    ) -> None:
+        problem = NVFP4Problem(
+            int(x.shape[0]), int(weight.shape[0]), int(x.shape[1])
+        )
+        stream_id = int(torch._C._cuda_getCurrentRawStream(x.device.index))
+        config = _resolve_forward_config(self.forward_config_key)
+        rejection = config.materialized_rejection(problem)
+        if rejection is not None:
+            raise RuntimeError(f"materialized NVFP4 cannot run: {rejection}")
+        key = (
+            x.device.index,
+            stream_id,
+            problem.m,
+            problem.n,
+            problem.k,
+            config,
+        )
+        runner = self.runners.get(key)
+        if runner is None:
+            runner = _make_dynamic_runner(problem, config, x.device)
+            self.runners[key] = runner
+        runner(x, weight, x_scale, weight_scale, output_scale, out)
+
+
+class _InductorNVFP4MaterializedRegistry(dict[str, object]):
+    def __missing__(self, config_key: str) -> object:
+        with _CONFIG_LOCK:
+            launcher = self.get(config_key)
+            if launcher is None:
+                launcher = _InductorNVFP4MaterializedLauncher(config_key)
+                self[config_key] = launcher
+        return launcher
+
+
+_INDUCTOR_MATERIALIZED_LAUNCHERS = _InductorNVFP4MaterializedRegistry()
+
+
+class _InductorNVFP4BlockLauncher:
+    """Two-input block-only launcher matching the MXFP8 prequant hot ABI."""
+
+    def __init__(self, forward_config_key: str) -> None:
+        self.forward_config_key = forward_config_key
+        self.runners: BoundedCache[tuple[object, ...], _BlockDynamicRunner] = (
+            BoundedCache(runner_cache_limit("inductor_block", 8, namespace="NVFP4"))
+        )
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        out: torch.Tensor,
+    ) -> None:
+        stream_id = int(torch._C._cuda_getCurrentRawStream(x.device.index))
+        key = (
+            x.device.index,
+            stream_id,
+            int(x.shape[0]),
+            int(weight.shape[0]),
+            int(x.shape[1]),
+        )
+        runner = self.runners.get(key)
+        if runner is None:
+            problem = NVFP4Problem(key[2], key[3], key[4])
+            config = _resolve_forward_config(self.forward_config_key)
+            rejection = config.materialized_rejection(problem)
+            if rejection is not None:
+                raise RuntimeError(f"block-only NVFP4 cannot run: {rejection}")
+            runner = _make_block_dynamic_runner(problem, config, x.device)
+            self.runners[key] = runner
+        runner(x, weight, out)
+
+
+class _InductorNVFP4BlockRegistry(dict[str, object]):
+    def __missing__(self, config_key: str) -> object:
+        with _CONFIG_LOCK:
+            launcher = self.get(config_key)
+            if launcher is None:
+                launcher = _InductorNVFP4BlockLauncher(config_key)
+                self[config_key] = launcher
+        return launcher
+
+
+_INDUCTOR_BLOCK_LAUNCHERS = _InductorNVFP4BlockRegistry()
+
+
 class _InductorNVFP4DynamicXLauncher:
     """Launch-only dynamic-X/prequant-W path used by generated wrappers."""
 
@@ -1474,6 +1992,8 @@ def _register_delayed_inductor_lowering() -> None:
 
     torch._rtx_nvfp4_delayed_launchers = _INDUCTOR_DELAYED_LAUNCHERS
     torch._rtx_nvfp4_current_launchers = _INDUCTOR_CURRENT_LAUNCHERS
+    torch._rtx_nvfp4_materialized_launchers = _INDUCTOR_MATERIALIZED_LAUNCHERS
+    torch._rtx_nvfp4_block_launchers = _INDUCTOR_BLOCK_LAUNCHERS
     torch._rtx_nvfp4_dynamic_x_launchers = _INDUCTOR_DYNAMIC_X_LAUNCHERS
     torch._rtx_nvfp4_prequant_launchers = _INDUCTOR_PREQUANT_LAUNCHERS
 
@@ -1522,6 +2042,92 @@ def _register_delayed_inductor_lowering() -> None:
         return lower_current_common(
             x, weight, x_scale, weight_scale, config_key
         )
+
+    def lower_materialized_common(
+        x, weight, x_scale, weight_scale, output_scale, config_key
+    ):
+        inputs = [
+            ir.ExternKernel.require_contiguous(ir.ExternKernel.realize_input(value))
+            for value in (x, weight, x_scale, weight_scale, output_scale)
+        ]
+        m = x.get_size()[0]
+        n = weight.get_size()[0]
+        name = f"torch._rtx_nvfp4_materialized_launchers[{config_key!r}]"
+        return ir.TensorBox.create(
+            ir.ExternKernelOut(
+                layout=ir.FixedLayout(
+                    device=x.get_device(),
+                    dtype=torch.bfloat16,
+                    size=[m, n],
+                    stride=[n, 1],
+                ),
+                inputs=inputs,
+                python_kernel_name=name,
+            )
+        )
+
+    @register_lowering(
+        torch.ops.rtx.nvfp4_linear_materialized_fwd.default,
+        type_promotion_kind=None,
+    )
+    def lower_materialized_fwd(
+        x, weight, x_scale, weight_scale, output_scale, config_key
+    ):
+        return lower_materialized_common(
+            x, weight, x_scale, weight_scale, output_scale, config_key
+        )
+
+    @register_lowering(
+        torch.ops.rtx.nvfp4_linear_materialized_train.default,
+        type_promotion_kind=None,
+    )
+    def lower_materialized_train(
+        x,
+        weight,
+        x_scale,
+        weight_scale,
+        output_scale,
+        config_key,
+        backward_config_key,
+    ):
+        return lower_materialized_common(
+            x, weight, x_scale, weight_scale, output_scale, config_key
+        )
+
+    def lower_block_common(x, weight, config_key):
+        inputs = [
+            ir.ExternKernel.require_contiguous(ir.ExternKernel.realize_input(value))
+            for value in (x, weight)
+        ]
+        m = x.get_size()[0]
+        n = weight.get_size()[0]
+        name = f"torch._rtx_nvfp4_block_launchers[{config_key!r}]"
+        return ir.TensorBox.create(
+            ir.ExternKernelOut(
+                layout=ir.FixedLayout(
+                    device=x.get_device(),
+                    dtype=torch.bfloat16,
+                    size=[m, n],
+                    stride=[n, 1],
+                ),
+                inputs=inputs,
+                python_kernel_name=name,
+            )
+        )
+
+    @register_lowering(
+        torch.ops.rtx.nvfp4_linear_block_fwd.default,
+        type_promotion_kind=None,
+    )
+    def lower_block_fwd(x, weight, config_key):
+        return lower_block_common(x, weight, config_key)
+
+    @register_lowering(
+        torch.ops.rtx.nvfp4_linear_block_train.default,
+        type_promotion_kind=None,
+    )
+    def lower_block_train(x, weight, config_key, backward_config_key):
+        return lower_block_common(x, weight, config_key)
 
     @register_lowering(
         torch.ops.rtx.nvfp4_linear_dynamic_x_prequant_w.default,
@@ -1727,6 +2333,7 @@ def nvfp4_linear(
     backward_config: "MXFP8BwdConfig | None" = None,
     scaling: Literal["current", "regional", "block"] = "current",
     scale_region_rows: int = 1,
+    backend: BackendMode = "auto",
 ) -> torch.Tensor:
     """Apply NVFP4 forward and MXFP8 backward to BF16 or packed operands."""
 
@@ -1736,6 +2343,8 @@ def nvfp4_linear(
         )
     if scale_region_rows <= 0:
         raise ValueError("scale_region_rows must be positive")
+    if backend not in ("auto", "fused", "materialized"):
+        raise ValueError("NVFP4 backend must be auto, fused, or materialized")
 
     if isinstance(weight, NVFP4Tensor):
         validate_nvfp4_tensor(weight)
@@ -1839,9 +2448,9 @@ def nvfp4_linear(
         else _backward_config_key(_autotune_mode(None), None, None)
     )
     fixed_scale_pack = None
-    if scaling == "block":
+    if scaling == "block" and backend == "fused":
         # Compiler-visible constant construction is folded/hoisted by
-        # Inductor. Stateful delayed scaling remains an nn.Module policy.
+        # Inductor. The materialized block path has a pointer-free scale ABI.
         fixed_scale_pack = x.new_tensor(
             (1.0, 1.0, 1.0 / 6.0), dtype=torch.float32
         )
@@ -1853,7 +2462,9 @@ def nvfp4_linear(
         tensor_scale_mode=tensor_scale_mode,
         x_scale_region_rows=region_rows,
         weight_scale_region_rows=region_rows,
+        block_only=scaling == "block",
         fixed_scale_pack=fixed_scale_pack,
+        backend=backend,
     )
 
 
@@ -1866,17 +2477,78 @@ def _nvfp4_dynamic_linear_with_keys(
     tensor_scale_mode: str,
     x_scale_region_rows: int = 0,
     weight_scale_region_rows: int = 0,
+    block_only: bool = False,
     fixed_scale_pack: torch.Tensor | None = None,
+    backend: BackendMode = "auto",
 ) -> torch.Tensor:
     """Compiler-visible current scaling around launch-only NVFP4 operators."""
 
     leading_shape = x.shape[:-1]
     x_2d = x.reshape(-1, x.shape[-1])
     _check_nvfp4_inputs(x_2d, weight)
+    selected_backend = backend
+    if selected_backend == "auto":
+        selected_backend = (
+            "fused"
+            if x_scale_region_rows or weight_scale_region_rows
+            else "materialized"
+        )
+    if selected_backend == "materialized" and (
+        x_scale_region_rows or weight_scale_region_rows
+    ):
+        raise NotImplementedError(
+            "materialized NVFP4 currently consumes one outer scale per operand; "
+            "regional scaling requires backend='fused'"
+        )
     # These reductions and pointwise expressions intentionally remain in FX.
     # Inductor owns their fusion and schedules only the final CuTe launch as an
     # external kernel; none of this eager tensor work is hidden in registration.
-    if fixed_scale_pack is None:
+    if selected_backend == "materialized":
+        materialized_key = _materialized_dynamic_config_key_from_dims(
+            int(x_2d.shape[0]),
+            int(weight.shape[0]),
+            int(x_2d.shape[1]),
+            x_2d.device,
+        )
+        if block_only:
+            out = (
+                _nvfp4_linear_block_train_op(
+                    x_2d,
+                    weight,
+                    materialized_key,
+                    backward_key,
+                )
+                if torch.is_grad_enabled()
+                and (x_2d.requires_grad or weight.requires_grad)
+                else _nvfp4_linear_block_fwd_op(
+                    x_2d, weight, materialized_key
+                )
+            )
+            return out.reshape(*leading_shape, weight.shape[0])
+        x_scale = _outer_tensor_scale(x_2d, tensor_scale_mode)
+        weight_scale = _outer_tensor_scale(weight, tensor_scale_mode)
+        output_scale = x_scale * weight_scale
+        if torch.is_grad_enabled() and (x_2d.requires_grad or weight.requires_grad):
+            out = _nvfp4_linear_materialized_train_op(
+                x_2d,
+                weight,
+                x_scale,
+                weight_scale,
+                output_scale,
+                materialized_key,
+                backward_key,
+            )
+        else:
+            out = _nvfp4_linear_materialized_fwd_op(
+                x_2d,
+                weight,
+                x_scale,
+                weight_scale,
+                output_scale,
+                materialized_key,
+            )
+        return out.reshape(*leading_shape, weight.shape[0])
+    if not block_only:
         effective_x_rows = _effective_scale_region_rows(
             x_2d.shape[0], x_scale_region_rows
         )
@@ -1898,6 +2570,10 @@ def _nvfp4_dynamic_linear_with_keys(
             else _tensor_scale_pack(weight, tensor_scale_mode)
         )
     else:
+        if fixed_scale_pack is None:
+            fixed_scale_pack = x_2d.new_tensor(
+                (1.0, 1.0, 1.0 / 6.0), dtype=torch.float32
+            )
         if fixed_scale_pack.dtype is not torch.float32:
             raise TypeError("block-only NVFP4 scale pack must use FP32")
         x_scale = weight_scale = fixed_scale_pack
@@ -1929,6 +2605,7 @@ class NVFP4Linear(nn.Module):
         "_backward_config_key",
         "_tensor_scale_mode",
         "scale_region_rows",
+        "backend",
     ]
 
     def __init__(
@@ -1943,6 +2620,7 @@ class NVFP4Linear(nn.Module):
         backward_config: "MXFP8BwdConfig | None" = None,
         scaling: ScalingMode = "delayed",
         scale_region_rows: int = 1,
+        backend: BackendMode = "auto",
         packed_weight: NVFP4Tensor | None = None,
     ) -> None:
         super().__init__()
@@ -1960,10 +2638,17 @@ class NVFP4Linear(nn.Module):
             )
         if scale_region_rows <= 0:
             raise ValueError("scale_region_rows must be positive")
+        if backend not in ("auto", "fused", "materialized"):
+            raise ValueError("NVFP4 backend must be auto, fused, or materialized")
+        if scaling == "regional" and backend == "materialized":
+            raise ValueError("regional scaling requires the fused NVFP4 backend")
+        if scaling == "delayed" and backend == "materialized":
+            raise ValueError("delayed scaling requires the fused NVFP4 backend")
         self.forward_config = forward_config
         self.backward_config = backward_config
         self.scaling = scaling
         self.scale_region_rows = int(scale_region_rows)
+        self.backend = backend
         self._forward_config_key = _intern_forward_config(
             NVFP4ForwardConfig(
                 fused=forward_config,
@@ -2184,6 +2869,7 @@ class NVFP4Linear(nn.Module):
             forward_config=self.forward_config,
             scaling=self.scaling,
             scale_region_rows=self.scale_region_rows,
+            backend=self.backend,
             packed_weight=packed,
         )
 
@@ -2346,8 +3032,14 @@ class NVFP4Linear(nn.Module):
             weight_scale_region_rows=(
                 self.scale_region_rows if self.scaling == "regional" else 0
             ),
+            block_only=self.scaling == "block",
             fixed_scale_pack=(
                 self._block_scale_pack if self.scaling == "block" else None
+            ),
+            backend=(
+                "fused"
+                if self.scaling == "delayed" and self.backend == "auto"
+                else self.backend
             ),
         )
 
@@ -2356,6 +3048,7 @@ class NVFP4Linear(nn.Module):
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias=False, forward=NVFP4, backward=MXFP8, "
             f"weight_mode={self.weight_mode}, scaling={self.scaling}"
+            f", backend={self.backend}"
         )
 
 
@@ -2363,12 +3056,15 @@ def _clear_runtime_caches() -> dict[str, object]:
     before = {
         "fused_dynamic": _FUSED_DYNAMIC_RUNNERS.stats(),
         "materialized_dynamic": _DYNAMIC_RUNNERS.stats(),
+        "block_dynamic": _BLOCK_DYNAMIC_RUNNERS.stats(),
         "dynamic_x": _DYNAMIC_X_RUNNERS.stats(),
     }
     _FUSED_DYNAMIC_RUNNERS.clear()
     _DYNAMIC_RUNNERS.clear()
+    _BLOCK_DYNAMIC_RUNNERS.clear()
     _DYNAMIC_X_RUNNERS.clear()
     _INFERENCE_CONFIG_SELECTIONS.clear()
+    _DYNAMIC_CONFIG_SELECTIONS.clear()
     _FUSED_CONFIG_SELECTIONS.clear()
     return before
 

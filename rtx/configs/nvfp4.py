@@ -136,10 +136,10 @@ class NVFP4FwdConfig(MXFP8FwdConfig):
             return reason
         if self.quant_vec not in (2, 4, 8, 16):
             return "NVFP4 quant_vec must own whole packed pairs"
-        if self.quant_math != "fp32":
-            return "the fused NVFP4 converter currently consumes FP32 pairs"
-        if self.quant_amax != "fp32":
-            return "the fused NVFP4 scale path currently reduces FP32 amax"
+        if self.quant_math not in ("fp32", "bf16x2"):
+            return "the fused NVFP4 converter requires fp32 or bf16x2 math"
+        if self.quant_amax not in ("fp32", "bf16_bits"):
+            return "the fused NVFP4 scale path requires fp32 or bf16_bits amax"
         if self.scale_reciprocal not in (
             "direct",
             "supplied_exact",
@@ -287,9 +287,41 @@ class NVFP4FullyPrequantConfig:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class NVFP4DynamicConfig:
+    """Materialized per-call schedule for two dynamic BF16 operands."""
+
+    quant: NVFP4QuantConfig = NVFP4QuantConfig()
+    gemm: NVFP4GemmConfig = NVFP4GemmConfig(
+        epilogue="direct", store_vec=1, a_swizzle="64b", b_swizzle="64b"
+    )
+    quant_launches: str = "dual"
+    l2_fetch_granularity: int | None = None
+
+    def rejection(self, problem: NVFP4Problem) -> str | None:
+        if self.quant_launches not in ("dual", "independent"):
+            return "quant_launches must be dual or independent"
+        # The pointer-free block GEMM uses the packed E2M1 CTA value maps.
+        # A 128-byte SMEM swizzle changes their top-level shape and CuTe rejects
+        # the resulting TMA/CTA mapping before lowering.  This was confirmed by
+        # every such candidate in the first revision-2 prospective run; keep it
+        # out of the compiler rather than learning the same failure per shape.
+        if self.gemm.a_swizzle == "128b" or self.gemm.b_swizzle == "128b":
+            return "dynamic NVFP4 block GEMM does not support 128-byte swizzles"
+        for label, rows in (("activation", problem.m), ("weight", problem.n)):
+            reason = self.quant.rejection(rows, problem.k)
+            if reason is not None:
+                return f"{label} quantizer: {reason}"
+        return (
+            _inference_l2_rejection(self.l2_fetch_granularity)
+            or self.gemm.rejection(problem)
+        )
+
+
 DEFAULT_NVFP4_GEMM_CONFIG = NVFP4GemmConfig()
 DEFAULT_NVFP4_QUANT_CONFIG = NVFP4QuantConfig()
 DEFAULT_NVFP4_FWD_CONFIG = NVFP4FwdConfig()
+DEFAULT_NVFP4_DYNAMIC_CONFIG = NVFP4DynamicConfig()
 NVFP4_KERNEL_REVISION = 5
 
 
@@ -309,8 +341,8 @@ NVFP4_FWD_SEARCH_SPACE.update(
     tile_k=(128, 256),
     bf16_tile_k=(64, 128, 256),
     quant_vec=(2, 4, 8, 16),
-    quant_math=("fp32",),
-    quant_amax=("fp32",),
+    quant_math=("fp32", "bf16x2"),
+    quant_amax=("fp32", "bf16_bits"),
     scale_reciprocal=(
         "supplied_pow2",
         "supplied_pow2_ptx_lut",

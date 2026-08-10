@@ -8,6 +8,8 @@ context identity. Add a newly versioned file instead.
 
 | Manifest | Purpose | Contexts |
 | --- | --- | ---: |
+| `nvfp4_dynamic_block_iteration_v2_128.json` | Bounded 128-trial joint dynamic block-quantizer/native-GEMM study | 2 |
+| `nvfp4_dynamic_components_iteration_v1.json` | Bounded packed-GEMM and dynamic-X component study | 4 |
 | `nvfp4_inference_states_v1.json` | NVFP4 dynamic-X/AOT-W and fully packed inference tuning | 16 |
 | `nvfp4_training_v1.json` | NVFP4 single-launch training-forward tuning, including per-CTA delayed-scale telemetry | 16 |
 | `mxfp8_bwd_revision19_calibration_v1.json` | Frozen-revision MXFP8 backward calibration and runtime-winner campaign | 12 |

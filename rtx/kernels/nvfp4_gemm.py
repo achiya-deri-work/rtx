@@ -36,6 +36,22 @@ class NVFP4GemmKernel(MXFP8GemmKernel):
         )
 
 
+class NVFP4BlockGemmKernel(NVFP4GemmKernel):
+    """Block-only GEMM whose unit output scale is folded out of device IR."""
+
+    def __init__(self, problem: NVFP4Problem, config: NVFP4GemmConfig):
+        super().__init__(problem, config)
+        self.apply_output_scale = False
+
+
+class _UnitOutputScaleLauncher:
+    def __init__(self, compiled):
+        self.compiled = compiled
+
+    def __call__(self, qx, qw, sx, sw, out):
+        return self.compiled(qx, qw, sx, sw, out, out)
+
+
 @lru_cache(maxsize=None)
 def compile_nvfp4_gemm(
     problem: NVFP4Problem,
@@ -97,4 +113,66 @@ def compile_nvfp4_gemm(
     )
 
 
-__all__ = ["NVFP4GemmConfig", "NVFP4GemmKernel", "compile_nvfp4_gemm"]
+@lru_cache(maxsize=None)
+def compile_nvfp4_block_gemm(
+    problem: NVFP4Problem,
+    config: NVFP4GemmConfig = NVFP4GemmConfig(),
+):
+    """Compile block-only NVFP4 GEMM with a five-tensor host ABI."""
+
+    kernel = NVFP4BlockGemmKernel(problem, config)
+    qx = cute.runtime.make_fake_tensor(
+        Float4E2M1FN,
+        (problem.m, problem.k),
+        stride=(problem.k, 1),
+        assumed_align=16,
+    )
+    qw = cute.runtime.make_fake_tensor(
+        Float4E2M1FN,
+        (problem.n, problem.k),
+        stride=(problem.k, 1),
+        assumed_align=16,
+    )
+    sx = cute.runtime.make_fake_tensor(
+        Float8E4M3FN,
+        (problem.m, problem.k // NVFP4_SF_VEC_SIZE),
+        stride=(problem.k // NVFP4_SF_VEC_SIZE, 1),
+        assumed_align=16,
+    )
+    sw = cute.runtime.make_fake_tensor(
+        Float8E4M3FN,
+        (problem.n, problem.k // NVFP4_SF_VEC_SIZE),
+        stride=(problem.k // NVFP4_SF_VEC_SIZE, 1),
+        assumed_align=16,
+    )
+    out = cute.runtime.make_fake_tensor(
+        BFloat16,
+        (problem.m, problem.n),
+        stride=(problem.n, 1),
+        assumed_align=16,
+    )
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return _UnitOutputScaleLauncher(
+        cute.compile(
+            kernel,
+            qx,
+            qw,
+            sx,
+            sw,
+            out,
+            out,
+            stream,
+            options=(
+                "--enable-tvm-ffi --opt-level 3 "
+                f"--ptxas-options '-O3 -v --maxrregcount={config.maxrregcount}'"
+            ),
+        )
+    )
+
+
+__all__ = [
+    "NVFP4GemmConfig",
+    "NVFP4GemmKernel",
+    "compile_nvfp4_block_gemm",
+    "compile_nvfp4_gemm",
+]

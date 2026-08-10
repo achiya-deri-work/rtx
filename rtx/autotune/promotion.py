@@ -65,6 +65,10 @@ def _current_revision(family: str) -> int:
         from ..nvfp4_inference_autotune import NVFP4_INFERENCE_KERNEL_REVISION
 
         return NVFP4_INFERENCE_KERNEL_REVISION
+    if family == "nvfp4_dynamic_fwd":
+        from ..nvfp4_inference_autotune import NVFP4_DYNAMIC_KERNEL_REVISION
+
+        return NVFP4_DYNAMIC_KERNEL_REVISION
     raise ValueError(f"unsupported runtime winner family {family!r}")
 
 
@@ -116,6 +120,13 @@ def _config_rejection(
             if family == "nvfp4_weight_prequant_fwd":
                 return weight_prequant_config_from_dict(config).rejection(nv_problem)
             return fully_prequant_config_from_dict(config).rejection(nv_problem)
+        if family == "nvfp4_dynamic_fwd":
+            from ..configs.nvfp4 import NVFP4Problem
+            from ..nvfp4_inference_autotune import dynamic_config_from_dict
+
+            return dynamic_config_from_dict(config).rejection(
+                NVFP4Problem(problem.m, problem.n, problem.k)
+            )
     except (KeyError, TypeError, ValueError) as exc:
         return f"cannot deserialize current config schema: {exc}"
     return f"unsupported runtime winner family {family!r}"

@@ -1011,6 +1011,95 @@ def make_nvfp4_weight_prequant_adapter(
     )
 
 
+def make_nvfp4_dynamic_adapter(
+    problem,
+    evaluator: Callable[[object], TrialOutcome],
+    *,
+    initial: object | None = None,
+    axes: Mapping[str, Iterable[Mapping[str, object]]] | None = None,
+    device: DeviceFingerprint | Mapping[str, object] | None = None,
+    regime: str = "hot",
+    tags: Mapping[str, object] | None = None,
+) -> DiscreteKernelAdapter[object]:
+    """Jointly tune both dynamic quantizers and the materialized NVFP4 GEMM."""
+
+    from ..configs.nvfp4 import NVFP4DynamicConfig
+    from ..nvfp4_inference_autotune import (
+        NVFP4_DYNAMIC_KERNEL_REVISION,
+        NVFP4_DYNAMIC_SEARCH_SPACE,
+        dynamic_config_from_dict,
+        dynamic_config_id,
+        dynamic_config_to_dict,
+        update_dynamic_config,
+    )
+
+    initial_config = NVFP4DynamicConfig() if initial is None else initial
+    selected_axes = NVFP4_DYNAMIC_SEARCH_SPACE if axes is None else axes
+    axis_values = {name: tuple(values) for name, values in selected_axes.items()}
+    unknown = set(axis_values).difference(NVFP4_DYNAMIC_SEARCH_SPACE)
+    if unknown:
+        raise ValueError(f"unknown dynamic NVFP4 tuning axes: {sorted(unknown)}")
+
+    def rejection(config: object) -> tuple[str, str] | None:
+        reason = config.rejection(problem)  # type: ignore[attr-defined]
+        if reason is None:
+            reason = _gemm_smem_rejection(config.gemm, device)  # type: ignore[attr-defined]
+        return None if reason is None else ("implementation_rejected", reason)
+
+    def derived(config: object) -> Mapping[str, float]:
+        gemm = config.gemm  # type: ignore[attr-defined]
+        quant = config.quant  # type: ignore[attr-defined]
+        values = _gemm_features(problem, gemm, device, materialized_quant=True)
+        values.update(
+            _prefix(
+                _nvfp4_quant_features(problem.m, problem.k, quant, device),
+                "quant_x_",
+            )
+        )
+        values.update(
+            _prefix(
+                _nvfp4_quant_features(problem.n, problem.k, quant, device),
+                "quant_w_",
+            )
+        )
+        qx = problem.m * problem.k / 2 + problem.m * (problem.k // 16)
+        qw = problem.n * problem.k / 2 + problem.n * (problem.k // 16)
+        values.update(
+            operand_state_dynamic=1.0,
+            quant_launch_count=(
+                1.0 if config.quant_launches == "dual" else 2.0  # type: ignore[attr-defined]
+            ),
+            total_kernel_launches=(
+                2.0 if config.quant_launches == "dual" else 3.0  # type: ignore[attr-defined]
+            ),
+            quantized_materialization_bytes=float(qx + qw),
+        )
+        return values
+
+    state_tags = {**dict(tags or {}), "operand_state": "dynamic"}
+    return DiscreteKernelAdapter(
+        context=_context(
+            "nvfp4_dynamic_fwd",
+            NVFP4_DYNAMIC_KERNEL_REVISION,
+            problem,
+            device,
+            regime,
+            state_tags,
+        ),
+        initial_config=initial_config,
+        axes=axis_values,
+        config_id_fn=dynamic_config_id,
+        serialize_fn=dynamic_config_to_dict,
+        deserialize_fn=dynamic_config_from_dict,
+        update_fn=lambda config, _coordinate, value: update_dynamic_config(
+            config, value
+        ),
+        evaluator=evaluator,
+        rejection_fn=rejection,
+        extra_features_fn=derived,
+    )
+
+
 def make_nvfp4_fully_prequant_adapter(
     problem,
     evaluator: Callable[[object], TrialOutcome],
@@ -1537,5 +1626,6 @@ __all__ = [
     "make_mxfp8_prequant_adapter",
     "make_mxfp8_weight_prequant_adapter",
     "make_nvfp4_fully_prequant_adapter",
+    "make_nvfp4_dynamic_adapter",
     "make_nvfp4_weight_prequant_adapter",
 ]

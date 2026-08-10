@@ -42,6 +42,9 @@ def _benchmark_shape(
     seed: int,
     compile_modules: bool,
     profile: bool,
+    nv_scaling: str,
+    nv_backend: str,
+    mx_backend: str,
 ) -> dict[str, object]:
     m, n, k = shape
     torch.manual_seed(seed)
@@ -49,10 +52,16 @@ def _benchmark_shape(
         k,
         n,
         device="cuda",
-        backend="fused",
+        backend=mx_backend,
         autotune="cache",
     )
-    nv = rtx.NVFP4Linear(k, n, device="cuda", scaling="delayed")
+    nv = rtx.NVFP4Linear(
+        k,
+        n,
+        device="cuda",
+        scaling=nv_scaling,
+        backend=nv_backend,
+    )
     with torch.no_grad():
         nv.weight.copy_(mx.weight)
     x_mx = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -61,8 +70,9 @@ def _benchmark_shape(
     if compile_modules:
         # Delayed state is intentionally shape-specific. Bootstrap once before
         # capturing the steady-state full graph, matching production usage.
-        nv(x_nv)
-        torch.cuda.synchronize()
+        if nv_scaling == "delayed":
+            nv(x_nv)
+            torch.cuda.synchronize()
         mx = torch.compile(mx, fullgraph=True, dynamic=False)
         nv = torch.compile(nv, fullgraph=True, dynamic=False)
 
@@ -155,6 +165,9 @@ def _benchmark_shape(
     return {
         "shape": {"m": m, "n": n, "k": k},
         "compiled": compile_modules,
+        "mxfp8_backend": mx_backend,
+        "nvfp4_backend": nv_backend,
+        "nvfp4_scaling": nv_scaling,
         "mxfp8_training_ms": mx_median,
         "nvfp4_training_ms": nv_median,
         "end_to_end_speedup": mx_median / nv_median,
@@ -180,6 +193,17 @@ def main() -> None:
     parser.add_argument("--calls", type=int, default=10)
     parser.add_argument("--seed", type=int, default=20260810)
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument(
+        "--mx-backend", choices=("auto", "fused", "prequant"), default="auto"
+    )
+    parser.add_argument(
+        "--nv-backend", choices=("auto", "fused", "materialized"), default="auto"
+    )
+    parser.add_argument(
+        "--nv-scaling",
+        choices=("delayed", "current", "regional", "block"),
+        default="block",
+    )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -195,6 +219,9 @@ def main() -> None:
             seed=args.seed + index,
             compile_modules=args.compile,
             profile=args.profile,
+            nv_scaling=args.nv_scaling,
+            nv_backend=args.nv_backend,
+            mx_backend=args.mx_backend,
         )
         for index, shape in enumerate(shapes)
     ]

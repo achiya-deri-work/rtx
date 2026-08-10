@@ -132,7 +132,13 @@ layer = rtx.MXFP8Linear(
 y2 = layer(x)
 
 nv_layer = rtx.NVFP4Linear(
-    1536, 1536, bias=False, device="cuda", dtype=torch.bfloat16
+    1536,
+    1536,
+    bias=False,
+    device="cuda",
+    dtype=torch.bfloat16,
+    scaling="block",
+    backend="auto",
 )
 nv_y = nv_layer(x)  # NVFP4 forward, MXFP8 backward
 ```
@@ -208,6 +214,12 @@ coordinate and can be varied independently of the CTA schedule. Set
 1x16 E4M3 block scales, eliminating both tensor-wide reductions. Block-only is
 the fastest policy when values stay inside the E4M3 scale exponent range;
 current scaling remains the tensorwide numerical reference for extreme/tiny ranges.
+For dynamic BF16 operands, `backend="auto"` selects a pointer-free three-kernel
+block path (dual or independent X/W quantizers plus native NVFP4 GEMM) for
+block-only execution. Its quantizer launch topology,
+vector/reduction/register schedule, GEMM TMA/mainloop/epilogue schedule, and L2
+fetch policy form the `nvfp4_dynamic_fwd` autotuning family. `backend="fused"`
+remains available for delayed telemetry and controlled fused-kernel studies.
 An explicit `NVFP4FwdConfig(tensor_scale_mode="exact")` retains the exact
 TorchAO tensorwise FP32 scale for controlled studies; power-of-two is the
 default because its reciprocal is exact and cheaper. A dynamic module honors
@@ -588,7 +600,7 @@ count:
 
 Supported families are `mxfp8_fused_fwd`, `mxfp8_prequant_fwd`,
 `mxfp8_weight_prequant_fwd`, `mxfp8_fully_prequant_fwd`, `mxfp8_bwd`,
-`nvfp4_fused_fwd`, `nvfp4_weight_prequant_fwd`, and
+`nvfp4_fused_fwd`, `nvfp4_dynamic_fwd`, `nvfp4_weight_prequant_fwd`, and
 `nvfp4_fully_prequant_fwd`. Persistent inference families never time their AOT
 packing work and do not expose inactive quantizer coordinates. Additional
 kernel families can register a `DatasetBackend` with

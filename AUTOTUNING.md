@@ -13,9 +13,18 @@ Persistent inference uses separate families:
   packing as untimed AOT work;
 - `mxfp8_fully_prequant_fwd` measures GEMM only and treats both packing steps
   as untimed AOT work.
+- `nvfp4_dynamic_fwd` jointly measures BF16-to-E2M1 block quantization for X/W
+  and the native packed GEMM; dual versus independent quantizer launches are a
+  real coordinate;
+- `nvfp4_weight_prequant_fwd` measures X quantization plus GEMM; and
+- `nvfp4_fully_prequant_fwd` measures the packed GEMM only.
 
 Their search spaces structurally remove inactive quantizer axes rather than
 relying on rejection or hoping the learned model ignores no-op coordinates.
+The dynamic NVFP4 family retains the complete active quantizer, GEMM, launch,
+register, TMA/epilogue, persistence/locality, and L2 policy space. Its
+revision-2 block-only kernels remove unit outer-scale pointers and arithmetic
+from both the quantizer and GEMM ABIs.
 
 The MXFP8 frontend has three selection modes:
 

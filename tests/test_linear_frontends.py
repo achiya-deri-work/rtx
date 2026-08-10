@@ -152,6 +152,14 @@ class LinearFrontendContractTests(unittest.TestCase):
                         "fake",
                     ),
                 ),
+                (
+                    torch.ops.rtx.nvfp4_linear_block_fwd,
+                    (x, weight, "fake"),
+                ),
+                (
+                    torch.ops.rtx.nvfp4_linear_block_train,
+                    (x, weight, "fake", "fake"),
+                ),
             )
             for op, args in calls:
                 with self.subTest(op=op):

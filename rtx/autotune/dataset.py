@@ -32,6 +32,7 @@ from .adapters import (
     make_mxfp8_prequant_adapter,
     make_mxfp8_weight_prequant_adapter,
     make_nvfp4_fully_prequant_adapter,
+    make_nvfp4_dynamic_adapter,
     make_nvfp4_fwd_adapter,
     make_nvfp4_weight_prequant_adapter,
 )
@@ -91,6 +92,7 @@ from ..inference_experiments import (
     WeightPrequantBenchmarkHarness,
 )
 from ..nvfp4_inference_experiments import (
+    NVFP4DynamicBenchmarkHarness,
     NVFP4FullyPrequantBenchmarkHarness,
     NVFP4WeightPrequantBenchmarkHarness,
 )
@@ -1090,6 +1092,18 @@ def _nvfp4_weight_prequant_harness(
     )
 
 
+def _nvfp4_dynamic_harness(
+    campaign: "DatasetCampaign", job: DatasetJob, shape: ShapeSpec, regime: CacheRegime
+):
+    return NVFP4DynamicBenchmarkHarness(
+        shape,
+        regime,
+        job.protocol,
+        device=campaign.device,
+        seed=_backend_seed(campaign, job, shape, regime),
+    )
+
+
 def _nvfp4_fully_prequant_harness(
     campaign: "DatasetCampaign", job: DatasetJob, shape: ShapeSpec, regime: CacheRegime
 ):
@@ -1260,6 +1274,26 @@ def _nvfp4_weight_prequant_adapter(
     )
 
 
+def _nvfp4_dynamic_adapter(
+    campaign: "DatasetCampaign",
+    job: DatasetJob,
+    shape: ShapeSpec,
+    regime: CacheRegime,
+    harness,
+    tags: Mapping[str, object],
+) -> KernelAdapter:
+    evaluator = CalibratedPrequantEvaluator(
+        harness, samples=job.protocol.samples, seed=campaign.manifest.seed
+    )
+    return make_nvfp4_dynamic_adapter(
+        NVFP4Problem(shape.m, shape.n, shape.k),
+        evaluator,
+        device=campaign.hardware_profile,
+        regime=regime,
+        tags=tags,
+    )
+
+
 def _nvfp4_fully_prequant_adapter(
     campaign: "DatasetCampaign",
     job: DatasetJob,
@@ -1304,6 +1338,10 @@ register_dataset_backend(
         _nvfp4_weight_prequant_harness,
         _nvfp4_weight_prequant_adapter,
     ),
+)
+register_dataset_backend(
+    "nvfp4_dynamic_fwd",
+    DatasetBackend(_nvfp4_dynamic_harness, _nvfp4_dynamic_adapter),
 )
 register_dataset_backend(
     "nvfp4_fully_prequant_fwd",
@@ -1696,12 +1734,13 @@ class DatasetCampaign:
         family_order = {
             "mxfp8_fused_fwd": 0,
             "nvfp4_fused_fwd": 1,
-            "mxfp8_prequant_fwd": 2,
-            "mxfp8_weight_prequant_fwd": 3,
-            "nvfp4_weight_prequant_fwd": 4,
-            "mxfp8_fully_prequant_fwd": 5,
-            "nvfp4_fully_prequant_fwd": 6,
-            "mxfp8_bwd": 7,
+            "nvfp4_dynamic_fwd": 2,
+            "mxfp8_prequant_fwd": 3,
+            "mxfp8_weight_prequant_fwd": 4,
+            "nvfp4_weight_prequant_fwd": 5,
+            "mxfp8_fully_prequant_fwd": 6,
+            "nvfp4_fully_prequant_fwd": 7,
+            "mxfp8_bwd": 8,
         }
 
         def shape_priority(shape: ShapeSpec) -> int:

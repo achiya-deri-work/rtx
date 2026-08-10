@@ -207,6 +207,10 @@ class PrequantAutotuneCudaTests(unittest.TestCase):
     def test_compile_first_runtime_autotune_request(self) -> None:
         if torch.cuda.get_device_capability()[0] != 12:
             self.skipTest("joint tuner requires SM120/SM121")
+        # Other frontend tests deliberately compile this shared module method
+        # under many constant policies.  Isolate this fullgraph test from the
+        # process-global Dynamo recompile budget.
+        torch.compiler.reset()
         policy = CoordinateDescentPolicy(
             time_budget_s=30,
             max_passes=1,

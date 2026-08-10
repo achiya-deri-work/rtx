@@ -7,6 +7,7 @@ import torch
 
 import rtx
 from rtx.autotune.adapters import (
+    make_nvfp4_dynamic_adapter,
     make_nvfp4_fully_prequant_adapter,
     make_nvfp4_fwd_adapter,
     make_nvfp4_weight_prequant_adapter,
@@ -15,8 +16,9 @@ from rtx.autotune.outcomes import TrialOutcome
 from rtx.autotune.promotion import _config_rejection, _current_revision
 from rtx.configs.nvfp4 import (
     DEFAULT_NVFP4_FWD_CONFIG,
-    NVFP4FwdConfig,
+    NVFP4DynamicConfig,
     NVFP4FullyPrequantConfig,
+    NVFP4FwdConfig,
     NVFP4GemmConfig,
     NVFP4Problem,
     NVFP4QuantConfig,
@@ -128,11 +130,15 @@ class NVFP4ConfigTests(unittest.TestCase):
             )
         )
         for family, inference_config in (
+            ("nvfp4_dynamic_fwd", NVFP4DynamicConfig()),
             ("nvfp4_weight_prequant_fwd", NVFP4WeightPrequantConfig()),
             ("nvfp4_fully_prequant_fwd", NVFP4FullyPrequantConfig()),
         ):
             with self.subTest(family=family):
-                self.assertEqual(_current_revision(family), 1)
+                self.assertEqual(
+                    _current_revision(family),
+                    2 if family == "nvfp4_dynamic_fwd" else 1,
+                )
                 self.assertIsNone(
                     _config_rejection(
                         family,
@@ -140,6 +146,11 @@ class NVFP4ConfigTests(unittest.TestCase):
                         problem,  # type: ignore[arg-type]
                     )
                 )
+        invalid_dynamic = replace(
+            NVFP4DynamicConfig(),
+            gemm=replace(NVFP4DynamicConfig().gemm, b_swizzle="128b"),
+        )
+        self.assertIn("128-byte swizzles", invalid_dynamic.rejection(problem))
 
     def test_inference_state_adapters_are_distinct_and_fp4_aware(self) -> None:
         problem = NVFP4Problem(64, 128, 128)
@@ -159,6 +170,13 @@ class NVFP4ConfigTests(unittest.TestCase):
             initial=NVFP4FullyPrequantConfig(),
             axes={"gemm_stages": ({"gemm": {"stages": 1}},)},
         )
+        dynamic = make_nvfp4_dynamic_adapter(
+            problem,
+            evaluator,
+            initial=NVFP4DynamicConfig(),
+            axes={"quant_launches": ({"quant_launches": "dual"},)},
+        )
+        self.assertEqual(dynamic.context.family, "nvfp4_dynamic_fwd")
         self.assertEqual(weight.context.family, "nvfp4_weight_prequant_fwd")
         self.assertEqual(fully.context.family, "nvfp4_fully_prequant_fwd")
         weight_features = weight.features(weight.initial_config)
@@ -511,7 +529,10 @@ class NVFP4CudaTests(unittest.TestCase):
                 stale = layer(jumped)
                 recovered = layer(jumped)
                 current = rtx.nvfp4_linear(
-                    jumped, layer.weight, forward_config=config
+                    jumped,
+                    layer.weight,
+                    forward_config=config,
+                    backend="fused",
                 )
                 torch.cuda.synchronize()
                 self.assertTrue(bool(torch.isfinite(stale).all()))

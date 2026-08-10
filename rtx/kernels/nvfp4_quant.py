@@ -345,6 +345,121 @@ class NVFP4DualQuantKernel(NVFP4QuantKernel):
                 )
 
 
+class NVFP4BlockQuantKernel(NVFP4QuantKernel):
+    """Block-only quantizer with the unit outer scale removed from its ABI."""
+
+    @cute.jit
+    def __call__(
+        self,
+        src: cute.Tensor,
+        quantized_packed: cute.Tensor,
+        scales: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.block_kernel(src, quantized_packed, scales).launch(
+            grid=(self.grid_ctas, 1, 1),
+            block=(self.config.num_warps * 32, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def block_kernel(
+        self,
+        src: cute.Tensor,
+        quantized_packed: cute.Tensor,
+        scales: cute.Tensor,
+    ):
+        cfg = self.config
+        lane_idx = cute.arch.lane_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_linear = block_idx * cfg.num_warps + warp_idx
+        warp_stride = self.grid_ctas * cfg.num_warps
+        block_in_warp = lane_idx // cfg.threads_per_scale
+        lane_in_scale = lane_idx % cfg.threads_per_scale
+        blocks_per_row = self.k // NVFP4_SF_VEC_SIZE
+        for task_group in cutlass.range(
+            warp_linear, self.task_groups, warp_stride, unroll=1
+        ):
+            linear_block = task_group * cfg.blocks_per_warp + block_in_warp
+            self._quantize_task(
+                src,
+                quantized_packed,
+                scales,
+                Float32(1.0),
+                linear_block // blocks_per_row,
+                linear_block % blocks_per_row,
+                lane_in_scale,
+            )
+
+
+class NVFP4BlockDualQuantKernel(NVFP4DualQuantKernel):
+    """Dual block-only quantizer without outer-scale pointer arguments."""
+
+    @cute.jit
+    def __call__(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        qx: cute.Tensor,
+        qw: cute.Tensor,
+        sx: cute.Tensor,
+        sw: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.block_dual_kernel(x, weight, qx, qw, sx, sw).launch(
+            grid=(self.grid_ctas, 1, 1),
+            block=(self.config.num_warps * 32, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def block_dual_kernel(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        qx: cute.Tensor,
+        qw: cute.Tensor,
+        sx: cute.Tensor,
+        sw: cute.Tensor,
+    ):
+        cfg = self.config
+        lane_idx = cute.arch.lane_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_linear = block_idx * cfg.num_warps + warp_idx
+        warp_stride = self.grid_ctas * cfg.num_warps
+        block_in_warp = lane_idx // cfg.threads_per_scale
+        lane_in_scale = lane_idx % cfg.threads_per_scale
+        blocks_per_row = self.k // NVFP4_SF_VEC_SIZE
+        for task_group in cutlass.range(
+            warp_linear, self.task_groups, warp_stride, unroll=1
+        ):
+            if task_group < self.x_task_groups:
+                linear_block = task_group * cfg.blocks_per_warp + block_in_warp
+                self._quantize_task(
+                    x,
+                    qx,
+                    sx,
+                    Float32(1.0),
+                    linear_block // blocks_per_row,
+                    linear_block % blocks_per_row,
+                    lane_in_scale,
+                )
+            else:
+                local_group = task_group - self.x_task_groups
+                linear_block = local_group * cfg.blocks_per_warp + block_in_warp
+                self._quantize_task(
+                    weight,
+                    qw,
+                    sw,
+                    Float32(1.0),
+                    linear_block // blocks_per_row,
+                    linear_block % blocks_per_row,
+                    lane_in_scale,
+                )
+
+
 def _fake_bf16(rows: int, k: int):
     return cute.runtime.make_fake_tensor(
         BFloat16, (rows, k), stride=(k, 1), assumed_align=16
@@ -421,10 +536,58 @@ def compile_nvfp4_dual_quant(
     )
 
 
+@lru_cache(maxsize=None)
+def compile_nvfp4_block_quant(
+    rows: int,
+    k: int,
+    config: NVFP4QuantConfig = NVFP4QuantConfig(),
+):
+    kernel = NVFP4BlockQuantKernel(rows, k, config)
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        kernel,
+        _fake_bf16(rows, k),
+        _fake_packed(rows, k),
+        _fake_scales(rows, k),
+        stream,
+        options=(
+            "--enable-tvm-ffi --opt-level 3 "
+            f"--ptxas-options '-O3 -v --maxrregcount={config.maxrregcount}'"
+        ),
+    )
+
+
+@lru_cache(maxsize=None)
+def compile_nvfp4_block_dual_quant(
+    x_rows: int,
+    weight_rows: int,
+    k: int,
+    config: NVFP4QuantConfig = NVFP4QuantConfig(),
+):
+    kernel = NVFP4BlockDualQuantKernel(x_rows, weight_rows, k, config)
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        kernel,
+        _fake_bf16(x_rows, k),
+        _fake_bf16(weight_rows, k),
+        _fake_packed(x_rows, k),
+        _fake_packed(weight_rows, k),
+        _fake_scales(x_rows, k),
+        _fake_scales(weight_rows, k),
+        stream,
+        options=(
+            "--enable-tvm-ffi --opt-level 3 "
+            f"--ptxas-options '-O3 -v --maxrregcount={config.maxrregcount}'"
+        ),
+    )
+
+
 __all__ = [
     "NVFP4DualQuantKernel",
     "NVFP4QuantConfig",
     "NVFP4QuantKernel",
     "compile_nvfp4_dual_quant",
+    "compile_nvfp4_block_dual_quant",
+    "compile_nvfp4_block_quant",
     "compile_nvfp4_quant",
 ]

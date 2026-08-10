@@ -10,6 +10,7 @@ import torch
 
 from .autotune.hardware import compiled_resource_metadata
 from .configs.nvfp4 import (
+    NVFP4DynamicConfig,
     NVFP4FullyPrequantConfig,
     NVFP4Problem,
     NVFP4WeightPrequantConfig,
@@ -17,6 +18,8 @@ from .configs.nvfp4 import (
 from .formats import NVFP4Tensor
 from .formats.nvfp4 import nvfp4_tensor_scale
 from .fp4 import (
+    NVFP4ForwardConfig,
+    _make_block_dynamic_runner,
     _current_tensor_scale,
     _packed_fp4_view,
     compile_nvfp4_gemm,
@@ -35,6 +38,116 @@ from .prequant_experiments import (
 
 
 InferenceOperandState = Literal["weight_prequantized", "fully_prequantized"]
+
+
+@dataclass(slots=True)
+class _PreparedNVFP4Dynamic:
+    config: NVFP4DynamicConfig
+    runner: object
+    out: torch.Tensor
+    compile_ms: float
+    max_abs_error: float
+    compiled_resources: Mapping[str, object]
+
+
+class NVFP4DynamicBenchmarkHarness(PrequantBenchmarkHarness):
+    """Measure block-scale quantize-both plus native NVFP4 GEMM schedules."""
+
+    def __init__(
+        self,
+        shape: ShapeSpec,
+        regime: CacheRegime,
+        protocol: BenchmarkProtocol,
+        *,
+        device: torch.device | str = "cuda",
+        seed: int = 0,
+    ) -> None:
+        self.shape = shape
+        self.problem = NVFP4Problem(shape.m, shape.n, shape.k)
+        self.regime = regime
+        self.protocol = protocol
+        self.device = torch.device(device)
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(seed)
+        self.x = torch.randn(
+            shape.m,
+            shape.k,
+            device=self.device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        self.weight = torch.randn(
+            shape.n,
+            shape.k,
+            device=self.device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        self._inputs = self._make_input_ring()
+        reference = self._build_runner(NVFP4DynamicConfig())
+        expected = torch.empty(
+            (shape.m, shape.n), device=self.device, dtype=torch.bfloat16
+        )
+        reference(self.x, self.weight, expected)
+        torch.cuda.synchronize(self.device)
+        self._expected = expected.clone()
+
+    def _build_runner(
+        self, config: NVFP4DynamicConfig
+    ) -> object:
+        return _make_block_dynamic_runner(
+            self.problem,
+            NVFP4ForwardConfig.from_materialized(config),
+            self.device,
+        )
+
+    def prepare(self, config: NVFP4DynamicConfig) -> _PreparedNVFP4Dynamic:
+        rejection = config.rejection(self.problem)
+        if rejection is not None:
+            raise CandidateCompileError(rejection)
+        previous_l2: int | None = None
+        if config.l2_fetch_granularity is not None:
+            previous_l2 = _set_l2_fetch_granularity(config.l2_fetch_granularity)
+        started = time.monotonic()
+        try:
+            try:
+                runner = self._build_runner(config)
+                torch.cuda.synchronize(self.device)
+            except Exception as exc:
+                raise CandidateCompileError(
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            compile_ms = (time.monotonic() - started) * 1000
+            out = torch.empty_like(self._expected)
+            runner(self.x, self.weight, out)
+            torch.cuda.synchronize(self.device)
+            max_abs_error = float(
+                (out.float() - self._expected.float()).abs().max()
+            )
+            if not torch.allclose(
+                out,
+                self._expected,
+                rtol=self.protocol.correctness_rtol,
+                atol=self.protocol.correctness_atol,
+                equal_nan=True,
+            ):
+                raise CandidateCorrectnessError(
+                    f"candidate differs from reference (max abs {max_abs_error})"
+                )
+            return _PreparedNVFP4Dynamic(
+                config,
+                runner,
+                out,
+                compile_ms,
+                max_abs_error,
+                compiled_resource_metadata(runner),
+            )
+        finally:
+            if previous_l2 is not None:
+                _set_l2_fetch_granularity(previous_l2)
+
+    def _measure_components(self, prepared, calls: int, samples: int):
+        return {}
 
 
 def _pair_key(x: torch.Tensor, weight: torch.Tensor) -> tuple[int, int]:
@@ -264,6 +377,7 @@ class NVFP4FullyPrequantBenchmarkHarness(NVFP4InferenceBenchmarkHarness):
 
 
 __all__ = [
+    "NVFP4DynamicBenchmarkHarness",
     "NVFP4FullyPrequantBenchmarkHarness",
     "NVFP4InferenceBenchmarkHarness",
     "NVFP4WeightPrequantBenchmarkHarness",
