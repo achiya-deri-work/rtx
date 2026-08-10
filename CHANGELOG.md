@@ -54,6 +54,15 @@ project follows semantic versioning while it is in active alpha development.
   only its selected backward matmul and quantizer instead of constructing the
   full two-gradient runner. Cover eager and fullgraph partial-gradient paths in
   the production matrix.
+- Add `rtx-autotune verify-winners` for independently confirming and racing the
+  latest finalists left by a wall-time-limited campaign. Make verification
+  journals idempotently resumable, deduplicate legacy confirmations before
+  racing, and let post-hoc summaries supersede shallower anytime winners during
+  runtime-cache promotion.
+- Add a frozen revision-19 backward calibration manifest. A ten-minute 5070 Ti
+  wave produced 264 valid observations across twelve hot/rotating contexts and
+  confirmed shape-specific improvements of roughly 4--8% without changing the
+  portable default.
 - Add 8/16/32-bit quantized GMEM store schedules and a CuTe `CopyG2SOp`
   logical-transpose transport family. Promote the 128-row, four-value,
   32-bit-store register schedule for backward after paired races improved

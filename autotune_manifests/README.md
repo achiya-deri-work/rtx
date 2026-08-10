@@ -8,6 +8,7 @@ context identity. Add a newly versioned file instead.
 
 | Manifest | Purpose | Contexts |
 | --- | --- | ---: |
+| `mxfp8_bwd_revision19_calibration_v1.json` | Frozen-revision MXFP8 backward calibration and runtime-winner campaign | 12 |
 | `autotuner_prospective_5070_v1.json` | Interruption-safe random vs. random+local vs. online-bandit study on the two 5070s | 144 residual units |
 | `cross_device_dataset_bandit_v1.json` | Hierarchical strategy/context-bandit campaign for new cross-device measurements | 54 |
 | `cross_device_dataset_v2.json` | Sequential-strategy control campaign and active resumable v2 dataset | 54 |
@@ -23,6 +24,10 @@ Validate a composable manifest without launching a kernel:
 ```bash
 rtx-autotune validate autotune_manifests/cross_device_dataset_bandit_v1.json
 ```
+
+After an anytime deadline, independently confirm the best candidates found at
+any completed depth with `rtx-autotune verify-winners MANIFEST ...`. This is
+required before promoting a winner discovered after the initial coverage wave.
 
 The prospective 5070 manifest expands every base workload across three search
 treatments and two independent replicates. Its order balances every prefix

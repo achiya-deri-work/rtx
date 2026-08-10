@@ -121,6 +121,18 @@ def install_verified_winners(
                 summary = json.loads(reader.read_text(prefix + "summary.json"))
             except (KeyError, OSError, json.JSONDecodeError):
                 continue
+            result_documents = list(summary.get("results", []))
+            try:
+                posthoc = json.loads(
+                    reader.read_text(prefix + "verification_summary.json")
+                )
+            except (KeyError, OSError, json.JSONDecodeError):
+                posthoc = None
+            if (
+                isinstance(posthoc, Mapping)
+                and posthoc.get("type") == "rtx_autotune_posthoc_verification"
+            ):
+                result_documents.extend(posthoc.get("results", []))
             device_id = str(machine.get("device", {}).get("fingerprint_id", ""))
             if not device_id or (device_filter is not None and device_id not in device_filter):
                 continue
@@ -148,7 +160,7 @@ def install_verified_winners(
                         "kernel_revision": record.get("kernel_revision"),
                     }
             latest: dict[str, Mapping[str, object]] = {}
-            for result in summary.get("results", []):
+            for result in result_documents:
                 if not isinstance(result, Mapping):
                     continue
                 verification = result.get("verification")

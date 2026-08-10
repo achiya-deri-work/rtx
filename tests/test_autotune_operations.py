@@ -136,6 +136,67 @@ class AutotuneOperationsTests(unittest.TestCase):
             self.assertEqual(document["median_ms"], 0.9)
             self.assertEqual(document["metadata"]["support"], 1)
 
+    def test_posthoc_verification_supersedes_the_anytime_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            posthoc_id = "posthoc-config-id"
+            posthoc_config = fwd_config_to_dict(
+                normalize_fwd_config(quant_vec=2)
+            )
+            verification_path = bundle / "residuals/unit/verification.jsonl"
+            with verification_path.open("a", encoding="utf-8") as sink:
+                sink.write(
+                    json.dumps(
+                        {
+                            "record_type": "verification_measurement",
+                            "observation_key": "posthoc-verify-id",
+                            "context_id": "context-id",
+                            "config_id": posthoc_id,
+                            "family": "mxfp8_fused_fwd",
+                            "outcome": {
+                                "status": "ok",
+                                "summary_ms": {"median": 0.8},
+                                "timings_ms": [0.8] * 11,
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            _write(
+                bundle / "verification_summary.json",
+                {
+                    "type": "rtx_autotune_posthoc_verification",
+                    "results": [
+                        {
+                            "context_id": "context-id",
+                            "family": "mxfp8_fused_fwd",
+                            "kernel_revision": MXFP8_FWD_KERNEL_REVISION,
+                            "shape": "m64_n128_k128",
+                            "regime": "hot",
+                            "treatment": "random_local",
+                            "replicate": 0,
+                            "target_trials": 65,
+                            "verification": {
+                                "status": "ok",
+                                "winner_id": posthoc_id,
+                                "winner_config": posthoc_config,
+                            },
+                        }
+                    ],
+                },
+            )
+
+            cache = root / "cache"
+            report = install_verified_winners((root,), cache_dir=cache)
+
+            self.assertEqual(len(report["installed"]), 1)
+            document = json.loads(
+                Path(report["installed"][0]["path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(document["config_id"], posthoc_id)
+            self.assertEqual(document["median_ms"], 0.8)
+
 
 if __name__ == "__main__":
     unittest.main()

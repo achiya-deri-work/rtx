@@ -1,0 +1,62 @@
+{
+  "schema_version": 2,
+  "name": "mxfp8_bwd_revision19_calibration_v1",
+  "seed": 20260810,
+  "storage_mode": "residual_context",
+  "rotation_mode": "balanced_categories",
+  "jobs": [
+    {
+      "family": "mxfp8_bwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "short_reduction"},
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "long_dw_reduction"},
+        {"m": 1536, "n": 6144, "k": 1536, "name": "wide"},
+        {"m": 1536, "n": 1536, "k": 6144, "name": "deep_k"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 4,
+      "tags": {
+        "purpose": "revision19_runtime_calibration",
+        "kernel_policy": "frozen_revision"
+      },
+      "tuning": {
+        "portfolio": "hybrid",
+        "orchestration": "bandit",
+        "max_trials": 96,
+        "time_budget_s": 900.0,
+        "cost_model_trials": 64,
+        "model_warmup": 12,
+        "model_pool_size": 4096,
+        "model_refit_interval": 8,
+        "bandit_exploration": 0.35,
+        "model_estimators": 24,
+        "model_ensembles": 2,
+        "model_max_depth": 3,
+        "model_min_leaf": 3,
+        "model_max_features": 96,
+        "local_beam_width": 4,
+        "confirmation_repeats": 1,
+        "confirmation_ratio": 0.02,
+        "confirm_initial": true,
+        "seed": 20260810
+      },
+      "protocol": {
+        "warmup_calls": 6,
+        "samples": 5,
+        "confirm_samples": 11,
+        "race_rounds": 15,
+        "target_batch_ms": 30.0,
+        "correctness_rtol": 0.07,
+        "correctness_atol": 1.0,
+        "practical_threshold": 0.005,
+        "bootstrap_resamples": 1000,
+        "rotation_l2_multiple": 2.0,
+        "max_rotation_buffers": 12,
+        "max_rotation_bytes": 536870912,
+        "telemetry": true
+      }
+    }
+  ]
+}

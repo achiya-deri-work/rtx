@@ -481,6 +481,10 @@ deployment gates.
 After audit and numerical verification, preview and install runtime winners:
 
 ```bash
+rtx-autotune verify-winners \
+  autotune_manifests/mxfp8_bwd_revision19_calibration_v1.json \
+  --device cuda:0 --output-dir autotune_datasets \
+  --calibration hardware_calibration.json --promote 4
 rtx-autotune install-winners copied_datasets/ laptop-results.zip \
   --minimum-support 2 --dry-run
 rtx-autotune install-winners copied_datasets/ laptop-results.zip \
@@ -490,6 +494,9 @@ rtx-autotune install-winners copied_datasets/ laptop-results.zip \
 Promotion is atomic and keyed by kernel family, exact device fingerprint,
 shape, cache regime, and packed scale-layout variant. Existing entries are not
 overwritten unless `--force` is supplied.
+`verify-winners` is a post-search GPU pass for interrupted anytime campaigns:
+it confirms the current residual-journal finalists, records paired races, and
+refreshes bundle-local winners without consuming additional search trials.
 
 ## Dataset manifest
 

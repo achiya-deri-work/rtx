@@ -1149,7 +1149,8 @@ class ExperimentJournal:
         return {
             str(record["observation_key"])
             for record in self.records()
-            if record.get("record_type") in ("measurement", "race")
+            if record.get("record_type")
+            in ("measurement", "verification_measurement", "race")
         }
 
 

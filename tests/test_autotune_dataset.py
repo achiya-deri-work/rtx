@@ -8,6 +8,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock
 import zipfile
 
 from rtx.autotune import (
@@ -214,12 +215,83 @@ class DatasetTests(unittest.TestCase):
             "cross_device_dataset_bandit_v1.json",
             "inference_states_pilot_v1.json",
             "autotuner_prospective_5070_v1.json",
+            "mxfp8_bwd_revision19_calibration_v1.json",
         ):
             manifest = DatasetManifest.load(root / "autotune_manifests" / name)
             restored = DatasetManifest.from_dict(manifest.as_dict())
             self.assertEqual(restored, manifest)
             self.assertEqual(restored.digest, manifest.digest)
             self.assertGreater(sum(len(job.shapes) for job in manifest.jobs), 0)
+
+    def test_posthoc_verification_rechecks_current_residual_finalists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            (bundle / "manifest.json").write_text("{}", encoding="utf-8")
+            campaign = DatasetCampaign.__new__(DatasetCampaign)
+            campaign.bundle = bundle
+            campaign.manifest = SimpleNamespace(digest="manifest-digest")
+            campaign.machine = {"machine_id": "machine-one"}
+            campaign.progress = None
+            job = DatasetManifest.from_dict(
+                {
+                    "name": "verify-test",
+                    "jobs": [
+                        {
+                            "family": "mxfp8_bwd",
+                            "shapes": [{"m": 128, "n": 128, "k": 128}],
+                            "promote": 2,
+                        }
+                    ],
+                }
+            ).jobs[0]
+            shape = job.shapes[0]
+            adapter = SimpleNamespace(
+                context=SimpleNamespace(
+                    identifier="context-one", kernel_revision=19
+                )
+            )
+            harness = object()
+            store = object()
+            campaign._assigned_contexts = lambda: [(job, shape, "hot")]
+            campaign._make_harness = Mock(return_value=harness)
+            campaign._make_adapter = Mock(return_value=adapter)
+            campaign._store = Mock(return_value=store)
+            campaign._context_trials = Mock(return_value=17)
+            campaign._verify = Mock(
+                return_value={
+                    "status": "ok",
+                    "screened": 17,
+                    "winner_id": "winner",
+                }
+            )
+
+            summary_path = campaign.verify_existing(promote=4)
+
+            verified_job = campaign._verify.call_args.args[2]
+            self.assertEqual(verified_job.promote, 4)
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(summary["contexts"], 1)
+            self.assertEqual(summary["verified"], 1)
+            self.assertEqual(
+                summary["results"][0]["verification"]["winner_id"], "winner"
+            )
+
+    def test_verification_measurements_are_resumable_completed_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            journal = ExperimentJournal(Path(directory) / "verification.jsonl")
+            for record_type, key in (
+                ("verification_measurement", "confirm-one"),
+                ("race", "race-one"),
+            ):
+                journal.append(
+                    {
+                        "record_type": record_type,
+                        "observation_key": key,
+                    }
+                )
+            self.assertEqual(
+                journal.completed_keys(), {"confirm-one", "race-one"}
+            )
 
     def test_prospective_matrix_rotates_balanced_residual_units(self) -> None:
         root = Path(__file__).resolve().parents[1]

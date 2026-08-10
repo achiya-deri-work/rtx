@@ -1191,8 +1191,22 @@ class DatasetCampaign:
             and isinstance(record.get("outcome"), dict)
             and record["outcome"].get("status") == "ok"  # type: ignore[union-attr]
         ]
+        # Older journals could contain a repeated confirmation because
+        # ``ExperimentJournal.completed_keys`` historically omitted the
+        # ``verification_measurement`` record type. Collapse those append-only
+        # duplicates here so they can never trigger a self-race or bias winner
+        # selection.
+        confirmed_by_config: dict[str, Mapping[str, object]] = {}
+        for record in records:
+            config_id = str(record.get("config_id", ""))
+            previous = confirmed_by_config.get(config_id)
+            median = float(record["outcome"]["summary_ms"]["median"])  # type: ignore[index]
+            if previous is None or median < float(
+                previous["outcome"]["summary_ms"]["median"]  # type: ignore[index]
+            ):
+                confirmed_by_config[config_id] = record
         confirmed = sorted(
-            records,
+            confirmed_by_config.values(),
             key=lambda record: float(record["outcome"]["summary_ms"]["median"]),  # type: ignore[index]
         )
         if not confirmed:
@@ -2074,6 +2088,81 @@ class DatasetCampaign:
             return self._run_anytime_bandit(results, started=started)
         return self._run_anytime_breadth_first(results, started=started)
 
+    def verify_existing(self, *, promote: int | None = None) -> Path:
+        """Independently confirm and race the best persisted candidates.
+
+        Anytime campaigns intentionally verify only their first coverage floor
+        and their final depth.  A wall-time deadline can therefore leave later,
+        better observations unconfirmed.  This pass consumes no new search
+        trials: it rebuilds each assigned context from its residual journal,
+        confirms its current finalists, records paired races, and refreshes the
+        bundle-local runtime winners used by ``install-winners``.
+        """
+
+        if promote is not None and promote <= 0:
+            raise ValueError("promote must be positive")
+        if not (self.bundle / "manifest.json").is_file():
+            raise RuntimeError(
+                f"no existing campaign bundle found at {self.bundle}"
+            )
+        results: list[dict[str, object]] = []
+        for job, shape, regime in self._assigned_contexts():
+            harness = self._make_harness(job, shape, regime)
+            adapter = self._make_adapter(job, shape, regime, harness)
+            store = self._store(adapter, job, shape, regime)
+            screened = self._context_trials(store, adapter)
+            self._log(
+                f"VERIFY  {job.family} {shape.key} {regime} "
+                f"screened={screened}"
+            )
+            if screened == 0:
+                result: dict[str, object] = {
+                    "status": "no_observations",
+                    "screened": 0,
+                }
+            else:
+                result = self._verify(
+                    adapter,
+                    harness,
+                    replace(job, promote=job.promote if promote is None else promote),
+                    shape,
+                    regime,
+                    store,
+                )
+            results.append(
+                {
+                    "family": job.family,
+                    "kernel_revision": adapter.context.kernel_revision,
+                    "shape": shape.key,
+                    "regime": regime,
+                    "context_id": adapter.context.identifier,
+                    "treatment": job.tags.get("treatment", "default"),
+                    "replicate": int(job.tags.get("replicate", 0)),
+                    "target_trials": screened,
+                    "verification": result,
+                }
+            )
+            del harness, adapter, store
+        summary_path = self.bundle / "verification_summary.json"
+        _atomic_json(
+            summary_path,
+            {
+                "schema_version": DATASET_SCHEMA_VERSION,
+                "type": "rtx_autotune_posthoc_verification",
+                "recorded_at": _utc_now(),
+                "manifest_digest": self.manifest.digest,
+                "machine_id": self.machine["machine_id"],
+                "contexts": len(results),
+                "verified": sum(
+                    isinstance(result.get("verification"), Mapping)
+                    and result["verification"].get("status") == "ok"  # type: ignore[union-attr]
+                    for result in results
+                ),
+                "results": results,
+            },
+        )
+        return summary_path
+
     def run(self, *, export_format: ExportFormat = "csv") -> Path:
         self.bundle.mkdir(parents=True, exist_ok=True)
         _atomic_json(self.bundle / "manifest.json", self.manifest.as_dict())
@@ -2330,6 +2419,23 @@ def _build_parser() -> argparse.ArgumentParser:
     install.add_argument("--dry-run", action="store_true")
     install.add_argument("--force", action="store_true")
 
+    verify = subparsers.add_parser(
+        "verify-winners",
+        help="confirm and race the best observations in an existing GPU campaign",
+    )
+    verify.add_argument("manifest", type=Path)
+    verify.add_argument("--output-dir", type=Path, default=Path("autotune_datasets"))
+    verify.add_argument("--device", default="cuda")
+    verify.add_argument("--calibration", type=Path)
+    verify.add_argument("--shard-index", type=int)
+    verify.add_argument("--shard-count", type=int)
+    verify.add_argument(
+        "--promote",
+        type=int,
+        help="number of screened finalists to confirm per context",
+    )
+    verify.add_argument("--quiet", action="store_true")
+
     pretrain = subparsers.add_parser(
         "pretrain", help="fit portable cost models and conditional-effect rules"
     )
@@ -2579,6 +2685,28 @@ def main(argv: Sequence[str] | None = None) -> None:
             force=args.force,
         )
         print(json.dumps(report, indent=2, sort_keys=True))
+        return
+    if args.command == "verify-winners":
+        if not torch.cuda.is_available():
+            parser.error("CUDA is not available")
+        manifest = DatasetManifest.load(args.manifest)
+        if (args.shard_index is None) != (args.shard_count is None):
+            parser.error("--shard-index and --shard-count must be provided together")
+        if args.shard_index is not None:
+            manifest = manifest.with_shard(args.shard_index, args.shard_count)
+        calibration = None
+        if args.calibration is not None:
+            calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
+        campaign = DatasetCampaign(
+            manifest,
+            args.output_dir,
+            device=args.device,
+            calibration=calibration,
+            adopt_existing_context_identity=True,
+            progress=None if args.quiet else print,
+        )
+        summary_path = campaign.verify_existing(promote=args.promote)
+        print(json.dumps({"verification": str(summary_path)}, indent=2))
         return
     if not torch.cuda.is_available():
         parser.error("CUDA is not available")
