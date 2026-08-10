@@ -110,6 +110,10 @@ class NVFP4FwdConfig(MXFP8FwdConfig):
     scale_reciprocal: str = "supplied_pow2_ptx_lut"
     tensor_scale_mode: str = "power2"
     collect_amax: bool = False
+    telemetry_layout: str = "scalar_atomic"
+    telemetry_ownership: str = "operand_owner"
+    amax_history_len: int = 16
+    amax_history_algo: str = "window_max"
 
     @property
     def native_operand_bits(self) -> int:
@@ -142,6 +146,14 @@ class NVFP4FwdConfig(MXFP8FwdConfig):
             )
         if self.tensor_scale_mode not in ("power2", "exact"):
             return "NVFP4 tensor_scale_mode must be power2 or exact"
+        if self.telemetry_layout not in ("per_cta", "scalar_atomic"):
+            return "NVFP4 telemetry_layout must be per_cta or scalar_atomic"
+        if self.telemetry_ownership not in ("all", "operand_owner"):
+            return "NVFP4 telemetry_ownership must be all or operand_owner"
+        if self.amax_history_len not in (1, 4, 16, 64):
+            return "NVFP4 amax_history_len must be 1, 4, 16, or 64"
+        if self.amax_history_algo not in ("most_recent", "window_max"):
+            return "NVFP4 amax_history_algo must be most_recent or window_max"
         if self.bf16_tile_k < 64:
             return "NVFP4 staged transport tiles must cover a complete K=64 MMA"
         return None
@@ -249,7 +261,7 @@ class NVFP4FullyPrequantConfig:
 DEFAULT_NVFP4_GEMM_CONFIG = NVFP4GemmConfig()
 DEFAULT_NVFP4_QUANT_CONFIG = NVFP4QuantConfig()
 DEFAULT_NVFP4_FWD_CONFIG = NVFP4FwdConfig()
-NVFP4_KERNEL_REVISION = 3
+NVFP4_KERNEL_REVISION = 4
 
 
 _NVFP4_EXCLUDED_COMPOUND_AXES = {
@@ -279,6 +291,13 @@ NVFP4_FWD_SEARCH_SPACE.update(
     # output comparison does not conflate schedules with quantization policy.
     tensor_scale_mode=("power2",),
     collect_amax=(True,),
+    telemetry_layout=("per_cta", "scalar_atomic"),
+    telemetry_ownership=("all", "operand_owner"),
+    # History policy changes numerical behavior. Keep the production recipe
+    # fixed in latency campaigns; numerical studies can explicitly override
+    # these axes without conflating quality and schedule performance.
+    amax_history_len=(16,),
+    amax_history_algo=("window_max",),
 )
 
 
@@ -298,6 +317,18 @@ def normalize_nvfp4_fwd_config(
         "tensor_scale_mode", values.pop("tensor_scale_mode")
     )
     collect_amax = updates.pop("collect_amax", values.pop("collect_amax"))
+    telemetry_layout = updates.pop(
+        "telemetry_layout", values.pop("telemetry_layout")
+    )
+    telemetry_ownership = updates.pop(
+        "telemetry_ownership", values.pop("telemetry_ownership")
+    )
+    amax_history_len = updates.pop(
+        "amax_history_len", values.pop("amax_history_len")
+    )
+    amax_history_algo = updates.pop(
+        "amax_history_algo", values.pop("amax_history_algo")
+    )
     common = MXFP8FwdConfig(**values)
     normalized = normalize_fwd_config(common, **updates)
     return NVFP4FwdConfig(
@@ -305,6 +336,10 @@ def normalize_nvfp4_fwd_config(
         scale_reciprocal=str(scale_reciprocal),
         tensor_scale_mode=str(tensor_scale_mode),
         collect_amax=bool(collect_amax),
+        telemetry_layout=str(telemetry_layout),
+        telemetry_ownership=str(telemetry_ownership),
+        amax_history_len=int(amax_history_len),
+        amax_history_algo=str(amax_history_algo),
     )
 
 

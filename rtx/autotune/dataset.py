@@ -116,6 +116,12 @@ def nvfp4_grid_ctas(*args, **kwargs):
     )
 
 
+def nvfp4_telemetry_values(*args, **kwargs):
+    return load_kernel_symbol("nvfp4_fwd", "nvfp4_telemetry_values")(
+        *args, **kwargs
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AnytimeRunPolicy:
     """Preemptible campaign scheduling with optional context-level bandits."""
@@ -746,9 +752,9 @@ class NVFP4FwdBenchmarkHarness(FusedFwdBenchmarkHarness):
             raise FusedCandidateCompileError(f"{type(exc).__name__}: {exc}") from exc
         compile_ms = (time.monotonic() - started) * 1000
         out = torch.empty_like(self._expected)
-        grid_ctas = nvfp4_grid_ctas(self.problem, config)
-        x_amax_state = _nvfp4_amax_state(self.x, grid_ctas)
-        weight_amax_state = _nvfp4_amax_state(self.weight, grid_ctas)
+        state_values = nvfp4_telemetry_values(self.problem, config)
+        x_amax_state = _nvfp4_amax_state(self.x, state_values)
+        weight_amax_state = _nvfp4_amax_state(self.weight, state_values)
         next_x_amax_state = torch.empty_like(x_amax_state)
         next_weight_amax_state = torch.empty_like(weight_amax_state)
         prepared = _PreparedNVFP4(
@@ -785,6 +791,11 @@ class NVFP4FwdBenchmarkHarness(FusedFwdBenchmarkHarness):
         x: torch.Tensor,
         weight: torch.Tensor,
     ) -> None:
+        if prepared.config.telemetry_layout == "scalar_atomic":
+            from ..fp8_bwd import _zero_tensor_async
+
+            _zero_tensor_async(prepared.next_x_amax_state)
+            _zero_tensor_async(prepared.next_weight_amax_state)
         prepared.launcher(
             x,
             weight,

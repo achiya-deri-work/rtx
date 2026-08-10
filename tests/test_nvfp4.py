@@ -49,6 +49,10 @@ class NVFP4ConfigTests(unittest.TestCase):
         self.assertTrue(config.collect_amax)
         self.assertEqual(config.k_unroll, 2)
         self.assertEqual(config.scale_reciprocal, "supplied_pow2_ptx_rcp")
+        self.assertEqual(config.telemetry_layout, "scalar_atomic")
+        self.assertEqual(config.telemetry_ownership, "operand_owner")
+        self.assertEqual(config.amax_history_len, 16)
+        self.assertEqual(config.amax_history_algo, "window_max")
 
     def test_standalone_quantizer_exposes_one_lane_per_block(self) -> None:
         config = NVFP4QuantConfig(values_per_lane=16, load_bits=128)
@@ -70,16 +74,17 @@ class NVFP4ConfigTests(unittest.TestCase):
         self.assertEqual(adapter.context.family, "nvfp4_fused_fwd")
         self.assertTrue(adapter.initial_config.collect_amax)
         features = adapter.features(adapter.initial_config)
-        self.assertEqual(features["derived.delayed_telemetry_slots"], 24.0)
+        self.assertEqual(features["derived.delayed_telemetry_slots"], 1.0)
         self.assertEqual(
-            features["derived.delayed_telemetry_state_bytes"], 192.0
+            features["derived.delayed_telemetry_state_bytes"], 128.0
         )
+        self.assertEqual(features["derived.delayed_telemetry_memsets"], 2.0)
         self.assertEqual(features["derived.total_kernel_launches"], 1.0)
 
     def test_runtime_promotion_understands_nvfp4_revision_and_schema(self) -> None:
         problem = NVFP4Problem(256, 1536, 1536)
         config = replace(DEFAULT_NVFP4_FWD_CONFIG, collect_amax=True)
-        self.assertEqual(_current_revision("nvfp4_fused_fwd"), 3)
+        self.assertEqual(_current_revision("nvfp4_fused_fwd"), 4)
         self.assertIsNone(
             _config_rejection(
                 "nvfp4_fused_fwd",
@@ -324,6 +329,32 @@ class NVFP4CudaTests(unittest.TestCase):
         reference = x.float() @ weight.float().T
         self.assertLess(float((exact.float() - reference).abs().mean()), 2.0)
 
+    def test_block_only_scaling_eliminates_global_scale_reductions(self) -> None:
+        torch.manual_seed(1912)
+        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        functional = rtx.nvfp4_linear(x, weight, scaling="block")
+        layer = rtx.NVFP4Linear(
+            128, 128, device="cuda", scaling="block"
+        ).eval()
+        with torch.no_grad():
+            layer.weight.copy_(weight)
+            modular = layer(x)
+        torch.testing.assert_close(functional, modular, rtol=0, atol=0)
+        self.assertTrue(bool(torch.isfinite(functional).all()))
+
+    def test_block_only_is_range_fast_path_not_extreme_range_reference(self) -> None:
+        x = torch.full(
+            (128, 128), 8192.0, device="cuda", dtype=torch.bfloat16
+        )
+        weight = torch.eye(128, device="cuda", dtype=torch.bfloat16)
+        current = rtx.nvfp4_linear(x, weight, scaling="current")
+        block = rtx.nvfp4_linear(x, weight, scaling="block")
+        reference = x.float() @ weight.float().T
+        current_error = (current.float() - reference).abs().mean()
+        block_error = (block.float() - reference).abs().mean()
+        self.assertLess(float(current_error), float(block_error))
+
     def test_delayed_scale_generation_and_mxfp8_backward(self) -> None:
         torch.manual_seed(1902)
         layer = rtx.NVFP4Linear(128, 128, device="cuda")
@@ -426,6 +457,22 @@ class NVFP4CudaTests(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(changed_m).all()))
         self.assertEqual(layer._delayed_problem[3], 128)
 
+    def test_delayed_history_rotates_without_losing_recent_maxima(self) -> None:
+        torch.manual_seed(1913)
+        layer = rtx.NVFP4Linear(128, 128, device="cuda")
+        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        layer(x)
+        first = layer._x_amax_state.clone()
+        layer(x * 0.5)
+        torch.cuda.synchronize()
+        self.assertEqual(layer._x_amax_state.numel(), 16)
+        torch.testing.assert_close(
+            layer._x_amax_state[0], first[0] * 0.5, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            layer._x_amax_state[1], first[0], rtol=0, atol=0
+        )
+
     def test_delayed_state_reboot_on_stream_change_and_state_load(self) -> None:
         torch.manual_seed(1911)
         layer = rtx.NVFP4Linear(128, 128, device="cuda")
@@ -504,6 +551,44 @@ class NVFP4CudaTests(unittest.TestCase):
 
         def functional(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             return rtx.nvfp4_linear(a, b)
+
+        compiled_functional = torch.compile(
+            functional,
+            fullgraph=True,
+            dynamic=False,
+            options={"triton.cudagraphs": False},
+        )
+        with torch.inference_mode():
+            functional_out = compiled_functional(x.detach(), layer.weight.detach())
+        self.assertTrue(bool(torch.isfinite(functional_out).all()))
+
+    def test_block_only_training_is_fullgraph_compileable(self) -> None:
+        torch.manual_seed(1914)
+        layer = rtx.NVFP4Linear(
+            128, 128, device="cuda", scaling="block"
+        )
+        compiled = torch.compile(
+            layer,
+            fullgraph=True,
+            dynamic=False,
+            options={"triton.cudagraphs": False},
+        )
+        x = torch.randn(
+            128,
+            128,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        out = compiled(x)
+        out.float().square().mean().backward()
+        torch.cuda.synchronize()
+        self.assertTrue(bool(torch.isfinite(out).all()))
+        self.assertTrue(bool(torch.isfinite(x.grad).all()))
+        self.assertTrue(bool(torch.isfinite(layer.weight.grad).all()))
+
+        def functional(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            return rtx.nvfp4_linear(a, b, scaling="block")
 
         compiled_functional = torch.compile(
             functional,

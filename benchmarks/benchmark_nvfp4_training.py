@@ -21,7 +21,7 @@ from rtx.kernels.mxfp8 import (
 from rtx.kernels.mxfp8_fwd import compile_mxfp8_fwd
 from rtx.kernels.nvfp4_fwd import (
     compile_nvfp4_fwd,
-    nvfp4_grid_ctas,
+    nvfp4_telemetry_values,
 )
 
 
@@ -84,9 +84,9 @@ def _benchmark_shape(
     nv_launcher = compile_nvfp4_fwd(nv_problem, nv_config)
     mx_out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
     nv_out = torch.empty_like(mx_out)
-    grid_ctas = nvfp4_grid_ctas(nv_problem, nv_config)
-    x_amax_state = _delayed_amax_state(x, grid_ctas)
-    weight_amax_state = _delayed_amax_state(weight, grid_ctas)
+    state_values = nvfp4_telemetry_values(nv_problem, nv_config)
+    x_amax_state = _delayed_amax_state(x, state_values)
+    weight_amax_state = _delayed_amax_state(weight, state_values)
     next_x_amax_state = torch.empty_like(x_amax_state)
     next_weight_amax_state = torch.empty_like(weight_amax_state)
 
@@ -96,6 +96,11 @@ def _benchmark_shape(
     def launch_nv() -> None:
         nonlocal x_amax_state, weight_amax_state
         nonlocal next_x_amax_state, next_weight_amax_state
+        if nv_config.telemetry_layout == "scalar_atomic":
+            from rtx.fp8_bwd import _zero_tensor_async
+
+            _zero_tensor_async(next_x_amax_state)
+            _zero_tensor_async(next_weight_amax_state)
         nv_launcher(
             x,
             weight,

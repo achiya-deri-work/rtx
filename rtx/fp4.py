@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from .kernels.mxfp8_bwd import MXFP8BwdConfig
 
 WeightMode = Literal["dynamic", "prequantized"]
+ScalingMode = Literal["delayed", "current", "block"]
 
 
 def compile_nvfp4_quant(*args, **kwargs):
@@ -67,6 +68,12 @@ def compile_nvfp4_fwd(*args, **kwargs):
 
 def nvfp4_grid_ctas(*args, **kwargs):
     return load_kernel_symbol("nvfp4_fwd", "nvfp4_grid_ctas")(
+        *args, **kwargs
+    )
+
+
+def nvfp4_telemetry_values(*args, **kwargs):
+    return load_kernel_symbol("nvfp4_fwd", "nvfp4_telemetry_values")(
         *args, **kwargs
     )
 
@@ -153,11 +160,11 @@ def _tensor_scale_pack(tensor: torch.Tensor, mode: str) -> torch.Tensor:
     raise ValueError(f"unknown NVFP4 tensor scale mode {mode!r}")
 
 
-def _delayed_amax_state(tensor: torch.Tensor, slots: int) -> torch.Tensor:
-    """Bootstrap per-CTA delayed telemetry without a host synchronization."""
+def _delayed_amax_state(tensor: torch.Tensor, values: int) -> torch.Tensor:
+    """Bootstrap delayed telemetry/history without a host synchronization."""
 
     amax = torch.amax(torch.abs(tensor.detach().float())).reshape(1)
-    return amax.expand(slots).clone()
+    return amax.expand(values).clone()
 
 
 def _fallback_fused_config(
@@ -332,6 +339,8 @@ _DYNAMIC_RUNNERS: BoundedCache[tuple[object, ...], _DynamicRunner] = BoundedCach
 class _FusedDynamicRunner:
     launcher: object
     grid_ctas: int
+    telemetry_values: int
+    scalar_telemetry: bool
     dummy_telemetry: torch.Tensor | None = None
 
     def __call__(
@@ -348,6 +357,13 @@ class _FusedDynamicRunner:
             if self.dummy_telemetry is None:
                 raise RuntimeError("NVFP4 current-scale runner has no telemetry sink")
             x_amax = weight_amax = self.dummy_telemetry
+        elif self.scalar_telemetry:
+            # Stream-ordered raw CUDA operations keep mutable state preparation
+            # out of the eager/FX graph while avoiding a separate CuTe kernel.
+            from .fp8_bwd import _zero_tensor_async
+
+            _zero_tensor_async(x_amax)
+            _zero_tensor_async(weight_amax)
         self.launcher(
             x,
             weight,
@@ -380,6 +396,8 @@ def _make_fused_dynamic_runner(
     return _FusedDynamicRunner(
         compile_nvfp4_fwd(problem, config),
         nvfp4_grid_ctas(problem, config),
+        nvfp4_telemetry_values(problem, config) if config.collect_amax else 0,
+        bool(config.collect_amax and config.telemetry_layout == "scalar_atomic"),
         dummy_telemetry,
     )
 
@@ -714,9 +732,10 @@ def _launch_nvfp4_forward_delayed_out(
         ("next_x_amax_state", next_x_amax_state),
         ("next_weight_amax_state", next_weight_amax_state),
     ):
-        if value.numel() != runner.grid_ctas:
+        if value.numel() != runner.telemetry_values:
             raise ValueError(
-                f"{name} has {value.numel()} slots, expected {runner.grid_ctas}"
+                f"{name} has {value.numel()} values, expected "
+                f"{runner.telemetry_values}"
             )
     out = torch.empty((problem.m, problem.n), dtype=torch.bfloat16, device=x.device)
     if next_x_amax_state.data_ptr() == x_amax_state.data_ptr():
@@ -1584,8 +1603,12 @@ def nvfp4_linear(
     *,
     forward_config: NVFP4FwdConfig | None = None,
     backward_config: "MXFP8BwdConfig | None" = None,
+    scaling: Literal["current", "block"] = "current",
 ) -> torch.Tensor:
     """Apply NVFP4 forward and MXFP8 backward to BF16 or packed operands."""
+
+    if scaling not in ("current", "block"):
+        raise ValueError("functional NVFP4 scaling must be current or block")
 
     if isinstance(weight, NVFP4Tensor):
         validate_nvfp4_tensor(weight)
@@ -1631,7 +1654,11 @@ def nvfp4_linear(
             raise RuntimeError("prequantized NVFP4 weights are inference-only")
         leading = x.shape[:-1]
         x_2d = x.reshape(-1, k)
-        x_scale = _current_tensor_scale(x_2d)
+        x_scale = (
+            x_2d.new_ones(1, dtype=torch.float32)
+            if scaling == "block"
+            else _current_tensor_scale(x_2d)
+        )
         weight_scale = nvfp4_tensor_scale(weight).reshape(1)
         output_scale = x_scale * weight_scale
         out = _nvfp4_linear_dynamic_x_prequant_w_op(
@@ -1679,12 +1706,20 @@ def nvfp4_linear(
         if backward_config is not None
         else _backward_config_key(_autotune_mode(None), None, None)
     )
+    fixed_scale_pack = None
+    if scaling == "block":
+        # Compiler-visible constant construction is folded/hoisted by
+        # Inductor. Stateful delayed scaling remains an nn.Module policy.
+        fixed_scale_pack = x.new_tensor(
+            (1.0, 1.0, 1.0 / 6.0), dtype=torch.float32
+        )
     return _nvfp4_dynamic_linear_with_keys(
         x,
         weight,
         forward_key=forward_key,
         backward_key=backward_key,
         tensor_scale_mode=tensor_scale_mode,
+        fixed_scale_pack=fixed_scale_pack,
     )
 
 
@@ -1695,6 +1730,7 @@ def _nvfp4_dynamic_linear_with_keys(
     forward_key: str,
     backward_key: str,
     tensor_scale_mode: str,
+    fixed_scale_pack: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compiler-visible current scaling around launch-only NVFP4 operators."""
 
@@ -1704,8 +1740,13 @@ def _nvfp4_dynamic_linear_with_keys(
     # These reductions and pointwise expressions intentionally remain in FX.
     # Inductor owns their fusion and schedules only the final CuTe launch as an
     # external kernel; none of this eager tensor work is hidden in registration.
-    x_scale = _tensor_scale_pack(x_2d, tensor_scale_mode)
-    weight_scale = _tensor_scale_pack(weight, tensor_scale_mode)
+    if fixed_scale_pack is None:
+        x_scale = _tensor_scale_pack(x_2d, tensor_scale_mode)
+        weight_scale = _tensor_scale_pack(weight, tensor_scale_mode)
+    else:
+        if fixed_scale_pack.dtype is not torch.float32:
+            raise TypeError("block-only NVFP4 scale pack must use FP32")
+        x_scale = weight_scale = fixed_scale_pack
     if torch.is_grad_enabled() and (x_2d.requires_grad or weight.requires_grad):
         out = _nvfp4_linear_train_op(
             x_2d,
@@ -1745,7 +1786,7 @@ class NVFP4Linear(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
         forward_config: NVFP4FwdConfig | None = None,
         backward_config: "MXFP8BwdConfig | None" = None,
-        scaling: Literal["delayed", "current"] = "delayed",
+        scaling: ScalingMode = "delayed",
         packed_weight: NVFP4Tensor | None = None,
     ) -> None:
         super().__init__()
@@ -1757,8 +1798,8 @@ class NVFP4Linear(nn.Module):
             raise TypeError(f"NVFP4Linear parameters must be BF16, got {dtype}")
         self.in_features = int(in_features)
         self.out_features = int(out_features)
-        if scaling not in ("delayed", "current"):
-            raise ValueError("NVFP4 scaling must be delayed or current")
+        if scaling not in ("delayed", "current", "block"):
+            raise ValueError("NVFP4 scaling must be delayed, current, or block")
         self.forward_config = forward_config
         self.backward_config = backward_config
         self.scaling = scaling
@@ -1767,6 +1808,15 @@ class NVFP4Linear(nn.Module):
         )
         self._tensor_scale_mode = (
             "power2" if forward_config is None else forward_config.tensor_scale_mode
+        )
+        self.register_buffer(
+            "_block_scale_pack",
+            torch.tensor(
+                (1.0, 1.0, 1.0 / 6.0),
+                dtype=torch.float32,
+                device=device,
+            ),
+            persistent=False,
         )
         from .fp8 import _autotune_mode, _backward_config_key
         from .fp8_bwd import _intern_bwd_config
@@ -2011,8 +2061,12 @@ class NVFP4Linear(nn.Module):
                 raise RuntimeError("prequantized NVFP4 weights are inference-only")
             leading_shape = x.shape[:-1]
             x_2d = x.reshape(-1, self.in_features)
-            x_scale = _current_tensor_scale(x_2d)
-            output_scale = x_scale * self.weight_tensor_scale.reshape(1)
+            if self.scaling == "block":
+                x_scale = self._block_scale_pack[:1]
+                output_scale = self.weight_tensor_scale.reshape(1)
+            else:
+                x_scale = _current_tensor_scale(x_2d)
+                output_scale = x_scale * self.weight_tensor_scale.reshape(1)
             out = _nvfp4_linear_dynamic_x_prequant_w_op(
                 x_2d,
                 _packed_fp4_view(self.weight_data),
@@ -2072,10 +2126,12 @@ class NVFP4Linear(nn.Module):
                             collect_amax=True,
                         )
                     )
-                    slots = nvfp4_grid_ctas(problem, fused_config)
-                    self._x_amax_state = _delayed_amax_state(x_2d, slots)
+                    state_values = nvfp4_telemetry_values(problem, fused_config)
+                    self._x_amax_state = _delayed_amax_state(
+                        x_2d, state_values
+                    )
                     self._weight_amax_state = _delayed_amax_state(
-                        self.weight, slots
+                        self.weight, state_values
                     )
                     self._next_x_amax_state = torch.empty_like(
                         self._x_amax_state
@@ -2110,12 +2166,16 @@ class NVFP4Linear(nn.Module):
             forward_key=self._forward_config_key,
             backward_key=self._backward_config_key,
             tensor_scale_mode=self._tensor_scale_mode,
+            fixed_scale_pack=(
+                self._block_scale_pack if self.scaling == "block" else None
+            ),
         )
 
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias=False, forward=NVFP4, backward=MXFP8, weight_mode={self.weight_mode}"
+            f"bias=False, forward=NVFP4, backward=MXFP8, "
+            f"weight_mode={self.weight_mode}, scaling={self.scaling}"
         )
 
 

@@ -532,6 +532,26 @@ def make_mxfp8_fwd_adapter(
                 ),
                 quantizer_registers=config.quantizer_registers,
             )
+        delayed_enabled = bool(getattr(config, "collect_amax", False))
+        telemetry_slots = (
+            1
+            if getattr(config, "telemetry_layout", "per_cta")
+            == "scalar_atomic"
+            else grid_ctas
+        )
+        history_len = int(getattr(config, "amax_history_len", 1))
+        history_reads = (
+            1
+            if getattr(config, "amax_history_algo", "most_recent")
+            == "most_recent"
+            else history_len
+        )
+        owner_only = (
+            getattr(config, "telemetry_ownership", "all")
+            == "operand_owner"
+        )
+        m_tiles = (problem.m + config.tile_m - 1) // config.tile_m
+        n_tiles = (problem.n + config.tile_n - 1) // config.tile_n
         values.update(
             launch_resource_features(
                 profile=profile,
@@ -587,17 +607,33 @@ def make_mxfp8_fwd_adapter(
             ),
             pipeline_buffer_bytes=float(_fused_smem_bytes(config)),
             delayed_telemetry_slots=float(
-                grid_ctas if getattr(config, "collect_amax", False) else 0
+                telemetry_slots if delayed_enabled else 0
             ),
             delayed_telemetry_state_bytes=float(
-                grid_ctas * 2 * 4
-                if getattr(config, "collect_amax", False)
-                else 0
+                telemetry_slots * history_len * 2 * 4
+                if delayed_enabled else 0
             ),
             delayed_telemetry_l2_read_bytes=float(
-                grid_ctas * grid_ctas * 2 * 4
-                if getattr(config, "collect_amax", False)
+                grid_ctas * telemetry_slots * history_reads * 2 * 4
+                if delayed_enabled else 0
+            ),
+            delayed_telemetry_memsets=float(
+                2
+                if delayed_enabled
+                and getattr(config, "telemetry_layout", "per_cta")
+                == "scalar_atomic"
                 else 0
+            ),
+            delayed_x_observer_fraction=float(
+                1.0 / n_tiles if delayed_enabled and owner_only else 1.0
+                if delayed_enabled else 0.0
+            ),
+            delayed_weight_observer_fraction=float(
+                1.0 / m_tiles if delayed_enabled and owner_only else 1.0
+                if delayed_enabled else 0.0
+            ),
+            delayed_atomic_contention_slots=float(
+                telemetry_slots if delayed_enabled else 0
             ),
             delayed_scale_prepare_launches=0.0,
             total_kernel_launches=1.0,

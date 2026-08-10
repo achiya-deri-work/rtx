@@ -67,6 +67,9 @@ def main() -> None:
         "current_power2": rtx.NVFP4Linear(
             features, features, device="cuda", scaling="current"
         ),
+        "block_only": rtx.NVFP4Linear(
+            features, features, device="cuda", scaling="block"
+        ),
     }
     for model in models.values():
         with torch.no_grad():
@@ -109,7 +112,12 @@ def main() -> None:
         }
     bf16_final = float(summaries["bf16"]["final_median"])
     passed = bool(summaries["bf16"]["finite"])
-    for name in ("delayed_power2", "delayed_exact", "current_power2"):
+    for name in (
+        "delayed_power2",
+        "delayed_exact",
+        "current_power2",
+        "block_only",
+    ):
         result = summaries[name]
         result["final_over_bf16"] = float(result["final_median"]) / bf16_final
         passed = passed and bool(result["finite"])

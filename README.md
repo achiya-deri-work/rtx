@@ -9,9 +9,9 @@ current implementation contains:
   persistent three-role TMA producer/quantizer/MMA schedules and staged async
   TMA epilogues;
 - fused BF16-to-NVFP4 training forward with packed E2M1 operands, E4M3
-  block scales, delayed power-of-two FP32 tensor scales, in-kernel amax
-  telemetry, and a native K=64 block-scaled MMA; NVFP4 training reuses the
-  MXFP8 backward kernels;
+  block scales, block-only/current/delayed FP32 tensor-scale policies,
+  rolling in-kernel amax telemetry, and a native K=64 block-scaled MMA;
+  NVFP4 training reuses the MXFP8 backward kernels;
 - materialized dynamic MXFP8 quantization plus GEMM, including autotunable
   one-to-four-stage mainloops and epilogues, locality scheduling, and up to
   eight output tiles per persistent CTA;
@@ -185,15 +185,25 @@ master weight.
 
 Both formats implement all three state boundaries. Dynamic NVFP4 training uses
 delayed tensorwise scaling by default: the first call bootstraps from current
-amax, then each fused forward emits per-CTA X/W amax into the alternate half of
-a non-aliasing double buffer. The following forward reduces that tiny
-L2-resident state and prepares its power-of-two scale inside the CTA, so
-steady-state delayed scaling remains a single launch without a device-wide
-barrier. Set `scaling="current"` to recompute tensor scales just in time instead.
+amax, then each fused forward rotates a 16-entry history and emits X/W amax into
+the alternate non-aliasing buffer. The default scalar-atomic topology keeps one
+FP32 value per operand and history generation; an autotunable per-CTA topology
+avoids the two stream-ordered async clears and can win on small grids. X
+telemetry is observed only by `block_n == 0` work and W telemetry only by
+`block_m == 0`, removing duplicated observations across output tiles. The next
+forward prepares its power-of-two scale from the history inside each CTA,
+without a device-wide barrier or scale-preparation kernel.
+
+Set `scaling="current"` to recompute tensor scales just in time. Set
+`scaling="block"` to use an implicit global scale of one and rely only on the
+1x16 E4M3 block scales, eliminating both tensor-wide reductions. Block-only is
+the fastest policy when values stay inside the E4M3 scale exponent range;
+current scaling remains the numerical reference for extreme/tiny ranges.
 An explicit `NVFP4FwdConfig(tensor_scale_mode="exact")` retains the exact
 TorchAO tensorwise FP32 scale for controlled studies; power-of-two is the
-default because its reciprocal is exact and cheaper. Dynamic inference always
-uses current scaling; AOT-weight and fully packed inference use the tensor
+default because its reciprocal is exact and cheaper. A dynamic module honors
+its selected policy during inference; AOT-weight dynamic-X inference supports
+current or block-only X scaling, and fully packed inference uses the tensor
 scale stored in TorchAO's `NVFP4Tensor`.
 
 All four NVFP4 runtime paths support

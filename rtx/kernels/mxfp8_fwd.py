@@ -989,17 +989,23 @@ class MXFP8LinearFwdKernel:
         if cutlass.const_expr(
             self.nvfp4 and self.config.collect_amax
         ):
-            # Generation t consumes one raw-amax slot from every CTA in
-            # generation t-1. Warp zero performs the tiny L2-resident reduction
-            # cooperatively, then broadcasts the prepared power-of-two scale
-            # through SMEM. Each CTA owns one fresh output slot, so telemetry
-            # never needs a grid barrier or a separate reset/prepare launch.
+            # Generation t consumes the configured history from generation
+            # t-1. ``per_cta`` is self-resetting and preserves the original
+            # barrier-free ABI. ``scalar_atomic`` reads one global slot per
+            # history entry; the launch wrapper clears its fresh slot with an
+            # asynchronous stream-ordered memset before entering this kernel.
             prior_x_amax = Float32(0.0)
             prior_weight_amax = Float32(0.0)
+            telemetry_slots = self.grid_ctas
+            if cutlass.const_expr(cfg.telemetry_layout == "scalar_atomic"):
+                telemetry_slots = 1
+            history_entries = cfg.amax_history_len
+            if cutlass.const_expr(cfg.amax_history_algo == "most_recent"):
+                history_entries = 1
             if warp_idx == 0:
                 for telemetry_idx in cutlass.range(
                     lane_idx,
-                    self.grid_ctas,
+                    telemetry_slots * history_entries,
                     32,
                     unroll=1,
                 ):
@@ -1038,8 +1044,33 @@ class MXFP8LinearFwdKernel:
                     storage.delayed_scale[3] = weight_scale
                     storage.delayed_scale[4] = weight_inverse
                     storage.delayed_scale[5] = weight_multiplier
-                    x_amax_out[linear_tile] = Float32(0.0)
-                    weight_amax_out[linear_tile] = Float32(0.0)
+                    if cutlass.const_expr(cfg.telemetry_layout == "per_cta"):
+                        x_amax_out[linear_tile] = Float32(0.0)
+                        weight_amax_out[linear_tile] = Float32(0.0)
+                        for history_idx in cutlass.range_constexpr(
+                            1, cfg.amax_history_len
+                        ):
+                            next_idx = history_idx * telemetry_slots + linear_tile
+                            prior_idx = (
+                                (history_idx - 1) * telemetry_slots + linear_tile
+                            )
+                            x_amax_out[next_idx] = x_tensor_scale[prior_idx]
+                            weight_amax_out[next_idx] = weight_tensor_scale[
+                                prior_idx
+                            ]
+                    elif linear_tile == 0:
+                        # Slot zero was cleared by the wrapper. CTA zero only
+                        # rotates immutable older generations while all CTAs
+                        # may atomically contribute to the fresh slot.
+                        for history_idx in cutlass.range_constexpr(
+                            1, cfg.amax_history_len
+                        ):
+                            x_amax_out[history_idx] = x_tensor_scale[
+                                history_idx - 1
+                            ]
+                            weight_amax_out[history_idx] = weight_tensor_scale[
+                                history_idx - 1
+                            ]
             cute.arch.sync_threads()
             x_tensor_scale_value = Float32(storage.delayed_scale[0])
             weight_tensor_scale_value = Float32(storage.delayed_scale[3])
@@ -1865,13 +1896,19 @@ class MXFP8LinearFwdKernel:
                         self.nvfp4 and self.config.collect_amax
                     ):
                         if is_a:
-                            warp_amax_a = cute.arch.fmax(
-                                warp_amax_a, amax, nan=True
-                            )
+                            if cutlass.const_expr(
+                                cfg.telemetry_ownership == "all"
+                            ) or block_n == 0:
+                                warp_amax_a = cute.arch.fmax(
+                                    warp_amax_a, amax, nan=True
+                                )
                         else:
-                            warp_amax_b = cute.arch.fmax(
-                                warp_amax_b, amax, nan=True
-                            )
+                            if cutlass.const_expr(
+                                cfg.telemetry_ownership == "all"
+                            ) or block_m == 0:
+                                warp_amax_b = cute.arch.fmax(
+                                    warp_amax_b, amax, nan=True
+                                )
                     if cutlass.const_expr(self.nvfp4):
                         tensor_scale = (
                             x_tensor_scale_value
@@ -2008,16 +2045,21 @@ class MXFP8LinearFwdKernel:
                         Int32(0xFFFFFFFF),
                     ).bitcast(Float32)
                     if lane_idx == 0:
+                        telemetry_index = linear_tile
+                        if cutlass.const_expr(
+                            cfg.telemetry_layout == "scalar_atomic"
+                        ):
+                            telemetry_index = 0
                         cute.arch.atomic_fmax(
                             x_amax_out.iterator
-                            + x_amax_out.layout(linear_tile),
+                            + x_amax_out.layout(telemetry_index),
                             warp_amax_a,
                             sign_bit=False,
                             scope="gpu",
                         )
                         cute.arch.atomic_fmax(
                             weight_amax_out.iterator
-                            + weight_amax_out.layout(linear_tile),
+                            + weight_amax_out.layout(telemetry_index),
                             warp_amax_b,
                             sign_bit=False,
                             scope="gpu",

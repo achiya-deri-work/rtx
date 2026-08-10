@@ -49,11 +49,15 @@ def compile_nvfp4_fwd(
         stride=(problem.n, 1),
         assumed_align=16,
     )
-    scale_values = kernel.grid_ctas if config.collect_amax else 3
+    telemetry_slots = (
+        1 if config.telemetry_layout == "scalar_atomic" else kernel.grid_ctas
+    )
+    state_values = telemetry_slots * config.amax_history_len
+    scale_values = state_values if config.collect_amax else 3
     tensor_scale = cute.runtime.make_fake_tensor(
         Float32, (scale_values,), stride=(1,), assumed_align=4
     )
-    telemetry_values = kernel.grid_ctas if config.collect_amax else 1
+    telemetry_values = state_values if config.collect_amax else 1
     amax = cute.runtime.make_fake_tensor(
         Float32, (telemetry_values,), stride=(1,), assumed_align=4
     )
@@ -79,9 +83,21 @@ def nvfp4_grid_ctas(problem: NVFP4Problem, config: NVFP4FwdConfig) -> int:
     return NVFP4LinearFwdKernel(problem, config).grid_ctas
 
 
+def nvfp4_telemetry_values(
+    problem: NVFP4Problem, config: NVFP4FwdConfig
+) -> int:
+    """Return FP32 values in one X or W delayed-history buffer."""
+
+    slots = 1 if config.telemetry_layout == "scalar_atomic" else nvfp4_grid_ctas(
+        problem, config
+    )
+    return slots * config.amax_history_len
+
+
 __all__ = [
     "NVFP4FwdConfig",
     "NVFP4LinearFwdKernel",
     "compile_nvfp4_fwd",
     "nvfp4_grid_ctas",
+    "nvfp4_telemetry_values",
 ]
