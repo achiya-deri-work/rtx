@@ -28,6 +28,10 @@ from .outcomes import TrialOutcome
 
 
 PRETRAINED_SCHEMA_VERSION = 1
+# Bump this whenever training, validation, or deployment semantics change in a
+# way that can alter how an otherwise identical set of model files is used.
+# Schema version describes readability; trainer revision describes behavior.
+PRETRAINED_TRAINER_REVISION = 2
 _ALL_FAILURES = (
     "compile_error",
     "runtime_error",
@@ -1413,6 +1417,7 @@ def train_pretrained_bundle(
         }
     manifest = {
         "schema_version": PRETRAINED_SCHEMA_VERSION,
+        "trainer_revision": PRETRAINED_TRAINER_REVISION,
         "type": "rtx_pretrained_autotune_bundle",
         "recorded_at": _utc_now(),
         "seed": seed,
@@ -1438,10 +1443,24 @@ def train_pretrained_bundle(
         canonical_json(
             {
                 "schema_version": PRETRAINED_SCHEMA_VERSION,
+                "trainer_revision": PRETRAINED_TRAINER_REVISION,
                 "seed": seed,
                 "dataset_sha256": load_report["dataset_sha256"],
+                "training": manifest["training"],
                 "files": {
                     key: value["files_sha256"]
+                    for key, value in sorted(families.items())
+                },
+                "deployment": {
+                    key: {
+                        "global": value["deployment"],
+                        "devices": {
+                            device: device_value["deployment"]
+                            for device, device_value in sorted(
+                                value["device_models"].items()
+                            )
+                        },
+                    }
                     for key, value in sorted(families.items())
                 },
             }
@@ -1457,6 +1476,7 @@ __all__ = [
     "ContextRankingModel",
     "NormalizedCostModel",
     "PRETRAINED_SCHEMA_VERSION",
+    "PRETRAINED_TRAINER_REVISION",
     "PretrainedFamilyModels",
     "analytical_baseline_ms",
     "evaluate_latency_model",

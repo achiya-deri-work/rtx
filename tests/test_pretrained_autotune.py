@@ -241,6 +241,7 @@ class PretrainedAutotuneTests(unittest.TestCase):
             )
             self.assertIn("toy@7", manifest["families"])
             self.assertEqual(len(manifest["artifact_id"]), 24)
+            self.assertEqual(manifest["trainer_revision"], 2)
             self.assertTrue(manifest["input"]["dataset_sha256"])
             self.assertEqual(
                 len(manifest["families"]["toy@7"]["files_sha256"]), 4
