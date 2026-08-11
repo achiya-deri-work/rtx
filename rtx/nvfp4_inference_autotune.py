@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 from typing import Mapping
@@ -18,7 +18,7 @@ from .prequant_autotune import PREQUANT_SEARCH_SPACE
 
 
 NVFP4_INFERENCE_KERNEL_REVISION = 1
-NVFP4_DYNAMIC_KERNEL_REVISION = 3
+NVFP4_DYNAMIC_KERNEL_REVISION = 4
 
 
 def _gemm_axes() -> dict[str, tuple[dict[str, object], ...]]:
@@ -26,9 +26,12 @@ def _gemm_axes() -> dict[str, tuple[dict[str, object], ...]]:
         "gemm_geometry",
         "gemm_stages",
         "ldmatrix",
+        "mma_schedule",
         "smem_swizzle",
         "scale_s2r",
         "scale_schedule",
+        "scale_recycle",
+        "scale_smem_store",
         "scale_cache",
         "gemm_registers",
         "producer_registers",
@@ -119,12 +122,73 @@ _QUANT_SCALE_COMPUTE = tuple(
     for mode in ("redundant", "leader_broadcast")
 )
 
-# A compound implementation anchor keeps the tuner from having to rediscover
-# a known-good materialized-GEMM basin one independent coordinate at a time.
-# It is deliberately a seed, not a hard-coded winner: every field remains
-# mutable through the ordinary axes below, and device/shape-specific results
-# still have to win measurement and confirmation.
+_NATIVE_DYNAMIC_ANCHOR = NVFP4DynamicConfig(
+    quant=NVFP4QuantConfig(
+        values_per_lane=8,
+        load_bits=16,
+        reduction="shuffle",
+        num_warps=8,
+        persistent_waves=6,
+        maxrregcount=128,
+        scale_layout="mma128",
+    ),
+    gemm=NVFP4GemmConfig(
+        tile_m=128,
+        tile_n=128,
+        tile_k=128,
+        atom_layout_m=8,
+        atom_layout_n=2,
+        stages=3,
+        a_ldmatrix_matrices=4,
+        b_ldmatrix_matrices=2,
+        a_swizzle="64b",
+        b_swizzle="64b",
+        scale_role="tma",
+        scale_layout="mma128",
+        sfa_s2r_bits=0,
+        sfb_s2r_bits=8,
+        producer_registers=24,
+        consumer_registers=128,
+        maxrregcount=192,
+        epilogue="tma",
+        epilogue_stages=1,
+        store_vec=4,
+        raster="n",
+        grid_swizzle=2,
+        tiles_per_cta=4,
+        tile_locality="same_b",
+        persistent_waves=1,
+    ),
+    quant_launches="dual",
+)
+
+
+# Compound implementation anchors keep the tuner from having to rediscover
+# known-good materialized-GEMM basins one independent coordinate at a time.
+# They are seeds, not hard-coded winners: every field remains mutable through
+# the ordinary axes below, and device/shape-specific results still have to win
+# measurement and confirmation.
 _DYNAMIC_IMPLEMENTATION_ANCHORS = (
+    # Native physical E4M3 scales let the GEMM's producer warp move operands
+    # and scales through the same TMA pipeline.  Three stages are decisive on
+    # SM120: the older one-stage native-scale comparison could not overlap the
+    # transfers and incorrectly made consumer-side scalar staging look faster.
+    asdict(_NATIVE_DYNAMIC_ANCHOR),
+    # Large CTA grids can profit from a higher persistent wave floor.  Keep a
+    # second seed because the best grid is discontinuous: on the 5070 Ti the
+    # 576-tile asymmetric probe drops from 68.8 to 54.9 us at three waves,
+    # while the 144-tile square probe prefers the one-wave balanced grid.
+    asdict(
+        replace(
+            _NATIVE_DYNAMIC_ANCHOR,
+            gemm=replace(
+                _NATIVE_DYNAMIC_ANCHOR.gemm,
+                persistent_waves=3,
+            ),
+        )
+    ),
+    # Row-major scales remain useful for shapes which cannot use mma128 and as
+    # an independent fallback basin on future SM12x devices.
     asdict(
         NVFP4DynamicConfig(
             quant=NVFP4QuantConfig(

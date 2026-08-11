@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover - Linux/CUDA is the supported target.
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_prequant_e2e"
-KERNEL_REVISION = 5
+KERNEL_REVISION = 6
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -186,6 +186,10 @@ PREQUANT_SEARCH_SPACE: dict[str, tuple[dict[str, object], ...]] = {
         for a in (1, 2, 4)
         for b in (1, 2, 4)
     ),
+    "mma_schedule": tuple(
+        {"gemm": {"mma_schedule": value}}
+        for value in ("interleaved", "preload")
+    ),
     "smem_swizzle": tuple(
         {"gemm": {"a_swizzle": a, "b_swizzle": b}}
         for a in ("none", "32b", "64b", "128b")
@@ -200,6 +204,24 @@ PREQUANT_SEARCH_SPACE: dict[str, tuple[dict[str, object], ...]] = {
         {"gemm": {"scale_schedule": schedule, "scale_load_vec": width}}
         for schedule in ("before_wait", "after_wait")
         for width in (1, 2, 4, 8)
+    ),
+    "scale_recycle": (
+        {"gemm": {"scale_recycle": "barrier"}},
+        {"gemm": {"scale_recycle": "staged", "stages": 2}},
+        {"gemm": {"scale_recycle": "staged", "stages": 3}},
+    ),
+    "scale_smem_store": (
+        {"gemm": {"scale_smem_store": "scalar"}},
+        *(
+            {
+                "gemm": {
+                    "scale_smem_store": "packed",
+                    "scale_role": "consumers",
+                    "scale_load_vec": width,
+                }
+            }
+            for width in (2, 4, 8)
+        ),
     ),
     "scale_cache": tuple(
         {"gemm": value}

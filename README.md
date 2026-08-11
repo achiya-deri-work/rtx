@@ -214,15 +214,16 @@ coordinate and can be varied independently of the CTA schedule. Set
 1x16 E4M3 block scales, eliminating both tensor-wide reductions. Block-only is
 the fastest policy when values stay inside the E4M3 scale exponent range;
 current scaling remains the tensorwide numerical reference for extreme/tiny ranges.
-For dynamic BF16 operands, `backend="auto"` selects a pointer-free three-kernel
-block path (dual, independent, or concurrent X/W quantizers plus native NVFP4 GEMM) for
-block-only execution. Its quantizer launch topology,
+For dynamic BF16 operands, `backend="auto"` selects a pointer-free materialized
+block path for block-only execution: either one dual X/W quantizer or two
+independent/concurrent quantizers, followed by native NVFP4 GEMM. Its quantizer launch topology,
 vector/reduction/register/scale-math schedule, native or row-major scale
 transport, GEMM SMEM/RMEM geometry, TMA/mainloop/epilogue schedule, balanced
 SM-count persistence, locality, and L2 fetch policy form the
-`nvfp4_dynamic_fwd` autotuning family. A compound materialized implementation
-anchor is measured early, then remains fully mutable; it prevents a learned
-search from spending its entire budget in the older non-persistent basin.
+`nvfp4_dynamic_fwd` autotuning family. Native-layout one-wave and three-wave
+anchors plus a row-major fallback are measured early, then remain fully
+mutable; they prevent a learned search from spending its entire budget in the
+older consumer-staged or non-persistent basins.
 `backend="fused"`
 remains available for delayed telemetry and controlled fused-kernel studies.
 An explicit `NVFP4FwdConfig(tensor_scale_mode="exact")` retains the exact
@@ -233,14 +234,19 @@ current or block-only X scaling (regional prequantized-W epilogues are not yet
 implemented), and fully packed inference uses the tensor
 scale stored in TorchAO's `NVFP4Tensor`.
 
-On the 70-SM RTX 5070 Ti used for the revision-3 study, verified hot-input
-block-only winners beat the compiled MXFP8 frontend at every sampled
-`N=K=1536` shape: 20.34 vs 24.05 us at M=128 (1.182x), 20.90 vs 24.79 us at
-M=512 (1.186x), 36.30 vs 40.97 us at M=1536 (1.129x), and 154.51 vs 170.02 us
-at M=8192 (1.100x). The NVFP4 output had cosine similarity about 0.991 and
-normalized RMSE about 0.134 against FP32. These are device/shape-specific
-measurements, not portable defaults; runtime winners remain keyed by the exact
-hardware/software fingerprint and shape.
+On the 70-SM RTX 5070 Ti used for the revision-4 study, putting E4M3 scales
+directly in tensor-core-native physical layout and moving them through the
+three-stage operand TMA pipeline changed the winning basin. Against the current
+materialized MXFP8 baseline, verified hot-input `N=K=1536` timings were 10.30
+vs 15.62 us at M=128 (1.516x), 11.51 vs 16.69 us at M=512 (1.450x), 24.71 vs
+40.58 us at M=1536 (1.642x), and 109.89 vs 170.90 us at M=8192 (1.555x).
+Rotated-input speedups on those shapes were 1.506x, 1.360x, 1.465x, and
+1.549x. A 15-sample rotated `(1536, 6144, 1536)` confirmation used the
+three-wave anchor and measured 85.07 vs 130.15 us (1.530x). The NVFP4 output
+had cosine similarity about 0.991 and normalized RMSE about 0.134 against
+FP32. These are device/shape-specific measurements, not portable defaults;
+runtime winners remain keyed by the exact hardware/software fingerprint and
+shape.
 
 All four NVFP4 runtime paths support
 `torch.compile(fullgraph=True, dynamic=False)`. Current/JIT scale arithmetic is

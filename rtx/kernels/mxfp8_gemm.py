@@ -22,6 +22,7 @@ from cutlass import (
     Float8E4M3FN,
     Float8E8M0FNU,
     Float32,
+    Int16,
     Int32,
     Int64,
     Uint8,
@@ -328,6 +329,7 @@ class MXFP8GemmKernel:
                                 (k_block + vec) * self.sf_vec_size,
                                 stage,
                             ] = Uint8(0).bitcast(self.sf_dtype)
+
                 else:
                     if global_row < row_limit:
                         src_row = sw[global_row, None]
@@ -352,6 +354,60 @@ class MXFP8GemmKernel:
                                 (k_block + vec) * self.sf_vec_size,
                                 stage,
                             ] = Uint8(0).bitcast(self.sf_dtype)
+
+    @cute.jit
+    def _store_consumer_scale_chunk(
+        self,
+        destination: cute.Tensor,
+        row: Int32,
+        k_block: Int32,
+        stage: Int32,
+        loaded: cute.Tensor,
+    ) -> None:
+        """Store one contiguous GMEM scale chunk into native SMEM layout."""
+
+        cfg = self.config
+        if cutlass.const_expr(cfg.scale_smem_store == "packed"):
+            if cutlass.const_expr(cfg.scale_load_vec == 2):
+                packed = Int32(loaded[0].bitcast(Uint8)) | (
+                    Int32(loaded[1].bitcast(Uint8)) << 8
+                )
+                nvvm.store_ext(
+                    Int16(packed),
+                    destination.iterator
+                    + destination.layout(
+                        (row, k_block * self.sf_vec_size, stage)
+                    ),
+                )
+            else:
+                for group in cutlass.range_constexpr(
+                    cfg.scale_load_vec // 4
+                ):
+                    first = group * 4
+                    packed = (
+                        Int32(loaded[first].bitcast(Uint8))
+                        | (Int32(loaded[first + 1].bitcast(Uint8)) << 8)
+                        | (Int32(loaded[first + 2].bitcast(Uint8)) << 16)
+                        | (Int32(loaded[first + 3].bitcast(Uint8)) << 24)
+                    )
+                    nvvm.store_ext(
+                        packed,
+                        destination.iterator
+                        + destination.layout(
+                            (
+                                row,
+                                (k_block + first) * self.sf_vec_size,
+                                stage,
+                            )
+                        ),
+                    )
+        else:
+            for vec in cutlass.range_constexpr(cfg.scale_load_vec):
+                destination[
+                    row,
+                    (k_block + vec) * self.sf_vec_size,
+                    stage,
+                ] = loaded[vec]
 
     @cute.jit
     def __call__(
@@ -1046,14 +1102,13 @@ class MXFP8GemmKernel:
                                         evict=scale_evict,
                                         cache_modifier=scale_cache,
                                     ).bitcast(self.sf_dtype)
-                                    for vec in cutlass.range_constexpr(
-                                        cfg.scale_load_vec
-                                    ):
-                                        s_sfa[
-                                            row,
-                                            (k_block + vec) * self.sf_vec_size,
-                                            stage,
-                                        ] = loaded[vec]
+                                    self._store_consumer_scale_chunk(
+                                        s_sfa,
+                                        row,
+                                        k_block,
+                                        stage,
+                                        loaded,
+                                    )
                                 else:
                                     for vec in cutlass.range_constexpr(
                                         cfg.scale_load_vec
@@ -1075,14 +1130,13 @@ class MXFP8GemmKernel:
                                         evict=scale_evict,
                                         cache_modifier=scale_cache,
                                     ).bitcast(self.sf_dtype)
-                                    for vec in cutlass.range_constexpr(
-                                        cfg.scale_load_vec
-                                    ):
-                                        s_sfb[
-                                            row,
-                                            (k_block + vec) * self.sf_vec_size,
-                                            stage,
-                                        ] = loaded[vec]
+                                    self._store_consumer_scale_chunk(
+                                        s_sfb,
+                                        row,
+                                        k_block,
+                                        stage,
+                                        loaded,
+                                    )
                                 else:
                                     for vec in cutlass.range_constexpr(
                                         cfg.scale_load_vec
@@ -1100,41 +1154,103 @@ class MXFP8GemmKernel:
                     ):
                         ready = tma_pipeline.consumer_try_wait(consumer_state)
                         tma_pipeline.consumer_wait(consumer_state, ready)
-                    for k_block in cutlass.range_constexpr(mma_k_blocks_per_tile):
-                        cute.copy(
-                            copy_a,
-                            t_cs_a_copy[None, None, k_block, stage],
-                            t_cr_a_copy[None, None, k_block],
-                        )
-                        cute.copy(
-                            copy_b,
-                            t_cs_b_copy[None, None, k_block, stage],
-                            t_cr_b_copy[None, None, k_block],
-                        )
-                        cute.copy(
-                            copy_sfa,
-                            cute.filter_zeros(t_cs_sfa)[None, None, k_block, stage],
-                            cute.filter_zeros(t_cr_sfa_copy)[None, None, k_block],
-                        )
-                        cute.copy(
-                            copy_sfb,
-                            cute.filter_zeros(t_cs_sfb)[None, None, k_block, stage],
-                            cute.filter_zeros(t_cr_sfb_copy)[None, None, k_block],
-                        )
-                        cute.gemm(
-                            tiled_mma,
-                            accumulators,
-                            [
-                                t_cr_a[None, None, k_block],
-                                t_cr_sfa[None, None, k_block],
-                            ],
-                            [
-                                t_cr_b[None, None, k_block],
-                                t_cr_sfb[None, None, k_block],
-                            ],
-                            accumulators,
-                        )
-                    if cutlass.const_expr(cfg.scale_role == "consumers"):
+                    if cutlass.const_expr(cfg.mma_schedule == "preload"):
+                        for k_block in cutlass.range_constexpr(
+                            mma_k_blocks_per_tile
+                        ):
+                            cute.copy(
+                                copy_a,
+                                t_cs_a_copy[None, None, k_block, stage],
+                                t_cr_a_copy[None, None, k_block],
+                            )
+                            cute.copy(
+                                copy_b,
+                                t_cs_b_copy[None, None, k_block, stage],
+                                t_cr_b_copy[None, None, k_block],
+                            )
+                            cute.copy(
+                                copy_sfa,
+                                cute.filter_zeros(t_cs_sfa)[
+                                    None, None, k_block, stage
+                                ],
+                                cute.filter_zeros(t_cr_sfa_copy)[
+                                    None, None, k_block
+                                ],
+                            )
+                            cute.copy(
+                                copy_sfb,
+                                cute.filter_zeros(t_cs_sfb)[
+                                    None, None, k_block, stage
+                                ],
+                                cute.filter_zeros(t_cr_sfb_copy)[
+                                    None, None, k_block
+                                ],
+                            )
+                        for k_block in cutlass.range_constexpr(
+                            mma_k_blocks_per_tile
+                        ):
+                            cute.gemm(
+                                tiled_mma,
+                                accumulators,
+                                [
+                                    t_cr_a[None, None, k_block],
+                                    t_cr_sfa[None, None, k_block],
+                                ],
+                                [
+                                    t_cr_b[None, None, k_block],
+                                    t_cr_sfb[None, None, k_block],
+                                ],
+                                accumulators,
+                            )
+                    else:
+                        for k_block in cutlass.range_constexpr(
+                            mma_k_blocks_per_tile
+                        ):
+                            cute.copy(
+                                copy_a,
+                                t_cs_a_copy[None, None, k_block, stage],
+                                t_cr_a_copy[None, None, k_block],
+                            )
+                            cute.copy(
+                                copy_b,
+                                t_cs_b_copy[None, None, k_block, stage],
+                                t_cr_b_copy[None, None, k_block],
+                            )
+                            cute.copy(
+                                copy_sfa,
+                                cute.filter_zeros(t_cs_sfa)[
+                                    None, None, k_block, stage
+                                ],
+                                cute.filter_zeros(t_cr_sfa_copy)[
+                                    None, None, k_block
+                                ],
+                            )
+                            cute.copy(
+                                copy_sfb,
+                                cute.filter_zeros(t_cs_sfb)[
+                                    None, None, k_block, stage
+                                ],
+                                cute.filter_zeros(t_cr_sfb_copy)[
+                                    None, None, k_block
+                                ],
+                            )
+                            cute.gemm(
+                                tiled_mma,
+                                accumulators,
+                                [
+                                    t_cr_a[None, None, k_block],
+                                    t_cr_sfa[None, None, k_block],
+                                ],
+                                [
+                                    t_cr_b[None, None, k_block],
+                                    t_cr_sfb[None, None, k_block],
+                                ],
+                                accumulators,
+                            )
+                    if cutlass.const_expr(
+                        cfg.scale_role == "consumers"
+                        and cfg.scale_recycle == "barrier"
+                    ):
                         # Consumer warps write the next K tile's scales without
                         # passing through the TMA pipeline's empty barrier.  Do
                         # not let a fast warp recycle this scale stage while a

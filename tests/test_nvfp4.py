@@ -141,7 +141,7 @@ class NVFP4ConfigTests(unittest.TestCase):
             with self.subTest(family=family):
                 self.assertEqual(
                     _current_revision(family),
-                    3 if family == "nvfp4_dynamic_fwd" else 1,
+                    4 if family == "nvfp4_dynamic_fwd" else 1,
                 )
                 self.assertIsNone(
                     _config_rejection(
@@ -248,6 +248,11 @@ class NVFP4ConfigTests(unittest.TestCase):
             adapter.initial_config, anchor_update
         )
         self.assertIsNone(anchor.rejection(problem))
+        self.assertEqual(anchor.quant.scale_layout, "mma128")
+        self.assertEqual(anchor.gemm.scale_layout, "mma128")
+        self.assertEqual(anchor.gemm.scale_role, "tma")
+        self.assertEqual(anchor.gemm.stages, 3)
+        self.assertEqual(anchor.gemm.epilogue_stages, 1)
         self.assertEqual(anchor.gemm.persistent_waves, 1)
         self.assertEqual(anchor.gemm.tiles_per_cta, 4)
         features = adapter.features(anchor)
@@ -300,7 +305,10 @@ class NVFP4CudaTests(unittest.TestCase):
                 scale_role="tma",
             ),
         )
-        for name, config in (("balanced", anchor), ("native_scales", native)):
+        for name, config in (
+            ("balanced_native", anchor),
+            ("native_scales", native),
+        ):
             with self.subTest(schedule=name):
                 self.assertIsNone(config.rejection(problem))
                 result = harness.measure(config, samples=3, seed=1918)

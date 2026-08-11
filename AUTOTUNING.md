@@ -28,7 +28,9 @@ from both the quantizer and GEMM ABIs. Revision 3 adds native K=64/128/256
 geometry, exact-E4M3-LUT and approximate reciprocal paths, leader-broadcast
 scale computation, tensor-core-native physical scale emission with TMA scale
 transport, concurrent quantizer launches, component timings, and balanced
-SM-count GEMM grids.
+SM-count GEMM grids. Revision 4 adds independently selected MMA preload order,
+packed consumer scale stores, barrier-free multi-stage scale recycling, and a
+three-stage tensor-core-native scale/operand TMA basin.
 
 Balanced persistence separates the maximum work tiles per CTA from the launch
 grid. Given `T` output tiles, cap `C`, SM count `S`, and requested waves `W`,
@@ -38,12 +40,15 @@ as 72 CTAs on a 70-SM GPU. A one-wave, cap-four schedule instead launches 70
 CTAs and was the decisive M=1536 NVFP4 improvement. It is still a tuning
 coordinate: the long-M study selected a different schedule.
 
-The search includes a complete materialized implementation anchor based on a
-previous verified basin plus the balanced grid. This is a proposal seed, not a
-winner or legality rule. All fields remain mutable and the anchor must pass the
-same compile, correctness, timing, confirmation, and paired-race protocol as
-any other candidate. In the bounded M=1536 study it was reached on trial three
-and reduced the screened median from 61.47 to 36.02 us.
+The search includes one-wave and three-wave native-scale anchors plus the
+previous row-major consumer-staged anchor. These are proposal seeds, not
+winners or legality rules. All fields remain mutable and every anchor must pass
+the same compile, correctness, timing, confirmation, and paired-race protocol
+as any other candidate. On RTX 5070 Ti the one-wave native anchor is the
+24.7-us M=N=K=1536 basin; the three-wave variant is the 85.1-us rotated
+M=1536, N=6144, K=1536 basin. The discontinuity is why persistent wave count
+remains a measured coordinate rather than a shape heuristic baked into the
+kernel.
 
 The MXFP8 frontend has three selection modes:
 

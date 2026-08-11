@@ -18,7 +18,7 @@ from .configs import (
 from .prequant_autotune import PREQUANT_SEARCH_SPACE
 
 
-INFERENCE_KERNEL_REVISION = 3
+INFERENCE_KERNEL_REVISION = 4
 
 _WEIGHT_ACTIVE_AXES = (
     "layout_transport",
@@ -30,9 +30,12 @@ _WEIGHT_ACTIVE_AXES = (
     "gemm_geometry",
     "gemm_stages",
     "ldmatrix",
+    "mma_schedule",
     "smem_swizzle",
     "scale_s2r",
     "scale_schedule",
+    "scale_recycle",
+    "scale_smem_store",
     "scale_cache",
     "gemm_registers",
     "producer_registers",
@@ -48,9 +51,12 @@ _FULLY_ACTIVE_AXES = (
     "gemm_geometry",
     "gemm_stages",
     "ldmatrix",
+    "mma_schedule",
     "smem_swizzle",
     "scale_s2r",
     "scale_schedule",
+    "scale_recycle",
+    "scale_smem_store",
     "scale_cache",
     "gemm_registers",
     "producer_registers",

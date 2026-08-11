@@ -3,6 +3,22 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.15.0
+
+- Add independently autotunable interleaved/preload MMA issue order, packed
+  consumer scale stores, and barrier-free staged scale recycling to the shared
+  materialized GEMM. Reject invalid `setmaxnreg` values before reaching NVVM.
+- Promote tensor-core-native NVFP4 E4M3 scale emission into a three-stage TMA
+  operand/scale pipeline. Preserve the consumer-staged row-major path as a
+  fallback and expose both implementations through ordinary search axes.
+- Seed one-wave and three-wave native-scale persistence regimes so bounded
+  search covers both balanced small grids and throughput-oriented asymmetric
+  grids early. Advance the dynamic NVFP4 kernel revision to 4.
+- Verify hot and rotated `N=K=1536` speedups above 1.3x over the materialized
+  MXFP8 baseline at M=128, 512, 1536, and 8192 on RTX 5070 Ti. Confirm the
+  rotated `(1536, 6144, 1536)` three-wave schedule at 85.07 us versus 130.15
+  us (1.530x) with exact agreement to the NVFP4 reference.
+
 ## 0.14.0
 
 - Add balanced SM-count persistent grids to the shared materialized GEMM,

@@ -99,6 +99,47 @@ class PrequantAutotuneTests(unittest.TestCase):
         )
         self.assertIn("inactive", config.rejection(self.problem))
 
+    def test_scale_pipeline_coordinates_have_static_legality(self) -> None:
+        for coordinate in (
+            "mma_schedule",
+            "scale_recycle",
+            "scale_smem_store",
+        ):
+            self.assertIn(coordinate, PREQUANT_SEARCH_SPACE)
+        self.assertIsNone(
+            MXFP8GemmConfig(
+                stages=2,
+                scale_recycle="staged",
+                scale_smem_store="packed",
+                scale_load_vec=4,
+                mma_schedule="preload",
+            ).rejection(self.problem)
+        )
+        self.assertIn(
+            "2+ stages",
+            MXFP8GemmConfig(
+                stages=1,
+                scale_recycle="staged",
+            ).rejection(self.problem),
+        )
+        self.assertIn(
+            "vectorized",
+            MXFP8GemmConfig(
+                scale_smem_store="packed",
+                scale_load_vec=1,
+            ).rejection(self.problem),
+        )
+
+    def test_setmaxregister_values_are_rejected_before_compilation(self) -> None:
+        self.assertIn(
+            "between 24 and 256",
+            MXFP8GemmConfig(producer_registers=16).rejection(self.problem),
+        )
+        self.assertIn(
+            "multiple of 8",
+            MXFP8GemmConfig(consumer_registers=130).rejection(self.problem),
+        )
+
     def test_w_coordinate_can_cross_to_independent_launches(self) -> None:
         axes = {
             "w_registers": (

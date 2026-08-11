@@ -112,10 +112,13 @@ class MXFP8GemmConfig:
     b_swizzle: str = "64b"
     a_ldmatrix_matrices: int = 4
     b_ldmatrix_matrices: int = 4
+    mma_schedule: str = "interleaved"
     sfa_s2r_bits: int = 8
     sfb_s2r_bits: int = 8
     scale_schedule: str = "before_wait"
+    scale_recycle: str = "barrier"
     scale_load_vec: int = 4
+    scale_smem_store: str = "scalar"
     scale_l2_prefetch: str = "none"
     scale_l1_evict: str = "default"
     scale_cache: str = "default"
@@ -180,12 +183,26 @@ class MXFP8GemmConfig:
             return "A ldmatrix width must be x1, x2, or x4"
         if self.b_ldmatrix_matrices not in (1, 2, 4):
             return "B ldmatrix width must be x1, x2, or x4"
+        if self.mma_schedule not in ("interleaved", "preload"):
+            return "mma_schedule must be interleaved or preload"
         if self.sfa_s2r_bits not in (0, 8) or self.sfb_s2r_bits not in (0, 8):
             return "scale S2R widths must be auto or 8 bits"
         if self.scale_schedule not in ("after_wait", "before_wait"):
             return "scale_schedule must be after_wait or before_wait"
+        if self.scale_recycle not in ("barrier", "staged"):
+            return "scale_recycle must be barrier or staged"
+        if self.scale_recycle == "staged" and (
+            self.scale_role != "consumers" or self.stages < 2
+        ):
+            return "staged scale recycling requires consumer staging and 2+ stages"
         if self.scale_load_vec not in (1, 2, 4, 8):
             return "scale_load_vec must be x1, x2, x4, or x8"
+        if self.scale_smem_store not in ("scalar", "packed"):
+            return "scale_smem_store must be scalar or packed"
+        if self.scale_smem_store == "packed" and (
+            self.scale_role != "consumers" or self.scale_load_vec == 1
+        ):
+            return "packed scale SMEM stores require vectorized consumer staging"
         if (self.tile_k // self.scale_vector_size) % self.scale_load_vec:
             return "scale_load_vec must divide the K tile scale count"
         if self.scale_l2_prefetch not in ("none", "64b", "128b", "256b"):
@@ -203,6 +220,7 @@ class MXFP8GemmConfig:
         if self.scale_role == "tma" and (
             self.scale_schedule != "before_wait"
             or self.scale_load_vec != 4
+            or self.scale_smem_store != "scalar"
             or self.scale_l2_prefetch != "none"
             or self.scale_l1_evict != "default"
             or self.scale_cache != "default"
@@ -252,6 +270,17 @@ class MXFP8GemmConfig:
             problem.m % self.tile_m or problem.n % self.tile_n
         ):
             return "TMA epilogue requires full M/N tiles"
+        for label, registers in (
+            ("producer", self.producer_registers),
+            ("consumer", self.consumer_registers),
+        ):
+            if not 24 <= registers <= 256 or registers % 8:
+                return (
+                    f"{label} setmaxregister value must be a multiple of 8 "
+                    "between 24 and 256"
+                )
+        if not 1 <= self.maxrregcount <= 255:
+            return "maxrregcount must be between 1 and 255"
         q_bytes = (
             self.stages
             * (self.tile_m + self.tile_n)
