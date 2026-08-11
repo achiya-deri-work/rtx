@@ -33,7 +33,7 @@ def main() -> None:
         input_bf16: torch.Tensor, weight_bf16: torch.Tensor
     ) -> torch.Tensor:
         return mxfp8_linear(
-            input_bf16, weight_bf16, backend="prequant", autotune=False
+            input_bf16, weight_bf16, backend="materialized", autotune=False
         )
 
     compiled = torch.compile(

@@ -3,6 +3,23 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.16.0
+
+- Give NVFP4 dynamic, AOT-weight, and fully packed inference the same explicit
+  configuration, installed-winner, runtime coordinate-tuning, policy, and
+  cache-root controls as MXFP8. Export the public NVFP4 dynamic configuration
+  and state tuner.
+- Freeze public backend terminology at `auto`, `fused`, and `materialized` for
+  both frontends. Preserve MXFP8 `prequant` as a normalized compatibility alias
+  and keep existing dataset family identifiers unchanged.
+- Add the unified MXFP8/NVFP4 production matrix covering eager/fullgraph
+  compilation, training, dX-only/dW-only autograd, all inference packing
+  states, delayed-scale stream/reset behavior, bounded caches, numerical
+  checks, and long-FP32 dW reductions.
+- Move delayed NVFP4 telemetry-size winner resolution behind a compiler
+  constant boundary, preventing filesystem/device fingerprint work from
+  entering fullgraph capture.
+
 ## 0.15.0
 
 - Add independently autotunable interleaved/preload MMA issue order, packed

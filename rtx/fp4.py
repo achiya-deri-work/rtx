@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+import hashlib
 import json
 import math
+import os
+from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING, Literal
 
@@ -17,10 +20,12 @@ from .configs import (
     DEFAULT_NVFP4_DYNAMIC_CONFIG,
     DEFAULT_NVFP4_QUANT_CONFIG,
     NVFP4FwdConfig,
+    NVFP4FullyPrequantConfig,
     NVFP4DynamicConfig,
     NVFP4GemmConfig,
     NVFP4Problem,
     NVFP4QuantConfig,
+    NVFP4WeightPrequantConfig,
 )
 from .formats import NVFP4Tensor, make_nvfp4_tensor
 from .formats.common import (
@@ -43,6 +48,8 @@ if TYPE_CHECKING:
 WeightMode = Literal["dynamic", "prequantized"]
 ScalingMode = Literal["delayed", "current", "regional", "block"]
 BackendMode = Literal["auto", "fused", "materialized"]
+AutotuneMode = Literal["off", "cache", "coordinate"]
+NVFP4_FRONTEND_REVISION = 1
 
 
 def _effective_scale_region_rows(rows: int, requested: int) -> int:
@@ -159,6 +166,78 @@ _CONFIG_LOCK = RLock()
 _INFERENCE_CONFIG_SELECTIONS: dict[tuple[object, ...], str] = {}
 _DYNAMIC_CONFIG_SELECTIONS: dict[tuple[object, ...], str] = {}
 _FUSED_CONFIG_SELECTIONS: dict[tuple[object, ...], NVFP4FwdConfig] = {}
+_AUTOTUNE_REQUESTS: dict[str, "_NVFP4AutotuneRequest"] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class _NVFP4AutotuneRequest:
+    mode: AutotuneMode
+    policy: object | None
+    cache_dir: str | None
+    dynamic: NVFP4DynamicConfig | None = None
+    weight_prequantized: NVFP4WeightPrequantConfig | None = None
+    fully_prequantized: NVFP4FullyPrequantConfig | None = None
+
+
+@torch.compiler.assume_constant_result
+def _intern_autotune_request(
+    mode: AutotuneMode,
+    policy: object | None,
+    cache_dir: Path | str | None,
+    *,
+    dynamic: NVFP4DynamicConfig | None = None,
+    weight_prequantized: NVFP4WeightPrequantConfig | None = None,
+    fully_prequantized: NVFP4FullyPrequantConfig | None = None,
+) -> str:
+    root = None if cache_dir is None else str(Path(cache_dir).expanduser())
+    payload = {
+        "mode": mode,
+        "policy": None if policy is None else asdict(policy),
+        "cache_dir": root,
+        "dynamic": None if dynamic is None else asdict(dynamic),
+        "weight_prequantized": (
+            None if weight_prequantized is None else asdict(weight_prequantized)
+        ),
+        "fully_prequantized": (
+            None if fully_prequantized is None else asdict(fully_prequantized)
+        ),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    key = (
+        f"nvfp4-autotune:v{NVFP4_FRONTEND_REVISION}:"
+        + hashlib.sha256(encoded.encode()).hexdigest()[:24]
+    )
+    with _CONFIG_LOCK:
+        _AUTOTUNE_REQUESTS[key] = _NVFP4AutotuneRequest(
+            mode=mode,
+            policy=policy,
+            cache_dir=root,
+            dynamic=dynamic,
+            weight_prequantized=weight_prequantized,
+            fully_prequantized=fully_prequantized,
+        )
+    return key
+
+
+def _nvfp4_autotune_mode(value: AutotuneMode | bool | None) -> AutotuneMode:
+    if isinstance(value, bool):
+        return "coordinate" if value else "off"
+    selected = (
+        os.getenv("RTX_NVFP4_AUTOTUNE", os.getenv("RTX_AUTOTUNE", "cache"))
+        if value is None
+        else value
+    )
+    if selected not in ("off", "cache", "coordinate"):
+        raise ValueError(
+            "autotune must be off, cache, or coordinate; "
+            f"got {selected!r}"
+        )
+    return selected
+
+
+_DEFAULT_NVFP4_AUTOTUNE_REQUEST_KEY = _intern_autotune_request(
+    "cache", None, None
+)
 
 
 @torch.compiler.assume_constant_result
@@ -406,6 +485,26 @@ def _resolved_fused_config(
             )
             _FUSED_CONFIG_SELECTIONS[key] = selected
     return selected
+
+
+@torch.compiler.assume_constant_result
+def _delayed_telemetry_values_from_dims(
+    forward_config_key: str,
+    m: int,
+    n: int,
+    k: int,
+    device: torch.device,
+) -> int:
+    """Resolve delayed-state size without tracing winner-cache I/O."""
+
+    problem = NVFP4Problem(int(m), int(n), int(k))
+    config = _resolved_fused_config(
+        forward_config_key,
+        problem,
+        device,
+        collect_amax=True,
+    )
+    return int(nvfp4_telemetry_values(problem, config))
 
 
 def _packed_fp4_view(tensor: torch.Tensor) -> torch.Tensor:
@@ -746,16 +845,19 @@ def _packed_inference_config_key(
     device: torch.device,
     *,
     fully_prequantized: bool,
+    request_key: str,
 ) -> str:
-    """Resolve an installed state-specific winner once per device and shape."""
+    """Resolve an explicit, cached, or tuned state-specific configuration."""
 
     state = "fully_prequantized" if fully_prequantized else "weight_prequantized"
+    request = _AUTOTUNE_REQUESTS[request_key]
     selection_key = (
         state,
         device.index,
         problem.m,
         problem.n,
         problem.k,
+        request_key,
     )
     selected_key = _INFERENCE_CONFIG_SELECTIONS.get(selection_key)
     if selected_key is not None:
@@ -766,14 +868,32 @@ def _packed_inference_config_key(
         weight_prequant_config_from_dict,
     )
 
+    explicit = (
+        request.fully_prequantized
+        if fully_prequantized
+        else request.weight_prequantized
+    )
     if fully_prequantized:
         family = "nvfp4_fully_prequant_fwd"
         variant = "x-row_major_w-row_major"
-        selected = load_runtime_winner(
-            runtime_winner_key(family, problem, device=device, variant=variant),
-            fully_prequant_config_from_dict,
-            rejection=lambda value: value.rejection(problem),
-        )
+        selected = explicit
+        if selected is None and request.mode != "off":
+            selected = load_runtime_winner(
+                runtime_winner_key(family, problem, device=device, variant=variant),
+                fully_prequant_config_from_dict,
+                root=request.cache_dir,
+                rejection=lambda value: value.rejection(problem),
+            )
+        if selected is None and request.mode == "coordinate":
+            from .nvfp4_inference_autotune import tune_nvfp4_inference_state
+
+            selected = tune_nvfp4_inference_state(
+                problem,
+                state=state,
+                device=device,
+                cache_dir=request.cache_dir,
+                policy=request.policy,
+            )
         config = (
             DEFAULT_NVFP4_FORWARD_CONFIG
             if selected is None
@@ -785,11 +905,24 @@ def _packed_inference_config_key(
     else:
         family = "nvfp4_weight_prequant_fwd"
         variant = "w-row_major"
-        selected = load_runtime_winner(
-            runtime_winner_key(family, problem, device=device, variant=variant),
-            weight_prequant_config_from_dict,
-            rejection=lambda value: value.rejection(problem),
-        )
+        selected = explicit
+        if selected is None and request.mode != "off":
+            selected = load_runtime_winner(
+                runtime_winner_key(family, problem, device=device, variant=variant),
+                weight_prequant_config_from_dict,
+                root=request.cache_dir,
+                rejection=lambda value: value.rejection(problem),
+            )
+        if selected is None and request.mode == "coordinate":
+            from .nvfp4_inference_autotune import tune_nvfp4_inference_state
+
+            selected = tune_nvfp4_inference_state(
+                problem,
+                state=state,
+                device=device,
+                cache_dir=request.cache_dir,
+                policy=request.policy,
+            )
         config = (
             DEFAULT_NVFP4_FORWARD_CONFIG
             if selected is None
@@ -812,6 +945,7 @@ def _packed_inference_config_key_from_dims(
     k: int,
     device: torch.device,
     fully_prequantized: bool,
+    request_key: str,
 ) -> str:
     """Compiler-safe shape facade for the inference winner lookup."""
 
@@ -819,27 +953,43 @@ def _packed_inference_config_key_from_dims(
         NVFP4Problem(int(m), int(n), int(k)),
         device,
         fully_prequantized=fully_prequantized,
+        request_key=request_key,
     )
 
 
 def _materialized_dynamic_config_key(
     problem: NVFP4Problem,
     device: torch.device,
+    request_key: str,
 ) -> str:
     """Resolve a verified joint quantize+GEMM winner for dynamic operands."""
 
-    selection_key = (device.index, problem.m, problem.n, problem.k)
+    request = _AUTOTUNE_REQUESTS[request_key]
+    selection_key = (device.index, problem.m, problem.n, problem.k, request_key)
     selected_key = _DYNAMIC_CONFIG_SELECTIONS.get(selection_key)
     if selected_key is not None:
         return selected_key
     from .autotune.winners import load_runtime_winner, runtime_winner_key
     from .nvfp4_inference_autotune import dynamic_config_from_dict
 
-    selected = load_runtime_winner(
-        runtime_winner_key("nvfp4_dynamic_fwd", problem, device=device),
-        dynamic_config_from_dict,
-        rejection=lambda value: value.rejection(problem),
-    )
+    selected = request.dynamic
+    if selected is None and request.mode != "off":
+        selected = load_runtime_winner(
+            runtime_winner_key("nvfp4_dynamic_fwd", problem, device=device),
+            dynamic_config_from_dict,
+            root=request.cache_dir,
+            rejection=lambda value: value.rejection(problem),
+        )
+    if selected is None and request.mode == "coordinate":
+        from .nvfp4_inference_autotune import tune_nvfp4_inference_state
+
+        selected = tune_nvfp4_inference_state(
+            problem,
+            state="dynamic",
+            device=device,
+            cache_dir=request.cache_dir,
+            policy=request.policy,
+        )
     config = NVFP4ForwardConfig.from_materialized(
         DEFAULT_NVFP4_DYNAMIC_CONFIG if selected is None else selected
     )
@@ -854,9 +1004,10 @@ def _materialized_dynamic_config_key_from_dims(
     n: int,
     k: int,
     device: torch.device,
+    request_key: str,
 ) -> str:
     return _materialized_dynamic_config_key(
-        NVFP4Problem(int(m), int(n), int(k)), device
+        NVFP4Problem(int(m), int(n), int(k)), device, request_key
     )
 
 
@@ -2369,6 +2520,12 @@ def nvfp4_linear(
     scaling: Literal["current", "regional", "block"] = "current",
     scale_region_rows: int = 1,
     backend: BackendMode = "auto",
+    autotune: AutotuneMode | bool | None = None,
+    tuning_policy: object | None = None,
+    autotune_cache_dir: Path | str | None = None,
+    dynamic_config: NVFP4DynamicConfig | None = None,
+    weight_prequant_config: NVFP4WeightPrequantConfig | None = None,
+    fully_prequant_config: NVFP4FullyPrequantConfig | None = None,
 ) -> torch.Tensor:
     """Apply NVFP4 forward and MXFP8 backward to BF16 or packed operands."""
 
@@ -2380,6 +2537,15 @@ def nvfp4_linear(
         raise ValueError("scale_region_rows must be positive")
     if backend not in ("auto", "fused", "materialized"):
         raise ValueError("NVFP4 backend must be auto, fused, or materialized")
+    mode = _nvfp4_autotune_mode(autotune)
+    request_key = _intern_autotune_request(
+        mode,
+        tuning_policy,
+        autotune_cache_dir,
+        dynamic=dynamic_config,
+        weight_prequantized=weight_prequant_config,
+        fully_prequantized=fully_prequant_config,
+    )
 
     if isinstance(weight, NVFP4Tensor):
         validate_nvfp4_tensor(weight)
@@ -2410,6 +2576,7 @@ def nvfp4_linear(
                     k,
                     weight.device,
                     True,
+                    request_key,
                 ),
             )
             return out.reshape(*x.shape[:-1], n)
@@ -2452,6 +2619,7 @@ def nvfp4_linear(
                 k,
                 weight.device,
                 False,
+                request_key,
             ),
         )
         return out.reshape(*leading, n)
@@ -2500,6 +2668,7 @@ def nvfp4_linear(
         block_only=scaling == "block",
         fixed_scale_pack=fixed_scale_pack,
         backend=backend,
+        materialized_request_key=request_key,
     )
 
 
@@ -2515,6 +2684,7 @@ def _nvfp4_dynamic_linear_with_keys(
     block_only: bool = False,
     fixed_scale_pack: torch.Tensor | None = None,
     backend: BackendMode = "auto",
+    materialized_request_key: str = _DEFAULT_NVFP4_AUTOTUNE_REQUEST_KEY,
 ) -> torch.Tensor:
     """Compiler-visible current scaling around launch-only NVFP4 operators."""
 
@@ -2544,6 +2714,7 @@ def _nvfp4_dynamic_linear_with_keys(
             int(weight.shape[0]),
             int(x_2d.shape[1]),
             x_2d.device,
+            materialized_request_key,
         )
         if block_only:
             out = (
@@ -2641,6 +2812,7 @@ class NVFP4Linear(nn.Module):
         "_tensor_scale_mode",
         "scale_region_rows",
         "backend",
+        "_materialized_request_key",
     ]
 
     def __init__(
@@ -2657,6 +2829,12 @@ class NVFP4Linear(nn.Module):
         scale_region_rows: int = 1,
         backend: BackendMode = "auto",
         packed_weight: NVFP4Tensor | None = None,
+        autotune: AutotuneMode | bool | None = None,
+        tuning_policy: object | None = None,
+        autotune_cache_dir: Path | str | None = None,
+        dynamic_config: NVFP4DynamicConfig | None = None,
+        weight_prequant_config: NVFP4WeightPrequantConfig | None = None,
+        fully_prequant_config: NVFP4FullyPrequantConfig | None = None,
     ) -> None:
         super().__init__()
         if bias:
@@ -2684,6 +2862,21 @@ class NVFP4Linear(nn.Module):
         self.scaling = scaling
         self.scale_region_rows = int(scale_region_rows)
         self.backend = backend
+        self.autotune = autotune
+        self.tuning_policy = tuning_policy
+        self.autotune_cache_dir = autotune_cache_dir
+        self.dynamic_config = dynamic_config
+        self.weight_prequant_config = weight_prequant_config
+        self.fully_prequant_config = fully_prequant_config
+        mode = _nvfp4_autotune_mode(autotune)
+        self._materialized_request_key = _intern_autotune_request(
+            mode,
+            tuning_policy,
+            autotune_cache_dir,
+            dynamic=dynamic_config,
+            weight_prequantized=weight_prequant_config,
+            fully_prequantized=fully_prequant_config,
+        )
         self._forward_config_key = _intern_forward_config(
             NVFP4ForwardConfig(
                 fused=forward_config,
@@ -2707,13 +2900,13 @@ class NVFP4Linear(nn.Module):
             ),
             persistent=False,
         )
-        from .fp8 import _autotune_mode, _backward_config_key
+        from .fp8 import _backward_config_key
         from .fp8_bwd import _intern_bwd_config
 
         self._backward_config_key = (
             _intern_bwd_config(backward_config)
             if backward_config is not None
-            else _backward_config_key(_autotune_mode(None), None, None)
+            else _backward_config_key(mode, tuning_policy, autotune_cache_dir)
         )
         self.weight_mode: WeightMode = (
             "prequantized" if packed_weight is not None else "dynamic"
@@ -2878,7 +3071,7 @@ class NVFP4Linear(nn.Module):
         )
 
     @classmethod
-    def from_float(cls, module: nn.Linear) -> "NVFP4Linear":
+    def from_float(cls, module: nn.Linear, **kwargs) -> "NVFP4Linear":
         if module.bias is not None:
             raise NotImplementedError("NVFP4Linear.from_float requires bias=False")
         packed = quantize_nvfp4(module.weight.detach())
@@ -2888,6 +3081,7 @@ class NVFP4Linear(nn.Module):
             bias=False,
             device=module.weight.device,
             packed_weight=packed,
+            **kwargs,
         )
 
     def to_quantized_weight(self) -> "NVFP4Linear":
@@ -2906,6 +3100,12 @@ class NVFP4Linear(nn.Module):
             scale_region_rows=self.scale_region_rows,
             backend=self.backend,
             packed_weight=packed,
+            autotune=self.autotune,
+            tuning_policy=self.tuning_policy,
+            autotune_cache_dir=self.autotune_cache_dir,
+            dynamic_config=self.dynamic_config,
+            weight_prequant_config=self.weight_prequant_config,
+            fully_prequant_config=self.fully_prequant_config,
         )
 
     def forward(self, x: torch.Tensor | NVFP4Tensor) -> torch.Tensor:
@@ -2939,6 +3139,7 @@ class NVFP4Linear(nn.Module):
                         self.in_features,
                         self.weight_data.device,
                         True,
+                        self._materialized_request_key,
                     ),
                 )
                 return out.reshape(*x.shape[:-1], self.out_features)
@@ -2977,6 +3178,7 @@ class NVFP4Linear(nn.Module):
                     self.in_features,
                     self.weight_data.device,
                     False,
+                    self._materialized_request_key,
                 ),
             )
             return out.reshape(*leading_shape, self.out_features)
@@ -3007,21 +3209,13 @@ class NVFP4Linear(nn.Module):
                 or self._delayed_problem != delayed_problem
             ):
                 with torch.no_grad():
-                    problem = NVFP4Problem(
+                    state_values = _delayed_telemetry_values_from_dims(
+                        self._forward_config_key,
                         int(x_2d.shape[0]),
                         int(self.weight.shape[0]),
                         int(x_2d.shape[1]),
+                        x_2d.device,
                     )
-                    fused_config = (
-                        replace(self.forward_config, collect_amax=True)
-                        if self.forward_config is not None
-                        else _runtime_fused_config(
-                            problem,
-                            x_2d.device,
-                            collect_amax=True,
-                        )
-                    )
-                    state_values = nvfp4_telemetry_values(problem, fused_config)
                     self._x_amax_state = _delayed_amax_state(
                         x_2d, state_values
                     )
@@ -3076,6 +3270,7 @@ class NVFP4Linear(nn.Module):
                 if self.scaling == "delayed" and self.backend == "auto"
                 else self.backend
             ),
+            materialized_request_key=self._materialized_request_key,
         )
 
     def extra_repr(self) -> str:

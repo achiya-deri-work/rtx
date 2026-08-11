@@ -443,10 +443,12 @@ def normalize_nvfp4_fwd_config(
 
 
 __all__ = [
+    "DEFAULT_NVFP4_DYNAMIC_CONFIG",
     "DEFAULT_NVFP4_GEMM_CONFIG",
     "DEFAULT_NVFP4_FWD_CONFIG",
     "DEFAULT_NVFP4_QUANT_CONFIG",
     "NVFP4GemmConfig",
+    "NVFP4DynamicConfig",
     "NVFP4FullyPrequantConfig",
     "NVFP4FwdConfig",
     "NVFP4Problem",

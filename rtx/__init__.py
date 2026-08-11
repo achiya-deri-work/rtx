@@ -25,6 +25,7 @@ _LAZY_EXPORTS = {
     "MXFP8FwdConfig": ("kernels.mxfp8", "MXFP8FwdConfig"),
     "MXFP8Problem": ("kernels.mxfp8", "MXFP8Problem"),
     "NVFP4FwdConfig": ("configs", "NVFP4FwdConfig"),
+    "NVFP4DynamicConfig": ("configs", "NVFP4DynamicConfig"),
     "NVFP4GemmConfig": ("configs", "NVFP4GemmConfig"),
     "NVFP4FullyPrequantConfig": ("configs", "NVFP4FullyPrequantConfig"),
     "NVFP4QuantConfig": ("configs", "NVFP4QuantConfig"),
@@ -60,6 +61,10 @@ _LAZY_EXPORTS = {
     "tune_mxfp8_inference_state": (
         "inference_autotune",
         "tune_mxfp8_inference_state",
+    ),
+    "tune_nvfp4_inference_state": (
+        "nvfp4_inference_autotune",
+        "tune_nvfp4_inference_state",
     ),
 }
 

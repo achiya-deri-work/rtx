@@ -107,6 +107,70 @@ class LinearFrontendContractTests(unittest.TestCase):
         self.assertIn("forward=NVFP4", layer.extra_repr())
         self.assertIn("backward=MXFP8", layer.extra_repr())
 
+    def test_backend_terminology_is_canonical_across_frontends(self) -> None:
+        legacy = rtx.MXFP8Linear(128, 64, device="cpu", backend="prequant")
+        self.assertEqual(legacy.backend, "materialized")
+        self.assertEqual(
+            rtx.MXFP8Linear(128, 64, device="cpu", backend="materialized").backend,
+            "materialized",
+        )
+        self.assertEqual(
+            rtx.NVFP4Linear(
+                128,
+                64,
+                device="cpu",
+                scaling="block",
+                backend="materialized",
+            ).backend,
+            "materialized",
+        )
+        with self.assertRaisesRegex(ValueError, "auto, fused, or materialized"):
+            rtx.MXFP8Linear(128, 64, device="cpu", backend="unknown")
+        with self.assertRaisesRegex(ValueError, "auto, fused, or materialized"):
+            rtx.NVFP4Linear(128, 64, device="cpu", backend="unknown")
+
+    def test_nvfp4_exposes_all_materialized_autotune_states(self) -> None:
+        from rtx import fp4
+
+        dynamic = rtx.NVFP4DynamicConfig()
+        weight = rtx.NVFP4WeightPrequantConfig()
+        fully = rtx.NVFP4FullyPrequantConfig()
+        layer = rtx.NVFP4Linear(
+            128,
+            64,
+            device="cpu",
+            scaling="block",
+            backend="materialized",
+            autotune="off",
+            dynamic_config=dynamic,
+            weight_prequant_config=weight,
+            fully_prequant_config=fully,
+            autotune_cache_dir="test-cache",
+        )
+        request = fp4._AUTOTUNE_REQUESTS[layer._materialized_request_key]
+        self.assertEqual(request.mode, "off")
+        self.assertEqual(request.dynamic, dynamic)
+        self.assertEqual(request.weight_prequantized, weight)
+        self.assertEqual(request.fully_prequantized, fully)
+        self.assertTrue(request.cache_dir.endswith("test-cache"))
+
+    def test_nvfp4_explicit_dynamic_config_bypasses_runtime_winners(self) -> None:
+        from rtx import fp4
+
+        config = rtx.NVFP4DynamicConfig()
+        request_key = fp4._intern_autotune_request(
+            "off", None, None, dynamic=config
+        )
+        key = fp4._materialized_dynamic_config_key(
+            rtx.NVFP4Problem(128, 64, 128),
+            torch.device("cpu"),
+            request_key,
+        )
+        self.assertEqual(
+            fp4._resolve_forward_config(key),
+            fp4.NVFP4ForwardConfig.from_materialized(config),
+        )
+
     def test_nvfp4_rejects_bias_and_non_bf16_parameters(self) -> None:
         with self.assertRaisesRegex(NotImplementedError, "bias=False"):
             rtx.NVFP4Linear(128, 64, bias=True, device="cpu")

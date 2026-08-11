@@ -8,6 +8,7 @@ from .adapters import (
     make_mxfp8_prequant_adapter,
     make_mxfp8_weight_prequant_adapter,
     make_nvfp4_fully_prequant_adapter,
+    make_nvfp4_dynamic_adapter,
     make_nvfp4_fwd_adapter,
     make_nvfp4_weight_prequant_adapter,
 )
@@ -257,6 +258,7 @@ __all__ = [
     "make_mxfp8_fully_prequant_adapter",
     "make_mxfp8_fwd_adapter",
     "make_nvfp4_fwd_adapter",
+    "make_nvfp4_dynamic_adapter",
     "make_nvfp4_fully_prequant_adapter",
     "make_nvfp4_weight_prequant_adapter",
     "make_mxfp8_prequant_adapter",

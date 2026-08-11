@@ -5,9 +5,12 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 import hashlib
 import json
+import os
+from pathlib import Path
 from typing import Mapping
 
 from .configs.nvfp4 import (
+    DEFAULT_NVFP4_DYNAMIC_CONFIG,
     NVFP4DynamicConfig,
     NVFP4FullyPrequantConfig,
     NVFP4GemmConfig,
@@ -406,6 +409,134 @@ def update_fully_prequant_config(
     )
 
 
+def tune_nvfp4_inference_state(
+    problem,
+    *,
+    state: str,
+    device="cuda",
+    cache_dir: Path | str | None = None,
+    policy=None,
+    progress=print,
+):
+    """Tune one NVFP4 materialized operand state and publish its winner.
+
+    ``state`` is one of ``dynamic``, ``weight_prequantized``, or
+    ``fully_prequantized``. Packed public operands currently use the canonical
+    row-major TorchAO-compatible representation; physical tensor-core scale
+    layouts remain an implementation coordinate inside the dynamic family.
+    """
+
+    from .autotune import (
+        CalibratedPrequantEvaluator,
+        DeviceFingerprint,
+        HybridTuningPolicy,
+        JsonlTuningStore,
+        make_hybrid_autotuner,
+        make_nvfp4_dynamic_adapter,
+        make_nvfp4_fully_prequant_adapter,
+        make_nvfp4_weight_prequant_adapter,
+    )
+    from .autotune.legacy import default_cache_dir
+    from .autotune.winners import runtime_winner_key, save_runtime_winner
+    from .nvfp4_inference_experiments import (
+        NVFP4DynamicBenchmarkHarness,
+        NVFP4FullyPrequantBenchmarkHarness,
+        NVFP4WeightPrequantBenchmarkHarness,
+    )
+    from .prequant_experiments import BenchmarkProtocol, ShapeSpec
+
+    root = default_cache_dir() if cache_dir is None else Path(cache_dir).expanduser()
+    fingerprint = DeviceFingerprint.current(device)
+    samples = int(getattr(policy, "samples", 7))
+    protocol = BenchmarkProtocol(
+        warmup_calls=int(getattr(policy, "warmup", 5)),
+        samples=samples,
+        confirm_samples=max(15, samples),
+        race_rounds=max(15, samples),
+        target_batch_ms=50.0,
+        max_calls_per_sample=max(1, int(getattr(policy, "calls_per_sample", 4096))),
+        correctness_rtol=float(getattr(policy, "correctness_rtol", 5e-2)),
+        correctness_atol=float(getattr(policy, "correctness_atol", 5e-1)),
+        telemetry=False,
+    )
+    shape = ShapeSpec(problem.m, problem.n, problem.k)
+    common = dict(
+        regime="hot",
+        protocol=protocol,
+        device=device,
+        seed=20260811,
+    )
+    if state == "dynamic":
+        harness = NVFP4DynamicBenchmarkHarness(shape, **common)
+        adapter_factory = make_nvfp4_dynamic_adapter
+        initial = DEFAULT_NVFP4_DYNAMIC_CONFIG
+        variant = "default"
+    elif state == "weight_prequantized":
+        harness = NVFP4WeightPrequantBenchmarkHarness(shape, **common)
+        adapter_factory = make_nvfp4_weight_prequant_adapter
+        initial = NVFP4WeightPrequantConfig()
+        variant = "w-row_major"
+    elif state == "fully_prequantized":
+        harness = NVFP4FullyPrequantBenchmarkHarness(shape, **common)
+        adapter_factory = make_nvfp4_fully_prequant_adapter
+        initial = NVFP4FullyPrequantConfig()
+        variant = "x-row_major_w-row_major"
+    else:
+        raise ValueError(f"unsupported NVFP4 inference state {state!r}")
+
+    evaluator = CalibratedPrequantEvaluator(
+        harness, samples=samples, seed=20260811
+    )
+    adapter = adapter_factory(
+        problem,
+        evaluator,
+        initial=initial,
+        device=fingerprint,
+        regime="hot",
+    )
+    if isinstance(policy, HybridTuningPolicy):
+        hybrid = policy
+    else:
+        hybrid = HybridTuningPolicy(
+            max_trials=int(getattr(policy, "max_trials", 512)),
+            time_budget_s=float(
+                getattr(
+                    policy,
+                    "time_budget_s",
+                    os.getenv(
+                        "RTX_NVFP4_AUTOTUNE_SECONDS",
+                        os.getenv("RTX_AUTOTUNE_SECONDS", "1800"),
+                    ),
+                )
+            ),
+            seed=int(getattr(policy, "seed", 20260811)),
+        )
+    suffix = f"m{problem.m}_n{problem.n}_k{problem.k}"
+    if variant != "default":
+        suffix += f"_{variant}"
+    store = JsonlTuningStore(
+        root / "runtime_sessions" / adapter.context.family / fingerprint.identifier / suffix
+    )
+    result = make_hybrid_autotuner(
+        adapter, store, hybrid, progress=progress
+    ).tune()
+    key = runtime_winner_key(
+        adapter.context.family,
+        problem,
+        fingerprint=fingerprint,
+        variant=variant,
+    )
+    save_runtime_winner(
+        key,
+        adapter.serialize(result.config),
+        config_id=adapter.config_id(result.config),
+        root=root,
+        median_ms=result.median_ms,
+        metadata={"context_id": result.context_id, "source": "runtime_tuner"},
+    )
+    return result.config
+
+
 __all__ = [
     "NVFP4_DYNAMIC_KERNEL_REVISION",
     "NVFP4_DYNAMIC_SEARCH_SPACE",
@@ -424,4 +555,5 @@ __all__ = [
     "weight_prequant_config_from_dict",
     "weight_prequant_config_id",
     "weight_prequant_config_to_dict",
+    "tune_nvfp4_inference_state",
 ]

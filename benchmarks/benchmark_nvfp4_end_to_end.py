@@ -194,7 +194,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260810)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument(
-        "--mx-backend", choices=("auto", "fused", "prequant"), default="auto"
+        "--mx-backend",
+        choices=("auto", "fused", "materialized"),
+        default="auto",
     )
     parser.add_argument(
         "--nv-backend", choices=("auto", "fused", "materialized"), default="auto"

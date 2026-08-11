@@ -43,13 +43,28 @@ if TYPE_CHECKING:
     from .kernels.mxfp8_bwd import MXFP8BwdConfig
 
 AutotuneMode = Literal["off", "cache", "coordinate"]
-MXFP8Backend = Literal["auto", "fused", "prequant"]
+MXFP8Backend = Literal["auto", "fused", "materialized", "prequant"]
 WeightMode = Literal["dynamic", "prequantized"]
 
 # This revision is part of every compiler-visible forward token. Increment it
 # whenever lowering/ABI behavior changes so AOTInductor cannot revive a stale
 # generated wrapper whose graph otherwise has identical tensor guards.
 MXFP8_FRONTEND_REVISION = 2
+
+
+def _normalize_mxfp8_backend(backend: MXFP8Backend) -> Literal[
+    "auto", "fused", "materialized"
+]:
+    """Canonicalize the historical ``prequant`` public alias."""
+
+    if backend == "prequant":
+        return "materialized"
+    if backend not in ("auto", "fused", "materialized"):
+        raise ValueError(
+            "backend must be auto, fused, or materialized; "
+            f"got {backend!r}"
+        )
+    return backend
 
 
 def compile_mxfp8_fwd(*args, **kwargs):
@@ -1867,6 +1882,7 @@ def mxfp8_linear(
     packed activation additionally skips all quantization in this invocation.
     """
 
+    backend = _normalize_mxfp8_backend(backend)
     if isinstance(weight, MXFP8Tensor):
         validate_mxfp8_tensor(weight)
         if isinstance(x, MXFP8Tensor):
@@ -1928,13 +1944,9 @@ def mxfp8_linear(
     leading_shape = x.shape[:-1]
     x_2d = x.reshape(-1, x.shape[-1])
     _check_inputs(x_2d, weight)
-    if backend not in ("auto", "fused", "prequant"):
-        raise ValueError(
-            f"backend must be auto, fused, or prequant; got {backend!r}"
-        )
     problem = MXFP8Problem(x_2d.shape[0], weight.shape[0], x_2d.shape[1])
     selected_prequant = prequant_config or DEFAULT_MXFP8_PREQUANT_CONFIG
-    use_prequant = backend == "prequant" or (
+    use_prequant = backend == "materialized" or (
         backend == "auto"
         and config is None
         and selected_prequant.rejection(problem) is None
@@ -1942,7 +1954,9 @@ def mxfp8_linear(
     if use_prequant:
         rejection = selected_prequant.rejection(problem)
         if rejection is not None:
-            raise RuntimeError(f"prequant MXFP8 backend is unavailable: {rejection}")
+            raise RuntimeError(
+                f"materialized MXFP8 backend is unavailable: {rejection}"
+            )
         mode = _autotune_mode(autotune)
         if prequant_config is not None or mode == "off":
             key = (
@@ -2202,7 +2216,7 @@ class MXFP8Linear(nn.Module):
         self.autotune = autotune
         self.tuning_policy = tuning_policy
         self.autotune_cache_dir = autotune_cache_dir
-        self.backend = backend
+        self.backend = _normalize_mxfp8_backend(backend)
         self.prequant_config = prequant_config
         self.backward_config = backward_config
         self.weight_mode: WeightMode = (
@@ -2399,7 +2413,7 @@ class MXFP8Linear(nn.Module):
                 "a prequantized activation requires a prequantized module weight"
             )
         assert self.weight is not None
-        use_prequant = self.backend == "prequant"
+        use_prequant = self.backend == "materialized"
         if (
             self.backend == "auto"
             and self.config is None

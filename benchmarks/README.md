@@ -12,7 +12,8 @@ repository root so imports and output paths are predictable.
 | `validate_nvfp4_convergence.py` | Controlled BF16/current/rowwise-JIT/delayed/exact scale-policy convergence study |
 | `benchmark_mxfp8_prequant.py` | Dynamic BF16 quantization plus native-scale MXFP8 GEMM, with mainloop/epilogue stage and persistent-locality controls |
 | `benchmark_torchao_fp8_rowwise.py` | TorchAO rowwise FP8 comparison baseline |
-| `validate_mxfp8_production.py` | Eager/compiled, training/inference, stream, cache, and long-dW readiness matrix |
+| `validate_production.py` | Unified MXFP8/NVFP4 eager/compiled, training/inference, packed-state, stream, cache, and long-dW readiness matrix |
+| `validate_mxfp8_production.py` | Legacy MXFP8-only readiness matrix |
 | `benchmark_mxfp8_bwd.py` | Fused and quantize-once full/workspace/atomic, persistent split-FP32, ordinary and one-BF16-load shared-G quad quantization, dual-stream, wide-CTA, and TMA/cp.async clustered operand-reuse backward families |
 | `tune_composable_prequant.py` | Composable learned/global plus local forward tuning |
 | `tune_composable_bwd.py` | Composable MXFP8 backward tuning |
@@ -38,12 +39,13 @@ ignored output directory such as `autotune_results/`, `autotune_logs/`, or
 Run the complete frontend matrix before promoting a release:
 
 ```bash
-python benchmarks/validate_mxfp8_production.py \
-  --output autotune_reports/mxfp8_production_matrix.json
+python benchmarks/validate_production.py \
+  --output autotune_reports/production_matrix.json
 ```
 
 `--quick` retains every category but reduces the long-reduction check from
-M=8192 to M=1024.
+M=8192 to M=1024. Use `--frontend mxfp8` or `--frontend nvfp4` for focused
+diagnosis; the release gate uses the default `both`.
 
 Gate the complete single-launch NVFP4 delayed-training forward against verified
 MXFP8 runtime winners with paired AB/BA rounds:

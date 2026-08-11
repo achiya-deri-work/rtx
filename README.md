@@ -259,10 +259,37 @@ constructs logical transpose layouts from the original contiguous G/W/X
 pointers inside its JIT entry, never through eager `.T`, `contiguous`, or
 transpose-copy kernels.
 
-The historical MXFP8 backend name `prequant` means *materialized dynamic*: it
-quantizes both BF16 operands into global memory on every call before launching
-the GEMM. It is an implementation strategy for the first row above, not an AOT
-weight state.
+Both frontends use the public backend terms `auto`, `fused`, and
+`materialized`. Materialized dynamic execution quantizes BF16 operands into
+global memory on every call before launching the GEMM; it is not an AOT weight
+state. MXFP8 still accepts the historical `prequant` spelling as a compatibility
+alias, but modules normalize it to `materialized`.
+
+The frontends also share runtime-tuning controls: `autotune="off"` uses an
+explicit or built-in configuration, `"cache"` consumes only an installed
+winner, and `"coordinate"` launches the composable tuner when no winner exists.
+Both accept `tuning_policy` and `autotune_cache_dir`. NVFP4 exposes independent
+schedule overrides for its three materialized states:
+
+```python
+layer = rtx.NVFP4Linear(
+    1536,
+    1536,
+    device="cuda",
+    scaling="block",
+    backend="materialized",
+    autotune="cache",
+    dynamic_config=rtx.NVFP4DynamicConfig(),
+    weight_prequant_config=rtx.NVFP4WeightPrequantConfig(),
+    fully_prequant_config=rtx.NVFP4FullyPrequantConfig(),
+)
+```
+
+An explicit state configuration takes precedence over runtime winners. Cached
+and tuned winners remain keyed by device/compiler fingerprint, exact shape,
+cache regime, operand state, and packed layout. Internal dataset family names
+such as `mxfp8_prequant_fwd` are stable schema identifiers and are not renamed
+with the public backend vocabulary.
 
 See `rtx/fp8.py` and `rtx/fp8_bwd.py` for backend, configuration, and explicit
 backward controls, and `rtx/fp4.py` for NVFP4 scaling and packing policies.

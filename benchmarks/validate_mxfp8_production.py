@@ -122,16 +122,23 @@ def _partial_training_case(
     return {"gradient": gradient, "relative_l2": error}
 
 
-def _packed_inference_case(*, fully_prequantized: bool) -> dict[str, object]:
+def _packed_inference_case(
+    *, fully_prequantized: bool, compiled: bool = False
+) -> dict[str, object]:
     torch.manual_seed(211 + int(fully_prequantized))
     dynamic = rtx.MXFP8Linear(
-        128, 128, device="cuda", backend="prequant", autotune="off"
+        128, 128, device="cuda", backend="materialized", autotune="off"
     ).eval()
     packed = dynamic.to_quantized_weight()
     x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
     operand = rtx.quantize_mxfp8(x) if fully_prequantized else x
+    function = (
+        torch.compile(packed, fullgraph=True, dynamic=False)
+        if compiled
+        else packed
+    )
     with torch.inference_mode():
-        actual = packed(operand)
+        actual = function(operand)
         expected = x.float() @ dynamic.weight.detach().float().T
     torch.cuda.synchronize()
     error = _relative_error(actual, expected)
@@ -140,6 +147,7 @@ def _packed_inference_case(*, fully_prequantized: bool) -> dict[str, object]:
     return {
         "activation": "packed" if fully_prequantized else "dynamic_bf16",
         "weight": "packed",
+        "compiled": compiled,
         "forward_relative_l2": error,
     }
 
@@ -260,7 +268,7 @@ def _cpasync_cluster_backward_case() -> dict[str, object]:
 def _multiple_stream_case() -> dict[str, object]:
     torch.manual_seed(401)
     layer = rtx.MXFP8Linear(
-        128, 128, device="cuda", backend="prequant", autotune="off"
+        128, 128, device="cuda", backend="materialized", autotune="off"
     ).eval()
     streams = [torch.cuda.Stream() for _ in range(3)]
     inputs = [
@@ -285,7 +293,7 @@ def _multiple_stream_case() -> dict[str, object]:
 def _variable_shape_cache_case() -> dict[str, object]:
     rtx.clear_runtime_caches()
     layer = rtx.MXFP8Linear(
-        128, 128, device="cuda", backend="prequant", autotune="off"
+        128, 128, device="cuda", backend="materialized", autotune="off"
     ).eval()
     with torch.inference_mode():
         for rows in range(128, 128 * 11, 128):

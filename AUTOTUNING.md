@@ -300,9 +300,9 @@ prospective bundle with the updated optimizer: changing an arm's behavior
 inside an existing treatment would invalidate the experiment. Start a new
 campaign identity for follow-up collection.
 
-## Native-scale prequant backend
+## Native-scale materialized backend
 
-The production materialize-once backend has a joint end-to-end tuner. It times
+The production materialized-dynamic backend has a joint end-to-end tuner. It times
 X quantization, W quantization, and GEMM in the same event interval; component
 minima are never added together. Run the complete search for thirty minutes:
 
@@ -341,8 +341,9 @@ value; if a non-default value wins, the frontend applies it when building that
 shape's runner. Use separate processes when comparing this coordinate against
 unrelated concurrent workloads.
 
-`mxfp8_linear(..., autotune="coordinate")` and `MXFP8Linear(...,
-autotune="coordinate")` use this tuner for the prequant backend. The request is
+`mxfp8_linear(..., backend="materialized", autotune="coordinate")` and
+`MXFP8Linear(..., backend="materialized", autotune="coordinate")` use this
+tuner. The request is
 resolved in the runtime launcher, so first-use tuning also works through
 `torch.compile` tracing. `autotune="cache"` loads a compatible winner without
 benchmarking and otherwise uses the built-in native-scale schedule.
