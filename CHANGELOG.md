@@ -19,6 +19,11 @@ project follows semantic versioning while it is in active alpha development.
 - Move delayed NVFP4 telemetry-size winner resolution behind a compiler
   constant boundary, preventing filesystem/device fingerprint work from
   entering fullgraph capture.
+- Correct the shared persistent GEMM's final TMA drain phase to use the
+  resolved per-CTA work count rather than the configured upper cap. This
+  removes a pathological NVVM compile and invalid barrier phase when balanced
+  persistence expands the launch grid, and advances every affected
+  materialized-GEMM kernel revision.
 
 ## 0.15.0
 

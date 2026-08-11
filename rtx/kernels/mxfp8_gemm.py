@@ -1408,7 +1408,10 @@ class MXFP8GemmKernel:
                             out_pipeline.producer_acquire()
 
         if cutlass.const_expr(self.split_reduction == 1):
-            final_count = cfg.tiles_per_cta * self.num_k_tiles
+            # Balanced persistence may raise the launch grid above the
+            # tiles-per-CTA cap, reducing the actual constexpr work slots.
+            # Drain the phases advanced by this CTA, not the requested cap.
+            final_count = self.work_tiles_per_cta * self.num_k_tiles
             final_index = final_count % cfg.stages
             final_phase = (final_count // cfg.stages) & 1
             final_producer_state = pipeline.PipelineState(

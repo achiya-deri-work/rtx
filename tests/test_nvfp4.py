@@ -141,7 +141,7 @@ class NVFP4ConfigTests(unittest.TestCase):
             with self.subTest(family=family):
                 self.assertEqual(
                     _current_revision(family),
-                    4 if family == "nvfp4_dynamic_fwd" else 1,
+                    5 if family == "nvfp4_dynamic_fwd" else 2,
                 )
                 self.assertIsNone(
                     _config_rejection(
