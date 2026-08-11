@@ -123,6 +123,27 @@ class AutotuneOperationsTests(unittest.TestCase):
             self.assertFalse(report["ok"])
             self.assertEqual(report["summary"]["errors"], 1)
 
+    def test_audit_reports_interrupted_candidate_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            _write(
+                bundle / "residuals/unit/events.jsonl",
+                {
+                    "kind": "candidate_started",
+                    "payload": {
+                        "attempt_id": "stalled-attempt",
+                        "context_id": "context-id",
+                        "config_id": "stalled-config",
+                    },
+                },
+            )
+            report = audit_bundles((root,))
+            attempts = report["bundles"][0]["candidate_attempts"]
+            self.assertEqual(attempts["started"], 1)
+            self.assertEqual(attempts["orphaned"], 1)
+            self.assertEqual(attempts["orphaned_config_ids"], ["stalled-config"])
+
     def test_install_winners_writes_runtime_cache_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

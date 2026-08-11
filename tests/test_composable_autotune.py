@@ -135,6 +135,47 @@ class ComposableAutotuneTests(unittest.TestCase):
             tuner.tune()
         self.assertEqual(len(store.observations), 1)
         self.assertEqual(store.observations[0].outcome.status, "runtime_error")
+        self.assertTrue(
+            any(event["kind"] == "candidate_started" for event in store.events)
+        )
+        self.assertTrue(
+            any(event["kind"] == "candidate_completed" for event in store.events)
+        )
+
+    def test_resume_excludes_candidate_interrupted_inside_cuda(self) -> None:
+        adapter = _toy_adapter()
+        store = InMemoryTuningStore()
+        abandoned_id = adapter.config_id(adapter.initial_config)
+        store.record_event(
+            "dead-session",
+            "candidate_started",
+            {
+                "attempt_id": "dead-attempt",
+                "context_id": adapter.context.identifier,
+                "config_id": abandoned_id,
+                "config": asdict(adapter.initial_config),
+                "strategy": "initial",
+            },
+        )
+        result = AutotuneOrchestrator(
+            adapter,
+            store,
+            [RandomSearch()],
+            SequentialScheduler((("random", None),)),
+            TuningBudget(max_trials=4, time_budget_s=10),
+            seed=7,
+        ).tune()
+        self.assertEqual(result.evaluated_trials, 4)
+        self.assertNotIn(
+            abandoned_id,
+            {observation.config_id for observation in store.observations},
+        )
+        self.assertTrue(
+            any(
+                event["kind"] == "abandoned_candidates_recovered"
+                for event in store.events
+            )
+        )
 
     def test_recipe_portfolios_are_explicit_experimental_arms(self) -> None:
         random_tuner = make_hybrid_autotuner(
@@ -428,6 +469,20 @@ class ComposableAutotuneTests(unittest.TestCase):
             self.assertGreater(len(lines_after), len(lines_before))
             self.assertEqual(first.context_id, second.context_id)
             self.assertTrue(all('"features"' in line for line in lines_after))
+            events = [
+                json.loads(line)
+                for line in store.events_path.read_text().splitlines()
+            ]
+            starts = [
+                event for event in events if event["kind"] == "candidate_started"
+            ]
+            self.assertTrue(starts)
+            self.assertTrue(
+                all(event["payload"].get("config") is not None for event in starts)
+            )
+            self.assertEqual(
+                tuple(store.incomplete_candidates(adapter.context.identifier)), ()
+            )
 
     def test_resumed_observations_can_count_toward_total_trial_cap(self) -> None:
         adapter = _toy_adapter()

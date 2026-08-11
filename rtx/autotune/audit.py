@@ -173,6 +173,9 @@ def _audit_bundle(reader: _BundleReader) -> dict[str, object]:
     context_config: set[tuple[str, str]] = set()
     duplicate_context_configs = 0
     observed_contexts: set[str] = set()
+    candidate_starts: dict[str, str] = {}
+    candidate_completions: set[str] = set()
+    observed_attempts: set[str] = set()
 
     for name in jsonl:
         text = reader.read_text(name)
@@ -221,6 +224,28 @@ def _audit_bundle(reader: _BundleReader) -> dict[str, object]:
                 unit = units.get(context_id)
                 if unit is not None and record.get("family") not in (None, unit.get("family")):
                     errors.append(f"{name}:{index + 1}: family differs from unit")
+                metadata = record.get("metadata", {})
+                if isinstance(metadata, Mapping):
+                    attempt_id = str(metadata.get("attempt_id", ""))
+                    if attempt_id:
+                        observed_attempts.add(attempt_id)
+            if name.endswith("/events.jsonl"):
+                event_kind = str(record.get("kind", ""))
+                payload = record.get("payload", {})
+                if isinstance(payload, Mapping):
+                    attempt_id = str(payload.get("attempt_id", ""))
+                    if attempt_id and event_kind in (
+                        "candidate_started",
+                        "trial_issued",
+                    ):
+                        candidate_starts[attempt_id] = str(
+                            payload.get("config_id", "")
+                        )
+                    elif attempt_id and event_kind in (
+                        "candidate_completed",
+                        "trial_completed",
+                    ):
+                        candidate_completions.add(attempt_id)
             if name.endswith("/verification.jsonl") or name == prefix + "verification.jsonl":
                 key = str(record.get("observation_key", ""))
                 if key:
@@ -248,6 +273,13 @@ def _audit_bundle(reader: _BundleReader) -> dict[str, object]:
     expected = _expected_contexts(manifest or {})
     if expected is not None and actual_contexts < expected:
         warnings.append(f"context coverage is partial: {actual_contexts}/{expected}")
+    orphaned_attempts = sorted(
+        set(candidate_starts) - candidate_completions - observed_attempts
+    )
+    if orphaned_attempts:
+        warnings.append(
+            f"{len(orphaned_attempts)} candidate attempt(s) were interrupted before completion"
+        )
     trial_counts = list(observations_per_context.values())
     return {
         "bundle": reader.label,
@@ -275,6 +307,15 @@ def _audit_bundle(reader: _BundleReader) -> dict[str, object]:
         "duplicate_observation_ids": duplicate_observation_ids,
         "conflicting_observation_ids": conflicting_observation_ids,
         "duplicate_context_configs": duplicate_context_configs,
+        "candidate_attempts": {
+            "started": len(candidate_starts),
+            "completed": len(candidate_completions | observed_attempts),
+            "orphaned": len(orphaned_attempts),
+            "orphaned_attempt_ids": orphaned_attempts,
+            "orphaned_config_ids": [
+                candidate_starts[attempt_id] for attempt_id in orphaned_attempts
+            ],
+        },
         "duplicate_verification_keys": duplicate_verification_keys,
         "conflicting_verification_keys": conflicting_verification_keys,
         "errors": errors,

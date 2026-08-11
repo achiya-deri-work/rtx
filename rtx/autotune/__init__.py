@@ -74,6 +74,7 @@ from .orchestrator import (
     ConfirmationPolicy,
     SequentialScheduler,
 )
+from .supervisor import STALL_EXIT_CODE, WATCHDOG_CHILD_ENV, supervise_command
 from .migration import import_legacy_json_database
 from .recipes import (
     HybridTuningPolicy,
@@ -226,6 +227,7 @@ __all__ = [
     "SpaceConstraint",
     "StageKind",
     "StageResult",
+    "STALL_EXIT_CODE",
     "StagedTaskAdapter",
     "StrategyPipeline",
     "TrialOutcome",
@@ -236,6 +238,7 @@ __all__ = [
     "TuningResult",
     "TuningStore",
     "UCB1Scheduler",
+    "WATCHDOG_CHILD_ENV",
     "default_cache_dir",
     "architecture_profile",
     "audit_bundles",
@@ -272,6 +275,7 @@ __all__ = [
     "save_runtime_winner",
     "static_device_profile",
     "summarize_optimizer_study",
+    "supervise_command",
     "tune_mxfp8_fwd",
     "train_pretrained_bundle",
 ]

@@ -94,6 +94,7 @@ rtx/
 │   ├── configs/        # immutable kernel and inference configuration models
 │   ├── formats/        # TorchAO-backed MXFP8/NVFP4 tensor contracts
 │   ├── kernels/        # lazily imported CuTe DSL kernel implementations
+│   ├── models/         # decoder-only convergence reference model
 │   └── autotune/       # adapters, bandits, cost models, stores, and campaigns
 ├── autotune_manifests/ # immutable portable campaign specifications
 ├── benchmarks/         # focused developer benchmarks and tuning utilities
@@ -142,6 +143,48 @@ nv_layer = rtx.NVFP4Linear(
 )
 nv_y = nv_layer(x)  # NVFP4 forward, MXFP8 backward
 ```
+
+### Decoder-only convergence model
+
+`rtx.models` contains a decoder-only language model for controlled BF16,
+MXFP8, and NVFP4 training comparisons. It uses fused QKV and gate/up
+projections, QK normalization, FP32-reduction RMSNorm and RoPE, and separate
+pre/post sublayer norms. Token embeddings, the tied vocabulary head, attention,
+and loss remain BF16/FP32 as appropriate; only transformer-internal linear
+projections change precision. Base projections retain truncated-normal 0.02
+initialization, while attention-output and MLP-down residual projections use
+depth-progressive residual scaling, `0.02 / sqrt(2 * current_depth)`, with
+one-based depth. Early residual branches are affected less than later ones,
+counteracting progressive pre-norm residual dilution at initialization.
+
+```python
+from dataclasses import replace
+
+import torch
+
+from rtx.models import DecoderConfig, DecoderOnlyTransformer, LinearSpec
+
+base = DecoderConfig()  # 8x768, SwiGLU-1536, 12 heads, context 512
+bf16 = DecoderOnlyTransformer(base, device="cuda")
+mxfp8 = DecoderOnlyTransformer(
+    replace(base, linear=LinearSpec(precision="mxfp8")), device="cuda"
+)
+nvfp4 = DecoderOnlyTransformer(
+    replace(base, linear=LinearSpec(precision="nvfp4")), device="cuda"
+)
+
+# All three dynamic models share state-dict keys.
+initial_state = bf16.state_dict()
+mxfp8.load_state_dict(initial_state, strict=True)
+nvfp4.load_state_dict(initial_state, strict=True)
+
+compiled = torch.compile(mxfp8, fullgraph=True, dynamic=False)
+```
+
+The low-precision default is `autotune="cache"`; convergence runs therefore
+consume verified device-local winners when available and do not launch a fresh
+coordinate search in the training process. The model is a validation scaffold,
+not a pretrained architecture or checkpoint format.
 
 Shape/stream-specific dynamic runners retain quantized workspaces for reuse.
 These caches are bounded to eight entries per execution family by default.
@@ -424,10 +467,17 @@ campaign or the first resumed observation. `SAVE` records are fsync'd. Pressing
 Ctrl-C and running the same command resumes at absolute 4/8/16/32/64-trial
 milestones. The script intentionally uses `--format none`; raw residuals are
 authoritative and no large monolithic export is rewritten during collection.
-Sticky CUDA faults such as illegal instructions are saved against the candidate
-that caused them, then terminate only that worker process. The launch script
-automatically starts a fresh CUDA context with the remaining global wall-time
-and resumes the existing residuals. It also preserves compatible context
+Every candidate's ID, complete serialized configuration, features, and search
+provenance are fsync'd before evaluation. Sticky CUDA faults such as illegal
+instructions are saved against the candidate that caused them, then terminate
+only that worker process. A parent watchdog also detects silent generated-kernel
+deadlocks, terminates the isolated CUDA process group, and returns restartable
+status 75. On resume, any issued candidate without a durable completion is
+reported by `audit` and excluded at exact context/config scope rather than
+launched again. The launch script automatically starts a fresh CUDA context
+with the remaining global wall-time and resumes the existing residuals. Set
+`RTX_AUTOTUNE_STALL_TIMEOUT` to increase the default 180-second threshold for
+an unusually slow compiler. The launcher also preserves compatible context
 identity across these runner-only upgrades. The launcher pins `CUDA_HOME` to
 the available CUDA 13.2 toolkit when the calling shell omitted it, keeping
 libNVVM discovery and the compiler/machine fingerprint stable across restarts.

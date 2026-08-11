@@ -2764,6 +2764,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "static failures within each treatment/replicate"
         ),
     )
+    run.add_argument(
+        "--stall-timeout",
+        type=_parse_duration,
+        help=(
+            "run the campaign under a parent-process watchdog and restartable "
+            "exit code 75 after this much output silence (for example 180s)"
+        ),
+    )
 
     collect = subparsers.add_parser("collect", help="merge copied campaign bundles")
     collect.add_argument("paths", type=Path, nargs="+")
@@ -2895,7 +2903,22 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
+    if (
+        args.command == "run"
+        and args.stall_timeout is not None
+        and os.environ.get("RTX_AUTOTUNE_WATCHDOG_CHILD") != "1"
+    ):
+        if args.quiet:
+            parser.error("--stall-timeout requires progress output; remove --quiet")
+        from .supervisor import supervise_command
+
+        status = supervise_command(
+            [sys.executable, "-m", "rtx.autotune.dataset", *raw_argv],
+            stall_timeout_s=args.stall_timeout,
+        )
+        raise SystemExit(status)
     if args.command == "evaluate-pretrained":
         from .pretrained import evaluate_pretrained_bundle
 

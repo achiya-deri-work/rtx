@@ -20,6 +20,7 @@ from .core import (
     TuningBudget,
     evaluate_proposal,
     observation_from_dict,
+    stable_id,
     utc_now,
 )
 from .outcomes import TrialOutcome, raise_if_fatal_device_context_error
@@ -146,6 +147,16 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 except (KeyError, TypeError, ValueError):
                     continue
         history = SearchHistory(restored, self.adapter.context.identifier)
+        incomplete = getattr(self.store, "incomplete_candidates", None)
+        abandoned = (
+            []
+            if incomplete is None
+            else list(incomplete(self.adapter.context.identifier))
+        )
+        abandoned_ids = {
+            str(item.get("config_id", "")) for item in abandoned
+        } - {""}
+        history.excluded_config_ids.update(abandoned_ids)
         resumed_active = (
             len(history.current) if self.max_trials_includes_resumed else 0
         )
@@ -173,6 +184,23 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 self.adapter.context.features(),
             )
         evaluated = 0
+        if abandoned:
+            self.store.record_event(
+                session_id,
+                "abandoned_candidates_recovered",
+                {
+                    "context_id": self.adapter.context.identifier,
+                    "count": len(abandoned),
+                    "config_ids": sorted(abandoned_ids),
+                    "attempt_ids": sorted(
+                        str(item.get("attempt_id", "")) for item in abandoned
+                    ),
+                },
+            )
+            self._log(
+                started,
+                f"RECOVER excluded {len(abandoned_ids)} incomplete candidate(s)",
+            )
 
         def confirm(
             observation: Observation[ConfigT],
@@ -253,16 +281,62 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         def run(proposal: Proposal[ConfigT]) -> Observation[ConfigT]:
             nonlocal evaluated
             before = math.inf if history.best is None else history.best.score
+            config_id = self.adapter.config_id(proposal.config)
+            attempt_id = stable_id(
+                {
+                    "session_id": session_id,
+                    "sequence": evaluated,
+                    "context_id": self.adapter.context.identifier,
+                    "config_id": config_id,
+                },
+                32,
+            )
+            self.store.record_event(
+                session_id,
+                "candidate_started",
+                {
+                    "attempt_id": attempt_id,
+                    "sequence": evaluated,
+                    "context_id": self.adapter.context.identifier,
+                    "family": self.adapter.context.family,
+                    "kernel_revision": self.adapter.context.kernel_revision,
+                    "config_id": config_id,
+                    "config": dict(self.adapter.serialize(proposal.config)),
+                    "features": dict(self.adapter.features(proposal.config)),
+                    "strategy": proposal.strategy,
+                    "parent_config_id": proposal.parent_config_id,
+                    "coordinate": proposal.coordinate,
+                    "coordinate_value": proposal.coordinate_value,
+                    "metadata": dict(proposal.metadata),
+                },
+            )
+            self._log(started, f"TRY  {proposal.strategy} {config_id}")
             observation = evaluate_proposal(
                 self.adapter,
                 proposal,
                 session_id=session_id,
                 sequence=evaluated,
             )
+            observation.metadata = {
+                **observation.metadata,
+                "attempt_id": attempt_id,
+            }
             confirm(observation, proposal, before)
             evaluated += 1
             history.observations.append(observation)
             self.store.record_observation(observation)
+            self.store.record_event(
+                session_id,
+                "candidate_completed",
+                {
+                    "attempt_id": attempt_id,
+                    "sequence": observation.sequence,
+                    "context_id": observation.context_id,
+                    "config_id": observation.config_id,
+                    "observation_id": observation.observation_id,
+                    "status": observation.outcome.status,
+                },
+            )
             arm = statistics.get(proposal.strategy)
             if arm is not None:
                 reward_fn = getattr(self.scheduler, "reward", self._reward)
@@ -296,7 +370,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
 
         initial_id = self.adapter.config_id(self.adapter.initial_config)
         if (
-            initial_id not in history.seen_ids
+            initial_id not in history.seen_ids | abandoned_ids
             and resumed_active + evaluated < self.budget.max_trials
         ):
             initial = run(Proposal(self.adapter.initial_config, "initial"))
@@ -356,7 +430,8 @@ class AutotuneOrchestrator(Generic[ConfigT]):
             proposals = [
                 proposal
                 for proposal in proposals
-                if self.adapter.config_id(proposal.config) not in history.seen_ids
+                if self.adapter.config_id(proposal.config)
+                not in history.seen_ids | abandoned_ids
             ]
             if not proposals:
                 empty_attempts += 1

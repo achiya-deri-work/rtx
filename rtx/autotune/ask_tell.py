@@ -201,6 +201,7 @@ class AskTellSession(Generic[ConfigT]):
         seed: int = 0,
         observations: Sequence[Observation[ConfigT]] = (),
         session_id: str = "ask-tell",
+        excluded_config_ids: Sequence[str] = (),
     ) -> None:
         if not strategies:
             raise ValueError("at least one strategy is required")
@@ -218,6 +219,8 @@ class AskTellSession(Generic[ConfigT]):
         )
         self.statistics = {name: ArmStatistics() for name in names}
         self.pending: dict[str, TrialRequest[ConfigT]] = {}
+        self.excluded_config_ids = set(excluded_config_ids)
+        self.history.excluded_config_ids.update(self.excluded_config_ids)
         self._next_sequence = 1 + max(
             (observation.sequence for observation in observations), default=-1
         )
@@ -365,7 +368,10 @@ class AskTellSession(Generic[ConfigT]):
         self.reclaim_expired()
         pending_ids = {request.config_id for request in self.pending.values()}
         initial_id = self.adapter.config_id(self.adapter.initial_config)
-        if initial_id not in self.history.seen_ids | pending_ids:
+        seen_or_excluded = (
+            self.history.seen_ids | pending_ids | self.excluded_config_ids
+        )
+        if initial_id not in seen_or_excluded:
             # Establish a valid baseline before strategies make incumbent-based
             # decisions. Subsequent asks can fan out across workers.
             return [
@@ -393,7 +399,9 @@ class AskTellSession(Generic[ConfigT]):
                     item
                     for item in proposals
                     if self.adapter.config_id(item.config)
-                    not in self.history.seen_ids | pending_ids
+                    not in self.history.seen_ids
+                    | pending_ids
+                    | self.excluded_config_ids
                 ),
                 None,
             )
@@ -495,6 +503,7 @@ class AskTellSession(Generic[ConfigT]):
                 name: asdict(value) for name, value in self.statistics.items()
             },
             "pending": [request.as_dict() for request in self.pending.values()],
+            "excluded_config_ids": sorted(self.excluded_config_ids),
             "observations": [
                 observation.as_dict() for observation in self.history.observations
             ],
@@ -523,6 +532,9 @@ class AskTellSession(Generic[ConfigT]):
             seed=int(state.get("seed", 0)),
             observations=observations,
             session_id=str(state.get("session_id", "ask-tell")),
+            excluded_config_ids=tuple(
+                str(value) for value in state.get("excluded_config_ids", [])
+            ),
         )
         if state.get("rng_state") is not None:
             session.rng.setstate(_tuple_tree(state["rng_state"]))
@@ -607,6 +619,20 @@ class DurableLocalAskTellRunner(Generic[ConfigT]):
     def tune(self) -> ComposableTuningResult[ConfigT]:
         started = time.monotonic()
         restored = self._restored()
+        incomplete = getattr(self.store, "incomplete_candidates", None)
+        abandoned = (
+            []
+            if incomplete is None
+            else list(incomplete(self.adapter.context.identifier))
+        )
+        abandoned_ids = tuple(
+            sorted(
+                {
+                    str(item.get("config_id", "")) for item in abandoned
+                }
+                - {""}
+            )
+        )
         active_restored = sum(
             item.context_id == self.adapter.context.identifier for item in restored
         )
@@ -634,7 +660,21 @@ class DurableLocalAskTellRunner(Generic[ConfigT]):
             seed=self.seed,
             observations=restored,
             session_id=session_id,
+            excluded_config_ids=abandoned_ids,
         )
+        if abandoned:
+            self.store.record_event(
+                session_id,
+                "abandoned_candidates_recovered",
+                {
+                    "context_id": self.adapter.context.identifier,
+                    "count": len(abandoned),
+                    "config_ids": list(abandoned_ids),
+                    "attempt_ids": sorted(
+                        str(item.get("attempt_id", "")) for item in abandoned
+                    ),
+                },
+            )
         worker = LocalTrialWorker(
             self.adapter,
             {"execution": "local", **self.worker_metadata},
@@ -655,14 +695,35 @@ class DurableLocalAskTellRunner(Generic[ConfigT]):
                 {
                     "sequence": request.sequence,
                     "request_id": request.request_id,
+                    "attempt_id": request.request_id,
+                    "context_id": request.context_id,
+                    "family": request.family,
+                    "kernel_revision": request.kernel_revision,
                     "config_id": request.config_id,
+                    "config": dict(request.serialized_config),
                     "strategy": request.strategy,
                     "fidelity": request.fidelity,
                 },
             )
             response = worker.evaluate(request)
             observation = optimizer.tell(response)
+            observation.metadata = {
+                **observation.metadata,
+                "attempt_id": request.request_id,
+            }
             self.store.record_observation(observation)
+            self.store.record_event(
+                session_id,
+                "trial_completed",
+                {
+                    "attempt_id": request.request_id,
+                    "sequence": observation.sequence,
+                    "context_id": observation.context_id,
+                    "config_id": observation.config_id,
+                    "observation_id": observation.observation_id,
+                    "status": observation.outcome.status,
+                },
+            )
             evaluated += 1
             if self.progress is not None:
                 suffix = (

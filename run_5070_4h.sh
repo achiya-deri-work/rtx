@@ -36,7 +36,7 @@ if [[ "${1:-}" != "--worker" ]]; then
   mkdir -p "$log_dir"
   tag="$(machine_tag)"
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  log_path="$log_dir/release_5070_${tag}_${stamp}.log"
+  log_path="$(realpath -m "$log_dir/release_5070_${tag}_${stamp}.log")"
   pid_path="$log_dir/release_5070_${tag}.pid"
 
   if [[ -f "$pid_path" ]]; then
@@ -48,9 +48,36 @@ if [[ "${1:-}" != "--worker" ]]; then
     fi
   fi
 
-  nohup "$repo_root/run_5070_4h.sh" --worker "$wall_seconds" "$tag" \
-    </dev/null >>"$log_path" 2>&1 &
-  worker_pid=$!
+  unit_tag="$(printf '%s' "$tag" | tr -cs '[:alnum:]-' '-')"
+  unit_name="rtx-autotune-release-${unit_tag}"
+  if command -v systemd-run >/dev/null 2>&1 \
+      && systemctl --user is-system-running >/dev/null 2>&1; then
+    if systemctl --user is-active --quiet "$unit_name.service"; then
+      worker_pid="$(systemctl --user show --property=MainPID --value "$unit_name.service")"
+      echo "A release campaign is already running: pid=$worker_pid unit=$unit_name.service"
+      exit 1
+    fi
+    systemd-run --user --unit="$unit_name" --collect \
+      --working-directory="$repo_root" \
+      --property="StandardInput=null" \
+      --property="StandardOutput=append:$log_path" \
+      --property="StandardError=append:$log_path" \
+      "$repo_root/run_5070_4h.sh" --worker "$wall_seconds" "$tag"
+    for _ in {1..20}; do
+      worker_pid="$(systemctl --user show --property=MainPID --value "$unit_name.service" 2>/dev/null || true)"
+      [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]] && break
+      sleep 0.1
+    done
+  else
+    nohup setsid "$repo_root/run_5070_4h.sh" --worker "$wall_seconds" "$tag" \
+      </dev/null >>"$log_path" 2>&1 &
+    worker_pid=$!
+    disown "$worker_pid" 2>/dev/null || true
+  fi
+  if [[ ! "$worker_pid" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Detached service started but no worker PID was reported." >&2
+    exit 1
+  fi
   echo "$worker_pid" >"$pid_path"
   echo "Started detached release campaign: pid=$worker_pid duration=$duration"
   echo "Log: $log_path"
@@ -139,6 +166,8 @@ while true; do
     --bandit-min-trials 8 \
     --context-bandit-exploration 0.35 \
     --max-milestone-lead 1 \
+    --adopt-existing-context-identity-if-present \
+    --stall-timeout "${RTX_AUTOTUNE_STALL_TIMEOUT:-180s}" \
     --reuse-deterministic-failures
   status=$?
   set -e
@@ -149,7 +178,7 @@ while true; do
     echo "TUNE failed status=$status"
     exit "$status"
   fi
-  echo "RESTART sticky CUDA context failure; durable residuals retained"
+  echo "RESTART CUDA fault or watchdog stall; durable residuals retained"
 done
 
 remaining=$(( deadline_epoch - $(date +%s) ))

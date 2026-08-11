@@ -32,6 +32,8 @@ class TuningStore(Protocol, Generic[ConfigT]):
 
     def records(self, context: KernelContext | None = None) -> Iterable[Mapping[str, object]]: ...
 
+    def incomplete_candidates(self, context_id: str) -> Iterable[Mapping[str, object]]: ...
+
 
 class JsonlTuningStore(Generic[ConfigT]):
     """One JSON object per line; every accepted measurement is immediately durable."""
@@ -156,6 +158,57 @@ class JsonlTuningStore(Generic[ConfigT]):
 
         return iterator()
 
+    def incomplete_candidates(
+        self, context_id: str
+    ) -> Iterable[Mapping[str, object]]:
+        """Return candidates durably issued but never durably completed.
+
+        An observation itself counts as completion.  This closes the tiny
+        crash window between saving an observation and appending its explicit
+        completion event.
+        """
+
+        started: dict[str, Mapping[str, object]] = {}
+        completed: set[str] = set()
+        if self.events_path.exists():
+            with self.events_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        value = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    payload = value.get("payload", {})
+                    if not isinstance(payload, Mapping):
+                        continue
+                    attempt_id = str(payload.get("attempt_id", ""))
+                    if not attempt_id:
+                        continue
+                    kind = value.get("kind")
+                    if kind in ("candidate_started", "trial_issued"):
+                        if payload.get("context_id") == context_id:
+                            started[attempt_id] = payload
+                    elif kind in ("candidate_completed", "trial_completed"):
+                        completed.add(attempt_id)
+        if self.observations_path.exists():
+            with self.observations_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        value = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if value.get("context_id") != context_id:
+                        continue
+                    metadata = value.get("metadata", {})
+                    if isinstance(metadata, Mapping):
+                        attempt_id = str(metadata.get("attempt_id", ""))
+                        if attempt_id:
+                            completed.add(attempt_id)
+        return tuple(
+            payload
+            for attempt_id, payload in started.items()
+            if attempt_id not in completed
+        )
+
 
 class ResidualTuningStore(Generic[ConfigT]):
     """Write one task residual while reading transferable sibling residuals.
@@ -223,6 +276,13 @@ class ResidualTuningStore(Generic[ConfigT]):
 
         return iterator()
 
+    def incomplete_candidates(
+        self, context_id: str
+    ) -> Iterable[Mapping[str, object]]:
+        # Only this residual owns executable attempts. Transfer siblings are
+        # training history and must never blacklist a local candidate.
+        return self.local.incomplete_candidates(context_id)
+
 
 class InMemoryTuningStore(Generic[ConfigT]):
     """Testing/embedding store with the same event model as the JSONL backend."""
@@ -261,6 +321,30 @@ class InMemoryTuningStore(Generic[ConfigT]):
             item.as_dict()
             for item in self.observations
             if context is None or item.context_id == context.identifier
+        )
+
+    def incomplete_candidates(
+        self, context_id: str
+    ) -> Iterable[Mapping[str, object]]:
+        started: dict[str, Mapping[str, object]] = {}
+        completed: set[str] = set()
+        for event in self.events:
+            attempt_id = str(event.get("attempt_id", ""))
+            if not attempt_id:
+                continue
+            if event.get("kind") in ("candidate_started", "trial_issued"):
+                if event.get("context_id") == context_id:
+                    started[attempt_id] = event
+            elif event.get("kind") in ("candidate_completed", "trial_completed"):
+                completed.add(attempt_id)
+        for observation in self.observations:
+            attempt_id = str(observation.metadata.get("attempt_id", ""))
+            if observation.context_id == context_id and attempt_id:
+                completed.add(attempt_id)
+        return tuple(
+            payload
+            for attempt_id, payload in started.items()
+            if attempt_id not in completed
         )
 
 

@@ -77,6 +77,7 @@ while true; do
     --calibration "$calibration" \
     --wall-time "${remaining_seconds}s" \
     --context-slice 45s \
+    --stall-timeout "${RTX_AUTOTUNE_STALL_TIMEOUT:-180s}" \
     --trial-milestones 4,8,16,32,64 \
     --initial-promote 1 \
     --strategy-orchestration manifest \
@@ -91,5 +92,5 @@ while true; do
   if ((status != 75)); then
     exit "$status"
   fi
-  echo "RESTART fatal device context; residuals are durable"
+  echo "RESTART CUDA fault or watchdog stall; residuals are durable"
 done

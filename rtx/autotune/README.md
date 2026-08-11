@@ -245,7 +245,7 @@ in `context_allocations.jsonl` and are included in CSV/Parquet exports.
 rtx-autotune run autotune_manifests/cross_device_dataset_bandit_v1.json \
   --device cuda:0 --output-dir autotune_datasets --format both \
   --wall-time 12h --context-slice 2m \
-  --context-orchestration bandit
+  --context-orchestration bandit --stall-timeout 180s
 ```
 
 To continue an existing manifest without changing its digest, add
@@ -278,11 +278,15 @@ because another arm inherited a favorable prior. Random search likewise retries
 progressively larger pools before reporting exhaustion in a sparse conditional
 space.
 
-Sticky accelerator failures use a supervisor boundary. A worker durably records
-the responsible proposal, raises `FatalDeviceContextError`, and the CLI exits
-75. Supervisors may restart that code only; ordinary Python, manifest, and
-dependency failures remain terminal. This prevents one illegal kernel from
-turning all later contexts into correlated setup failures.
+Sticky accelerator failures and generated-kernel deadlocks use a real process
+boundary. Before evaluation, the worker fsyncs an event containing the exact
+serialized configuration and provenance. `--stall-timeout` runs the campaign
+under a parent process which streams progress and kills the whole child process
+group after prolonged silence; it exits 75 so a deadline-aware launcher can
+resume. Incomplete attempts are excluded at exact context/config scope, and
+`rtx-autotune audit` reports their IDs. Ordinary Python, manifest, and dependency
+failures remain terminal. Threads or Python signals are intentionally not used
+as a CUDA kernel that never returns requires destroying its CUDA context.
 
 For a new campaign, `--reuse-deterministic-failures` avoids recompiling exact
 known static/compiler failures across cache regimes. Its fsync'd JSONL ledger is
