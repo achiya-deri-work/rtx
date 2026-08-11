@@ -186,6 +186,11 @@ consume verified device-local winners when available and do not launch a fresh
 coordinate search in the training process. The model is a validation scaffold,
 not a pretrained architecture or checkpoint format.
 
+[`benchmarks/train_decoder.py`](benchmarks/train_decoder.py) provides the
+resumable fixed-token TinyStories convergence run for BF16, MXFP8, and NVFP4;
+the exact one-shard-equivalent invocation and artifact contract are documented
+in [`benchmarks/README.md`](benchmarks/README.md).
+
 Shape/stream-specific dynamic runners retain quantized workspaces for reuse.
 These caches are bounded to eight entries per execution family by default.
 Use `RTX_MXFP8_RUNNER_CACHE_ENTRIES`, or a family-specific variable such as

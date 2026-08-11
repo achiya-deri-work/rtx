@@ -19,6 +19,9 @@ project follows semantic versioning while it is in active alpha development.
   module metadata.
 - Extend prospective autotuning manifests to ragged K and expose physical K,
   tail size, storage overhead, and scale bytes to portable cost models.
+- Add a resumable full-decoder TinyStories convergence harness with identical
+  initialization and step-indexed byte-token batches across BF16, MXFP8, and
+  NVFP4, append-only metrics, and atomic model/optimizer checkpoints.
 
 ## 0.16.0
 

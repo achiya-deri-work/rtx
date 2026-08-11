@@ -5,6 +5,7 @@ repository root so imports and output paths are predictable.
 
 | Script | Purpose |
 | --- | --- |
+| `train_decoder.py` | Resumable byte-level TinyStories BF16/MXFP8/NVFP4 decoder convergence comparison |
 | `benchmark_mxfp8_frontend.py` | End-to-end `torch.compile` MXFP8 frontend benchmark |
 | `benchmark_nvfp4_training.py` | Paired full delayed-scale NVFP4 training-forward versus fused MXFP8 performance gate |
 | `benchmark_nvfp4_end_to_end.py` | Paired forward-plus-MXFP8-backward layer benchmark |
@@ -48,6 +49,26 @@ journals, exports CSV/Parquet, and installs verified device-local winners.
 All generated JSON, JSONL, logs, datasets, and compiled artifacts must go to an
 ignored output directory such as `autotune_results/`, `autotune_logs/`, or
 `autotune_datasets/`.
+
+Run the fixed-token decoder convergence comparison with:
+
+```bash
+python benchmarks/train_decoder.py \
+  --precision bf16 mxfp8 nvfp4 \
+  --steps 300000 \
+  --warmup-steps 3000 \
+  --log-interval 100 \
+  --validation-interval 5000 \
+  --checkpoint-interval 5000
+```
+
+The first invocation downloads one official TinyStories training parquet
+shard and creates a byte-token cache. All precisions receive the same initial
+state and deterministic step-indexed windows. Metrics are append-only JSONL;
+each precision has an atomic checkpoint and resumes by default. A clean
+300,000-step run presents 460.8 million tokens to each model, approximately
+one shard-equivalent token pass. Use a new `--output` directory when changing
+the model geometry or training schedule.
 
 Run the complete frontend matrix before promoting a release:
 

@@ -16,6 +16,8 @@ autotune_datasets*.zip
 blackwell_release_candidate*.zip
 autotune_models/
 autotune_reports/
+training_data/
+training_results/
 copied_datasets/
 hardware_calibration*.json
 *.log
