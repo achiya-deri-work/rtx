@@ -34,6 +34,7 @@ class HybridTuningPolicy:
     cost_model_trials: int = 320
     model_warmup: int = 16
     model_pool_size: int = 4096
+    model_neighbor_cap: int = 512
     model_refit_interval: int = 16
     model_exploration: float = 0.15
     model_estimators: int = 24
@@ -49,6 +50,7 @@ class HybridTuningPolicy:
     feasibility_exploration: float = 0.5
     minimum_optimistic_feasibility: float = 0.05
     local_beam_width: int = 3
+    local_model_neighbor_cap: int = 1024
     local_model_refit_interval: int = 32
     bandit_exploration: float = 0.15
     bandit_coordinate_bootstrap: int = 8
@@ -222,6 +224,7 @@ def make_hybrid_autotuner(
         warmup=random_search,
         min_observations=policy.model_warmup,
         pool_size=policy.model_pool_size,
+        local_candidate_cap=policy.model_neighbor_cap,
         refit_interval=policy.model_refit_interval,
         exploration=policy.model_exploration,
         feasibility_model=feasibility,
@@ -238,6 +241,7 @@ def make_hybrid_autotuner(
         model_provenance=provenance,
         fit_state=shared_fit_state,
         beam_width=policy.local_beam_width,
+        candidate_cap=policy.local_model_neighbor_cap,
         exploration=policy.model_exploration * 0.25,
         refit_interval=policy.local_model_refit_interval,
         feasibility_exploration=policy.feasibility_exploration,

@@ -178,7 +178,11 @@ queues.
 
 The configured learned-search pool is a quality ceiling. Its effective size
 starts conservatively and adapts to a bounded CPU proposal budget, which keeps
-large Python feature spaces from starving the GPU. Every observation preserves
+large Python feature spaces from starving the GPU. Global and model-local
+neighborhoods use bounded reservoir samples, so thousands of coordinate moves
+cannot silently bypass that budget. Both caps remain policy fields
+(`model_neighbor_cap` and `local_model_neighbor_cap`) for project-specific
+spaces. Every observation preserves
 the requested/effective pool size, pool construction time, next pool size, fit
 count, and fit time. The bandit charges both proposal and evaluator time to the
 responsible arm; a strategy cannot appear efficient merely because its CPU

@@ -431,7 +431,7 @@ class ComposableAutotuneTests(unittest.TestCase):
                     session_id="training",
                     sequence=x * 5 + y,
                 )
-                for x in range(5)
+                for x in range(4)
                 for y in range(5)
             ],
             adapter.context.identifier,
@@ -458,12 +458,17 @@ class ComposableAutotuneTests(unittest.TestCase):
             model=model,
             feasibility_model=feasibility,
             refit_interval=4,
+            candidate_cap=1,
             fit_state=state,
         )
         global_search.propose(adapter, history, random.Random(3), 1)
         fit_counts = (state.cost_fit_count, state.feasibility_fit_count)
         self.assertLessEqual(state.recommended_pool_size, global_search.pool_size)
-        local_search.propose(adapter, history, random.Random(4), 1)
+        local_proposals = local_search.propose(adapter, history, random.Random(4), 1)
+        self.assertEqual(local_proposals[0].metadata["candidate_pool_size"], 1)
+        self.assertGreater(
+            local_proposals[0].metadata["candidate_pool_population"], 1
+        )
         self.assertEqual(
             (state.cost_fit_count, state.feasibility_fit_count), fit_counts
         )

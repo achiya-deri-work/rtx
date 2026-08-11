@@ -193,6 +193,7 @@ class CostModelGuidedSearch(Generic[ConfigT]):
     feasibility_exploration: float = 0.5
     minimum_optimistic_feasibility: float = 0.05
     include_local_neighbors: int = 4
+    local_candidate_cap: int = 512
     initial_pool_cap: int = 2048
     proposal_budget_s: float = 1.0
     model_provenance: Mapping[str, object] | None = None
@@ -208,6 +209,7 @@ class CostModelGuidedSearch(Generic[ConfigT]):
             or not 0 <= self.refit_growth_fraction <= 1
             or self.initial_pool_cap <= 0
             or self.proposal_budget_s <= 0
+            or self.local_candidate_cap < 0
         ):
             raise ValueError("invalid model refit policy")
         if self.fit_state is None:
@@ -299,13 +301,36 @@ class CostModelGuidedSearch(Generic[ConfigT]):
             if adapter.rejection(candidate) is not None:
                 continue
             candidate_by_id.setdefault(adapter.config_id(candidate), candidate)
-        for base in sorted(current_successes, key=lambda item: item.score)[
-            : self.include_local_neighbors
-        ]:
-            for _coordinate, _value, candidate in adapter.neighbors(base.config):
-                if adapter.rejection(candidate) is not None:
-                    continue
-                candidate_by_id.setdefault(adapter.config_id(candidate), candidate)
+        # Full coordinate neighborhoods can dwarf the nominal random pool in
+        # coupled kernel spaces (7K+ backward candidates in practice). Keep an
+        # unbiased bounded reservoir so the adaptive pool is a real wall-time
+        # control rather than a misleading lower bound.
+        local_candidates: list[tuple[str, ConfigT]] = []
+        local_seen: set[str] = set()
+        local_population = 0
+        if self.local_candidate_cap:
+            for base in sorted(current_successes, key=lambda item: item.score)[
+                : self.include_local_neighbors
+            ]:
+                for _coordinate, _value, candidate in adapter.neighbors(base.config):
+                    config_id = adapter.config_id(candidate)
+                    if (
+                        config_id in candidate_by_id
+                        or config_id in local_seen
+                        or config_id in history.seen_ids
+                        or adapter.rejection(candidate) is not None
+                    ):
+                        continue
+                    local_seen.add(config_id)
+                    local_population += 1
+                    if len(local_candidates) < self.local_candidate_cap:
+                        local_candidates.append((config_id, candidate))
+                        continue
+                    slot = rng.randrange(local_population)
+                    if slot < self.local_candidate_cap:
+                        local_candidates[slot] = (config_id, candidate)
+        for config_id, candidate in local_candidates:
+            candidate_by_id[config_id] = candidate
         for config_id in history.seen_ids:
             candidate_by_id.pop(config_id, None)
         candidates = list(candidate_by_id.values())
@@ -364,6 +389,9 @@ class CostModelGuidedSearch(Generic[ConfigT]):
                 "feasibility_fit_count": fit_state.feasibility_fit_count,
                 "feasibility_fit_elapsed_s": fit_state.feasibility_fit_elapsed_s,
                 "candidate_pool_size": len(candidates),
+                "local_candidate_cap": self.local_candidate_cap,
+                "local_candidate_population": local_population,
+                "local_candidates_selected": len(local_candidates),
                 "requested_candidate_pool_size": self.pool_size,
                 "effective_candidate_pool_size": effective_pool_size,
                 "candidate_pool_elapsed_s": pool_elapsed_s,
@@ -413,6 +441,7 @@ class CostModelLocalSearch(Generic[ConfigT]):
     refresh_interval: int = 8
     refit_interval: int = 32
     refit_growth_fraction: float = 0.05
+    candidate_cap: int = 1024
     name: str = "model_local"
     _queue: list[Proposal[ConfigT]] = field(default_factory=list, init=False, repr=False)
     _observed: int = field(default=0, init=False, repr=False)
@@ -421,7 +450,11 @@ class CostModelLocalSearch(Generic[ConfigT]):
     fit_state: SharedModelFitState | None = None
 
     def __post_init__(self) -> None:
-        if self.refit_interval <= 0 or not 0 <= self.refit_growth_fraction <= 1:
+        if (
+            self.refit_interval <= 0
+            or not 0 <= self.refit_growth_fraction <= 1
+            or self.candidate_cap <= 0
+        ):
             raise ValueError("invalid local-model refit policy")
         if self.fit_state is None:
             self.fit_state = SharedModelFitState(self.model, self.feasibility_model)
@@ -493,6 +526,7 @@ class CostModelLocalSearch(Generic[ConfigT]):
         ranked = sorted(history.successful, key=lambda item: item.score)
         candidates: list[Proposal[ConfigT]] = []
         emitted: set[str] = set()
+        candidate_population = 0
         for base in ranked[: self.beam_width]:
             for coordinate, value, candidate in adapter.neighbors(base.config):
                 config_id = adapter.config_id(candidate)
@@ -503,15 +537,20 @@ class CostModelLocalSearch(Generic[ConfigT]):
                 ):
                     continue
                 emitted.add(config_id)
-                candidates.append(
-                    Proposal(
-                        candidate,
-                        self.name,
-                        parent_config_id=base.config_id,
-                        coordinate=coordinate,
-                        coordinate_value=value,
-                    )
+                candidate_population += 1
+                proposal = Proposal(
+                    candidate,
+                    self.name,
+                    parent_config_id=base.config_id,
+                    coordinate=coordinate,
+                    coordinate_value=value,
                 )
+                if len(candidates) < self.candidate_cap:
+                    candidates.append(proposal)
+                    continue
+                slot = rng.randrange(candidate_population)
+                if slot < self.candidate_cap:
+                    candidates[slot] = proposal
         if not candidates:
             return selected
         feature_rows = [adapter.features(item.config) for item in candidates]
@@ -560,6 +599,8 @@ class CostModelLocalSearch(Generic[ConfigT]):
                 conditional_rule_effect=float(rule_effects[index]),
                 conditional_rule_matches=rule_matches[index],
                 candidate_pool_size=len(candidates),
+                candidate_pool_cap=self.candidate_cap,
+                candidate_pool_population=candidate_population,
                 candidate_rank=rank,
                 model_fit_count=fit_state.cost_fit_count,
                 model_fit_elapsed_s=fit_state.cost_fit_elapsed_s,
