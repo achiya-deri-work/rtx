@@ -13,6 +13,7 @@ autotune_datasets/
 autotune_datasets*.zip
 *autotuner*dataset*.zip
 *autotuner*prospective*.zip
+blackwell_release_candidate*.zip
 autotune_models/
 autotune_reports/
 copied_datasets/

@@ -819,28 +819,45 @@ def evaluate_feasibility_model(
 def _fold_head_beats_random(
     folds: Sequence[Mapping[str, object]], head: str, budget: str = "4"
 ) -> tuple[bool, dict[str, object]]:
-    comparisons = []
+    comparisons: list[tuple[float, float, float, float]] = []
     for fold in folds:
         metrics = fold[head]
-        model = float(metrics["catalog_replay_regret"][budget]["median"])
-        random_regret = float(
-            metrics["random_catalog_replay_regret"][budget]["median"]
+        model_metrics = metrics["catalog_replay_regret"][budget]
+        random_metrics = metrics["random_catalog_replay_regret"][budget]
+        comparisons.append(
+            (
+                float(model_metrics["median"]),
+                float(model_metrics["p90"]),
+                float(random_metrics["median"]),
+                float(random_metrics["p90"]),
+            )
         )
-        comparisons.append((model, random_regret))
     if not comparisons:
         return False, {"folds": 0, "wins": 0}
-    wins = sum(model <= random for model, random in comparisons)
+    wins = sum(
+        model_median <= random_median and model_p90 <= random_p90
+        for model_median, model_p90, random_median, random_p90 in comparisons
+    )
     required = max(1, math.ceil(0.75 * len(comparisons)))
-    model_median = float(np.median([model for model, _random in comparisons]))
-    random_median = float(np.median([random for _model, random in comparisons]))
+    model_median = float(np.median([item[0] for item in comparisons]))
+    model_p90 = float(np.median([item[1] for item in comparisons]))
+    random_median = float(np.median([item[2] for item in comparisons]))
+    random_p90 = float(np.median([item[3] for item in comparisons]))
     summary = {
         "folds": len(comparisons),
         "wins": wins,
         "required_wins": required,
         "model_median_regret": model_median,
+        "model_p90_regret": model_p90,
         "random_median_regret": random_median,
+        "random_p90_regret": random_p90,
     }
-    return wins >= required and model_median <= random_median, summary
+    return (
+        wins >= required
+        and model_median <= random_median
+        and model_p90 <= random_p90,
+        summary,
+    )
 
 
 def _balanced_training_rows(
@@ -1338,7 +1355,12 @@ def train_pretrained_bundle(
             for metrics in validation.values():
                 model_metrics = metrics[head]["catalog_replay_regret"][budget]
                 random_metrics = metrics[head]["random_catalog_replay_regret"][budget]
-                if float(model_metrics["median"]) > float(random_metrics["median"]):
+                if (
+                    float(model_metrics["median"])
+                    > float(random_metrics["median"])
+                    or float(model_metrics["p90"])
+                    > float(random_metrics["p90"])
+                ):
                     return False
             return True
 

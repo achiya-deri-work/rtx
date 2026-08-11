@@ -197,7 +197,8 @@ revision-scoped heads from directories or ZIP archives:
 - feasibility over compile, launch, correctness, and implementation failures.
 
 The ranking and latency heads compete against matched random catalogue replay;
-a head drives proposal order only when it wins on every held-out device.
+a head drives proposal order only when both median and p90 regret beat matched
+random catalogue replay on every held-out device.
 Otherwise both remain diagnostic outputs. Parent-linked local moves also
 produce bootstrap-qualified conditional-effect rules. Rules record
 their support, confidence interval, contexts, and devices and act only as a

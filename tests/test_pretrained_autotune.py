@@ -22,6 +22,7 @@ from rtx.autotune.legacy import TrialOutcome
 from rtx.autotune.pretrained import (
     ConditionalRuleSet,
     NormalizedCostModel,
+    _fold_head_beats_random,
     analytical_baseline_ms,
     extract_conditional_rules,
     evaluate_latency_model,
@@ -105,6 +106,27 @@ def _observations():
 
 
 class PretrainedAutotuneTests(unittest.TestCase):
+    def test_deployment_gate_rejects_tail_regret_worse_than_random(self) -> None:
+        folds = [
+            {
+                "ranking": {
+                    "catalog_replay_regret": {
+                        "4": {"median": 0.01, "p90": 0.50}
+                    },
+                    "random_catalog_replay_regret": {
+                        "4": {"median": 0.10, "p90": 0.20}
+                    },
+                }
+            }
+            for _ in range(4)
+        ]
+        accepted, summary = _fold_head_beats_random(folds, "ranking")
+        self.assertFalse(accepted)
+        self.assertEqual(summary["wins"], 0)
+        self.assertGreater(
+            summary["model_p90_regret"], summary["random_p90_regret"]
+        )
+
     def test_analytical_baseline_combines_compute_and_memory(self) -> None:
         features = {
             "derived.nominal_flops": 2.0e9,

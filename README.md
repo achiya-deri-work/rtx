@@ -618,7 +618,8 @@ rtx-autotune run autotune_manifests/cross_device_dataset_bandit_v1.json \
   --pretrained-artifact autotune_models/mxfp8_blackwell_bandit_v1
 ```
 
-Only a head that beats matched random catalogue replay on every held-out device
+Only a head whose median and p90 regret both beat matched random catalogue
+replay on every held-out device
 is allowed to propose from the first model-guided trial. Otherwise the family
 keeps its ordinary online model and uses only validated feasibility/rule priors.
 Four initial random trials retain local exploration for an enabled model, and
