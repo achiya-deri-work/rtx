@@ -198,6 +198,15 @@ released = rtx.clear_runtime_caches()  # synchronizes before releasing buffers
 
 Both modules return BF16 and expose the usual no-bias
 `nn.Linear(in_features, out_features, bias=False, ...)` shape convention.
+All positive M/N/K shapes are supported. Dynamic fused kernels keep the BF16
+GMEM tensors at their exact logical shape and predicate or TMA-zero-fill the
+final tensor-core tile on chip. Materialized and AOT operands allocate only the
+smallest format block tail: `ceil(K / 32) * 32` E4M3 values for MXFP8 and
+`ceil(K / 16) * 16` logical E2M1 values for NVFP4. Their original logical shape
+is retained as RTX metadata while GEMM sees the zero-filled physical extent;
+there is no `torch.pad`, padded BF16 temporary, or explicit transpose in a
+registered forward/backward path. Native blocked scale layouts remain an
+aligned fast path, while ragged packed operands use row-major block scales.
 Quantization state is independent from training mode:
 
 | State | Activation | Weight | Training | Per-call work |

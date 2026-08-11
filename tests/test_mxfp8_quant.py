@@ -42,9 +42,8 @@ def _reference(src: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 class MXFP8QuantConfigTests(unittest.TestCase):
     def test_legality_is_explicit(self) -> None:
         self.assertIsNone(MXFP8QuantConfig().rejection(128, 256))
-        self.assertIn(
-            "divisible by quant_vec",
-            MXFP8QuantConfig(quant_vec=8, load_bits=128).rejection(128, 128),
+        self.assertIsNone(
+            MXFP8QuantConfig(quant_vec=8, load_bits=128).rejection(128, 128)
         )
         self.assertIn(
             "load width exceeds",
@@ -452,6 +451,48 @@ class MXFP8QuantCudaTests(unittest.TestCase):
             compiled_aot_weight = compiled(x)
             compiled_fully_packed = compiled(packed_x)
         torch.cuda.synchronize()
+        torch.testing.assert_close(aot_weight, dynamic, rtol=0, atol=0)
+        torch.testing.assert_close(fully_packed, dynamic, rtol=0, atol=0)
+        torch.testing.assert_close(compiled_aot_weight, dynamic, rtol=0, atol=0)
+        torch.testing.assert_close(compiled_fully_packed, dynamic, rtol=0, atol=0)
+
+    def test_ragged_k_three_operand_states_share_zero_padded_storage(self) -> None:
+        torch.manual_seed(1706)
+        m, n, k = 17, 29, 33
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        config = rtx.DEFAULT_MXFP8_INFERENCE_CONFIG
+        with torch.inference_mode():
+            dynamic = rtx.mxfp8_linear(
+                x, weight, backend="materialized", prequant_config=config
+            )
+            packed_x = rtx.quantize_mxfp8(x, config=config.quant)
+            packed_weight = rtx.quantize_mxfp8(
+                weight, config=config.resolved_weight_quant()
+            )
+            aot_weight = rtx.mxfp8_linear(
+                x, packed_weight, prequant_config=config, autotune="off"
+            )
+            fully_packed = rtx.mxfp8_linear(
+                packed_x,
+                packed_weight,
+                prequant_config=config,
+                autotune="off",
+            )
+            layer = rtx.MXFP8Linear(
+                k,
+                n,
+                packed_weight=packed_weight,
+                prequant_config=config,
+                autotune="off",
+            )
+            torch.compiler.reset()
+            compiled = torch.compile(layer, fullgraph=True, dynamic=False)
+            compiled_aot_weight = compiled(x)
+            compiled_fully_packed = compiled(packed_x)
+        torch.cuda.synchronize()
+        self.assertEqual(tuple(packed_x.qdata.shape), (m, 64))
+        self.assertEqual(tuple(packed_weight.qdata.shape), (n, 64))
         torch.testing.assert_close(aot_weight, dynamic, rtol=0, atol=0)
         torch.testing.assert_close(fully_packed, dynamic, rtol=0, atol=0)
         torch.testing.assert_close(compiled_aot_weight, dynamic, rtol=0, atol=0)

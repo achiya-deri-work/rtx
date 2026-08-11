@@ -43,16 +43,16 @@ class DecoderConfigurationTests(unittest.TestCase):
         self.assertTrue(config.post_sublayer_norm)
         self.assertTrue(config.tie_word_embeddings)
 
-    def test_invalid_precision_geometry_is_rejected_early(self) -> None:
+    def test_precision_geometry_accepts_logical_tail_padding(self) -> None:
         with self.assertRaisesRegex(ValueError, "divisible by num_attention_heads"):
             replace(_small_config(), hidden_size=130)
         with self.assertRaisesRegex(TypeError, "require BF16"):
             _small_config("mxfp8", dtype=torch.float32)
-        with self.assertRaisesRegex(ValueError, "divisible by 64"):
-            replace(
-                _small_config("nvfp4", dtype=torch.bfloat16),
-                intermediate_size=224,
-            )
+        config = replace(
+            _small_config("nvfp4", dtype=torch.bfloat16),
+            intermediate_size=225,
+        )
+        self.assertEqual(config.intermediate_size, 225)
 
 
 class DecoderNumericsTests(unittest.TestCase):

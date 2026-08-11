@@ -13,7 +13,9 @@ def _reference_to_mx(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Independent FLOOR-mode E4M3/E8M0 reference (scale-vector size 32)."""
 
     shape = x.shape
-    blocks = x.reshape(*shape[:-1], shape[-1] // 32, 32)
+    storage_k = (shape[-1] + 31) // 32 * 32
+    padded = torch.nn.functional.pad(x, (0, storage_k - shape[-1]))
+    blocks = padded.reshape(*shape[:-1], storage_k // 32, 32)
     amax = blocks.abs().amax(dim=-1, keepdim=True).float()
     exponent = ((amax.view(torch.int32) >> 23) & 0xFF) - 127
     scale_code = ((exponent - 8).clamp(-127, 128) + 127).to(torch.uint8)
@@ -23,7 +25,7 @@ def _reference_to_mx(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scale = (scale_code.int() << 23).view(torch.float32).clamp_min(2**-126)
     values = (blocks.float() / scale).clamp(-448, 448)
     return (
-        values.to(torch.float8_e4m3fn).reshape(shape),
+        values.to(torch.float8_e4m3fn).reshape(*shape[:-1], storage_k),
         scale_code.view(torch.float8_e8m0fnu).squeeze(-1),
     )
 
@@ -66,9 +68,23 @@ class MXFP8ConfigTests(unittest.TestCase):
             ),
         )
 
-    def test_k_must_be_scale_aligned(self) -> None:
-        with self.assertRaisesRegex(ValueError, "divisible by 32"):
-            MXFP8Problem(1, 1, 33).validate()
+    def test_logical_k_is_padded_only_to_the_scale_block(self) -> None:
+        problem = MXFP8Problem(1, 1, 33)
+        problem.validate()
+        self.assertEqual(problem.k, 33)
+        self.assertEqual(problem.storage_k, 64)
+        self.assertEqual(MXFP8Problem(1, 1, 32).storage_k, 32)
+
+    def test_scalar_vector_tail_is_legal_but_cpasync_tail_is_not(self) -> None:
+        problem = MXFP8Problem(65, 129, 33)
+        scalar_vector = normalize_fwd_config(quant_vec=4, quant_load_bits=64)
+        self.assertIsNone(scalar_vector.implementation_rejection(problem))
+        self.assertIn(
+            "requires full M/N/K tiles",
+            normalize_fwd_config(load_engine="cpasync").implementation_rejection(
+                problem
+            ),
+        )
 
     def test_64_row_and_three_role_schedules_are_legal(self) -> None:
         problem = MXFP8Problem(512, 1536, 1536)
@@ -335,6 +351,10 @@ class MXFP8CudaTests(unittest.TestCase):
             ((37,), 70, 128),
             ((2, 3), 77, 128),
             ((5,), 129, 256),
+            ((3,), 5, 1),
+            ((7,), 11, 17),
+            ((2, 5), 19, 33),
+            ((9,), 131, 127),
         ]
         for leading, n, k in cases:
             with self.subTest(leading=leading, n=n, k=k):
@@ -345,6 +365,18 @@ class MXFP8CudaTests(unittest.TestCase):
                 expected = _reference_linear(x, weight)
                 torch.cuda.synchronize()
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_ragged_rows_vector_loads_fall_back_without_changing_math(self) -> None:
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("native kernel requires SM120/SM121")
+        torch.manual_seed(124)
+        x = torch.randn(17, 33, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(29, 33, device="cuda", dtype=torch.bfloat16)
+        config = normalize_fwd_config(quant_vec=8, quant_load_bits=128)
+        actual = mxfp8_linear(x, weight, config=config, autotune="off")
+        expected = _reference_linear(x, weight)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_real_schedule_variants_match_reference(self) -> None:
         if torch.cuda.get_device_capability()[0] != 12:

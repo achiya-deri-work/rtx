@@ -36,6 +36,15 @@ def _has_sm12x() -> bool:
 
 
 class NVFP4ConfigTests(unittest.TestCase):
+    def test_problem_keeps_logical_k_and_exposes_minimal_storage_k(self) -> None:
+        problem = NVFP4Problem(3, 5, 17)
+        problem.validate()
+        self.assertEqual(problem.k, 17)
+        self.assertEqual(problem.storage_k, 32)
+        self.assertIsNone(
+            DEFAULT_NVFP4_FWD_CONFIG.implementation_rejection(problem)
+        )
+
     def test_training_fallback_exposes_full_block_lane_ownership(self) -> None:
         config = DEFAULT_NVFP4_FWD_CONFIG
         self.assertEqual(config.quant_vec, 16)
@@ -125,7 +134,7 @@ class NVFP4ConfigTests(unittest.TestCase):
     def test_runtime_promotion_understands_nvfp4_revision_and_schema(self) -> None:
         problem = NVFP4Problem(256, 1536, 1536)
         config = replace(DEFAULT_NVFP4_FWD_CONFIG, collect_amax=True)
-        self.assertEqual(_current_revision("nvfp4_fused_fwd"), 5)
+        self.assertEqual(_current_revision("nvfp4_fused_fwd"), 6)
         self.assertIsNone(
             _config_rejection(
                 "nvfp4_fused_fwd",
@@ -141,7 +150,7 @@ class NVFP4ConfigTests(unittest.TestCase):
             with self.subTest(family=family):
                 self.assertEqual(
                     _current_revision(family),
-                    5 if family == "nvfp4_dynamic_fwd" else 2,
+                    6 if family == "nvfp4_dynamic_fwd" else 3,
                 )
                 self.assertIsNone(
                     _config_rejection(
@@ -440,6 +449,46 @@ class NVFP4CudaTests(unittest.TestCase):
             )
         torch.testing.assert_close(dynamic_x, expected_dynamic_x, rtol=0, atol=0)
 
+    def test_ragged_k_packed_inference_uses_minimal_fp4_storage(self) -> None:
+        torch.manual_seed(1919)
+        m, n, k = 17, 29, 33
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        with torch.inference_mode():
+            packed_x = rtx.quantize_nvfp4(x)
+            packed_weight = rtx.quantize_nvfp4(weight)
+            fully_packed = rtx.nvfp4_linear(
+                packed_x, packed_weight, autotune="off"
+            )
+            layer = rtx.NVFP4Linear(
+                k,
+                n,
+                packed_weight=packed_weight,
+                scaling="current",
+                autotune="off",
+            )
+            dynamic_x = layer(x)
+            torch.compiler.reset()
+            compiled = torch.compile(
+                layer,
+                fullgraph=True,
+                dynamic=False,
+                options={"triton.cudagraphs": False},
+            )
+            compiled_dynamic_x = compiled(x)
+            compiled_fully_packed = compiled(packed_x)
+        torch.cuda.synchronize()
+        self.assertEqual(tuple(packed_x.qdata.shape), (m, 24))
+        self.assertEqual(tuple(packed_weight.qdata.shape), (n, 24))
+        self.assertEqual(tuple(fully_packed.shape), (m, n))
+        self.assertEqual(tuple(dynamic_x.shape), (m, n))
+        self.assertEqual(tuple(compiled_dynamic_x.shape), (m, n))
+        self.assertEqual(tuple(compiled_fully_packed.shape), (m, n))
+        self.assertTrue(bool(torch.isfinite(fully_packed).all()))
+        self.assertTrue(bool(torch.isfinite(dynamic_x).all()))
+        self.assertTrue(bool(torch.isfinite(compiled_dynamic_x).all()))
+        self.assertTrue(bool(torch.isfinite(compiled_fully_packed).all()))
+
     def test_native_64_row_packed_gemm_matches_dequantized_reference(self) -> None:
         torch.manual_seed(1908)
         x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
@@ -477,13 +526,39 @@ class NVFP4CudaTests(unittest.TestCase):
 
     def test_ragged_and_minimum_k_fused_shapes(self) -> None:
         torch.manual_seed(1909)
-        for m, n, k in ((65, 130, 128), (64, 128, 64)):
+        for m, n, k in (
+            (65, 130, 128),
+            (64, 128, 64),
+            (17, 29, 1),
+            (33, 65, 17),
+            (63, 127, 33),
+        ):
             with self.subTest(shape=(m, n, k)):
                 x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
                 weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-                actual = rtx.nvfp4_linear(x, weight)
+                actual = rtx.nvfp4_linear(x, weight, backend="fused")
                 self.assertEqual(tuple(actual.shape), (m, n))
                 self.assertTrue(bool(torch.isfinite(actual).all()))
+
+    def test_ragged_nvfp4_training_is_fullgraph_compileable(self) -> None:
+        torch.manual_seed(1918)
+        layer = rtx.NVFP4Linear(
+            33,
+            29,
+            device="cuda",
+            backend="fused",
+            autotune="off",
+        ).train()
+        compiled = torch.compile(layer, fullgraph=True, dynamic=False)
+        x = torch.randn(
+            17, 33, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        output = compiled(x)
+        output.float().square().mean().backward()
+        torch.cuda.synchronize()
+        self.assertEqual(tuple(output.shape), (17, 29))
+        self.assertTrue(bool(torch.isfinite(x.grad).all()))
+        self.assertTrue(bool(torch.isfinite(layer.weight.grad).all()))
 
     def test_exact_and_power2_tensor_scale_policies(self) -> None:
         torch.manual_seed(1910)

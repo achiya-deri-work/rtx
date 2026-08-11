@@ -49,7 +49,7 @@ WeightMode = Literal["dynamic", "prequantized"]
 # This revision is part of every compiler-visible forward token. Increment it
 # whenever lowering/ABI behavior changes so AOTInductor cannot revive a stale
 # generated wrapper whose graph otherwise has identical tensor guards.
-MXFP8_FRONTEND_REVISION = 2
+MXFP8_FRONTEND_REVISION = 3
 
 
 def _normalize_mxfp8_backend(backend: MXFP8Backend) -> Literal[
@@ -467,8 +467,6 @@ def _check_inputs(x: torch.Tensor, weight: torch.Tensor) -> None:
         raise ValueError(
             f"in_features mismatch: activation K={x.shape[1]}, weight K={weight.shape[1]}"
         )
-    if x.shape[1] % 32:
-        raise ValueError(f"in_features must be divisible by 32, got {x.shape[1]}")
 
 
 @torch.library.custom_op(
@@ -703,9 +701,10 @@ def _allocate_scales(
     scale_layout: str,
     device: torch.device,
 ) -> torch.Tensor:
+    storage_k = (k + 31) // 32 * 32
     if scale_layout == "row_major":
         return torch.empty(
-            rows, k // 32, dtype=torch.float8_e8m0fnu, device=device
+            rows, storage_k // 32, dtype=torch.float8_e8m0fnu, device=device
         )
     tile_rows = 64 if scale_layout == "mma64" else 128
     return torch.empty(
@@ -743,7 +742,12 @@ def quantize_mxfp8(
             "native RTX MXFP8 quantization requires SM120/SM121; "
             f"got {(major, minor)}"
         )
-    data = torch.empty_like(source, dtype=torch.float8_e4m3fn)
+    storage_k = (int(source.shape[1]) + 31) // 32 * 32
+    data = torch.empty(
+        (int(source.shape[0]), storage_k),
+        dtype=torch.float8_e4m3fn,
+        device=source.device,
+    )
     scales = _allocate_scales(
         int(source.shape[0]),
         int(source.shape[1]),
@@ -833,8 +837,17 @@ def _build_prequant_runner(
             "native RTX MXFP8 kernel requires an SM120/SM121 GPU; "
             f"got compute capability {torch.cuda.get_device_capability(x.device)}"
         )
-    qx = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    qw = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    storage_problem = MXFP8Problem(problem.m, problem.n, problem.storage_k)
+    qx = torch.empty(
+        (problem.m, problem.storage_k),
+        dtype=torch.float8_e4m3fn,
+        device=x.device,
+    )
+    qw = torch.empty(
+        (problem.n, problem.storage_k),
+        dtype=torch.float8_e4m3fn,
+        device=x.device,
+    )
     weight_config = config.resolved_weight_quant()
     weight_scale_layout = weight_config.scale_layout
     sx = _allocate_scales(
@@ -855,7 +868,7 @@ def _build_prequant_runner(
     else:
         quant_x = compile_mxfp8_quant(problem.m, problem.k, config.quant)
         quant_w = compile_mxfp8_quant(problem.n, problem.k, weight_config)
-    gemm = compile_mxfp8_gemm(problem, config.gemm)
+    gemm = compile_mxfp8_gemm(storage_problem, config.gemm)
     return _PrequantRunner(
         config.quant_launches,
         quant_x,
@@ -1121,6 +1134,7 @@ def _launch_weight_prequant_out(
         raise ValueError("dynamic X and packed W have incompatible shape/device")
     x_c = x if x.is_contiguous() else x.contiguous()
     problem = MXFP8Problem(int(x_c.shape[0]), n, k)
+    storage_problem = MXFP8Problem(problem.m, problem.n, int(weight.qdata.shape[-1]))
     config_key = _resolve_packed_inference_request(
         problem, weight, x=None, config_key=config_key
     )
@@ -1154,7 +1168,11 @@ def _launch_weight_prequant_out(
             if runner is None:
                 if config.l2_fetch_granularity is not None:
                     _set_l2_fetch_granularity(config.l2_fetch_granularity)
-                qx = torch.empty_like(x_c, dtype=torch.float8_e4m3fn)
+                qx = torch.empty(
+                    (problem.m, storage_problem.k),
+                    dtype=torch.float8_e4m3fn,
+                    device=x.device,
+                )
                 sx = _allocate_scales(
                     problem.m,
                     problem.k,
@@ -1165,7 +1183,7 @@ def _launch_weight_prequant_out(
                     quant_x=compile_mxfp8_quant(
                         problem.m, problem.k, config.quant
                     ),
-                    gemm=compile_mxfp8_gemm(problem, config.gemm),
+                    gemm=compile_mxfp8_gemm(storage_problem, config.gemm),
                     qx=qx,
                     sx=sx,
                     l2_fetch_granularity=config.l2_fetch_granularity,
@@ -1243,7 +1261,10 @@ def _mxfp8_linear_prequantized_op(
     )
     _ensure_l2_fetch_granularity(config.l2_fetch_granularity)
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    launcher = compile_mxfp8_gemm(problem, config.gemm)
+    launcher = compile_mxfp8_gemm(
+        MXFP8Problem(problem.m, problem.n, int(x_data.shape[-1])),
+        config.gemm,
+    )
     launcher(
         mxfp8_qdata_2d(x),
         mxfp8_qdata_2d(weight),
@@ -1318,6 +1339,9 @@ class _InductorWeightPrequantLauncher:
                         self.weight_scale_layout,
                     )
                     problem = MXFP8Problem(int(x.shape[0]), self.n, self.k)
+                    storage_problem = MXFP8Problem(
+                        problem.m, problem.n, int(weight_data.shape[-1])
+                    )
                     resolved_key = _resolve_packed_inference_request(
                         problem,
                         weight,
@@ -1340,8 +1364,12 @@ class _InductorWeightPrequantLauncher:
                         quant_x=compile_mxfp8_quant(
                             problem.m, problem.k, config.quant
                         ),
-                        gemm=compile_mxfp8_gemm(problem, config.gemm),
-                        qx=torch.empty_like(x, dtype=torch.float8_e4m3fn),
+                        gemm=compile_mxfp8_gemm(storage_problem, config.gemm),
+                        qx=torch.empty(
+                            (problem.m, storage_problem.k),
+                            dtype=torch.float8_e4m3fn,
+                            device=x.device,
+                        ),
                         sx=_allocate_scales(
                             problem.m,
                             problem.k,
@@ -1437,7 +1465,14 @@ class _InductorFullyPrequantLauncher:
                         resolved_key,
                     )
                     cached = (
-                        compile_mxfp8_gemm(self.problem, config.gemm),
+                        compile_mxfp8_gemm(
+                            MXFP8Problem(
+                                self.problem.m,
+                                self.problem.n,
+                                int(x_data.shape[-1]),
+                            ),
+                            config.gemm,
+                        ),
                         config.l2_fetch_granularity,
                     )
                     self.runners[key] = cached
@@ -1885,8 +1920,10 @@ def mxfp8_linear(
     backend = _normalize_mxfp8_backend(backend)
     if isinstance(weight, MXFP8Tensor):
         validate_mxfp8_tensor(weight)
+        weight_rows, weight_k = mxfp8_matrix_shape(weight)
         if isinstance(x, MXFP8Tensor):
-            if x.shape[-1] != weight.shape[-1]:
+            _x_rows, x_k = mxfp8_matrix_shape(x)
+            if x_k != weight_k:
                 raise ValueError("packed activation and weight K must match")
             problem = _validate_packed_linear_operands(x, weight)
             key = _packed_inference_config_key(
@@ -1899,10 +1936,11 @@ def mxfp8_linear(
                 cache_dir=autotune_cache_dir,
             )
             out = _run_fully_prequantized(x, weight, key)
-            return out.reshape(*x.shape[:-1], mxfp8_matrix_shape(weight)[0])
-        if x.ndim < 1 or x.shape[-1] != weight.shape[-1]:
+            logical_shape = getattr(x, "_rtx_logical_shape", tuple(x.shape))
+            return out.reshape(*logical_shape[:-1], weight_rows)
+        if x.ndim < 1 or x.shape[-1] != weight_k:
             raise ValueError(
-                f"expected activation [..., {weight.shape[-1]}], got {x.shape}"
+                f"expected activation [..., {weight_k}], got {x.shape}"
             )
         if x.device.type != "cuda" or weight.device.type != "cuda":
             raise ValueError("dynamic-X/prequant-W MXFP8 execution requires CUDA")
@@ -1917,7 +1955,6 @@ def mxfp8_linear(
             )
         leading_shape = x.shape[:-1]
         x_2d = x.reshape(-1, x.shape[-1])
-        weight_rows, weight_k = mxfp8_matrix_shape(weight)
         problem = MXFP8Problem(int(x_2d.shape[0]), weight_rows, weight_k)
         key = _packed_inference_config_key(
             problem,
@@ -2203,11 +2240,6 @@ class MXFP8Linear(nn.Module):
             raise NotImplementedError(
                 "MXFP8Linear is a no-bias linear layer; pass bias=False"
             )
-        if in_features % 32:
-            raise ValueError(
-                f"MXFP8 in_features must be divisible by scale-vector size 32, "
-                f"got {in_features}"
-            )
         if dtype is not torch.bfloat16:
             raise TypeError(f"MXFP8Linear parameters must be BF16, got {dtype}")
         self.in_features = int(in_features)
@@ -2257,10 +2289,14 @@ class MXFP8Linear(nn.Module):
             self.reset_parameters()
         else:
             validate_mxfp8_tensor(packed_weight)
-            if packed_weight.shape != (out_features, in_features):
+            if mxfp8_matrix_shape(packed_weight) != (
+                out_features,
+                in_features,
+            ):
                 raise ValueError(
                     "packed MXFP8 weight shape must equal "
-                    f"{(out_features, in_features)}, got {packed_weight.shape}"
+                    f"{(out_features, in_features)}, got "
+                    f"{mxfp8_matrix_shape(packed_weight)}"
                 )
             if mxfp8_orientation(packed_weight) != "row_major":
                 raise ValueError("packed linear weights must be row-major")
@@ -2276,6 +2312,8 @@ class MXFP8Linear(nn.Module):
                     [
                         PACKED_OPERAND_SCHEMA_VERSION,
                         SCALE_LAYOUT_CODES[packed_layout],
+                        self.in_features,
+                        int(packed_weight.qdata.shape[-1]),
                     ],
                     dtype=torch.int64,
                     device=packed_weight.device,

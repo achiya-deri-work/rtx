@@ -18,18 +18,20 @@ def make_nvfp4_tensor(
     scale_layout: ScaleLayout = "row_major",
 ) -> NVFP4Tensor:
     rows, k = flattened_matrix_shape(shape)
-    if k % 16:
-        raise ValueError("NVFP4 packed K must be divisible by 16")
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     if qdata.dtype not in (torch.uint8, fp4_dtype):
         raise TypeError(
             "NVFP4 qdata must use TorchAO's uint8 container or "
             "torch.float4_e2m1fn_x2"
         )
-    if qdata.numel() != rows * (k // 2):
+    if (qdata.numel() * 2) % rows:
+        raise ValueError("NVFP4 qdata rows do not divide its packed storage")
+    storage_k = qdata.numel() * 2 // rows
+    expected_storage_k = (k + 15) // 16 * 16
+    if storage_k != expected_storage_k:
         raise ValueError(
-            f"NVFP4 qdata has {qdata.numel()} packed values, expected "
-            f"{rows * (k // 2)}"
+            f"NVFP4 qdata storage K={storage_k} cannot represent logical K={k}; "
+            f"expected the minimal block-aligned K={expected_storage_k}"
         )
     if scales.dtype is not torch.float8_e4m3fn:
         raise TypeError("NVFP4 block scales must use float8_e4m3fn")
@@ -38,9 +40,11 @@ def make_nvfp4_tensor(
     if not (qdata.device == scales.device == tensor_scale.device):
         raise ValueError("NVFP4 qdata and both scale levels must share one device")
     if scale_layout == "row_major":
-        expected_scales = rows * (k // 16)
-        scale_shape = (*shape[:-1], k // 16)
+        expected_scales = rows * (storage_k // 16)
+        scale_shape = (*shape[:-1], storage_k // 16)
     elif scale_layout == "mma128":
+        if storage_k != k:
+            raise ValueError("blocked NVFP4 scales require aligned logical K")
         expected_scales = ceil(rows / 128) * ceil(k / 64) * 512
         scale_shape = (ceil(rows / 128) * 32, ceil(k / 64) * 16)
     else:
@@ -53,7 +57,7 @@ def make_nvfp4_tensor(
             f"expected {expected_scales}"
         )
     value = NVFP4Tensor(
-        qdata.view(*shape[:-1], k // 2),
+        qdata.view(*shape[:-1], storage_k // 2),
         scales.view(scale_shape),
         16,
         torch.bfloat16,
@@ -61,6 +65,7 @@ def make_nvfp4_tensor(
         is_swizzled_scales=scale_layout != "row_major",
     )
     value._rtx_scale_layout = scale_layout
+    value._rtx_logical_shape = tuple(int(dim) for dim in shape)
     return value
 
 
@@ -72,12 +77,13 @@ def validate_nvfp4_tensor(value: NVFP4Tensor) -> None:
             f"RTX NVFP4 requires BF16 logical dtype, got {value.orig_dtype}"
         )
     rows, k = nvfp4_matrix_shape(value)
-    if k % 16:
-        raise ValueError("RTX NVFP4 requires K divisible by 16")
+    storage_k = int(value.qdata.shape[-1]) * 2
+    if storage_k < k or storage_k % 16:
+        raise ValueError("RTX NVFP4 storage K must cover logical K in blocks of 16")
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     if value.qdata.dtype not in (torch.uint8, fp4_dtype):
         raise TypeError("RTX NVFP4 requires uint8 or float4_e2m1fn_x2 qdata")
-    if value.qdata.numel() != rows * (k // 2):
+    if value.qdata.numel() != rows * (storage_k // 2):
         raise ValueError("TorchAO NVFP4 qdata does not match its logical shape")
     if value.scale.dtype is not torch.float8_e4m3fn:
         raise TypeError("RTX NVFP4 requires E4M3 block scales")
@@ -93,7 +99,7 @@ def validate_nvfp4_tensor(value: NVFP4Tensor) -> None:
         raise ValueError("NVFP4 qdata and block scales must share one device")
     layout = nvfp4_scale_layout(value)
     expected_scales = (
-        rows * (k // 16)
+        rows * (storage_k // 16)
         if layout == "row_major"
         else ceil(rows / 128) * ceil(k / 64) * 512
     )
@@ -113,7 +119,10 @@ def nvfp4_orientation(value: NVFP4Tensor) -> Orientation:
 
 
 def nvfp4_matrix_shape(value: NVFP4Tensor) -> tuple[int, int]:
-    return flattened_matrix_shape(tuple(int(dim) for dim in value.shape))
+    logical_shape = getattr(value, "_rtx_logical_shape", None)
+    return flattened_matrix_shape(
+        tuple(int(dim) for dim in (logical_shape or value.shape))
+    )
 
 
 def nvfp4_scale_layout(value: NVFP4Tensor) -> ScaleLayout:

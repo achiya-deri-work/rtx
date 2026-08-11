@@ -134,11 +134,14 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
             )
             partial.assert_called_once()
 
-    def test_forward_scales_are_not_admitted_as_backward_scales(self) -> None:
+    def test_ragged_reduction_axes_use_logical_padding(self) -> None:
         problem = MXFP8Problem(510, 1536, 1536)
-        reason = DEFAULT_MXFP8_BWD_CONFIG.rejection(problem)
-        self.assertIsNotNone(reason)
-        self.assertIn("become MXFP8 reduction axes", reason)
+        reason = DEFAULT_FUSED_MXFP8_BWD_CONFIG.rejection(problem)
+        self.assertIsNone(reason)
+        fully_ragged = MXFP8Problem(17, 29, 33)
+        self.assertIsNone(
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG.rejection(fully_ragged)
+        )
 
     def test_serialization_is_stable(self) -> None:
         restored = bwd_config_from_dict(
@@ -517,6 +520,10 @@ class TestMXFP8BwdCuda(unittest.TestCase):
     def test_training_frontends_use_direct_fullgraph_lowerings(self) -> None:
         for seed, backend in enumerate(("fused", "prequant"), start=1901):
             with self.subTest(backend=backend):
+                # This suite compiles many MXFP8Linear shape/backend variants.
+                # Keep this production-path assertion independent of Dynamo's
+                # process-global eight-entry recompile budget.
+                torch.compiler.reset()
                 torch.manual_seed(seed)
                 layer = MXFP8Linear(
                     128,
@@ -573,6 +580,46 @@ class TestMXFP8BwdCuda(unittest.TestCase):
                 f"backward error exceeds 7%: dX={float(relative_x)} "
                 f"dW={float(relative_weight)} config={config}"
             )
+
+    def test_fused_backward_accepts_ragged_m_n_and_k(self) -> None:
+        torch.manual_seed(47)
+        m, n, k = 17, 29, 33
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        grad_output = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+        self.assertIsNone(
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG.implementation_rejection(
+                MXFP8Problem(m, n, k)
+            )
+        )
+        self._assert_backward_close(
+            DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+            grad_output,
+            x,
+            weight,
+        )
+
+    def test_ragged_linear_training_is_fullgraph_compileable(self) -> None:
+        torch.manual_seed(48)
+        layer = MXFP8Linear(
+            33,
+            29,
+            device="cuda",
+            dtype=torch.bfloat16,
+            backend="fused",
+            autotune="off",
+            backward_config=DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+        ).train()
+        compiled = torch.compile(layer, fullgraph=True, dynamic=False)
+        x = torch.randn(
+            17, 33, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        output = compiled(x)
+        output.float().square().mean().backward()
+        torch.cuda.synchronize()
+        self.assertEqual(tuple(output.shape), (17, 29))
+        self.assertTrue(bool(torch.isfinite(x.grad).all()))
+        self.assertTrue(bool(torch.isfinite(layer.weight.grad).all()))
 
     def test_cute_logical_transpose_quant_matches_contiguous_reference(self) -> None:
         rows, k = 128, 256

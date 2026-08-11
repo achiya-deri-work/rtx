@@ -624,6 +624,14 @@ def _intern_bwd_autotune_request(
 _DEFAULT_BWD_KEY = _intern_bwd_config(DEFAULT_MXFP8_BWD_CONFIG)
 
 
+def _default_bwd_config(problem: MXFP8Problem) -> MXFP8BwdConfig:
+    """Prefer the measured decomposed baseline, using fused tails as needed."""
+
+    if DEFAULT_MXFP8_BWD_CONFIG.implementation_rejection(problem) is None:
+        return DEFAULT_MXFP8_BWD_CONFIG
+    return DEFAULT_FUSED_MXFP8_BWD_CONFIG
+
+
 def _check_bwd_inputs(
     grad_output: torch.Tensor,
     x: torch.Tensor,
@@ -739,9 +747,10 @@ def _resolve_bwd_context(
                     weight,
                     policy=request.policy,
                     cache_dir=request.cache_dir,
+                    initial=_default_bwd_config(problem),
                 ).config
             selected_key = _intern_bwd_config(
-                selected or DEFAULT_MXFP8_BWD_CONFIG
+                selected or _default_bwd_config(problem)
             )
             _AUTOTUNE_SELECTIONS[selection_key] = selected_key
         config_key = selected_key
@@ -749,6 +758,18 @@ def _resolve_bwd_context(
     if config is None:
         raise RuntimeError("unknown MXFP8 backward configuration key")
     reason = config.implementation_rejection(problem)
+    if reason is not None and config == DEFAULT_MXFP8_BWD_CONFIG:
+        # The decomposed legacy winner materializes native-layout scales and
+        # therefore still needs aligned reduction axes.  Fused backward owns
+        # its tail in registers/SMEM and is the correctness fallback for every
+        # logical shape; no eager pad or BF16 GMEM temporary is introduced.
+        fused_reason = DEFAULT_FUSED_MXFP8_BWD_CONFIG.implementation_rejection(
+            problem
+        )
+        if fused_reason is None:
+            config = DEFAULT_FUSED_MXFP8_BWD_CONFIG
+            config_key = _intern_bwd_config(config)
+            reason = None
     if reason is not None:
         raise RuntimeError(f"MXFP8 backward configuration cannot run: {reason}")
     major, _minor = torch.cuda.get_device_capability(x.device)
@@ -1448,9 +1469,8 @@ def mxfp8_linear_backward(
     """Compute BF16 dX and dW using independently quantized MXFP8 GEMMs.
 
     Leading dimensions of ``x`` and ``grad_output`` are flattened into the
-    token/reduction dimension.  The initial executable family requires both
-    that dimension and ``out_features`` to be divisible by 128 when using the
-    default native-scale/TMA GEMM configuration.
+    token/reduction dimension. Ragged reductions use the fused path and are
+    zero-filled only through the final on-chip 32-value MXFP8 scale block.
     """
 
     if x.ndim < 1 or grad_output.ndim < 1 or weight.ndim != 2:
@@ -1478,8 +1498,11 @@ def mxfp8_linear_backward(
                 "backward autotune must be off, cache, or coordinate; "
                 f"got {mode!r}"
             )
+        problem = MXFP8Problem(
+            int(x_2d.shape[0]), int(weight.shape[0]), int(x_2d.shape[1])
+        )
         if mode == "off" or torch.compiler.is_compiling():
-            selected = DEFAULT_MXFP8_BWD_CONFIG
+            selected = _default_bwd_config(problem)
         else:
             from .bwd_autotune import (
                 bwd_config_from_dict,
@@ -1488,9 +1511,6 @@ def mxfp8_linear_backward(
             )
             from .autotune.winners import load_runtime_winner, runtime_winner_key
 
-            problem = MXFP8Problem(
-                int(x_2d.shape[0]), int(weight.shape[0]), int(x_2d.shape[1])
-            )
             cached = load_runtime_winner(
                 runtime_winner_key("mxfp8_bwd", problem, device=x.device),
                 bwd_config_from_dict,
@@ -1514,9 +1534,10 @@ def mxfp8_linear_backward(
                     weight,
                     policy=tuning_policy,
                     cache_dir=autotune_cache_dir,
+                    initial=_default_bwd_config(problem),
                 ).config
             else:
-                selected = DEFAULT_MXFP8_BWD_CONFIG
+                selected = _default_bwd_config(problem)
     key = (
         _DEFAULT_BWD_KEY
         if selected == DEFAULT_MXFP8_BWD_CONFIG

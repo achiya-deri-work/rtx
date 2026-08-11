@@ -39,8 +39,8 @@ class NVFP4QuantConfig:
         return 32 // self.threads_per_scale
 
     def rejection(self, rows: int, k: int) -> str | None:
-        if rows <= 0 or k <= 0 or k % 64:
-            return "rows must be positive and K must be divisible by 64"
+        if rows <= 0 or k <= 0:
+            return "rows and K must be positive"
         if self.values_per_lane not in (2, 4, 8, 16):
             return (
                 "values_per_lane must be 2, 4, 8, or 16 so each lane owns "
@@ -52,8 +52,6 @@ class NVFP4QuantConfig:
             return "load width exceeds the BF16 values owned by one lane"
         if (self.values_per_lane * 16) % self.load_bits:
             return "values_per_lane must contain whole vector loads"
-        if (rows * (k // NVFP4_SF_VEC_SIZE)) % self.blocks_per_warp:
-            return "the block grid must contain complete warp tasks"
         if self.reduction not in ("shuffle", "redux"):
             return "reduction must be shuffle or redux"
         if self.quant_math != "fp32":
@@ -84,11 +82,14 @@ class NVFP4Problem:
     def validate(self) -> None:
         if min(self.m, self.n, self.k) <= 0:
             raise ValueError(f"M, N and K must be positive, got {self}")
-        if self.k % 64:
-            raise ValueError(
-                "SM120 NVFP4 MMA consumes K in groups of 64; "
-                f"got K={self.k}"
-            )
+
+    @property
+    def storage_k(self) -> int:
+        """Smallest NVFP4 block-aligned packed reduction extent."""
+
+        return ((self.k + NVFP4_SF_VEC_SIZE - 1) // NVFP4_SF_VEC_SIZE) * (
+            NVFP4_SF_VEC_SIZE
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,7 +353,7 @@ DEFAULT_NVFP4_GEMM_CONFIG = NVFP4GemmConfig()
 DEFAULT_NVFP4_QUANT_CONFIG = NVFP4QuantConfig()
 DEFAULT_NVFP4_FWD_CONFIG = NVFP4FwdConfig()
 DEFAULT_NVFP4_DYNAMIC_CONFIG = NVFP4DynamicConfig()
-NVFP4_KERNEL_REVISION = 5
+NVFP4_KERNEL_REVISION = 6
 
 
 _NVFP4_EXCLUDED_COMPOUND_AXES = {

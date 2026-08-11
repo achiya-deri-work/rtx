@@ -3,6 +3,23 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.17.0
+
+- Support every positive logical M/N/K shape in the MXFP8 and NVFP4
+  frontends. Fused kernels predicate scalar/vector BF16 tail loads and rely on
+  on-chip zero fill; backward automatically selects the fused family when a
+  decomposed native-layout reduction is illegal.
+- Materialize only the unavoidable format storage tail: 32 logical values for
+  MXFP8 and 16 for NVFP4. Standalone, dual, dynamic-X/AOT-weight, and fully
+  packed quantization share the same physical contract, including naturally
+  aligned vector loads and predicated final scale tasks.
+- Preserve the original logical shape on TorchAO `MXTensor` and `NVFP4Tensor`
+  operands while carrying the minimal physical K through GEMM. Advance the
+  packed operand schema to version 2 and record logical/physical K in packed
+  module metadata.
+- Extend prospective autotuning manifests to ragged K and expose physical K,
+  tail size, storage overhead, and scale bytes to portable cost models.
+
 ## 0.16.0
 
 - Give NVFP4 dynamic, AOT-weight, and fully packed inference the same explicit

@@ -373,8 +373,6 @@ class MXFP8BwdConfig:
             forward.validate()
         except ValueError as exc:
             return str(exc)
-        if forward.m % 32 or forward.n % 32:
-            return "M and N become MXFP8 reduction axes and must be divisible by 32"
         if self.execution_order not in ("dx_first", "dw_first", "interleaved"):
             return "execution_order must be dx_first, dw_first, or interleaved"
         if self.stream_schedule not in ("single", "dual_stream", "graph"):

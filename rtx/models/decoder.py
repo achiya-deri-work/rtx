@@ -99,12 +99,6 @@ class DecoderConfig:
             raise ValueError("residual_init_multiplier must be positive")
         if self.linear.precision != "bf16" and self.dtype is not torch.bfloat16:
             raise TypeError("MXFP8/NVFP4 transformer projections require BF16 weights")
-        if self.linear.precision == "mxfp8":
-            if self.hidden_size % 32 or self.intermediate_size % 32:
-                raise ValueError("MXFP8 transformer widths must be divisible by 32")
-        if self.linear.precision == "nvfp4":
-            if self.hidden_size % 64 or self.intermediate_size % 64:
-                raise ValueError("NVFP4 transformer widths must be divisible by 64")
 
     @property
     def head_dim(self) -> int:

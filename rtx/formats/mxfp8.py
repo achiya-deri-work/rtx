@@ -24,17 +24,22 @@ def _logical_qdata_view(
     rows, k = flattened_matrix_shape(shape)
     if qdata.dtype is not torch.float8_e4m3fn:
         raise TypeError(f"MXFP8 qdata must be float8_e4m3fn, got {qdata.dtype}")
-    if qdata.numel() != rows * k:
+    if qdata.numel() % rows:
+        raise ValueError("MXFP8 qdata rows do not divide its storage")
+    storage_k = qdata.numel() // rows
+    expected_storage_k = (k + 31) // 32 * 32
+    if storage_k != expected_storage_k:
         raise ValueError(
-            f"MXFP8 qdata has {qdata.numel()} values, expected {rows * k} "
-            f"for logical shape {shape}"
+            f"MXFP8 qdata storage K={storage_k} cannot represent logical "
+            f"K={k}; expected the minimal block-aligned K={expected_storage_k}"
         )
-    return qdata.view(shape)
+    return qdata.view(*shape[:-1], storage_k)
 
 
 def _canonical_scale_view(
     scales: torch.Tensor,
     shape: tuple[int, ...],
+    storage_k: int,
     scale_layout: ScaleLayout,
 ) -> torch.Tensor:
     rows, k = flattened_matrix_shape(shape)
@@ -42,15 +47,15 @@ def _canonical_scale_view(
         raise TypeError(
             f"MXFP8 scales must be float8_e8m0fnu, got {scales.dtype}"
         )
-    if k % 32:
-        raise ValueError("MXFP8 packed K must be divisible by 32")
+    if storage_k < k or storage_k % 32:
+        raise ValueError("MXFP8 storage K must cover logical K in 32-value blocks")
     if scale_layout == "row_major":
-        expected = rows * (k // 32)
-        canonical_shape = (*shape[:-1], k // 32)
+        expected = rows * (storage_k // 32)
+        canonical_shape = (*shape[:-1], storage_k // 32)
     else:
         if scale_layout not in ("mma64", "mma128"):
             raise ValueError(f"unknown MXFP8 scale layout {scale_layout!r}")
-        if k % 128:
+        if storage_k != k or k % 128:
             raise ValueError("tensor-core-native MXFP8 scales require K % 128 == 0")
         tile_rows = 64 if scale_layout == "mma64" else 128
         if rows % tile_rows:
@@ -88,7 +93,8 @@ def make_mxfp8_tensor(
     if qdata.device != scales.device:
         raise ValueError("MXFP8 qdata and scales must share one device")
     qdata = _logical_qdata_view(qdata, shape)
-    scales = _canonical_scale_view(scales, shape, scale_layout)
+    storage_k = int(qdata.shape[-1])
+    scales = _canonical_scale_view(scales, shape, storage_k, scale_layout)
     value = MXTensor.from_qdata_and_scales(
         qdata,
         scales,
@@ -101,6 +107,7 @@ def make_mxfp8_tensor(
     # distinguishes our independently padded 64-row schedule; storage size is
     # also sufficient to recover it after TorchAO device movement.
     value._rtx_scale_layout = scale_layout
+    value._rtx_logical_shape = tuple(int(dim) for dim in shape)
     return value
 
 
@@ -116,9 +123,10 @@ def validate_mxfp8_tensor(value: MXTensor) -> None:
     if value.qdata.device != value.scale.device:
         raise ValueError("MXFP8 qdata and scales must share one device")
     rows, k = mxfp8_matrix_shape(value)
-    if k % 32:
-        raise ValueError("RTX MXFP8 requires K divisible by 32")
-    if value.qdata.numel() != rows * k:
+    storage_k = int(value.qdata.shape[-1])
+    if storage_k < k or storage_k % 32:
+        raise ValueError("RTX MXFP8 storage K must cover logical K in blocks of 32")
+    if value.qdata.numel() != rows * storage_k:
         raise ValueError("TorchAO MXTensor qdata does not match its logical shape")
     if value.scale.dtype is not torch.float8_e8m0fnu:
         raise TypeError("RTX MXFP8 requires E8M0 scales")
@@ -137,20 +145,24 @@ def mxfp8_orientation(value: MXTensor) -> Orientation:
 
 
 def mxfp8_matrix_shape(value: MXTensor) -> tuple[int, int]:
-    return flattened_matrix_shape(tuple(int(dim) for dim in value.shape))
+    logical_shape = getattr(value, "_rtx_logical_shape", None)
+    return flattened_matrix_shape(
+        tuple(int(dim) for dim in (logical_shape or value.shape))
+    )
 
 
 def mxfp8_scale_layout(value: MXTensor) -> ScaleLayout:
     rows, k = mxfp8_matrix_shape(value)
+    storage_k = int(value.qdata.shape[-1])
     if not value.is_swizzled_scales:
-        expected = rows * (k // 32)
+        expected = rows * (storage_k // 32)
         if value.scale.numel() != expected:
             raise ValueError(
                 f"row-major MXFP8 scales have {value.scale.numel()} values, "
                 f"expected {expected}"
             )
         return "row_major"
-    if k % 128:
+    if storage_k != k or k % 128:
         raise ValueError("blocked MXFP8 scales require K divisible by 128")
     mma128_values = ceil(rows / 128) * (k // 128) * 512
     mma64_values = (
@@ -178,18 +190,20 @@ def mxfp8_scale_layout(value: MXTensor) -> ScaleLayout:
 
 def mxfp8_qdata_2d(value: MXTensor) -> torch.Tensor:
     validate_mxfp8_tensor(value)
-    rows, k = mxfp8_matrix_shape(value)
+    rows, _k = mxfp8_matrix_shape(value)
+    storage_k = int(value.qdata.shape[-1])
     if mxfp8_orientation(value) != "row_major":
         raise ValueError("packed RTX linear operands must be row-major")
-    return value.qdata.view(rows, k)
+    return value.qdata.view(rows, storage_k)
 
 
 def mxfp8_scales_for_kernel(value: MXTensor) -> torch.Tensor:
     validate_mxfp8_tensor(value)
     rows, k = mxfp8_matrix_shape(value)
+    storage_k = int(value.qdata.shape[-1])
     layout = mxfp8_scale_layout(value)
     if layout == "row_major":
-        return value.scale.view(rows, k // 32)
+        return value.scale.view(rows, storage_k // 32)
     tile_rows = 64 if layout == "mma64" else 128
     if rows % tile_rows:
         raise ValueError(

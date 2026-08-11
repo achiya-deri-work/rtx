@@ -93,8 +93,6 @@ class ShapeSpec:
     def __post_init__(self) -> None:
         if min(self.m, self.n, self.k) <= 0:
             raise ValueError("shape dimensions must be positive")
-        if self.k % 32:
-            raise ValueError("MXFP8 K must be divisible by 32")
         if self.weight <= 0:
             raise ValueError("shape weight must be positive")
 
@@ -689,11 +687,16 @@ def derived_features(
     x_bytes = shape.m * shape.k * 2
     w_bytes = shape.n * shape.k * 2
     output_bytes = shape.m * shape.n * 2
-    quantized_bytes = shape.m * shape.k + shape.n * shape.k
+    storage_k = shape.problem.storage_k
+    quantized_bytes = (shape.m + shape.n) * storage_k
+    scale_bytes = (shape.m + shape.n) * (storage_k // 32)
     result: dict[str, object] = {
         "m": shape.m,
         "n": shape.n,
         "k": shape.k,
+        "storage_k": storage_k,
+        "storage_k_tail": storage_k - shape.k,
+        "storage_k_overhead": storage_k / shape.k - 1.0,
         "m_over_n": shape.m / shape.n,
         "k_over_mn_sqrt": shape.k / math.sqrt(shape.m * shape.n),
         "cta_m": cta_m,
@@ -708,6 +711,7 @@ def derived_features(
         "w_bytes": w_bytes,
         "output_bytes": output_bytes,
         "quantized_operand_bytes": quantized_bytes,
+        "scale_bytes": scale_bytes,
         "nominal_flops": 2 * shape.m * shape.n * shape.k,
         "x_reuse_ctas": cta_n,
         "w_reuse_ctas": cta_m,

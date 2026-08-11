@@ -33,8 +33,8 @@ class MXFP8QuantConfig:
     transposed_smem_padding: int = 1
 
     def rejection(self, rows: int, k: int) -> str | None:
-        if rows <= 0 or k <= 0 or k % SF_VEC_SIZE:
-            return "rows must be positive and K must be divisible by 32"
+        if rows <= 0 or k <= 0:
+            return "rows and K must be positive"
         if self.quant_vec not in (1, 2, 4, 8):
             return "quant_vec must be one of 1, 2, 4, 8"
         if self.load_bits not in (16, 32, 64, 128):
@@ -49,8 +49,6 @@ class MXFP8QuantConfig:
             return "quantized store width exceeds values owned by one lane"
         if (self.quant_vec * 8) % self.quant_store_bits:
             return "quant_vec must contain an integer number of quantized stores"
-        if (k // SF_VEC_SIZE) % self.quant_vec:
-            return "K scale blocks must be divisible by quant_vec"
         if self.quant_math not in ("fp32", "bf16x2"):
             return "quant_math must be fp32 or bf16x2"
         if self.quant_amax not in ("fp32", "bf16_bits"):
@@ -93,6 +91,8 @@ class MXFP8QuantConfig:
         reason = self.rejection(rows, k)
         if reason is not None:
             return reason
+        if k % SF_VEC_SIZE:
+            return "decomposed logical-transpose K must be divisible by 32"
         if k % self.transposed_tile_k:
             return "logical-transpose K must contain full SMEM tiles"
         if self.native_scale_store == "packed" and self.transposed_tile_k != 128:

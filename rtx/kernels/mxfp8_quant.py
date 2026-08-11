@@ -58,11 +58,13 @@ class MXFP8QuantKernel:
             raise ValueError(f"illegal MXFP8 quantizer configuration: {rejection}")
         self.rows = rows
         self.k = k
+        self.storage_k = (k + SF_VEC_SIZE - 1) // SF_VEC_SIZE * SF_VEC_SIZE
         self.config = config
         self.row_config = config
         self.scale_tile_rows = _native_scale_tile_rows(config.scale_layout)
-        blocks_per_row = k // SF_VEC_SIZE
-        self.task_groups = rows * blocks_per_row // config.quant_vec
+        blocks_per_row = self.storage_k // SF_VEC_SIZE
+        total_blocks = rows * blocks_per_row
+        self.task_groups = cute.ceil_div(total_blocks, config.quant_vec)
         sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
         max_ctas = sm_count * config.persistent_waves
         natural_ctas = cute.ceil_div(self.task_groups, config.num_warps)
@@ -157,16 +159,31 @@ class MXFP8QuantKernel:
         src_row = src[row, None]
         for load_idx in cutlass.range_constexpr(loads_per_lane):
             vec_base = load_idx * values_per_load
+            global_k_base = k_base + vec_base
             if cutlass.const_expr(values_per_load == 1):
-                bf16_values[vec_base] = src_row[k_base + vec_base]
+                if global_k_base < self.k:
+                    bf16_values[vec_base] = src_row[global_k_base]
             else:
-                loaded = nvvm.load_ext(
-                    src_row.iterator + src_row.layout(k_base + vec_base),
-                    dtype=Uint16,
-                    count=values_per_load,
-                ).bitcast(BFloat16)
-                for load_vec in cutlass.range_constexpr(values_per_load):
-                    bf16_values[vec_base + load_vec] = loaded[load_vec]
+                load_bytes = cfg.load_bits // 8
+                naturally_aligned = (
+                    (row * self.k + global_k_base) * (BFloat16.width // 8)
+                ) % load_bytes == 0
+                if (
+                    global_k_base + values_per_load <= self.k
+                    and naturally_aligned
+                ):
+                    loaded = nvvm.load_ext(
+                        src_row.iterator + src_row.layout(global_k_base),
+                        dtype=Uint16,
+                        count=values_per_load,
+                    ).bitcast(BFloat16)
+                    for load_vec in cutlass.range_constexpr(values_per_load):
+                        bf16_values[vec_base + load_vec] = loaded[load_vec]
+                else:
+                    for load_vec in cutlass.range_constexpr(values_per_load):
+                        scalar_k = global_k_base + load_vec
+                        if scalar_k < self.k:
+                            bf16_values[vec_base + load_vec] = src_row[scalar_k]
 
         values = [Float32(0.0)] * cfg.quant_vec
         local_maximum = Float32(0.0)
@@ -342,7 +359,7 @@ class MXFP8QuantKernel:
         block_idx, _, _ = cute.arch.block_idx()
         warp_linear = block_idx * cfg.num_warps + warp_idx
         warp_stride = self.grid_ctas * cfg.num_warps
-        blocks_per_row = self.k // SF_VEC_SIZE
+        blocks_per_row = self.storage_k // SF_VEC_SIZE
         threads_per_scale = 32 // cfg.quant_vec
         scale_in_warp = lane_idx // threads_per_scale
         lane_in_scale = lane_idx % threads_per_scale
@@ -350,20 +367,24 @@ class MXFP8QuantKernel:
         for task_group in cutlass.range(
             warp_linear, self.task_groups, warp_stride, unroll=1
         ):
-            first_block = task_group * cfg.quant_vec
-            row = first_block // blocks_per_row
-            scale_block = first_block % blocks_per_row + scale_in_warp
-            k_base = scale_block * SF_VEC_SIZE + lane_in_scale * cfg.quant_vec
-            self._quantize_task(
-                src,
-                quantized,
-                scales,
-                row,
-                scale_block,
-                lane_in_scale,
-                k_base,
-                self.scale_tile_rows,
-            )
+            linear_block = task_group * cfg.quant_vec + scale_in_warp
+            if linear_block < self.rows * blocks_per_row:
+                row = linear_block // blocks_per_row
+                scale_block = linear_block % blocks_per_row
+                k_base = (
+                    scale_block * SF_VEC_SIZE
+                    + lane_in_scale * cfg.quant_vec
+                )
+                self._quantize_task(
+                    src,
+                    quantized,
+                    scales,
+                    row,
+                    scale_block,
+                    lane_in_scale,
+                    k_base,
+                    self.scale_tile_rows,
+                )
 
 
 class MXFP8DualQuantKernel(MXFP8QuantKernel):
@@ -393,15 +414,18 @@ class MXFP8DualQuantKernel(MXFP8QuantKernel):
         self.x_rows = x_rows
         self.weight_rows = weight_rows
         self.k = k
+        self.storage_k = (k + SF_VEC_SIZE - 1) // SF_VEC_SIZE * SF_VEC_SIZE
         self.config = config
         self.x_scale_tile_rows = _native_scale_tile_rows(config.scale_layout)
         self.weight_scale_tile_rows = _native_scale_tile_rows(
             weight_config.scale_layout
         )
-        blocks_per_row = k // SF_VEC_SIZE
-        self.x_task_groups = x_rows * blocks_per_row // config.quant_vec
-        self.weight_task_groups = (
-            weight_rows * blocks_per_row // config.quant_vec
+        blocks_per_row = self.storage_k // SF_VEC_SIZE
+        self.x_task_groups = cute.ceil_div(
+            x_rows * blocks_per_row, config.quant_vec
+        )
+        self.weight_task_groups = cute.ceil_div(
+            weight_rows * blocks_per_row, config.quant_vec
         )
         self.task_groups = self.x_task_groups + self.weight_task_groups
         sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
@@ -442,7 +466,7 @@ class MXFP8DualQuantKernel(MXFP8QuantKernel):
         block_idx, _, _ = cute.arch.block_idx()
         warp_linear = block_idx * cfg.num_warps + warp_idx
         warp_stride = self.grid_ctas * cfg.num_warps
-        blocks_per_row = self.k // SF_VEC_SIZE
+        blocks_per_row = self.storage_k // SF_VEC_SIZE
         threads_per_scale = 32 // cfg.quant_vec
         scale_in_warp = lane_idx // threads_per_scale
         lane_in_scale = lane_idx % threads_per_scale
@@ -451,42 +475,44 @@ class MXFP8DualQuantKernel(MXFP8QuantKernel):
             warp_linear, self.task_groups, warp_stride, unroll=1
         ):
             if task_group < self.x_task_groups:
-                first_block = task_group * cfg.quant_vec
-                row = first_block // blocks_per_row
-                scale_block = first_block % blocks_per_row + scale_in_warp
-                k_base = (
-                    scale_block * SF_VEC_SIZE
-                    + lane_in_scale * cfg.quant_vec
-                )
-                self._quantize_task(
-                    x,
-                    qx,
-                    sx,
-                    row,
-                    scale_block,
-                    lane_in_scale,
-                    k_base,
-                    self.x_scale_tile_rows,
-                )
+                linear_block = task_group * cfg.quant_vec + scale_in_warp
+                if linear_block < self.x_rows * blocks_per_row:
+                    row = linear_block // blocks_per_row
+                    scale_block = linear_block % blocks_per_row
+                    k_base = (
+                        scale_block * SF_VEC_SIZE
+                        + lane_in_scale * cfg.quant_vec
+                    )
+                    self._quantize_task(
+                        x,
+                        qx,
+                        sx,
+                        row,
+                        scale_block,
+                        lane_in_scale,
+                        k_base,
+                        self.x_scale_tile_rows,
+                    )
             else:
                 local_task = task_group - self.x_task_groups
-                first_block = local_task * cfg.quant_vec
-                row = first_block // blocks_per_row
-                scale_block = first_block % blocks_per_row + scale_in_warp
-                k_base = (
-                    scale_block * SF_VEC_SIZE
-                    + lane_in_scale * cfg.quant_vec
-                )
-                self._quantize_task(
-                    weight,
-                    qw,
-                    sw,
-                    row,
-                    scale_block,
-                    lane_in_scale,
-                    k_base,
-                    self.weight_scale_tile_rows,
-                )
+                linear_block = local_task * cfg.quant_vec + scale_in_warp
+                if linear_block < self.weight_rows * blocks_per_row:
+                    row = linear_block // blocks_per_row
+                    scale_block = linear_block % blocks_per_row
+                    k_base = (
+                        scale_block * SF_VEC_SIZE
+                        + lane_in_scale * cfg.quant_vec
+                    )
+                    self._quantize_task(
+                        weight,
+                        qw,
+                        sw,
+                        row,
+                        scale_block,
+                        lane_in_scale,
+                        k_base,
+                        self.weight_scale_tile_rows,
+                    )
 
 
 class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
@@ -1744,17 +1770,18 @@ def compile_mxfp8_quant(
         stride=(k, 1),
         assumed_align=16,
     )
+    storage_k = (k + SF_VEC_SIZE - 1) // SF_VEC_SIZE * SF_VEC_SIZE
     quantized = cute.runtime.make_fake_tensor(
         Float8E4M3FN,
-        (rows, k),
-        stride=(k, 1),
+        (rows, storage_k),
+        stride=(storage_k, 1),
         assumed_align=16,
     )
     if config.scale_layout == "row_major":
         scales = cute.runtime.make_fake_tensor(
             Float8E8M0FNU,
-            (rows, k // SF_VEC_SIZE),
-            stride=(k // SF_VEC_SIZE, 1),
+            (rows, storage_k // SF_VEC_SIZE),
+            stride=(storage_k // SF_VEC_SIZE, 1),
             assumed_align=16,
         )
     else:
@@ -1807,12 +1834,13 @@ def compile_mxfp8_dual_quant(
 
     x = fake(BFloat16, x_rows, k)
     weight = fake(BFloat16, weight_rows, k)
-    qx = fake(Float8E4M3FN, x_rows, k)
-    qw = fake(Float8E4M3FN, weight_rows, k)
+    storage_k = (k + SF_VEC_SIZE - 1) // SF_VEC_SIZE * SF_VEC_SIZE
+    qx = fake(Float8E4M3FN, x_rows, storage_k)
+    qw = fake(Float8E4M3FN, weight_rows, storage_k)
 
     def fake_scales(rows: int, scale_layout: str):
         if scale_layout == "row_major":
-            return fake(Float8E8M0FNU, rows, k // SF_VEC_SIZE)
+            return fake(Float8E8M0FNU, rows, storage_k // SF_VEC_SIZE)
         tile_rows = _native_scale_tile_rows(scale_layout)
         return cute.runtime.make_fake_tensor(
             Float8E8M0FNU,

@@ -314,6 +314,23 @@ class LinearFrontendContractTests(unittest.TestCase):
                 rtx.mxfp8_linear(packed_x, packed_w).shape, (2, 64)
             )
 
+    def test_mxfp8_packed_operands_preserve_ragged_logical_k(self) -> None:
+        from rtx.formats.mxfp8 import mxfp8_matrix_shape, mxfp8_qdata_2d
+
+        with FakeTensorMode():
+            x = torch.empty(17, 33, device="cuda", dtype=torch.bfloat16)
+            qx = torch.empty(17, 64, device="cuda", dtype=torch.float8_e4m3fn)
+            qw = torch.empty(29, 64, device="cuda", dtype=torch.float8_e4m3fn)
+            sx = torch.empty(17, 2, device="cuda", dtype=torch.float8_e8m0fnu)
+            sw = torch.empty(29, 2, device="cuda", dtype=torch.float8_e8m0fnu)
+            packed_x = make_mxfp8_tensor(qx, sx, (17, 33))
+            packed_w = make_mxfp8_tensor(qw, sw, (29, 33))
+            self.assertEqual(mxfp8_matrix_shape(packed_x), (17, 33))
+            self.assertEqual(tuple(mxfp8_qdata_2d(packed_x).shape), (17, 64))
+            layer = rtx.MXFP8Linear(33, 29, packed_weight=packed_w)
+            self.assertEqual(layer(x).shape, (17, 29))
+            self.assertEqual(layer(packed_x).shape, (17, 29))
+
     def test_packed_cache_selection_is_deferred_behind_an_opaque_token(self) -> None:
         from rtx import fp8
         from rtx.kernels.mxfp8 import MXFP8Problem
@@ -379,13 +396,33 @@ class LinearFrontendContractTests(unittest.TestCase):
         self.assertEqual(layer.weight_data.shape, (64, 64))
         self.assertIsNone(layer.weight)
         self.assertFalse(layer.training)
-        with self.assertRaisesRegex(ValueError, "qdata has"):
+        with self.assertRaisesRegex(ValueError, "qdata storage"):
             make_nvfp4_tensor(
                 torch.empty(64, 128, dtype=fp4_dtype),
                 scales,
                 tensor_scale,
                 shape=(64, 128),
             )
+
+    def test_nvfp4_packed_operands_preserve_ragged_logical_k(self) -> None:
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        if fp4_dtype is None:
+            self.skipTest("PyTorch does not expose packed FP4")
+        from rtx.formats.nvfp4 import nvfp4_matrix_shape
+
+        with FakeTensorMode():
+            scale = torch.ones((), device="cuda", dtype=torch.float32)
+            qx = torch.empty(17, 24, device="cuda", dtype=fp4_dtype)
+            qw = torch.empty(29, 24, device="cuda", dtype=fp4_dtype)
+            sx = torch.empty(17, 3, device="cuda", dtype=torch.float8_e4m3fn)
+            sw = torch.empty(29, 3, device="cuda", dtype=torch.float8_e4m3fn)
+            packed_x = make_nvfp4_tensor(qx, sx, scale, (17, 33))
+            packed_w = make_nvfp4_tensor(qw, sw, scale, (29, 33))
+            self.assertEqual(nvfp4_matrix_shape(packed_x), (17, 33))
+            layer = rtx.NVFP4Linear(
+                33, 29, packed_weight=packed_w, autotune="off"
+            )
+            self.assertEqual(layer(packed_x).shape, (17, 29))
 
 
 if __name__ == "__main__":

@@ -166,6 +166,19 @@ class PrequantExperimentTests(unittest.TestCase):
         self.assertEqual(features["w_reuse_ctas"], 64)
         self.assertIn("working_set_l2_ratio", features)
 
+    def test_ragged_k_features_record_minimal_physical_tail(self) -> None:
+        shape = ShapeSpec(17, 29, 33)
+        features = derived_features(
+            shape,
+            DEFAULT_MXFP8_PREQUANT_CONFIG,
+            _fingerprint(),
+        )
+        self.assertEqual(features["k"], 33)
+        self.assertEqual(features["storage_k"], 64)
+        self.assertEqual(features["storage_k_tail"], 31)
+        self.assertEqual(features["quantized_operand_bytes"], (17 + 29) * 64)
+        self.assertEqual(features["scale_bytes"], (17 + 29) * 2)
+
     def test_journal_is_append_only_resumable_and_exports_csv(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trials.jsonl"

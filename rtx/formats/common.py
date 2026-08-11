@@ -13,7 +13,7 @@ Orientation = Literal["row_major", "transpose"]
 LinearOperandState = Literal[
     "dynamic", "weight_prequantized", "fully_prequantized"
 ]
-PACKED_OPERAND_SCHEMA_VERSION = 1
+PACKED_OPERAND_SCHEMA_VERSION = 2
 SCALE_LAYOUT_CODES = {"row_major": 0, "mma64": 1, "mma128": 2}
 SCALE_LAYOUT_NAMES = {value: key for key, value in SCALE_LAYOUT_CODES.items()}
 

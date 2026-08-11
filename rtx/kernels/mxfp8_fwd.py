@@ -1827,32 +1827,78 @@ class MXFP8LinearFwdKernel:
                                 )
                                 if is_a:
                                     src_row_a = x[global_row, None]
-                                    loaded = nvvm.load_ext(
-                                        src_row_a.iterator
-                                        + src_row_a.layout(global_k_base),
-                                        dtype=Uint16,
-                                        count=values_per_load,
-                                    ).bitcast(BFloat16)
-                                    for load_vec in cutlass.range_constexpr(
-                                        values_per_load
+                                    load_bytes = cfg.quant_load_bits // 8
+                                    naturally_aligned = (
+                                        (global_row * self.problem.k + global_k_base)
+                                        * (BFloat16.width // 8)
+                                    ) % load_bytes == 0
+                                    if (
+                                        global_row < row_limit
+                                        and global_k_base + values_per_load
+                                        <= self.problem.k
+                                        and naturally_aligned
                                     ):
-                                        bf16_values[vec_base + load_vec] = loaded[
-                                            load_vec
-                                        ]
+                                        loaded = nvvm.load_ext(
+                                            src_row_a.iterator
+                                            + src_row_a.layout(global_k_base),
+                                            dtype=Uint16,
+                                            count=values_per_load,
+                                        ).bitcast(BFloat16)
+                                        for load_vec in cutlass.range_constexpr(
+                                            values_per_load
+                                        ):
+                                            bf16_values[vec_base + load_vec] = loaded[
+                                                load_vec
+                                            ]
+                                    else:
+                                        for load_vec in cutlass.range_constexpr(
+                                            values_per_load
+                                        ):
+                                            scalar_k = global_k_base + load_vec
+                                            if (
+                                                global_row < row_limit
+                                                and scalar_k < self.problem.k
+                                            ):
+                                                bf16_values[vec_base + load_vec] = (
+                                                    x[global_row, scalar_k]
+                                                )
                                 else:
                                     src_row_b = weight[global_row, None]
-                                    loaded = nvvm.load_ext(
-                                        src_row_b.iterator
-                                        + src_row_b.layout(global_k_base),
-                                        dtype=Uint16,
-                                        count=values_per_load,
-                                    ).bitcast(BFloat16)
-                                    for load_vec in cutlass.range_constexpr(
-                                        values_per_load
+                                    load_bytes = cfg.quant_load_bits // 8
+                                    naturally_aligned = (
+                                        (global_row * self.problem.k + global_k_base)
+                                        * (BFloat16.width // 8)
+                                    ) % load_bytes == 0
+                                    if (
+                                        global_row < row_limit
+                                        and global_k_base + values_per_load
+                                        <= self.problem.k
+                                        and naturally_aligned
                                     ):
-                                        bf16_values[vec_base + load_vec] = loaded[
-                                            load_vec
-                                        ]
+                                        loaded = nvvm.load_ext(
+                                            src_row_b.iterator
+                                            + src_row_b.layout(global_k_base),
+                                            dtype=Uint16,
+                                            count=values_per_load,
+                                        ).bitcast(BFloat16)
+                                        for load_vec in cutlass.range_constexpr(
+                                            values_per_load
+                                        ):
+                                            bf16_values[vec_base + load_vec] = loaded[
+                                                load_vec
+                                            ]
+                                    else:
+                                        for load_vec in cutlass.range_constexpr(
+                                            values_per_load
+                                        ):
+                                            scalar_k = global_k_base + load_vec
+                                            if (
+                                                global_row < row_limit
+                                                and scalar_k < self.problem.k
+                                            ):
+                                                bf16_values[vec_base + load_vec] = (
+                                                    weight[global_row, scalar_k]
+                                                )
                     for vec in cutlass.range_constexpr(cfg.quant_vec):
                         bf16_k = (
                             scale_block * self.sf_vec_size

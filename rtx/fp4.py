@@ -49,7 +49,7 @@ WeightMode = Literal["dynamic", "prequantized"]
 ScalingMode = Literal["delayed", "current", "regional", "block"]
 BackendMode = Literal["auto", "fused", "materialized"]
 AutotuneMode = Literal["off", "cache", "coordinate"]
-NVFP4_FRONTEND_REVISION = 1
+NVFP4_FRONTEND_REVISION = 2
 
 
 def _effective_scale_region_rows(rows: int, requested: int) -> int:
@@ -521,7 +521,7 @@ def _empty_nvfp4_scales(
     device: torch.device,
 ) -> torch.Tensor:
     if config.scale_layout == "row_major":
-        shape = (rows, k // 16)
+        shape = (rows, ((k + 15) // 16))
     else:
         shape = (rows // 128, k // 128, 1024)
     return torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
@@ -743,8 +743,13 @@ def _make_dynamic_runner(
     config: NVFP4ForwardConfig,
     device: torch.device,
 ) -> _DynamicRunner:
-    qx = torch.empty((problem.m, problem.k // 2), dtype=torch.uint8, device=device)
-    qw = torch.empty((problem.n, problem.k // 2), dtype=torch.uint8, device=device)
+    storage_problem = NVFP4Problem(problem.m, problem.n, problem.storage_k)
+    qx = torch.empty(
+        (problem.m, problem.storage_k // 2), dtype=torch.uint8, device=device
+    )
+    qw = torch.empty(
+        (problem.n, problem.storage_k // 2), dtype=torch.uint8, device=device
+    )
     sx = _empty_nvfp4_scales(problem.m, problem.k, config.quant, device)
     sw = _empty_nvfp4_scales(problem.n, problem.k, config.quant, device)
     if config.quant_launches == "dual":
@@ -764,7 +769,7 @@ def _make_dynamic_runner(
         config.quant_launches,
         quant_x,
         quant_w,
-        compile_nvfp4_gemm(problem, config.gemm),
+        compile_nvfp4_gemm(storage_problem, config.gemm),
         qx,
         qw,
         sx,
@@ -781,8 +786,13 @@ def _make_block_dynamic_runner(
     config: NVFP4ForwardConfig,
     device: torch.device,
 ) -> _BlockDynamicRunner:
-    qx = torch.empty((problem.m, problem.k // 2), dtype=torch.uint8, device=device)
-    qw = torch.empty((problem.n, problem.k // 2), dtype=torch.uint8, device=device)
+    storage_problem = NVFP4Problem(problem.m, problem.n, problem.storage_k)
+    qx = torch.empty(
+        (problem.m, problem.storage_k // 2), dtype=torch.uint8, device=device
+    )
+    qw = torch.empty(
+        (problem.n, problem.storage_k // 2), dtype=torch.uint8, device=device
+    )
     sx = _empty_nvfp4_scales(problem.m, problem.k, config.quant, device)
     sw = _empty_nvfp4_scales(problem.n, problem.k, config.quant, device)
     if config.quant_launches == "dual":
@@ -802,7 +812,7 @@ def _make_block_dynamic_runner(
         config.quant_launches,
         quant_x,
         quant_w,
-        compile_nvfp4_block_gemm(problem, config.gemm),
+        compile_nvfp4_block_gemm(storage_problem, config.gemm),
         qx,
         qw,
         sx,
@@ -819,13 +829,16 @@ def _make_dynamic_x_runner(
     config: NVFP4ForwardConfig,
     device: torch.device,
 ) -> _DynamicXRunner:
-    qx = torch.empty((problem.m, problem.k // 2), dtype=torch.uint8, device=device)
+    storage_problem = NVFP4Problem(problem.m, problem.n, problem.storage_k)
+    qx = torch.empty(
+        (problem.m, problem.storage_k // 2), dtype=torch.uint8, device=device
+    )
     sx = torch.empty(
-        (problem.m, problem.k // 16), dtype=torch.float8_e4m3fn, device=device
+        (problem.m, problem.storage_k // 16), dtype=torch.float8_e4m3fn, device=device
     )
     return _DynamicXRunner(
         compile_nvfp4_quant(problem.m, problem.k, config.quant),
-        compile_nvfp4_gemm(problem, config.gemm),
+        compile_nvfp4_gemm(storage_problem, config.gemm),
         qx,
         sx,
         _packed_fp4_view(qx),
@@ -894,13 +907,10 @@ def _packed_inference_config_key(
                 cache_dir=request.cache_dir,
                 policy=request.policy,
             )
-        config = (
-            DEFAULT_NVFP4_FORWARD_CONFIG
-            if selected is None
-            else NVFP4ForwardConfig(
-                gemm=selected.gemm,
-                l2_fetch_granularity=selected.l2_fetch_granularity,
-            )
+        selected = selected or NVFP4FullyPrequantConfig()
+        config = NVFP4ForwardConfig(
+            gemm=selected.gemm,
+            l2_fetch_granularity=selected.l2_fetch_granularity,
         )
     else:
         family = "nvfp4_weight_prequant_fwd"
@@ -923,15 +933,12 @@ def _packed_inference_config_key(
                 cache_dir=request.cache_dir,
                 policy=request.policy,
             )
-        config = (
-            DEFAULT_NVFP4_FORWARD_CONFIG
-            if selected is None
-            else NVFP4ForwardConfig(
-                quant=selected.quant_x,
-                gemm=selected.gemm,
-                quant_launches="independent",
-                l2_fetch_granularity=selected.l2_fetch_granularity,
-            )
+        selected = selected or NVFP4WeightPrequantConfig()
+        config = NVFP4ForwardConfig(
+            quant=selected.quant_x,
+            gemm=selected.gemm,
+            quant_launches="independent",
+            l2_fetch_granularity=selected.l2_fetch_granularity,
         )
     selected_key = _intern_forward_config(config)
     _INFERENCE_CONFIG_SELECTIONS[selection_key] = selected_key
@@ -1323,9 +1330,10 @@ def quantize_nvfp4(
         raise TypeError("NVFP4 tensor_scale must be one FP32 value")
     if scale.device != source.device:
         raise ValueError("NVFP4 tensor_scale and source must share one device")
-    qdata = torch.empty((rows, k // 2), dtype=torch.uint8, device=source.device)
+    storage_k = (k + 15) // 16 * 16
+    qdata = torch.empty((rows, storage_k // 2), dtype=torch.uint8, device=source.device)
     scales = torch.empty(
-        (rows, k // 16), dtype=torch.float8_e4m3fn, device=source.device
+        (rows, storage_k // 16), dtype=torch.float8_e4m3fn, device=source.device
     )
     scale_1d = scale.reshape(1)
     compile_nvfp4_quant(rows, k, selected)(source, qdata, scales, scale_1d)
@@ -1448,7 +1456,8 @@ def _nvfp4_linear_dynamic_x_prequant_w_op(
 ) -> torch.Tensor:
     if weight_scale_layout != "row_major":
         raise RuntimeError("native NVFP4 GEMM currently requires row-major scales")
-    if x.ndim != 2 or tuple(weight_data.shape) != (n, k // 2):
+    storage_k = (k + 15) // 16 * 16
+    if x.ndim != 2 or tuple(weight_data.shape) != (n, storage_k // 2):
         raise ValueError("dynamic-X/prequant-W NVFP4 operand shape mismatch")
     _check_sm12x(x.device)
     x_c = x if x.is_contiguous() else x.contiguous()
@@ -1535,7 +1544,10 @@ def _nvfp4_linear_prequantized_op(
 
     _ensure_l2_fetch_granularity(config.l2_fetch_granularity)
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x_data.device)
-    compile_nvfp4_gemm(problem, config.gemm)(
+    compile_nvfp4_gemm(
+        NVFP4Problem(problem.m, problem.n, int(x_data.shape[-1]) * 2),
+        config.gemm,
+    )(
         x_data,
         weight_data,
         x_block_scales,
@@ -2579,7 +2591,8 @@ def nvfp4_linear(
                     request_key,
                 ),
             )
-            return out.reshape(*x.shape[:-1], n)
+            logical_shape = getattr(x, "_rtx_logical_shape", tuple(x.shape))
+            return out.reshape(*logical_shape[:-1], n)
         if x.ndim < 1 or x.shape[-1] != k:
             raise ValueError(f"expected activation [..., {k}], got {x.shape}")
         if x.device.type != "cuda" or weight.device.type != "cuda":
@@ -2693,9 +2706,18 @@ def _nvfp4_dynamic_linear_with_keys(
     _check_nvfp4_inputs(x_2d, weight)
     selected_backend = backend
     if selected_backend == "auto":
+        problem = NVFP4Problem(
+            int(x_2d.shape[0]), int(weight.shape[0]), int(x_2d.shape[1])
+        )
+        request = _AUTOTUNE_REQUESTS[materialized_request_key]
+        materialized = request.dynamic or DEFAULT_NVFP4_DYNAMIC_CONFIG
         selected_backend = (
             "fused"
-            if x_scale_region_rows or weight_scale_region_rows
+            if (
+                x_scale_region_rows
+                or weight_scale_region_rows
+                or materialized.rejection(problem) is not None
+            )
             else "materialized"
         )
     if selected_backend == "materialized" and (
@@ -2942,9 +2964,13 @@ class NVFP4Linear(nn.Module):
             self._delayed_problem: tuple[object, ...] | None = None
         else:
             validate_nvfp4_tensor(packed_weight)
-            if packed_weight.shape != (out_features, in_features):
+            if nvfp4_matrix_shape(packed_weight) != (
+                out_features,
+                in_features,
+            ):
                 raise ValueError(
-                    f"packed NVFP4 weight must have shape {(out_features, in_features)}"
+                    f"packed NVFP4 weight must have shape "
+                    f"{(out_features, in_features)}"
                 )
             if nvfp4_orientation(packed_weight) != "row_major":
                 raise ValueError("packed linear weights must be row-major")
@@ -2963,6 +2989,8 @@ class NVFP4Linear(nn.Module):
                     [
                         PACKED_OPERAND_SCHEMA_VERSION,
                         SCALE_LAYOUT_CODES[packed_layout],
+                        self.in_features,
+                        int(packed_weight.qdata.shape[-1]) * 2,
                     ],
                     dtype=torch.int64,
                     device=packed_weight.device,
@@ -3142,7 +3170,10 @@ class NVFP4Linear(nn.Module):
                         self._materialized_request_key,
                     ),
                 )
-                return out.reshape(*x.shape[:-1], self.out_features)
+                logical_shape = getattr(
+                    x, "_rtx_logical_shape", tuple(x.shape)
+                )
+                return out.reshape(*logical_shape[:-1], self.out_features)
             if x.ndim < 1 or x.shape[-1] != self.in_features:
                 raise ValueError(
                     f"expected activation [..., {self.in_features}], got {x.shape}"

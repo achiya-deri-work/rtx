@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import lru_cache
 import os
 
@@ -51,6 +52,20 @@ class MXFP8GemmKernel:
         atomic_output: bool = False,
         cluster_output: bool = False,
     ):
+        if problem.k % config.tile_k:
+            # Qdata TMA naturally zero-fills a short K tile. Scale vectors are
+            # byte-addressed separately, and a wide GMEM load would either
+            # cross the row boundary or require alignment based on the padded
+            # macro tile. Use predicated scalar scale loads only for this final
+            # tile; full-tile configurations retain their autotuned vector path.
+            config = replace(
+                config,
+                scale_load_vec=1,
+                scale_smem_store="scalar",
+                scale_l2_prefetch="none",
+                scale_l1_evict="default",
+                scale_cache="default",
+            )
         self.ab_dtype = Float8E4M3FN
         self.sf_dtype = Float8E8M0FNU
         self.sf_vec_size = SF_VEC_SIZE
@@ -295,7 +310,11 @@ class MXFP8GemmKernel:
             global_k_block = k_tile * scale_blocks_per_tile + k_block
             if cutlass.const_expr(cfg.scale_load_vec == 1):
                 scale = Uint8(0).bitcast(self.sf_dtype)
-                if global_row < row_limit:
+                if (
+                    global_row < row_limit
+                    and global_k_block
+                    < self.problem.k // self.sf_vec_size
+                ):
                     if is_a:
                         scale = sx[global_row, global_k_block]
                     else:
@@ -1080,7 +1099,11 @@ class MXFP8GemmKernel:
                         )
                         if cutlass.const_expr(cfg.scale_load_vec == 1):
                             scale = Uint8(0).bitcast(self.sf_dtype)
-                            if global_row < row_limit:
+                            if (
+                                global_row < row_limit
+                                and global_k_block
+                                < self.problem.k // self.sf_vec_size
+                            ):
                                 if is_a:
                                     scale = sx_row_view[global_row, global_k_block]
                                 else:

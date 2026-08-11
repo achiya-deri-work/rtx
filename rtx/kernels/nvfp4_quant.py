@@ -34,9 +34,14 @@ class NVFP4QuantKernel:
             raise ValueError(f"illegal NVFP4 quantizer configuration: {rejection}")
         self.rows = rows
         self.k = k
+        self.storage_k = (
+            (k + NVFP4_SF_VEC_SIZE - 1)
+            // NVFP4_SF_VEC_SIZE
+            * NVFP4_SF_VEC_SIZE
+        )
         self.config = config
-        blocks = rows * (k // NVFP4_SF_VEC_SIZE)
-        self.task_groups = blocks // config.blocks_per_warp
+        blocks = rows * (self.storage_k // NVFP4_SF_VEC_SIZE)
+        self.task_groups = cute.ceil_div(blocks, config.blocks_per_warp)
         sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
         natural_ctas = cute.ceil_div(self.task_groups, config.num_warps)
         self.grid_ctas = min(
@@ -170,16 +175,31 @@ class NVFP4QuantKernel:
         src_row = src[row, None]
         for load_idx in cutlass.range_constexpr(loads_per_lane):
             value_base = load_idx * values_per_load
+            global_k_base = k_base + value_base
             if cutlass.const_expr(values_per_load == 1):
-                values_bf16[value_base] = src_row[k_base + value_base]
+                if global_k_base < self.k:
+                    values_bf16[value_base] = src_row[global_k_base]
             else:
-                loaded = nvvm.load_ext(
-                    src_row.iterator + src_row.layout(k_base + value_base),
-                    dtype=Uint16,
-                    count=values_per_load,
-                ).bitcast(BFloat16)
-                for vec in cutlass.range_constexpr(values_per_load):
-                    values_bf16[value_base + vec] = loaded[vec]
+                load_bytes = cfg.load_bits // 8
+                naturally_aligned = (
+                    (row * self.k + global_k_base) * (BFloat16.width // 8)
+                ) % load_bytes == 0
+                if (
+                    global_k_base + values_per_load <= self.k
+                    and naturally_aligned
+                ):
+                    loaded = nvvm.load_ext(
+                        src_row.iterator + src_row.layout(global_k_base),
+                        dtype=Uint16,
+                        count=values_per_load,
+                    ).bitcast(BFloat16)
+                    for vec in cutlass.range_constexpr(values_per_load):
+                        values_bf16[value_base + vec] = loaded[vec]
+                else:
+                    for vec in cutlass.range_constexpr(values_per_load):
+                        scalar_k = global_k_base + vec
+                        if scalar_k < self.k:
+                            values_bf16[value_base + vec] = src_row[scalar_k]
 
         values = [Float32(0.0)] * cfg.values_per_lane
         local_amax = Float32(0.0)
@@ -277,7 +297,7 @@ class NVFP4QuantKernel:
         warp_stride = self.grid_ctas * cfg.num_warps
         block_in_warp = lane_idx // cfg.threads_per_scale
         lane_in_scale = lane_idx % cfg.threads_per_scale
-        blocks_per_row = self.k // NVFP4_SF_VEC_SIZE
+        blocks_per_row = self.storage_k // NVFP4_SF_VEC_SIZE
         global_scale = Float32(tensor_scale[0])
         for task_group in cutlass.range(
             warp_linear,
@@ -286,17 +306,18 @@ class NVFP4QuantKernel:
             unroll=1,
         ):
             linear_block = task_group * cfg.blocks_per_warp + block_in_warp
-            row = linear_block // blocks_per_row
-            scale_block = linear_block % blocks_per_row
-            self._quantize_task(
-                src,
-                quantized_packed,
-                scales,
-                global_scale,
-                row,
-                scale_block,
-                lane_in_scale,
-            )
+            if linear_block < self.rows * blocks_per_row:
+                row = linear_block // blocks_per_row
+                scale_block = linear_block % blocks_per_row
+                self._quantize_task(
+                    src,
+                    quantized_packed,
+                    scales,
+                    global_scale,
+                    row,
+                    scale_block,
+                    lane_in_scale,
+                )
 
 
 class NVFP4DualQuantKernel(NVFP4QuantKernel):
@@ -316,13 +337,18 @@ class NVFP4DualQuantKernel(NVFP4QuantKernel):
         self.x_rows = x_rows
         self.weight_rows = weight_rows
         self.k = k
-        self.config = config
-        blocks_per_row = k // NVFP4_SF_VEC_SIZE
-        self.x_task_groups = (
-            x_rows * blocks_per_row // config.blocks_per_warp
+        self.storage_k = (
+            (k + NVFP4_SF_VEC_SIZE - 1)
+            // NVFP4_SF_VEC_SIZE
+            * NVFP4_SF_VEC_SIZE
         )
-        self.weight_task_groups = (
-            weight_rows * blocks_per_row // config.blocks_per_warp
+        self.config = config
+        blocks_per_row = self.storage_k // NVFP4_SF_VEC_SIZE
+        self.x_task_groups = cute.ceil_div(
+            x_rows * blocks_per_row, config.blocks_per_warp
+        )
+        self.weight_task_groups = cute.ceil_div(
+            weight_rows * blocks_per_row, config.blocks_per_warp
         )
         self.task_groups = self.x_task_groups + self.weight_task_groups
         sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
@@ -379,7 +405,7 @@ class NVFP4DualQuantKernel(NVFP4QuantKernel):
         warp_stride = self.grid_ctas * cfg.num_warps
         block_in_warp = lane_idx // cfg.threads_per_scale
         lane_in_scale = lane_idx % cfg.threads_per_scale
-        blocks_per_row = self.k // NVFP4_SF_VEC_SIZE
+        blocks_per_row = self.storage_k // NVFP4_SF_VEC_SIZE
         x_global_scale = Float32(x_tensor_scale[0])
         w_global_scale = Float32(weight_tensor_scale[0])
         for task_group in cutlass.range(
@@ -392,29 +418,31 @@ class NVFP4DualQuantKernel(NVFP4QuantKernel):
                 linear_block = (
                     task_group * cfg.blocks_per_warp + block_in_warp
                 )
-                self._quantize_task(
-                    x,
-                    qx,
-                    sx,
-                    x_global_scale,
-                    linear_block // blocks_per_row,
-                    linear_block % blocks_per_row,
-                    lane_in_scale,
-                )
+                if linear_block < self.x_rows * blocks_per_row:
+                    self._quantize_task(
+                        x,
+                        qx,
+                        sx,
+                        x_global_scale,
+                        linear_block // blocks_per_row,
+                        linear_block % blocks_per_row,
+                        lane_in_scale,
+                    )
             else:
                 local_group = task_group - self.x_task_groups
                 linear_block = (
                     local_group * cfg.blocks_per_warp + block_in_warp
                 )
-                self._quantize_task(
-                    weight,
-                    qw,
-                    sw,
-                    w_global_scale,
-                    linear_block // blocks_per_row,
-                    linear_block % blocks_per_row,
-                    lane_in_scale,
-                )
+                if linear_block < self.weight_rows * blocks_per_row:
+                    self._quantize_task(
+                        weight,
+                        qw,
+                        sw,
+                        w_global_scale,
+                        linear_block // blocks_per_row,
+                        linear_block % blocks_per_row,
+                        lane_in_scale,
+                    )
 
 
 class NVFP4BlockQuantKernel(NVFP4QuantKernel):
@@ -449,20 +477,21 @@ class NVFP4BlockQuantKernel(NVFP4QuantKernel):
         warp_stride = self.grid_ctas * cfg.num_warps
         block_in_warp = lane_idx // cfg.threads_per_scale
         lane_in_scale = lane_idx % cfg.threads_per_scale
-        blocks_per_row = self.k // NVFP4_SF_VEC_SIZE
+        blocks_per_row = self.storage_k // NVFP4_SF_VEC_SIZE
         for task_group in cutlass.range(
             warp_linear, self.task_groups, warp_stride, unroll=1
         ):
             linear_block = task_group * cfg.blocks_per_warp + block_in_warp
-            self._quantize_task(
-                src,
-                quantized_packed,
-                scales,
-                Float32(1.0),
-                linear_block // blocks_per_row,
-                linear_block % blocks_per_row,
-                lane_in_scale,
-            )
+            if linear_block < self.rows * blocks_per_row:
+                self._quantize_task(
+                    src,
+                    quantized_packed,
+                    scales,
+                    Float32(1.0),
+                    linear_block // blocks_per_row,
+                    linear_block % blocks_per_row,
+                    lane_in_scale,
+                )
 
 
 class NVFP4BlockDualQuantKernel(NVFP4DualQuantKernel):
@@ -503,33 +532,35 @@ class NVFP4BlockDualQuantKernel(NVFP4DualQuantKernel):
         warp_stride = self.grid_ctas * cfg.num_warps
         block_in_warp = lane_idx // cfg.threads_per_scale
         lane_in_scale = lane_idx % cfg.threads_per_scale
-        blocks_per_row = self.k // NVFP4_SF_VEC_SIZE
+        blocks_per_row = self.storage_k // NVFP4_SF_VEC_SIZE
         for task_group in cutlass.range(
             warp_linear, self.task_groups, warp_stride, unroll=1
         ):
             if task_group < self.x_task_groups:
                 linear_block = task_group * cfg.blocks_per_warp + block_in_warp
-                self._quantize_task(
-                    x,
-                    qx,
-                    sx,
-                    Float32(1.0),
-                    linear_block // blocks_per_row,
-                    linear_block % blocks_per_row,
-                    lane_in_scale,
-                )
+                if linear_block < self.x_rows * blocks_per_row:
+                    self._quantize_task(
+                        x,
+                        qx,
+                        sx,
+                        Float32(1.0),
+                        linear_block // blocks_per_row,
+                        linear_block % blocks_per_row,
+                        lane_in_scale,
+                    )
             else:
                 local_group = task_group - self.x_task_groups
                 linear_block = local_group * cfg.blocks_per_warp + block_in_warp
-                self._quantize_task(
-                    weight,
-                    qw,
-                    sw,
-                    Float32(1.0),
-                    linear_block // blocks_per_row,
-                    linear_block % blocks_per_row,
-                    lane_in_scale,
-                )
+                if linear_block < self.weight_rows * blocks_per_row:
+                    self._quantize_task(
+                        weight,
+                        qw,
+                        sw,
+                        Float32(1.0),
+                        linear_block // blocks_per_row,
+                        linear_block % blocks_per_row,
+                        lane_in_scale,
+                    )
 
 
 def _fake_bf16(rows: int, k: int):
@@ -539,17 +570,30 @@ def _fake_bf16(rows: int, k: int):
 
 
 def _fake_packed(rows: int, k: int):
+    storage_k = (
+        (k + NVFP4_SF_VEC_SIZE - 1)
+        // NVFP4_SF_VEC_SIZE
+        * NVFP4_SF_VEC_SIZE
+    )
     return cute.runtime.make_fake_tensor(
-        Uint8, (rows, k // 2), stride=(k // 2, 1), assumed_align=16
+        Uint8,
+        (rows, storage_k // 2),
+        stride=(storage_k // 2, 1),
+        assumed_align=16,
     )
 
 
 def _fake_scales(rows: int, k: int, scale_layout: str = "row_major"):
     if scale_layout == "row_major":
+        storage_k = (
+            (k + NVFP4_SF_VEC_SIZE - 1)
+            // NVFP4_SF_VEC_SIZE
+            * NVFP4_SF_VEC_SIZE
+        )
         return cute.runtime.make_fake_tensor(
             Float8E4M3FN,
-            (rows, k // NVFP4_SF_VEC_SIZE),
-            stride=(k // NVFP4_SF_VEC_SIZE, 1),
+            (rows, storage_k // NVFP4_SF_VEC_SIZE),
+            stride=(storage_k // NVFP4_SF_VEC_SIZE, 1),
             assumed_align=16,
         )
     return cute.runtime.make_fake_tensor(

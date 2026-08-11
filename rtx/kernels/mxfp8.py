@@ -52,11 +52,17 @@ class MXFP8Problem:
     def validate(self) -> None:
         if min(self.m, self.n, self.k) <= 0:
             raise ValueError(f"M, N and K must be positive, got {self}")
-        if self.k % 32:
-            raise ValueError(
-                f"MXFP8 scale vectors contain 32 values, so K must be divisible "
-                f"by 32; got K={self.k}"
-            )
+
+    @property
+    def storage_k(self) -> int:
+        """Smallest MXFP8 block-aligned reduction extent.
+
+        ``k`` is always the user-visible BF16 extent.  Kernels issue complete
+        32-value scale blocks and predicate/zero-fill coordinates in
+        ``[k, storage_k)``; no padded BF16 tensor exists in global memory.
+        """
+
+        return ((self.k + 31) // 32) * 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,12 +318,6 @@ class MXFP8FwdConfig:
             or problem.k % self.bf16_tile_k
         ):
             return "cp.async staging currently requires full M/N/K tiles"
-        if self.quant_load_bits > 16 and (
-            problem.m % self.tile_m
-            or problem.n % self.tile_n
-            or problem.k % self.bf16_tile_k
-        ):
-            return "vector quantizer loads currently require full M/N/K tiles"
         if (
             self.quant_load_bits > 16
             and self.load_engine != "scalar"
@@ -533,7 +533,7 @@ class MXFP8FwdConfig:
 
 
 DEFAULT_MXFP8_FWD_CONFIG = MXFP8FwdConfig()
-MXFP8_FWD_KERNEL_REVISION = 20
+MXFP8_FWD_KERNEL_REVISION = 21
 
 
 # Block coordinates supplement, rather than replace, their primitive fields.

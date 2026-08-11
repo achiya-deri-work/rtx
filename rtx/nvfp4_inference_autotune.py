@@ -20,8 +20,8 @@ from .configs.nvfp4 import (
 from .prequant_autotune import PREQUANT_SEARCH_SPACE
 
 
-NVFP4_INFERENCE_KERNEL_REVISION = 2
-NVFP4_DYNAMIC_KERNEL_REVISION = 5
+NVFP4_INFERENCE_KERNEL_REVISION = 3
+NVFP4_DYNAMIC_KERNEL_REVISION = 6
 
 
 def _gemm_axes() -> dict[str, tuple[dict[str, object], ...]]:
