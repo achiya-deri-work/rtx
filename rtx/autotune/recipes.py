@@ -21,6 +21,7 @@ from .strategies import (
     CostModelGuidedSearch,
     CostModelLocalSearch,
     RandomSearch,
+    SharedModelFitState,
 )
 
 
@@ -72,6 +73,7 @@ def make_hybrid_autotuner(
     policy: HybridTuningPolicy = HybridTuningPolicy(),
     *,
     progress=None,
+    shared_fit_state: SharedModelFitState | None = None,
 ) -> AutotuneOrchestrator[ConfigT]:
     """Build GBT-guided global search followed by/bandited with local search."""
 
@@ -190,6 +192,13 @@ def make_hybrid_autotuner(
             max_thresholds=policy.model_max_thresholds,
             seed=policy.seed ^ 0x5EED,
         )
+    if shared_fit_state is not None:
+        cost_model = shared_fit_state.cost_model
+        if shared_fit_state.feasibility_model is None:
+            raise ValueError("shared fit state has no feasibility model")
+        feasibility = shared_fit_state.feasibility_model
+    else:
+        shared_fit_state = SharedModelFitState(cost_model, feasibility)
     if pretrained is not None and bool(
         pretrained.deployment.get("conditional_rules_enabled", False)
     ):
@@ -219,6 +228,7 @@ def make_hybrid_autotuner(
         feasibility_exploration=policy.feasibility_exploration,
         minimum_optimistic_feasibility=policy.minimum_optimistic_feasibility,
         model_provenance=provenance,
+        fit_state=shared_fit_state,
     )
     local = CostModelLocalSearch[ConfigT](
         model=learned.model,
@@ -226,6 +236,7 @@ def make_hybrid_autotuner(
         rule_prior=rules,
         rule_weight=policy.pretrained_rule_weight,
         model_provenance=provenance,
+        fit_state=shared_fit_state,
         beam_width=policy.local_beam_width,
         exploration=policy.model_exploration * 0.25,
         refit_interval=policy.local_model_refit_interval,
@@ -281,6 +292,7 @@ def make_hybrid_ask_tell_runner(
     policy: HybridTuningPolicy = HybridTuningPolicy(),
     *,
     progress=None,
+    shared_fit_state: SharedModelFitState | None = None,
 ) -> DurableLocalAskTellRunner[ConfigT]:
     """Build the same hybrid policy on the portable ask/tell execution path."""
 
@@ -293,7 +305,13 @@ def make_hybrid_ask_tell_runner(
             "ask/tell confirmation belongs in staged evaluation; use a task "
             "with an explicit confirmation fidelity"
         )
-    synchronous = make_hybrid_autotuner(adapter, store, policy, progress=progress)
+    synchronous = make_hybrid_autotuner(
+        adapter,
+        store,
+        policy,
+        progress=progress,
+        shared_fit_state=shared_fit_state,
+    )
     return DurableLocalAskTellRunner(
         adapter,
         store,

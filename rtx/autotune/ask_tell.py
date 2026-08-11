@@ -10,6 +10,7 @@ from typing import Generic, Mapping, Sequence, TypeVar
 import uuid
 
 from .bandit import ArmStatistics
+from .bandit import observation_strategy_cost_s
 from .core import (
     ComposableTuningResult,
     KernelAdapter,
@@ -376,7 +377,11 @@ class AskTellSession(Generic[ConfigT]):
             # decisions. Subsequent asks can fan out across workers.
             return [
                 self._request(
-                    Proposal(self.adapter.initial_config, "initial"),
+                    Proposal(
+                        self.adapter.initial_config,
+                        "initial",
+                        metadata={"proposal_elapsed_s": 0.0},
+                    ),
                     lease_s=lease_s,
                     fidelity=fidelity,
                 )
@@ -392,7 +397,19 @@ class AskTellSession(Generic[ConfigT]):
             if arm_name is None:
                 break
             strategy = self.strategies[arm_name]
+            proposal_started = time.monotonic()
             proposals = strategy.propose(self.adapter, self.history, self.rng, 1)
+            proposal_elapsed_s = time.monotonic() - proposal_started
+            arm = self.statistics[arm_name]
+            arm.proposal_calls += 1
+            arm.proposal_elapsed_s += proposal_elapsed_s
+            if not proposals:
+                arm.proposal_empty += 1
+            for item in proposals:
+                item.metadata = {
+                    **item.metadata,
+                    "proposal_elapsed_s": proposal_elapsed_s / max(1, len(proposals)),
+                }
             pending_ids = {request.config_id for request in self.pending.values()}
             proposal = next(
                 (
@@ -479,7 +496,7 @@ class AskTellSession(Generic[ConfigT]):
                 arm = self.statistics[request.strategy]
                 arm.pulls += 1
                 arm.successes += int(observation.successful)
-                arm.elapsed_s += observation.elapsed_s
+                arm.elapsed_s += observation_strategy_cost_s(observation)
                 arm.reward_sum += reward
         return observation
 

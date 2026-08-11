@@ -1223,6 +1223,23 @@ def make_mxfp8_bwd_adapter(
     if unknown:
         raise ValueError(f"unknown backward tuning axes: {sorted(unknown)}")
 
+    # A random walk usually changes only dX or dW. Cache the unchanged half's
+    # derived geometry/traffic vector so a large learned-search pool does not
+    # recompute both matmuls for every candidate.
+    matmul_feature_cache: dict[tuple[str, object], dict[str, float]] = {}
+    matmul_feature_cache_limit = 4096
+
+    def remember_matmul_features(
+        key: tuple[str, object],
+        values: Mapping[str, float],
+    ) -> None:
+        if len(matmul_feature_cache) >= matmul_feature_cache_limit:
+            # Clearing is deterministic and bounds what can otherwise become a
+            # multi-hour campaign cache. Hot random-walk components repopulate
+            # immediately.
+            matmul_feature_cache.clear()
+        matmul_feature_cache[key] = dict(values)
+
     def update(config: object, coordinate: str, value: object) -> object:
         current = config
         parts = coordinate.split("_")
@@ -1272,6 +1289,12 @@ def make_mxfp8_bwd_adapter(
             ("dx", dx_matmul, dx_problem),
             ("dw", dw_matmul, dw_problem),
         ):
+            cache_key = (name, matmul)
+            cached = matmul_feature_cache.get(cache_key)
+            if cached is not None:
+                values.update(cached)
+                continue
+            keys_before = set(values)
             if matmul.backend == "fused":
                 fused = matmul.fused
                 profile = _device_dict(device)
@@ -1452,6 +1475,14 @@ def make_mxfp8_bwd_adapter(
                     and fused.quant_load_bits == 128
                     else 0
                 )
+                remember_matmul_features(
+                    cache_key,
+                    {
+                        key: value
+                        for key, value in values.items()
+                        if key not in keys_before
+                    },
+                )
                 continue
 
             values.update(
@@ -1578,6 +1609,14 @@ def make_mxfp8_bwd_adapter(
             )
             values[f"{name}_oriented_cpasync"] = 0.0
             values[f"{name}_oriented_cpasync_ldmatrix_operands"] = 0.0
+            remember_matmul_features(
+                cache_key,
+                {
+                    key: value
+                    for key, value in values.items()
+                    if key not in keys_before
+                },
+            )
         quant_schedule = config.quant_schedule  # type: ignore[attr-defined]
         is_quad = quant_schedule in ("quad", "shared_g_quad")
         is_shared_g = quant_schedule == "shared_g_quad"

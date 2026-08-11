@@ -171,7 +171,19 @@ with a lower-confidence-bound acquisition. A separate classifier learns from
 `compile_error` observations and estimates compilation feasibility. Its
 optimistic probability adjusts ranking but never hard-prunes an uncertain
 region. The local stage explores complete coordinate neighborhoods around the
-best measured configurations and refits both shared models as labels arrive.
+best measured configurations. Global and local strategies share one fit clock,
+so a model is not redundantly refit by both consumers. Campaigns reuse that
+state across compatible context slices while retaining context-local proposal
+queues.
+
+The configured learned-search pool is a quality ceiling. Its effective size
+starts conservatively and adapts to a bounded CPU proposal budget, which keeps
+large Python feature spaces from starving the GPU. Every observation preserves
+the requested/effective pool size, pool construction time, next pool size, fit
+count, and fit time. The bandit charges both proposal and evaluator time to the
+responsible arm; a strategy cannot appear efficient merely because its CPU
+optimizer work happened outside the GPU benchmark. This accounting optimizes
+valid configurations per wall-clock hour rather than host-core utilization.
 
 For cross-machine warm starts, `rtx-autotune pretrain` fits three distinct
 revision-scoped heads from directories or ZIP archives:

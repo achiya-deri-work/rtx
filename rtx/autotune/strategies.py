@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 import random
+import time
 from typing import Generic, Mapping, Protocol, Sequence
 
 import numpy as np
@@ -25,6 +27,38 @@ class SearchStrategy(Protocol, Generic[ConfigT]):
     ) -> list[Proposal[ConfigT]]: ...
 
     def observe(self, observation: Observation[ConfigT]) -> None: ...
+
+
+@dataclass(slots=True)
+class SharedModelFitState:
+    """One fit clock shared by every strategy consuming the same models."""
+
+    cost_model: CostModel
+    feasibility_model: GradientBoostedFeasibilityModel | None = None
+    cost_fitted_count: int = 0
+    feasibility_fitted_count: int = 0
+    cost_fit_elapsed_s: float = 0.0
+    feasibility_fit_elapsed_s: float = 0.0
+    cost_fit_count: int = 0
+    feasibility_fit_count: int = 0
+    recommended_pool_size: int = 0
+    last_pool_size: int = 0
+    last_pool_elapsed_s: float = 0.0
+
+    @staticmethod
+    def refit_due(
+        current_count: int,
+        fitted_count: int,
+        minimum_interval: int,
+        growth_fraction: float,
+    ) -> bool:
+        if fitted_count <= 0:
+            return True
+        interval = max(
+            minimum_interval,
+            int(math.ceil(fitted_count * growth_fraction)),
+        )
+        return current_count - fitted_count >= interval
 
 
 @dataclass(slots=True)
@@ -154,15 +188,35 @@ class CostModelGuidedSearch(Generic[ConfigT]):
     min_observations: int = 16
     pool_size: int = 2048
     refit_interval: int = 8
+    refit_growth_fraction: float = 0.05
     exploration: float = 0.15
     feasibility_exploration: float = 0.5
     minimum_optimistic_feasibility: float = 0.05
     include_local_neighbors: int = 4
+    initial_pool_cap: int = 2048
+    proposal_budget_s: float = 1.0
     model_provenance: Mapping[str, object] | None = None
     name: str = "gradient_boosted"
     _fitted_count: int = field(default=0, init=False, repr=False)
     _feasibility_fitted_count: int = field(default=0, init=False, repr=False)
     _queue: list[Proposal[ConfigT]] = field(default_factory=list, init=False, repr=False)
+    fit_state: SharedModelFitState | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.refit_interval <= 0
+            or not 0 <= self.refit_growth_fraction <= 1
+            or self.initial_pool_cap <= 0
+            or self.proposal_budget_s <= 0
+        ):
+            raise ValueError("invalid model refit policy")
+        if self.fit_state is None:
+            self.fit_state = SharedModelFitState(self.model, self.feasibility_model)
+        elif (
+            self.fit_state.cost_model is not self.model
+            or self.fit_state.feasibility_model is not self.feasibility_model
+        ):
+            raise ValueError("shared fit state must own the strategy models")
 
     def propose(
         self,
@@ -173,27 +227,50 @@ class CostModelGuidedSearch(Generic[ConfigT]):
     ) -> list[Proposal[ConfigT]]:
         current_successes = history.successful
         training_successes = history.training_successful
+        assert self.fit_state is not None
+        fit_state = self.fit_state
         if len(training_successes) < self.min_observations and not self.model.fitted:
             proposals = self.warmup.propose(adapter, history, rng, limit)
             for proposal in proposals:
                 proposal.strategy = self.name
                 proposal.metadata["phase"] = "warmup"
             return proposals
-        if (
-            not self.model.fitted
-            or len(training_successes) - self._fitted_count >= self.refit_interval
+        if self.model.fitted and fit_state.cost_fitted_count == 0:
+            # A loaded pretrained model already represents the available prior
+            # evidence; do not immediately overwrite it on its first proposal.
+            fit_state.cost_fitted_count = len(training_successes)
+        if fit_state.cost_fitted_count == 0 or fit_state.refit_due(
+            len(training_successes),
+            fit_state.cost_fitted_count,
+            self.refit_interval,
+            self.refit_growth_fraction,
         ):
+            fit_started = time.monotonic()
             self.model.fit(history.observations)  # type: ignore[arg-type]
-            self._fitted_count = len(training_successes)
+            fit_state.cost_fit_elapsed_s = time.monotonic() - fit_started
+            fit_state.cost_fit_count += 1
+            fit_state.cost_fitted_count = len(training_successes)
+            self._fitted_count = fit_state.cost_fitted_count
             self._queue.clear()
         feasibility_count = self.feasibility_model.labeled_count(
             history.observations  # type: ignore[arg-type]
         )
         if (
-            not self.feasibility_model.fitted
-            or feasibility_count - self._feasibility_fitted_count >= self.refit_interval
+            self.feasibility_model.fitted
+            and fit_state.feasibility_fitted_count == 0
         ):
+            fit_state.feasibility_fitted_count = feasibility_count
+        if fit_state.feasibility_fitted_count == 0 or fit_state.refit_due(
+            feasibility_count,
+            fit_state.feasibility_fitted_count,
+            self.refit_interval,
+            self.refit_growth_fraction,
+        ):
+            fit_started = time.monotonic()
             self.feasibility_model.fit(history.observations)  # type: ignore[arg-type]
+            fit_state.feasibility_fit_elapsed_s = time.monotonic() - fit_started
+            fit_state.feasibility_fit_count += 1
+            fit_state.feasibility_fitted_count = feasibility_count
             self._feasibility_fitted_count = feasibility_count
             self._queue.clear()
         if not self.model.fitted:
@@ -211,8 +288,14 @@ class CostModelGuidedSearch(Generic[ConfigT]):
         seeds = [
             item.config for item in sorted(seed_observations, key=lambda item: item.score)[:8]
         ]
+        effective_pool_size = min(
+            self.pool_size,
+            fit_state.recommended_pool_size
+            or min(self.pool_size, self.initial_pool_cap),
+        )
+        pool_started = time.monotonic()
         candidate_by_id: dict[str, ConfigT] = {}
-        for candidate in adapter.sample(rng, self.pool_size, seeds):
+        for candidate in adapter.sample(rng, effective_pool_size, seeds):
             if adapter.rejection(candidate) is not None:
                 continue
             candidate_by_id.setdefault(adapter.config_id(candidate), candidate)
@@ -246,6 +329,22 @@ class CostModelGuidedSearch(Generic[ConfigT]):
             # Expected latency per successful trial. Uncertain regions retain
             # an optimistic probability and are explored rather than pruned.
             acquisition = mean / optimistic_probability - self.exploration * uncertainty
+        pool_elapsed_s = time.monotonic() - pool_started
+        fit_state.last_pool_size = effective_pool_size
+        fit_state.last_pool_elapsed_s = pool_elapsed_s
+        scaled_pool = int(
+            effective_pool_size
+            * self.proposal_budget_s
+            / max(pool_elapsed_s, 1.0e-6)
+        )
+        # Move gradually when under budget, but react immediately to a severe
+        # overrun. The configured pool remains the hard quality ceiling.
+        if pool_elapsed_s <= self.proposal_budget_s:
+            scaled_pool = min(effective_pool_size * 2, scaled_pool)
+        fit_state.recommended_pool_size = min(
+            self.pool_size,
+            max(min(256, self.pool_size), scaled_pool),
+        )
         order = sorted(range(len(candidates)), key=lambda index: float(acquisition[index]))
         queue_limit = min(len(order), max(256, self.refit_interval * 8))
         best_acquisition = float(acquisition[order[0]])
@@ -259,7 +358,16 @@ class CostModelGuidedSearch(Generic[ConfigT]):
                 "model_parameters": self.model.parameter_count,
                 "compile_training_labels": feasibility_count,
                 "feasibility_model_parameters": self.feasibility_model.parameter_count,
+                "model_fit_count": fit_state.cost_fit_count,
+                "model_fit_elapsed_s": fit_state.cost_fit_elapsed_s,
+                "model_fitted_observations": fit_state.cost_fitted_count,
+                "feasibility_fit_count": fit_state.feasibility_fit_count,
+                "feasibility_fit_elapsed_s": fit_state.feasibility_fit_elapsed_s,
                 "candidate_pool_size": len(candidates),
+                "requested_candidate_pool_size": self.pool_size,
+                "effective_candidate_pool_size": effective_pool_size,
+                "candidate_pool_elapsed_s": pool_elapsed_s,
+                "next_candidate_pool_size": fit_state.recommended_pool_size,
                 "candidate_rank": rank,
                 "acquisition_gap_to_best": float(acquisition[index]) - best_acquisition,
                 "proposal_probability": None,
@@ -304,11 +412,24 @@ class CostModelLocalSearch(Generic[ConfigT]):
     minimum_optimistic_feasibility: float = 0.05
     refresh_interval: int = 8
     refit_interval: int = 32
+    refit_growth_fraction: float = 0.05
     name: str = "model_local"
     _queue: list[Proposal[ConfigT]] = field(default_factory=list, init=False, repr=False)
     _observed: int = field(default=0, init=False, repr=False)
     _fitted_count: int = field(default=0, init=False, repr=False)
     _feasibility_fitted_count: int = field(default=0, init=False, repr=False)
+    fit_state: SharedModelFitState | None = None
+
+    def __post_init__(self) -> None:
+        if self.refit_interval <= 0 or not 0 <= self.refit_growth_fraction <= 1:
+            raise ValueError("invalid local-model refit policy")
+        if self.fit_state is None:
+            self.fit_state = SharedModelFitState(self.model, self.feasibility_model)
+        elif (
+            self.fit_state.cost_model is not self.model
+            or self.fit_state.feasibility_model is not self.feasibility_model
+        ):
+            raise ValueError("shared fit state must own the local strategy models")
 
     def propose(
         self,
@@ -318,11 +439,21 @@ class CostModelLocalSearch(Generic[ConfigT]):
         limit: int,
     ) -> list[Proposal[ConfigT]]:
         training_count = len(history.training_successful)
-        if self.model.fitted and training_count >= self.refit_interval and (
-            self._fitted_count == 0
-            or training_count - self._fitted_count >= self.refit_interval
+        assert self.fit_state is not None
+        fit_state = self.fit_state
+        if self.model.fitted and fit_state.cost_fitted_count == 0:
+            fit_state.cost_fitted_count = training_count
+        if self.model.fitted and fit_state.refit_due(
+            training_count,
+            fit_state.cost_fitted_count,
+            self.refit_interval,
+            self.refit_growth_fraction,
         ):
+            fit_started = time.monotonic()
             self.model.fit(history.observations)  # type: ignore[arg-type]
+            fit_state.cost_fit_elapsed_s = time.monotonic() - fit_started
+            fit_state.cost_fit_count += 1
+            fit_state.cost_fitted_count = training_count
             self._fitted_count = training_count
             self._queue.clear()
         if self.feasibility_model is not None:
@@ -330,11 +461,21 @@ class CostModelLocalSearch(Generic[ConfigT]):
                 history.observations  # type: ignore[arg-type]
             )
             if (
-                not self.feasibility_model.fitted
-                or feasibility_count - self._feasibility_fitted_count
-                >= self.refit_interval
+                self.feasibility_model.fitted
+                and fit_state.feasibility_fitted_count == 0
             ):
+                fit_state.feasibility_fitted_count = feasibility_count
+            if fit_state.feasibility_fitted_count == 0 or fit_state.refit_due(
+                feasibility_count,
+                fit_state.feasibility_fitted_count,
+                self.refit_interval,
+                self.refit_growth_fraction,
+            ):
+                fit_started = time.monotonic()
                 self.feasibility_model.fit(history.observations)  # type: ignore[arg-type]
+                fit_state.feasibility_fit_elapsed_s = time.monotonic() - fit_started
+                fit_state.feasibility_fit_count += 1
+                fit_state.feasibility_fitted_count = feasibility_count
                 self._feasibility_fitted_count = feasibility_count
                 self._queue.clear()
         if not self.model.fitted:
@@ -420,6 +561,9 @@ class CostModelLocalSearch(Generic[ConfigT]):
                 conditional_rule_matches=rule_matches[index],
                 candidate_pool_size=len(candidates),
                 candidate_rank=rank,
+                model_fit_count=fit_state.cost_fit_count,
+                model_fit_elapsed_s=fit_state.cost_fit_elapsed_s,
+                model_fitted_observations=fit_state.cost_fitted_count,
                 acquisition_gap_to_best=float(acquisition[index]) - best_acquisition,
                 proposal_probability=None,
                 proposal_probability_kind="deterministic_coordinate_rank",
@@ -486,5 +630,6 @@ __all__ = [
     "CostModelGuidedSearch",
     "RandomSearch",
     "SearchStrategy",
+    "SharedModelFitState",
     "StrategyPipeline",
 ]

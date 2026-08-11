@@ -9,7 +9,12 @@ import statistics as python_statistics
 import time
 from typing import Callable, Generic, Mapping, Protocol, Sequence
 
-from .bandit import AdaptiveBanditScheduler, ArmStatistics, UCB1Scheduler
+from .bandit import (
+    AdaptiveBanditScheduler,
+    ArmStatistics,
+    UCB1Scheduler,
+    observation_strategy_cost_s,
+)
 from .core import (
     ComposableTuningResult,
     ConfigT,
@@ -347,7 +352,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 else:
                     arm.pulls += 1
                     arm.successes += int(observation.successful)
-                    arm.elapsed_s += observation.elapsed_s
+                    arm.elapsed_s += observation_strategy_cost_s(observation)
                     arm.reward_sum += reward
             self._log(
                 started,
@@ -410,9 +415,14 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                     ),
                 },
             )
+            proposal_started = time.monotonic()
             try:
                 proposals = strategy.propose(self.adapter, history, rng, 1)
             except Exception as exc:
+                proposal_elapsed_s = time.monotonic() - proposal_started
+                statistics[arm_name].proposal_calls += 1
+                statistics[arm_name].proposal_elapsed_s += proposal_elapsed_s
+                statistics[arm_name].proposal_errors += 1
                 statistics[arm_name].unavailable_until = trial_index + len(names)
                 self.store.record_event(
                     session_id,
@@ -420,6 +430,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                     {
                         "trial": trial_index,
                         "strategy": arm_name,
+                        "proposal_elapsed_s": proposal_elapsed_s,
                         "error": f"{type(exc).__name__}: {exc}"[:4000],
                     },
                 )
@@ -427,6 +438,9 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 if empty_attempts >= len(names) * 2:
                     break
                 continue
+            proposal_elapsed_s = time.monotonic() - proposal_started
+            statistics[arm_name].proposal_calls += 1
+            statistics[arm_name].proposal_elapsed_s += proposal_elapsed_s
             proposals = [
                 proposal
                 for proposal in proposals
@@ -434,6 +448,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 not in history.seen_ids | abandoned_ids
             ]
             if not proposals:
+                statistics[arm_name].proposal_empty += 1
                 empty_attempts += 1
                 statistics[arm_name].unavailable_until = trial_index + len(names)
                 self.store.record_event(
@@ -447,6 +462,10 @@ class AutotuneOrchestrator(Generic[ConfigT]):
             empty_attempts = 0
             proposal = proposals[0]
             proposal.strategy = arm_name
+            proposal.metadata = {
+                **proposal.metadata,
+                "proposal_elapsed_s": proposal_elapsed_s,
+            }
             observation = run(proposal)
             strategy.observe(observation)
 

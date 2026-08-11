@@ -24,6 +24,7 @@ from rtx.autotune import (
     RandomSearch,
     RuntimeWinnerKey,
     SearchHistory,
+    SharedModelFitState,
     SequentialScheduler,
     TrialOutcome,
     TuningBudget,
@@ -296,6 +297,23 @@ class ComposableAutotuneTests(unittest.TestCase):
         slow = replace(fast, elapsed_s=10.0)
         self.assertLess(scheduler.reward(float("inf"), slow), scheduler.reward(float("inf"), fast))
 
+    def test_adaptive_bandit_charges_cpu_proposal_time(self) -> None:
+        scheduler = AdaptiveBanditScheduler(cost_scale_s=1.0)
+        cheap = evaluate_proposal(
+            _toy_adapter(),
+            Proposal(_ToyConfig(), "gradient_boosted"),
+            session_id="session",
+            sequence=0,
+        )
+        expensive = replace(
+            cheap,
+            metadata={**cheap.metadata, "proposal_elapsed_s": 10.0},
+        )
+        self.assertLess(
+            scheduler.reward(float("inf"), expensive),
+            scheduler.reward(float("inf"), cheap),
+        )
+
     def test_adaptive_bandit_bootstraps_each_configured_arm_after_warmup(self) -> None:
         scheduler = AdaptiveBanditScheduler(
             warmup_trials=2,
@@ -369,6 +387,86 @@ class ComposableAutotuneTests(unittest.TestCase):
                 [adapter.features(_ToyConfig(3, 2)), adapter.features(_ToyConfig(0, 4))]
             )
             self.assertTrue((abs(restored_mean - mean) < 1e-10).all())
+
+    def test_tree_prediction_matches_scalar_reference(self) -> None:
+        adapter = _toy_adapter()
+        observations = [
+            evaluate_proposal(
+                adapter,
+                Proposal(_ToyConfig(x, y), "grid"),
+                session_id="training",
+                sequence=x * 5 + y,
+            )
+            for x in range(5)
+            for y in range(5)
+        ]
+        model = GradientBoostedCostModel(
+            n_estimators=6, ensembles=2, max_depth=3, min_leaf=2, seed=9
+        )
+        model.fit(observations)
+        features = [adapter.features(_ToyConfig(x, y)) for x in range(5) for y in range(5)]
+        matrix = model.vectorizer.transform(features)
+        for ensemble in model.models:
+            for tree in ensemble.trees:
+                expected = []
+                for row in matrix:
+                    node_index = 0
+                    while tree.nodes[node_index].feature >= 0:
+                        node = tree.nodes[node_index]
+                        node_index = (
+                            node.left
+                            if row[node.feature] <= node.threshold
+                            else node.right
+                        )
+                    expected.append(tree.nodes[node_index].value)
+                self.assertTrue((abs(tree.predict(matrix) - expected) < 1e-12).all())
+
+    def test_shared_fit_state_prevents_duplicate_local_refit(self) -> None:
+        adapter = _toy_adapter()
+        history = SearchHistory(
+            [
+                evaluate_proposal(
+                    adapter,
+                    Proposal(_ToyConfig(x, y), "grid"),
+                    session_id="training",
+                    sequence=x * 5 + y,
+                )
+                for x in range(5)
+                for y in range(5)
+            ],
+            adapter.context.identifier,
+        )
+        model = GradientBoostedCostModel(
+            n_estimators=4, ensembles=1, max_depth=2, min_leaf=2, seed=3
+        )
+        from rtx.autotune.cost_model import GradientBoostedFeasibilityModel
+        from rtx.autotune.strategies import CostModelLocalSearch
+
+        feasibility = GradientBoostedFeasibilityModel(
+            n_estimators=2, ensembles=1, max_depth=1, min_leaf=2
+        )
+        state = SharedModelFitState(model, feasibility)
+        global_search = CostModelGuidedSearch(
+            model=model,
+            feasibility_model=feasibility,
+            min_observations=4,
+            pool_size=32,
+            refit_interval=4,
+            fit_state=state,
+        )
+        local_search = CostModelLocalSearch(
+            model=model,
+            feasibility_model=feasibility,
+            refit_interval=4,
+            fit_state=state,
+        )
+        global_search.propose(adapter, history, random.Random(3), 1)
+        fit_counts = (state.cost_fit_count, state.feasibility_fit_count)
+        self.assertLessEqual(state.recommended_pool_size, global_search.pool_size)
+        local_search.propose(adapter, history, random.Random(4), 1)
+        self.assertEqual(
+            (state.cost_fit_count, state.feasibility_fit_count), fit_counts
+        )
 
     def test_sequential_cost_model_then_coordinate_search(self) -> None:
         adapter = _toy_adapter()

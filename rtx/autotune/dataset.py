@@ -60,6 +60,7 @@ from .recipes import (
 )
 from .safety import JsonlFailureLedger, SafetyAwareAdapter
 from .store import JsonlTuningStore, ResidualTuningStore, TuningStore
+from .strategies import SharedModelFitState
 from .winners import runtime_winner_key, save_runtime_winner
 from ..bwd_experiments import BwdBenchmarkHarness
 from ..kernels.mxfp8 import (
@@ -1412,6 +1413,10 @@ class DatasetCampaign:
         self.context_allocations = ExperimentJournal(
             self.bundle / "context_allocations.jsonl"
         )
+        # Fitted models are family/policy assets, not context-local queues.
+        # Reuse them across anytime slices while strategies retain independent
+        # proposal queues for each workload.
+        self._shared_model_states: dict[str, SharedModelFitState] = {}
 
     def _existing_context_source(self) -> Mapping[str, object]:
         """Adopt v2 context tags after runner-only source changes.
@@ -1999,12 +2004,43 @@ class DatasetCampaign:
             if self.execution_engine == "ask_tell"
             else make_hybrid_autotuner
         )
+        model_policy = {
+            key: value
+            for key, value in asdict(effective_job.tuning).items()
+            if key.startswith(("model_", "feasibility_", "pretrained_"))
+            or key in ("use_pretrained",)
+        }
+        model_state_key = stable_id(
+            {
+                "family": job.family,
+                "kernel_revision": adapter.context.kernel_revision,
+                "treatment": job.tags.get("treatment", "default"),
+                "replicate": int(job.tags.get("replicate", 0)),
+                "pretrained_artifact": self.pretrained_artifact,
+                "policy": model_policy,
+            },
+            32,
+        )
+        shared_fit_state = self._shared_model_states.get(model_state_key)
         tuner = make_tuner(
             adapter,
             store,
             effective_job.tuning,
             progress=self.progress,
+            shared_fit_state=shared_fit_state,
         )
+        if shared_fit_state is None:
+            strategies = getattr(tuner, "strategies", ())
+            strategy_values = (
+                strategies.values()
+                if isinstance(strategies, Mapping)
+                else strategies
+            )
+            for strategy in strategy_values:
+                candidate_state = getattr(strategy, "fit_state", None)
+                if isinstance(candidate_state, SharedModelFitState):
+                    self._shared_model_states[model_state_key] = candidate_state
+                    break
         tuned = tuner.tune()
         after = self._context_trials(store, adapter)
         verification = (

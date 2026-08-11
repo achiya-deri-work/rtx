@@ -129,6 +129,7 @@ from .strategies import (
     CostModelLocalSearch,
     RandomSearch,
     SearchStrategy,
+    SharedModelFitState,
     StrategyPipeline,
 )
 
@@ -222,6 +223,7 @@ __all__ = [
     "SafetyAwareAdapter",
     "SearchSpace",
     "SearchStrategy",
+    "SharedModelFitState",
     "SequentialScheduler",
     "SparseFeatureVectorizer",
     "SpaceConstraint",

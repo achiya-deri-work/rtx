@@ -201,6 +201,7 @@ class DiscreteKernelAdapter(Generic[ConfigT]):
     evaluator: Callable[[ConfigT], TrialOutcome]
     rejection_fn: Callable[[ConfigT], tuple[str, str] | None]
     extra_features_fn: Callable[[ConfigT], Mapping[str, float]] | None = None
+    _context_feature_cache: FeatureMap = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.axes:
@@ -208,6 +209,7 @@ class DiscreteKernelAdapter(Generic[ConfigT]):
         empty = [name for name, values in self.axes.items() if not values]
         if empty:
             raise ValueError(f"tuning axes have no values: {empty}")
+        self._context_feature_cache = self.context.features()
 
     def config_id(self, config: ConfigT) -> str:
         return self.config_id_fn(config)
@@ -219,7 +221,7 @@ class DiscreteKernelAdapter(Generic[ConfigT]):
         return self.deserialize_fn(value)
 
     def features(self, config: ConfigT) -> FeatureMap:
-        values = self.context.features()
+        values = dict(self._context_feature_cache)
         values.update(flatten_features(self.serialize(config), "config"))
         if self.extra_features_fn is not None:
             values.update(
@@ -238,11 +240,12 @@ class DiscreteKernelAdapter(Generic[ConfigT]):
 
     def neighbors(self, config: ConfigT) -> Iterable[tuple[str, object, ConfigT]]:
         seen: set[str] = set()
+        base_id = self.config_id(config)
         for coordinate, values in self.axes.items():
             for value in values:
                 candidate = self.update_fn(config, coordinate, value)
                 identifier = self.config_id(candidate)
-                if identifier == self.config_id(config) or identifier in seen:
+                if identifier == base_id or identifier in seen:
                     continue
                 seen.add(identifier)
                 yield coordinate, value, candidate
@@ -259,7 +262,11 @@ class DiscreteKernelAdapter(Generic[ConfigT]):
         result: list[ConfigT] = []
         seen: set[str] = set()
         coordinates = tuple(self.axes)
-        attempts = max(32, count * 20)
+        # Every accepted step is already a legal point. Emit those intermediate
+        # points instead of throwing away up to seven of them and retaining
+        # only the walk endpoint; sparse coupled spaces otherwise require tens
+        # of thousands of redundant normalize/reject calls for a model pool.
+        attempts = max(32, count * 4)
         for _ in range(attempts):
             if len(result) >= count:
                 break
@@ -268,7 +275,7 @@ class DiscreteKernelAdapter(Generic[ConfigT]):
             for _step in range(steps):
                 coordinate = rng.choice(coordinates)
                 proposal = self.update_fn(
-                    candidate, coordinate, rng.choice(tuple(self.axes[coordinate]))
+                    candidate, coordinate, rng.choice(self.axes[coordinate])
                 )
                 # Coupled hardware spaces are overwhelmingly sparse. Preserve
                 # legality after every random-walk step rather than applying a
@@ -276,11 +283,13 @@ class DiscreteKernelAdapter(Generic[ConfigT]):
                 # happens to repair every broken invariant.
                 if self.rejection(proposal) is None:
                     candidate = proposal
-            identifier = self.config_id(candidate)
-            if identifier in seen or self.rejection(candidate) is not None:
-                continue
-            seen.add(identifier)
-            result.append(candidate)
+                    identifier = self.config_id(candidate)
+                    if identifier in seen:
+                        continue
+                    seen.add(identifier)
+                    result.append(candidate)
+                    if len(result) >= count:
+                        break
         return result
 
 

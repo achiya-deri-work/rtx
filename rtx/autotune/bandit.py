@@ -29,6 +29,10 @@ class ArmStatistics:
     prior_pulls: float = 0.0
     prior_reward_sum: float = 0.0
     last_reward: float = 0.0
+    proposal_calls: int = 0
+    proposal_elapsed_s: float = 0.0
+    proposal_errors: int = 0
+    proposal_empty: int = 0
 
     @property
     def mean_reward(self) -> float:
@@ -183,6 +187,7 @@ class AdaptiveBanditScheduler:
     minimum_pulls: Mapping[str, int] = field(default_factory=dict)
     transfer_prior_strength: float = 3.0
     cost_scale_s: float = 2.0
+    cost_weight: float = 0.05
     name: str = "adaptive_contextual_bandit"
 
     def __post_init__(self) -> None:
@@ -194,11 +199,13 @@ class AdaptiveBanditScheduler:
             raise ValueError("bandit warmup/prior strength cannot be negative")
         if any(int(value) < 0 for value in self.minimum_pulls.values()):
             raise ValueError("bandit minimum arm pulls cannot be negative")
-        if self.cost_scale_s <= 0:
-            raise ValueError("bandit cost scale must be positive")
+        if self.cost_scale_s <= 0 or self.cost_weight < 0:
+            raise ValueError("bandit cost policy is invalid")
 
     def reward(self, before: float, observation: Observation) -> float:
-        cost = 0.04 * math.tanh(max(0.0, observation.elapsed_s) / self.cost_scale_s)
+        cost = self.cost_weight * math.log1p(
+            observation_strategy_cost_s(observation) / self.cost_scale_s
+        )
         if not observation.successful:
             return -0.20 - cost
         improvement = 0.0
@@ -228,7 +235,7 @@ class AdaptiveBanditScheduler:
         arm = statistics[arm_name]
         arm.pulls += 1
         arm.successes += int(observation.successful)
-        arm.elapsed_s += observation.elapsed_s
+        arm.elapsed_s += observation_strategy_cost_s(observation)
         arm.reward_sum += reward
         arm.effective_pulls += 1.0
         arm.effective_reward_sum += reward
@@ -335,6 +342,8 @@ class AdaptiveBanditScheduler:
             "trial": trial_index,
             "discount": self.discount,
             "exploration": self.exploration,
+            "cost_scale_s": self.cost_scale_s,
+            "cost_weight": self.cost_weight,
             "minimum_pulls": {
                 name: int(self.minimum_pulls.get(name, 0)) for name in names
             },
@@ -392,10 +401,22 @@ def contextual_ucb_scores(
     return result
 
 
+def observation_strategy_cost_s(observation: Observation) -> float:
+    """Evaluator plus optimizer work attributable to one candidate trial."""
+
+    proposal_elapsed = observation.metadata.get("proposal_elapsed_s", 0.0)
+    try:
+        proposal_s = max(0.0, float(proposal_elapsed))
+    except (TypeError, ValueError):
+        proposal_s = 0.0
+    return max(0.0, float(observation.elapsed_s)) + proposal_s
+
+
 __all__ = [
     "AdaptiveBanditScheduler",
     "ArmStatistics",
     "DiscountedArmStatistics",
     "UCB1Scheduler",
     "contextual_ucb_scores",
+    "observation_strategy_cost_s",
 ]
