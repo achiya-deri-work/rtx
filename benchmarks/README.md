@@ -32,6 +32,19 @@ After pulling the same commit on each 5070 machine, launch with
 uses the pulled checkout even with a non-editable environment install, and
 resumes the same residual journals when rerun.
 
+For the current-revision release-candidate campaign, run the same command on
+the RTX 5070 Ti and RTX 5070 Laptop:
+
+```bash
+./run_5070_4h.sh
+```
+
+The root launcher fast-forward pulls, detaches itself, runs the CUDA and unified
+production gates, calibrates the exact GPU/compiler checkout, and spends the
+remaining four-hour deadline on balanced residual collection across all nine
+MXFP8/NVFP4 production families. It then verifies finalists, audits the
+journals, exports CSV/Parquet, and installs verified device-local winners.
+
 All generated JSON, JSONL, logs, datasets, and compiled artifacts must go to an
 ignored output directory such as `autotune_results/`, `autotune_logs/`, or
 `autotune_datasets/`.

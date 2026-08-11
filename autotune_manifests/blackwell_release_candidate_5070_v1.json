@@ -1,0 +1,280 @@
+{
+  "schema_version": 2,
+  "name": "blackwell_release_candidate_5070_v1",
+  "seed": 20260811,
+  "storage_mode": "residual_context",
+  "rotation_mode": "balanced_categories",
+  "jobs": [
+    {
+      "family": "mxfp8_fused_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "one_m_tile"},
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "tall_long_reduction"},
+        {"m": 1536, "n": 6144, "k": 1536, "name": "wide"},
+        {"m": 1536, "n": 1536, "k": 6144, "name": "deep_k"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 2,
+      "tags": {"purpose": "release_candidate", "frontend": "mxfp8", "operand_state": "dynamic"},
+      "tuning": {
+        "portfolio": "hybrid", "orchestration": "bandit", "max_trials": 64,
+        "time_budget_s": 14400.0, "cost_model_trials": 40, "model_warmup": 8,
+        "model_pool_size": 4096, "model_refit_interval": 8, "bandit_exploration": 0.35,
+        "model_estimators": 24, "model_ensembles": 2, "model_max_depth": 3,
+        "model_min_leaf": 3, "model_max_features": 96, "local_beam_width": 4,
+        "confirmation_repeats": 1, "confirmation_ratio": 0.02,
+        "confirm_initial": true, "seed": 20260811
+      },
+      "protocol": {
+        "warmup_calls": 4, "samples": 5, "confirm_samples": 11,
+        "race_rounds": 11, "target_batch_ms": 30.0, "practical_threshold": 0.005,
+        "bootstrap_resamples": 1000, "rotation_l2_multiple": 2.0,
+        "max_rotation_buffers": 12, "max_rotation_bytes": 536870912,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "mxfp8_prequant_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "one_m_tile"},
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "tall_long_reduction"},
+        {"m": 1536, "n": 6144, "k": 1536, "name": "wide"},
+        {"m": 1536, "n": 1536, "k": 6144, "name": "deep_k"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 2,
+      "tags": {"purpose": "release_candidate", "frontend": "mxfp8", "operand_state": "materialized_dynamic"},
+      "tuning": {
+        "portfolio": "hybrid", "orchestration": "bandit", "max_trials": 64,
+        "time_budget_s": 14400.0, "cost_model_trials": 40, "model_warmup": 8,
+        "model_pool_size": 4096, "model_refit_interval": 8, "bandit_exploration": 0.35,
+        "model_estimators": 24, "model_ensembles": 2, "model_max_depth": 3,
+        "model_min_leaf": 3, "model_max_features": 96, "local_beam_width": 4,
+        "confirmation_repeats": 1, "confirmation_ratio": 0.02,
+        "confirm_initial": true, "seed": 20260811
+      },
+      "protocol": {
+        "warmup_calls": 4, "samples": 5, "confirm_samples": 11,
+        "race_rounds": 11, "target_batch_ms": 30.0, "practical_threshold": 0.005,
+        "bootstrap_resamples": 1000, "rotation_l2_multiple": 2.0,
+        "max_rotation_buffers": 12, "max_rotation_bytes": 536870912,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "mxfp8_weight_prequant_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "one_m_tile"},
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "tall_long_reduction"},
+        {"m": 1536, "n": 6144, "k": 1536, "name": "wide"},
+        {"m": 1536, "n": 1536, "k": 6144, "name": "deep_k"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 2,
+      "tags": {"purpose": "release_candidate", "frontend": "mxfp8", "operand_state": "dynamic_x_prequant_w"},
+      "tuning": {
+        "portfolio": "hybrid", "orchestration": "bandit", "max_trials": 64,
+        "time_budget_s": 14400.0, "cost_model_trials": 40, "model_warmup": 8,
+        "model_pool_size": 4096, "model_refit_interval": 8, "bandit_exploration": 0.35,
+        "model_estimators": 24, "model_ensembles": 2, "model_max_depth": 3,
+        "model_min_leaf": 3, "model_max_features": 96, "local_beam_width": 4,
+        "confirmation_repeats": 1, "confirmation_ratio": 0.02,
+        "confirm_initial": true, "seed": 20260811
+      },
+      "protocol": {
+        "warmup_calls": 4, "samples": 5, "confirm_samples": 11,
+        "race_rounds": 11, "target_batch_ms": 30.0, "practical_threshold": 0.005,
+        "bootstrap_resamples": 1000, "rotation_l2_multiple": 2.0,
+        "max_rotation_buffers": 12, "max_rotation_bytes": 536870912,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "mxfp8_fully_prequant_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "one_m_tile"},
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "tall_long_reduction"},
+        {"m": 1536, "n": 6144, "k": 1536, "name": "wide"},
+        {"m": 1536, "n": 1536, "k": 6144, "name": "deep_k"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 2,
+      "tags": {"purpose": "release_candidate", "frontend": "mxfp8", "operand_state": "fully_prequant"},
+      "tuning": {
+        "portfolio": "hybrid", "orchestration": "bandit", "max_trials": 64,
+        "time_budget_s": 14400.0, "cost_model_trials": 40, "model_warmup": 8,
+        "model_pool_size": 4096, "model_refit_interval": 8, "bandit_exploration": 0.35,
+        "model_estimators": 24, "model_ensembles": 2, "model_max_depth": 3,
+        "model_min_leaf": 3, "model_max_features": 96, "local_beam_width": 4,
+        "confirmation_repeats": 1, "confirmation_ratio": 0.02,
+        "confirm_initial": true, "seed": 20260811
+      },
+      "protocol": {
+        "warmup_calls": 4, "samples": 5, "confirm_samples": 11,
+        "race_rounds": 11, "target_batch_ms": 30.0, "practical_threshold": 0.005,
+        "bootstrap_resamples": 1000, "rotation_l2_multiple": 2.0,
+        "max_rotation_buffers": 12, "max_rotation_bytes": 536870912,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "mxfp8_bwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "one_m_tile"},
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "tall_long_reduction"},
+        {"m": 1536, "n": 6144, "k": 1536, "name": "wide"},
+        {"m": 1536, "n": 1536, "k": 6144, "name": "deep_k"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 2,
+      "tags": {"purpose": "release_candidate", "frontend": "shared", "operand_state": "backward"},
+      "tuning": {
+        "portfolio": "hybrid", "orchestration": "bandit", "max_trials": 64,
+        "time_budget_s": 14400.0, "cost_model_trials": 40, "model_warmup": 8,
+        "model_pool_size": 6144, "model_refit_interval": 8, "bandit_exploration": 0.35,
+        "model_estimators": 24, "model_ensembles": 2, "model_max_depth": 3,
+        "model_min_leaf": 3, "model_max_features": 128, "local_beam_width": 4,
+        "confirmation_repeats": 1, "confirmation_ratio": 0.02,
+        "confirm_initial": true, "seed": 20260811
+      },
+      "protocol": {
+        "warmup_calls": 6, "samples": 5, "confirm_samples": 11,
+        "race_rounds": 15, "target_batch_ms": 30.0,
+        "correctness_rtol": 0.07, "correctness_atol": 1.0,
+        "practical_threshold": 0.005, "bootstrap_resamples": 1000,
+        "rotation_l2_multiple": 2.0, "max_rotation_buffers": 12,
+        "max_rotation_bytes": 536870912, "telemetry": true
+      }
+    },
+    {
+      "family": "nvfp4_fused_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "one_m_tile"},
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "tall_long_reduction"},
+        {"m": 1536, "n": 6144, "k": 1536, "name": "wide"},
+        {"m": 1536, "n": 1536, "k": 6144, "name": "deep_k"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 2,
+      "tags": {"purpose": "release_candidate", "frontend": "nvfp4", "operand_state": "training_dynamic"},
+      "tuning": {
+        "portfolio": "hybrid", "orchestration": "bandit", "max_trials": 64,
+        "time_budget_s": 14400.0, "cost_model_trials": 40, "model_warmup": 8,
+        "model_pool_size": 4096, "model_refit_interval": 8, "bandit_exploration": 0.35,
+        "model_estimators": 24, "model_ensembles": 2, "model_max_depth": 3,
+        "model_min_leaf": 3, "model_max_features": 96, "local_beam_width": 4,
+        "confirmation_repeats": 1, "confirmation_ratio": 0.02,
+        "confirm_initial": true, "seed": 20260811
+      },
+      "protocol": {
+        "warmup_calls": 4, "samples": 5, "confirm_samples": 11,
+        "race_rounds": 11, "target_batch_ms": 30.0, "practical_threshold": 0.005,
+        "bootstrap_resamples": 1000, "rotation_l2_multiple": 2.0,
+        "max_rotation_buffers": 12, "max_rotation_bytes": 536870912,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "nvfp4_dynamic_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "one_m_tile"},
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "tall_long_reduction"},
+        {"m": 1536, "n": 6144, "k": 1536, "name": "wide"},
+        {"m": 1536, "n": 1536, "k": 6144, "name": "deep_k"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 2,
+      "tags": {"purpose": "release_candidate", "frontend": "nvfp4", "operand_state": "materialized_dynamic"},
+      "tuning": {
+        "portfolio": "hybrid", "orchestration": "bandit", "max_trials": 64,
+        "time_budget_s": 14400.0, "cost_model_trials": 40, "model_warmup": 8,
+        "model_pool_size": 4096, "model_refit_interval": 8, "bandit_exploration": 0.35,
+        "model_estimators": 24, "model_ensembles": 2, "model_max_depth": 3,
+        "model_min_leaf": 3, "model_max_features": 128, "local_beam_width": 4,
+        "confirmation_repeats": 1, "confirmation_ratio": 0.02,
+        "confirm_initial": true, "seed": 20260811
+      },
+      "protocol": {
+        "warmup_calls": 4, "samples": 5, "confirm_samples": 11,
+        "race_rounds": 11, "target_batch_ms": 30.0, "practical_threshold": 0.005,
+        "bootstrap_resamples": 1000, "rotation_l2_multiple": 2.0,
+        "max_rotation_buffers": 12, "max_rotation_bytes": 536870912,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "nvfp4_weight_prequant_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "one_m_tile"},
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "tall_long_reduction"},
+        {"m": 1536, "n": 6144, "k": 1536, "name": "wide"},
+        {"m": 1536, "n": 1536, "k": 6144, "name": "deep_k"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 2,
+      "tags": {"purpose": "release_candidate", "frontend": "nvfp4", "operand_state": "dynamic_x_prequant_w"},
+      "tuning": {
+        "portfolio": "hybrid", "orchestration": "bandit", "max_trials": 64,
+        "time_budget_s": 14400.0, "cost_model_trials": 40, "model_warmup": 8,
+        "model_pool_size": 4096, "model_refit_interval": 8, "bandit_exploration": 0.35,
+        "model_estimators": 24, "model_ensembles": 2, "model_max_depth": 3,
+        "model_min_leaf": 3, "model_max_features": 96, "local_beam_width": 4,
+        "confirmation_repeats": 1, "confirmation_ratio": 0.02,
+        "confirm_initial": true, "seed": 20260811
+      },
+      "protocol": {
+        "warmup_calls": 4, "samples": 5, "confirm_samples": 11,
+        "race_rounds": 11, "target_batch_ms": 30.0, "practical_threshold": 0.005,
+        "bootstrap_resamples": 1000, "rotation_l2_multiple": 2.0,
+        "max_rotation_buffers": 12, "max_rotation_bytes": 536870912,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "nvfp4_fully_prequant_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "one_m_tile"},
+        {"m": 512, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "tall_long_reduction"},
+        {"m": 1536, "n": 6144, "k": 1536, "name": "wide"},
+        {"m": 1536, "n": 1536, "k": 6144, "name": "deep_k"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 2,
+      "tags": {"purpose": "release_candidate", "frontend": "nvfp4", "operand_state": "fully_prequant"},
+      "tuning": {
+        "portfolio": "hybrid", "orchestration": "bandit", "max_trials": 64,
+        "time_budget_s": 14400.0, "cost_model_trials": 40, "model_warmup": 8,
+        "model_pool_size": 4096, "model_refit_interval": 8, "bandit_exploration": 0.35,
+        "model_estimators": 24, "model_ensembles": 2, "model_max_depth": 3,
+        "model_min_leaf": 3, "model_max_features": 96, "local_beam_width": 4,
+        "confirmation_repeats": 1, "confirmation_ratio": 0.02,
+        "confirm_initial": true, "seed": 20260811
+      },
+      "protocol": {
+        "warmup_calls": 4, "samples": 5, "confirm_samples": 11,
+        "race_rounds": 11, "target_batch_ms": 30.0, "practical_threshold": 0.005,
+        "bootstrap_resamples": 1000, "rotation_l2_multiple": 2.0,
+        "max_rotation_buffers": 12, "max_rotation_bytes": 536870912,
+        "telemetry": true
+      }
+    }
+  ]
+}
