@@ -165,9 +165,16 @@ def install_verified_winners(
             names = reader.names()
             try:
                 machine = json.loads(reader.read_text(prefix + "machine.json"))
-                summary = json.loads(reader.read_text(prefix + "summary.json"))
             except (KeyError, OSError, json.JSONDecodeError):
                 continue
+            # A watchdog- or deadline-ended residual campaign may not reach
+            # the final monolithic export. Post-hoc verification is itself a
+            # complete promotion source, so do not discard that durable bundle
+            # merely because summary.json is absent.
+            try:
+                summary = json.loads(reader.read_text(prefix + "summary.json"))
+            except (KeyError, OSError, json.JSONDecodeError):
+                summary = {"results": []}
             result_documents = list(summary.get("results", []))
             try:
                 posthoc = json.loads(

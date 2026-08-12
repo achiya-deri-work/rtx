@@ -218,6 +218,32 @@ class AutotuneOperationsTests(unittest.TestCase):
             self.assertEqual(document["config_id"], posthoc_id)
             self.assertEqual(document["median_ms"], 0.8)
 
+    def test_posthoc_only_bundle_installs_after_watchdog_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            summary = json.loads(
+                (bundle / "summary.json").read_text(encoding="utf-8")
+            )
+            _write(
+                bundle / "verification_summary.json",
+                {
+                    "type": "rtx_autotune_posthoc_verification",
+                    "results": summary["results"],
+                },
+            )
+            (bundle / "summary.json").unlink()
+
+            cache = root / "cache"
+            report = install_verified_winners((root,), cache_dir=cache)
+
+            self.assertEqual(len(report["installed"]), 1)
+            document = json.loads(
+                Path(report["installed"][0]["path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(document["config_id"], "config-id")
+            self.assertEqual(document["median_ms"], 0.9)
+
 
 if __name__ == "__main__":
     unittest.main()
