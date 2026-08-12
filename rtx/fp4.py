@@ -977,7 +977,10 @@ def _materialized_dynamic_config_key(
     if selected_key is not None:
         return selected_key
     from .autotune.winners import load_runtime_winner, runtime_winner_key
-    from .nvfp4_inference_autotune import dynamic_config_from_dict
+    from .nvfp4_inference_autotune import (
+        dynamic_config_from_dict,
+        preferred_dynamic_config,
+    )
 
     selected = request.dynamic
     if selected is None and request.mode != "off":
@@ -998,7 +1001,7 @@ def _materialized_dynamic_config_key(
             policy=request.policy,
         )
     config = NVFP4ForwardConfig.from_materialized(
-        DEFAULT_NVFP4_DYNAMIC_CONFIG if selected is None else selected
+        preferred_dynamic_config(problem) if selected is None else selected
     )
     selected_key = _intern_forward_config(config)
     _DYNAMIC_CONFIG_SELECTIONS[selection_key] = selected_key

@@ -14,6 +14,7 @@ from .configs.nvfp4 import (
     NVFP4DynamicConfig,
     NVFP4FullyPrequantConfig,
     NVFP4GemmConfig,
+    NVFP4Problem,
     NVFP4QuantConfig,
     NVFP4WeightPrequantConfig,
 )
@@ -237,6 +238,20 @@ _DYNAMIC_IMPLEMENTATION_ANCHORS = (
         )
     ),
 )
+
+
+def preferred_dynamic_config(problem: NVFP4Problem) -> NVFP4DynamicConfig:
+    """Return the fastest known portable starting basin for ``problem``.
+
+    Native MMA-layout scales are not merely a local schedule adjustment: the
+    quantizer and GEMM transport must change together. Starting eligible
+    searches from the row-major fallback left short, breadth-first campaigns
+    unable to reach this compound basin. Keep the general row-major fallback
+    for shapes which cannot represent complete 128x128 scale tiles.
+    """
+
+    native = dynamic_config_from_dict(_DYNAMIC_IMPLEMENTATION_ANCHORS[0])
+    return native if native.rejection(problem) is None else DEFAULT_NVFP4_DYNAMIC_CONFIG
 
 NVFP4_WEIGHT_PREQUANT_SEARCH_SPACE = {
     "x_vector_load": _QUANT_VECTOR,
@@ -549,6 +564,7 @@ __all__ = [
     "fully_prequant_config_from_dict",
     "fully_prequant_config_id",
     "fully_prequant_config_to_dict",
+    "preferred_dynamic_config",
     "update_fully_prequant_config",
     "update_dynamic_config",
     "update_weight_prequant_config",

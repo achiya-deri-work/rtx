@@ -1075,10 +1075,11 @@ def make_nvfp4_dynamic_adapter(
         dynamic_config_from_dict,
         dynamic_config_id,
         dynamic_config_to_dict,
+        preferred_dynamic_config,
         update_dynamic_config,
     )
 
-    initial_config = NVFP4DynamicConfig() if initial is None else initial
+    initial_config = preferred_dynamic_config(problem) if initial is None else initial
     selected_axes = NVFP4_DYNAMIC_SEARCH_SPACE if axes is None else axes
     axis_values = {name: tuple(values) for name, values in selected_axes.items()}
     unknown = set(axis_values).difference(NVFP4_DYNAMIC_SEARCH_SPACE)

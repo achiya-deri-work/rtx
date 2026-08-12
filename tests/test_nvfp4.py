@@ -27,6 +27,7 @@ from rtx.configs.nvfp4 import (
 )
 from rtx.nvfp4_inference_autotune import (
     NVFP4_DYNAMIC_SEARCH_SPACE,
+    preferred_dynamic_config,
     update_dynamic_config,
 )
 
@@ -274,6 +275,26 @@ class NVFP4ConfigTests(unittest.TestCase):
         self.assertEqual(
             concurrent_features["derived.quant_launch_concurrency"], 2.0
         )
+
+    def test_dynamic_search_starts_in_native_scale_basin_when_legal(self) -> None:
+        eligible = NVFP4Problem(32_768, 3_072, 768)
+        ragged = NVFP4Problem(127, 129, 130)
+
+        preferred = preferred_dynamic_config(eligible)
+        self.assertEqual(preferred.quant.scale_layout, "mma128")
+        self.assertEqual(preferred.gemm.scale_layout, "mma128")
+        self.assertEqual(preferred.gemm.scale_role, "tma")
+        self.assertIsNone(preferred.rejection(eligible))
+        self.assertEqual(
+            preferred_dynamic_config(ragged),
+            NVFP4DynamicConfig(),
+        )
+
+        adapter = make_nvfp4_dynamic_adapter(
+            eligible,
+            lambda _config: TrialOutcome("ok", median_ms=1.0),
+        )
+        self.assertEqual(adapter.initial_config, preferred)
 
 
 @unittest.skipUnless(_has_sm12x(), "requires an SM120/SM121 CUDA GPU")
