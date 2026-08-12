@@ -8,6 +8,8 @@ context identity. Add a newly versioned file instead.
 
 | Manifest | Purpose | Contexts |
 | --- | --- | ---: |
+| `decoder_batch64_mxfp8_v1.json` | Batch-64 decoder MXFP8 fused-forward/shared-backward tuning | 8 |
+| `decoder_batch64_nvfp4_v1.json` | Batch-64 decoder delayed-fused and block-materialized NVFP4 tuning | 8 |
 | `decoder_training_hot_v1.json` | Exact decoder-shape NVFP4 dynamic-forward and MXFP8 backward training study | 8 |
 | `decoder_mxfp8_forward_hot_v1.json` | Exact decoder-shape materialized MXFP8 forward study | 4 |
 | `blackwell_release_candidate_5070_v1.json` | Current-revision MXFP8/NVFP4 production calibration across every operand state on both 5070 variants | 108 |

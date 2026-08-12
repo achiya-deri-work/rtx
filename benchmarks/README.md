@@ -6,7 +6,8 @@ repository root so imports and output paths are predictable.
 | Script | Purpose |
 | --- | --- |
 | `train_decoder.py` | Resumable byte-level TinyStories BF16/MXFP8/NVFP4-delayed/NVFP4-block decoder comparison |
-| `run_decoder_four_mode.sh` | Exact 300k-step four-mode release convergence/runtime launcher |
+| `run_decoder_four_mode.sh` | Exact 460.8M-token four-mode release convergence/runtime launcher |
+| `run_decoder_batch64_autotune.sh` | Two bounded 12-minute searches plus verification, winner installation, and batch-24/64 model races |
 | `benchmark_mxfp8_frontend.py` | End-to-end `torch.compile` MXFP8 frontend benchmark |
 | `benchmark_nvfp4_training.py` | Paired full delayed-scale NVFP4 training-forward versus fused MXFP8 performance gate |
 | `benchmark_nvfp4_end_to_end.py` | Paired forward-plus-MXFP8-backward layer benchmark |
