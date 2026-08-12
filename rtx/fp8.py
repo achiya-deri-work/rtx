@@ -49,7 +49,7 @@ WeightMode = Literal["dynamic", "prequantized"]
 # This revision is part of every compiler-visible forward token. Increment it
 # whenever lowering/ABI behavior changes so AOTInductor cannot revive a stale
 # generated wrapper whose graph otherwise has identical tensor guards.
-MXFP8_FRONTEND_REVISION = 6
+MXFP8_FRONTEND_REVISION = 7
 
 
 def _normalize_mxfp8_backend(backend: MXFP8Backend) -> Literal[
@@ -110,9 +110,10 @@ class MXFP8PrequantConfig:
     quant_launches: str = "dual"
     weight_quant: MXFP8QuantConfig | None = None
     weight_scale_layout: str | None = None
-    # cudaLimitMaxL2FetchGranularity is process-global. It is represented so
-    # experiments and selected winners are reproducible; the tuner restores
-    # the previous value between candidates.
+    # cudaLimitMaxL2FetchGranularity is process-global. It is represented for
+    # isolated experiments, but heterogeneous runtime graphs must select one
+    # process policy through RTX_L2_FETCH_GRANULARITY instead of switching it
+    # between individual kernels.
     l2_fetch_granularity: int | None = None
 
     def resolved_weight_quant(self) -> MXFP8QuantConfig:
@@ -258,9 +259,34 @@ def _set_l2_fetch_granularity(value: int) -> int:
     return int(previous.value)
 
 
-def _ensure_l2_fetch_granularity(value: int | None) -> None:
-    if value is not None and _CURRENT_L2_FETCH_GRANULARITY != value:
-        _set_l2_fetch_granularity(value)
+def _ensure_l2_fetch_granularity(_candidate_value: int | None) -> None:
+    """Apply one explicit process-wide L2 policy, never a per-op winner value.
+
+    Calling ``cudaDeviceSetLimit`` between heterogeneous kernels serializes
+    the device.  A standalone autotune context cannot price that interaction:
+    four individually faster decoder winners caused sixteen limit changes per
+    forward and cut end-to-end throughput by more than one third.  Candidate
+    values remain available to isolated experiments, which scope and restore
+    them directly with ``_set_l2_fetch_granularity``.  Production execution
+    changes the process-global limit only when the user selects a single
+    graph-wide value via ``RTX_L2_FETCH_GRANULARITY``.
+    """
+
+    raw = os.environ.get("RTX_L2_FETCH_GRANULARITY")
+    if raw is None:
+        return
+    try:
+        selected = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "RTX_L2_FETCH_GRANULARITY must be 0, 32, 64, or 128"
+        ) from exc
+    if selected not in (0, 32, 64, 128):
+        raise RuntimeError(
+            "RTX_L2_FETCH_GRANULARITY must be 0, 32, 64, or 128"
+        )
+    if _CURRENT_L2_FETCH_GRANULARITY != selected:
+        _set_l2_fetch_granularity(selected)
 
 
 @dataclass(slots=True)
@@ -829,8 +855,7 @@ def _build_prequant_runner(
     rejection = config.rejection(problem)
     if rejection is not None:
         raise RuntimeError(f"prequant MXFP8 cannot run this problem: {rejection}")
-    if config.l2_fetch_granularity is not None:
-        _set_l2_fetch_granularity(config.l2_fetch_granularity)
+    _ensure_l2_fetch_granularity(config.l2_fetch_granularity)
     major, _minor = torch.cuda.get_device_capability(x.device)
     if major != 12:
         raise RuntimeError(
@@ -1166,8 +1191,7 @@ def _launch_weight_prequant_out(
         with _CONFIG_LOCK:
             runner = _WEIGHT_PREQUANT_RUNNERS.get(runner_key)
             if runner is None:
-                if config.l2_fetch_granularity is not None:
-                    _set_l2_fetch_granularity(config.l2_fetch_granularity)
+                _ensure_l2_fetch_granularity(config.l2_fetch_granularity)
                 qx = torch.empty(
                     (problem.m, storage_problem.k),
                     dtype=torch.float8_e4m3fn,

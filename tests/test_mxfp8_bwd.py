@@ -537,7 +537,7 @@ class TestMXFP8BwdCuda(unittest.TestCase):
         torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
 
     def test_repeated_fullgraph_linears_preserve_every_weight_gradient(self) -> None:
-        """Guard dW lifetimes across repeated direct Inductor lowerings."""
+        """Guard packed dX/dW view lifetimes across repeated lowerings."""
 
         torch.compiler.reset()
         torch.manual_seed(1899)

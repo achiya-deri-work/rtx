@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     from .autotune import CoordinateDescentPolicy
 
 AutotuneMode = Literal["off", "cache", "coordinate"]
+BWD_FRONTEND_REVISION = 2
 
 
 def _zero_tensor_async(tensor: torch.Tensor) -> None:
@@ -593,7 +594,8 @@ class _BwdAutotuneRequest:
 @torch.compiler.assume_constant_result
 def _intern_bwd_config(config: MXFP8BwdConfig) -> str:
     config = config.normalized()
-    key = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
+    key = f"bwd-v{BWD_FRONTEND_REVISION}:{payload}"
     with _LOCK:
         _CONFIGS[key] = config
     return key
@@ -613,7 +615,10 @@ def _intern_bwd_autotune_request(
         ),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    key = "bwd-autotune:" + hashlib.sha256(encoded.encode()).hexdigest()[:24]
+    key = (
+        f"bwd-autotune:v{BWD_FRONTEND_REVISION}:"
+        + hashlib.sha256(encoded.encode()).hexdigest()[:24]
+    )
     with _LOCK:
         _AUTOTUNE_REQUESTS[key] = _BwdAutotuneRequest(
             mode, policy, payload["cache_dir"]
@@ -986,6 +991,63 @@ def _mxfp8_linear_bwd_fake(
 
 
 @torch.library.custom_op(
+    "rtx::mxfp8_linear_bwd_packed",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _mxfp8_linear_bwd_packed_op(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+) -> torch.Tensor:
+    """Run the shared backward schedule into one non-aliasable allocation.
+
+    A single storage object is intentional.  Inductor used to recycle one of
+    the buffers produced by the generic two-output custom-op lowering when a
+    compiled decoder contained several identical linears.  Packing dX and dW
+    makes their joint lifetime explicit while preserving the backend's shared
+    grad-output/X quantization and dual-stream GEMM schedule.
+    """
+
+    x_elements = x.numel()
+    weight_offset = ((x_elements + 7) // 8) * 8
+    packed = torch.empty(
+        weight_offset + weight.numel(),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    grad_x = packed[:x_elements].view_as(x)
+    grad_weight = packed[weight_offset:].view_as(weight)
+    _launch_bwd_out(
+        grad_output,
+        x,
+        weight,
+        config_key,
+        grad_x,
+        grad_weight,
+    )
+    packed._base_inputs = (grad_output, x, weight)
+    return packed
+
+
+@_mxfp8_linear_bwd_packed_op.register_fake
+def _mxfp8_linear_bwd_packed_fake(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    config_key: str,
+) -> torch.Tensor:
+    x_elements = x.numel()
+    weight_offset = ((x_elements + 7) // 8) * 8
+    return torch.empty(
+        weight_offset + weight.numel(),
+        dtype=x.dtype,
+        device=x.device,
+    )
+
+
+@torch.library.custom_op(
     "rtx::mxfp8_linear_dx",
     mutates_args=(),
     device_types="cuda",
@@ -1142,11 +1204,16 @@ def _mxfp8_bwd_compiler_visible(
     weight: torch.Tensor,
     config_key: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Represent a full backward as two unaliased functional graph nodes."""
+    """Represent a full backward as two views of one functional result."""
 
+    packed = _mxfp8_linear_bwd_packed_op(
+        grad_output, x, weight, config_key
+    )
+    x_elements = x.numel()
+    weight_offset = ((x_elements + 7) // 8) * 8
     return (
-        _mxfp8_linear_dx_op(grad_output, x, weight, config_key),
-        _mxfp8_linear_dw_op(grad_output, x, weight, config_key),
+        packed[:x_elements].view_as(x),
+        packed[weight_offset:].view_as(weight),
     )
 
 
@@ -1197,6 +1264,35 @@ class _InductorMXFP8BwdLauncher:
         return grad_x, grad_weight
 
 
+class _InductorMXFP8BwdPackedLauncher:
+    """Generated-wrapper entry point for a packed shared backward result."""
+
+    def __init__(self, config_key: str) -> None:
+        self.config_key = config_key
+
+    def __call__(
+        self,
+        grad_output: torch.Tensor,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        config_key: str,
+        *,
+        out: torch.Tensor,
+    ) -> None:
+        x_elements = x.numel()
+        weight_offset = ((x_elements + 7) // 8) * 8
+        grad_x = out[:x_elements].view_as(x)
+        grad_weight = out[weight_offset:].view_as(weight)
+        _launch_bwd_out(
+            grad_output,
+            x,
+            weight,
+            self.config_key,
+            grad_x,
+            grad_weight,
+        )
+
+
 class _InductorMXFP8PartialLauncher:
     def __init__(self, config_key: str, gradient: str) -> None:
         self.config_key = config_key
@@ -1221,7 +1317,10 @@ class _InductorMXFP8BwdRegistry(dict[object, object]):
     def __missing__(self, key: object) -> object:
         if isinstance(key, tuple):
             config_key, gradient = key
-            launcher = _InductorMXFP8PartialLauncher(config_key, gradient)
+            if gradient == "packed":
+                launcher = _InductorMXFP8BwdPackedLauncher(config_key)
+            else:
+                launcher = _InductorMXFP8PartialLauncher(config_key, gradient)
         else:
             launcher = _InductorMXFP8BwdLauncher(str(key))
         with _LOCK:
@@ -1252,6 +1351,39 @@ def _register_bwd_inductor_lowerings() -> None:
         return (
             lower_partial("dx", grad_output, x, weight, config_key),
             lower_partial("dw", grad_output, x, weight, config_key),
+        )
+
+    @register_lowering(
+        torch.ops.rtx.mxfp8_linear_bwd_packed.default,
+        type_promotion_kind=None,
+    )
+    def lower_bwd_packed(grad_output, x, weight, config_key):
+        inputs = [
+            ir.ExternKernel.require_contiguous(
+                ir.ExternKernel.realize_input(value)
+            )
+            for value in (grad_output, x, weight)
+        ]
+        x_size = x.get_size()
+        weight_size = weight.get_size()
+        x_elements = x_size[0] * x_size[1]
+        weight_offset = ((x_elements + 7) // 8) * 8
+        elements = weight_offset + weight_size[0] * weight_size[1]
+        return ir.TensorBox.create(
+            ir.ExternKernelOut(
+                layout=ir.FixedLayout(
+                    device=x.get_device(),
+                    dtype=torch.bfloat16,
+                    size=[elements],
+                    stride=[1],
+                ),
+                inputs=inputs,
+                constant_args=[config_key],
+                python_kernel_name=(
+                    "torch._rtx_mxfp8_bwd_launchers"
+                    f"[{(config_key, 'packed')!r}]"
+                ),
+            )
         )
 
     def lower_partial(gradient, grad_output, x, weight, config_key):
@@ -1397,16 +1529,7 @@ def _train_backward(ctx, grad_output: torch.Tensor):
     need_x, need_weight = ctx.needs_input_grad[:2]
     grad_x = grad_weight = None
     if need_x and need_weight:
-        # Keep the two output buffers as independent ExternKernelOut nodes.
-        # Inductor's generic multi-output fallback can reuse/overwrite dW
-        # buffers when many identical linear calls appear in one full graph;
-        # a single-layer test does not expose that lifetime bug.  The backend
-        # already executes distinct dX and dW matmuls, so this does not split a
-        # genuinely joint tensor-core kernel.
-        grad_x = _mxfp8_dx_compiler_visible(
-            grad_output, x, weight, ctx.backward_config_key
-        )
-        grad_weight = _mxfp8_dw_compiler_visible(
+        grad_x, grad_weight = _mxfp8_bwd_compiler_visible(
             grad_output, x, weight, ctx.backward_config_key
         )
     elif need_x:

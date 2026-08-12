@@ -79,26 +79,45 @@ class FP32MasterAdamW:
         return self.optimizer.param_groups
 
     def zero_grad(self, *, set_to_none: bool = True) -> None:
-        self.optimizer.zero_grad(set_to_none=set_to_none)
+        # Master gradients are overwritten by the grouped BF16->FP32 copy in
+        # ``step``.  Clearing them here would force a large FP32 allocation for
+        # every parameter on every iteration.
         for parameter in self.model_parameters:
             parameter.grad = None
 
     @torch.no_grad()
-    def step(self) -> None:
-        for model_parameter, master_parameter in zip(
-            self.model_parameters, self.master_parameters, strict=True
-        ):
-            if model_parameter.grad is None:
-                master_parameter.grad = None
-                continue
+    def step(self, *, grad_scale: torch.Tensor | None = None) -> None:
+        active = [
+            (model_parameter, master_parameter)
+            for model_parameter, master_parameter in zip(
+                self.model_parameters, self.master_parameters, strict=True
+            )
+            if model_parameter.grad is not None
+        ]
+        inactive = set(self.master_parameters).difference(
+            master_parameter for _, master_parameter in active
+        )
+        for master_parameter in inactive:
+            master_parameter.grad = None
+        for _, master_parameter in active:
             if master_parameter.grad is None:
                 master_parameter.grad = torch.empty_like(master_parameter)
-            master_parameter.grad.copy_(model_parameter.grad)
+        # One foreach launch replaces a Python-dispatched copy kernel for every
+        # parameter.  The cast from BF16 execution gradients to FP32 master
+        # gradients is performed by the copy kernels themselves.
+        torch._foreach_copy_(
+            [master_parameter.grad for _, master_parameter in active],
+            [model_parameter.grad for model_parameter, _ in active],
+        )
+        if grad_scale is not None:
+            # Fused AdamW divides each gradient by ``grad_scale`` internally.
+            # Supplying the reciprocal clipping coefficient avoids a separate
+            # foreach pass that rewrites every BF16 execution gradient.
+            self.optimizer.grad_scale = grad_scale
+            self.optimizer.found_inf = torch.zeros_like(grad_scale)
         self.optimizer.step()
-        for model_parameter, master_parameter in zip(
-            self.model_parameters, self.master_parameters, strict=True
-        ):
-            model_parameter.copy_(master_parameter)
+        # Refresh every BF16 execution parameter as one grouped operation.
+        torch._foreach_copy_(self.model_parameters, self.master_parameters)
 
     def state_dict(self) -> dict[str, object]:
         return {
@@ -429,15 +448,35 @@ def _train_precision(
 
     train_stop = int(tokens.size * (1.0 - args.validation_fraction))
     validation_start = train_stop
+    def training_loss(
+        inputs: torch.Tensor, targets: torch.Tensor
+    ) -> torch.Tensor:
+        return causal_lm_loss(model(inputs), targets)
+
+    compile_options = {
+        "epilogue_fusion": True,
+        "prologue_fusion": True,
+        "triton.cudagraphs": False,
+        "aggressive_fusion": True,
+        "memory_planning": True,
+        "inplace_buffers": True,
+        "allow_buffer_reuse": True,
+        "reorder_for_locality": True,
+    }
+
+    # Compile the complete differentiable training calculation, including the
+    # language-model loss.  Compiling only ``model`` strands flatten/cast/
+    # cross-entropy work in eager mode and prevents Inductor from scheduling
+    # the output projection and loss as one graph.
     executable = (
         torch.compile(
-            model,
+            training_loss,
             fullgraph=True,
             dynamic=False,
-            options={"triton.cudagraphs": False},
+            options=compile_options,
         )
         if args.compile
-        else model
+        else training_loss
     )
     metrics_path = output / "metrics.jsonl"
     interval_started = time.perf_counter()
@@ -471,7 +510,7 @@ def _train_precision(
                 start=0,
                 stop=train_stop,
             )
-            loss = causal_lm_loss(executable(x), targets)
+            loss = executable(x, targets)
             (loss / args.gradient_accumulation).backward()
             detached_loss = loss.detach()
             accumulated = (
@@ -479,10 +518,25 @@ def _train_precision(
                 if accumulated is None
                 else accumulated + detached_loss
             )
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), args.max_grad_norm, foreach=True
-        )
-        optimizer.step()
+        if isinstance(optimizer, FP32MasterAdamW):
+            grad_norm = torch.nn.utils.get_total_norm(
+                [
+                    parameter.grad
+                    for parameter in model.parameters()
+                    if parameter.grad is not None
+                ],
+                foreach=True,
+            )
+            reciprocal_clip = torch.clamp(
+                (grad_norm + 1.0e-6) / args.max_grad_norm,
+                min=1.0,
+            ).float()
+            optimizer.step(grad_scale=reciprocal_clip)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), args.max_grad_norm, foreach=True
+            )
+            optimizer.step()
         assert accumulated is not None
         recent_losses.append(accumulated / args.gradient_accumulation)
         should_log = (
@@ -637,7 +691,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--nvfp4-scaling",
         choices=("delayed", "current", "regional", "block"),
-        default="delayed",
+        default="block",
     )
     parser.add_argument(
         "--nvfp4-backend",

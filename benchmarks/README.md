@@ -69,6 +69,16 @@ explicit reduced-state-precision ablation. A bounded study can use
 rerunning the same command without that bound resumes from its atomic
 checkpoint.
 
+For a throughput-only comparison, pass `--optimizer bf16` uniformly to all
+three precisions and check the append-only results with:
+
+```bash
+python benchmarks/check_decoder_throughput.py <run-directory>
+```
+
+This enforces the default 1.30x MXFP8 and 1.35x NVFP4 speedup thresholds. The
+convergence run above intentionally retains FP32 master parameters.
+
 The first invocation downloads one official TinyStories training parquet
 shard and creates a byte-token cache. All precisions receive the same initial
 state and deterministic step-indexed windows. Metrics are append-only JSONL;

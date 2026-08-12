@@ -1,0 +1,67 @@
+{
+  "schema_version": 2,
+  "name": "decoder_training_hot_v1",
+  "seed": 20260812,
+  "jobs": [
+    {
+      "family": "nvfp4_dynamic_fwd",
+      "shapes": [
+        {"m": 1536, "n": 2304, "k": 768, "name": "qkv"},
+        {"m": 1536, "n": 768, "k": 768, "name": "attention_out"},
+        {"m": 1536, "n": 3072, "k": 768, "name": "gate_up"},
+        {"m": 1536, "n": 768, "k": 1536, "name": "down"}
+      ],
+      "regimes": ["hot"],
+      "promote": 8,
+      "tuning": {
+        "max_trials": 192,
+        "time_budget_s": 600.0,
+        "cost_model_trials": 72,
+        "model_warmup": 20,
+        "model_pool_size": 8192,
+        "local_beam_width": 8,
+        "confirmation_repeats": 2,
+        "confirm_initial": true,
+        "seed": 20260812
+      },
+      "protocol": {
+        "warmup_calls": 5,
+        "samples": 7,
+        "confirm_samples": 21,
+        "race_rounds": 21,
+        "target_batch_ms": 30.0,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "mxfp8_bwd",
+      "shapes": [
+        {"m": 1536, "n": 2304, "k": 768, "name": "qkv"},
+        {"m": 1536, "n": 768, "k": 768, "name": "attention_out"},
+        {"m": 1536, "n": 3072, "k": 768, "name": "gate_up"},
+        {"m": 1536, "n": 768, "k": 1536, "name": "down"}
+      ],
+      "regimes": ["hot"],
+      "promote": 8,
+      "tuning": {
+        "max_trials": 192,
+        "time_budget_s": 600.0,
+        "cost_model_trials": 72,
+        "model_warmup": 20,
+        "model_pool_size": 8192,
+        "local_beam_width": 8,
+        "confirmation_repeats": 2,
+        "confirm_initial": true,
+        "seed": 20260813
+      },
+      "protocol": {
+        "warmup_calls": 5,
+        "samples": 7,
+        "confirm_samples": 21,
+        "race_rounds": 21,
+        "target_batch_ms": 30.0,
+        "telemetry": true
+      }
+    }
+  ]
+}

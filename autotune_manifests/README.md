@@ -8,6 +8,8 @@ context identity. Add a newly versioned file instead.
 
 | Manifest | Purpose | Contexts |
 | --- | --- | ---: |
+| `decoder_training_hot_v1.json` | Exact decoder-shape NVFP4 dynamic-forward and MXFP8 backward training study | 8 |
+| `decoder_mxfp8_forward_hot_v1.json` | Exact decoder-shape materialized MXFP8 forward study | 4 |
 | `blackwell_release_candidate_5070_v1.json` | Current-revision MXFP8/NVFP4 production calibration across every operand state on both 5070 variants | 108 |
 | `nvfp4_dynamic_persistent_shapes_v1.json` | Bounded revision-3 anchor/generalization study at M=128/512/8192 | 3 |
 | `nvfp4_dynamic_balanced_iteration_v5.json` | Corrected cap-four balanced-grid confirmation at M=N=K=1536 | 1 |

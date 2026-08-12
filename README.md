@@ -194,6 +194,20 @@ sub-BF16 updates without changing the BF16 inputs consumed by RTX kernels.
 `--stop-after-step N` to pause a run at an absolute checkpoint while preserving
 the original `--steps` learning-rate schedule and resume contract.
 
+Kernel/model throughput gates use the fused BF16 optimizer for all three
+precisions so FP32-master refresh bandwidth does not hide the linear-kernel
+delta. Check a completed run with:
+
+```bash
+python benchmarks/check_decoder_throughput.py <run-directory>
+```
+
+The default thresholds are MXFP8 >= 1.30x and NVFP4 >= 1.35x BF16. On the
+70-SM RTX 5070 Ti decoder run used for this change, the measured steady-state
+rates were 186.8k BF16, 243.3k MXFP8, and 255.1k NVFP4 tokens/s: 1.302x and
+1.365x. These are exact-shape, device-local results rather than portable
+guarantees; convergence studies continue to use the FP32-master default.
+
 [`benchmarks/train_decoder.py`](benchmarks/train_decoder.py) provides the
 resumable fixed-token TinyStories convergence run for BF16, MXFP8, and NVFP4;
 the exact one-shard-equivalent invocation and artifact contract are documented
@@ -257,10 +271,13 @@ TorchAO's packed qdata, E4M3 block scale, and optional FP32
 Packed module weights remain persistent raw buffers and do not retain a BF16
 master weight.
 
-Both formats implement all three state boundaries. Dynamic NVFP4 training uses
-delayed tensorwise scaling by default: the first call bootstraps from current
-amax, then each fused forward rotates a 16-entry history and emits X/W amax into
-the alternate non-aliasing buffer. The default scalar-atomic topology keeps one
+Both formats implement all three state boundaries. The compiled decoder
+throughput recipe uses block-only scaling by default, selecting the
+materialize-once quantizers and native NVFP4 GEMM without a tensorwide
+reduction. The general `NVFP4Linear` API retains delayed tensorwise scaling
+as its numerical default: the first call bootstraps from current amax,
+then each fused forward rotates a 16-entry history and emits X/W amax into the
+alternate non-aliasing buffer. The default scalar-atomic topology keeps one
 FP32 value per operand and history generation; an autotunable per-CTA topology
 avoids the two stream-ordered async clears and can win on small grids. X
 telemetry is observed only by `block_n == 0` work and W telemetry only by

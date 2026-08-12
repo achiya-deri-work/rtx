@@ -29,7 +29,7 @@ class LinearSpec:
     precision: LinearPrecision = "bf16"
     autotune: str | bool | None = "cache"
     mxfp8_backend: str = "auto"
-    nvfp4_scaling: str = "delayed"
+    nvfp4_scaling: str = "block"
     nvfp4_backend: str = "auto"
 
     def __post_init__(self) -> None:
