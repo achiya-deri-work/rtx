@@ -10,6 +10,7 @@ import torch
 
 from .autotune.hardware import compiled_resource_metadata
 from .configs.nvfp4 import (
+    DEFAULT_NVFP4_FWD_CONFIG,
     NVFP4DynamicConfig,
     NVFP4FullyPrequantConfig,
     NVFP4Problem,
@@ -19,6 +20,8 @@ from .formats import NVFP4Tensor
 from .formats.nvfp4 import nvfp4_tensor_scale
 from .fp4 import (
     NVFP4ForwardConfig,
+    _delayed_amax_state,
+    _make_delayed_dynamic_runner,
     _make_block_dynamic_runner,
     _current_tensor_scale,
     _packed_fp4_view,
@@ -214,6 +217,62 @@ class NVFP4DynamicBenchmarkHarness(PrequantBenchmarkHarness):
             }
             for name, timings in components.items()
         }
+
+
+@dataclass(slots=True)
+class _DelayedBenchmarkRunner:
+    runner: object
+    x_history: torch.Tensor
+    weight_history: torch.Tensor
+    next_x_history: torch.Tensor
+    next_weight_history: torch.Tensor
+
+    def __call__(
+        self, x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        self.runner(
+            x,
+            weight,
+            self.x_history,
+            self.weight_history,
+            self.next_x_history,
+            self.next_weight_history,
+            out,
+        )
+        self.x_history, self.next_x_history = (
+            self.next_x_history,
+            self.x_history,
+        )
+        self.weight_history, self.next_weight_history = (
+            self.next_weight_history,
+            self.weight_history,
+        )
+
+
+class NVFP4DelayedBenchmarkHarness(NVFP4DynamicBenchmarkHarness):
+    """Measure compact delayed observation + native materialized GEMM."""
+
+    def _build_runner(self, config: NVFP4DynamicConfig) -> object:
+        policy = DEFAULT_NVFP4_FWD_CONFIG
+        history_len = policy.amax_history_len
+        return _DelayedBenchmarkRunner(
+            _make_delayed_dynamic_runner(
+                self.problem,
+                NVFP4ForwardConfig.from_materialized(config),
+                policy,
+                self.device,
+            ),
+            _delayed_amax_state(self.x, history_len),
+            _delayed_amax_state(self.weight, history_len),
+            torch.empty(history_len, dtype=torch.float32, device=self.device),
+            torch.empty(history_len, dtype=torch.float32, device=self.device),
+        )
+
+    def _measure_components(self, prepared, calls: int, samples: int):
+        # The observer is fused into quantization; timing it independently
+        # would change the state-generation semantics. E2E timing remains the
+        # authoritative objective for this family.
+        return {}
 
 
 def _pair_key(x: torch.Tensor, weight: torch.Tensor) -> tuple[int, int]:
@@ -443,6 +502,7 @@ class NVFP4FullyPrequantBenchmarkHarness(NVFP4InferenceBenchmarkHarness):
 
 
 __all__ = [
+    "NVFP4DelayedBenchmarkHarness",
     "NVFP4DynamicBenchmarkHarness",
     "NVFP4FullyPrequantBenchmarkHarness",
     "NVFP4InferenceBenchmarkHarness",

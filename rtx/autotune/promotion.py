@@ -65,10 +65,17 @@ def _current_revision(family: str) -> int:
         from ..nvfp4_inference_autotune import NVFP4_INFERENCE_KERNEL_REVISION
 
         return NVFP4_INFERENCE_KERNEL_REVISION
-    if family == "nvfp4_dynamic_fwd":
-        from ..nvfp4_inference_autotune import NVFP4_DYNAMIC_KERNEL_REVISION
+    if family in ("nvfp4_dynamic_fwd", "nvfp4_delayed_fwd"):
+        from ..nvfp4_inference_autotune import (
+            NVFP4_DELAYED_KERNEL_REVISION,
+            NVFP4_DYNAMIC_KERNEL_REVISION,
+        )
 
-        return NVFP4_DYNAMIC_KERNEL_REVISION
+        return (
+            NVFP4_DELAYED_KERNEL_REVISION
+            if family == "nvfp4_delayed_fwd"
+            else NVFP4_DYNAMIC_KERNEL_REVISION
+        )
     raise ValueError(f"unsupported runtime winner family {family!r}")
 
 
@@ -120,7 +127,7 @@ def _config_rejection(
             if family == "nvfp4_weight_prequant_fwd":
                 return weight_prequant_config_from_dict(config).rejection(nv_problem)
             return fully_prequant_config_from_dict(config).rejection(nv_problem)
-        if family == "nvfp4_dynamic_fwd":
+        if family in ("nvfp4_dynamic_fwd", "nvfp4_delayed_fwd"):
             from ..configs.nvfp4 import NVFP4Problem
             from ..nvfp4_inference_autotune import dynamic_config_from_dict
 

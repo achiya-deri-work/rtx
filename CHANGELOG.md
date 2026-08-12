@@ -3,6 +3,18 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## Unreleased
+
+- Replace delayed NVFP4's repeated CTA-local BF16 quantization with one
+  persistent dual observer/quantizer followed by the native materialized GEMM.
+  Amax observation shares the quantizer's operand reads, history rotation and
+  power-of-two scale publication stay on device, and the compiled frontend has
+  no eager reduction or scale-preparation operators.
+- Add the independently versioned `nvfp4_delayed_fwd` autotuning, dataset,
+  verification, promotion, and runtime-winner family. Preserve the former
+  fused implementation behind explicit `backend="fused"` for controlled
+  comparisons while `backend="auto"` selects the production path.
+
 ## 0.18.0
 
 - Rename the installable distribution to `rtx-blackwell` while preserving the

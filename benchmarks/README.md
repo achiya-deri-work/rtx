@@ -9,8 +9,8 @@ repository root so imports and output paths are predictable.
 | `run_decoder_four_mode.sh` | Exact 460.8M-token four-mode release convergence/runtime launcher |
 | `run_decoder_batch64_autotune.sh` | Two bounded 12-minute searches plus verification, winner installation, and batch-24/64 model races |
 | `benchmark_mxfp8_frontend.py` | End-to-end `torch.compile` MXFP8 frontend benchmark |
-| `benchmark_nvfp4_training.py` | Paired full delayed-scale NVFP4 training-forward versus fused MXFP8 performance gate |
-| `benchmark_nvfp4_end_to_end.py` | Paired forward-plus-MXFP8-backward layer benchmark |
+| `benchmark_nvfp4_training.py` | Legacy CTA-local fused NVFP4 study retained for implementation comparisons |
+| `benchmark_nvfp4_end_to_end.py` | Production backend paired forward-plus-MXFP8-backward layer benchmark |
 | `benchmark_nvfp4_frontend.py` | Paired fullgraph dynamic-forward latency and normalized numerical-error comparison against MXFP8 |
 | `validate_nvfp4_convergence.py` | Controlled BF16/current/rowwise-JIT/delayed/exact scale-policy convergence study |
 | `benchmark_mxfp8_prequant.py` | Dynamic BF16 quantization plus native-scale MXFP8 GEMM, with mainloop/epilogue stage and persistent-locality controls |
@@ -133,16 +133,19 @@ python benchmarks/validate_production.py \
 M=8192 to M=1024. Use `--frontend mxfp8` or `--frontend nvfp4` for focused
 diagnosis; the release gate uses the default `both`.
 
-Gate the complete single-launch NVFP4 delayed-training forward against verified
-MXFP8 runtime winners with paired AB/BA rounds:
+Benchmark the production materialized delayed forward and its MXFP8 backward
+against `MXFP8Linear` with paired AB/BA rounds:
 
 ```bash
-python benchmarks/benchmark_nvfp4_training.py \
-  --winner-root /path/to/audited-bundle/shard-000-of-001 \
-  --output autotune_reports/nvfp4_training_gate.json
+python benchmarks/benchmark_nvfp4_end_to_end.py \
+  --compile --nv-scaling delayed --nv-backend auto \
+  --output autotune_reports/nvfp4_delayed_end_to_end.json
 ```
 
-The command exits nonzero if either default training shape is below 1.5x.
+`benchmark_nvfp4_training.py` directly launches the older fused CTA-local
+kernel and is intentionally retained as an implementation-control experiment;
+it does not represent the `NVFP4Linear(..., scaling="delayed",
+backend="auto")` production path.
 
 The end-to-end benchmark supports eager and `--compile` runs. It verifies that
 both frontends produce bit-identical MXFP8 dX/dW and uses device-wide fences so

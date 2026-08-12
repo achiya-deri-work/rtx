@@ -1,4 +1,9 @@
-"""Paired NVFP4 delayed-training versus MXFP8 fused-forward benchmark."""
+"""Legacy CTA-local delayed-NVFP4 versus MXFP8 implementation study.
+
+Use ``benchmark_nvfp4_end_to_end.py --compile --nv-scaling delayed`` to
+benchmark the production materialize-once frontend selected by
+``NVFP4Linear(..., backend="auto")``.
+"""
 
 from __future__ import annotations
 

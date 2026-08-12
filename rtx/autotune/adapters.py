@@ -1065,6 +1065,8 @@ def make_nvfp4_dynamic_adapter(
     device: DeviceFingerprint | Mapping[str, object] | None = None,
     regime: str = "hot",
     tags: Mapping[str, object] | None = None,
+    _family: str = "nvfp4_dynamic_fwd",
+    _revision: int | None = None,
 ) -> DiscreteKernelAdapter[object]:
     """Jointly tune both dynamic quantizers and the materialized NVFP4 GEMM."""
 
@@ -1080,6 +1082,7 @@ def make_nvfp4_dynamic_adapter(
     )
 
     initial_config = preferred_dynamic_config(problem) if initial is None else initial
+    revision = NVFP4_DYNAMIC_KERNEL_REVISION if _revision is None else _revision
     selected_axes = NVFP4_DYNAMIC_SEARCH_SPACE if axes is None else axes
     axis_values = {name: tuple(values) for name, values in selected_axes.items()}
     unknown = set(axis_values).difference(NVFP4_DYNAMIC_SEARCH_SPACE)
@@ -1128,11 +1131,16 @@ def make_nvfp4_dynamic_adapter(
         )
         return values
 
-    state_tags = {**dict(tags or {}), "operand_state": "dynamic"}
+    state_tags = {
+        **dict(tags or {}),
+        "operand_state": (
+            "delayed_materialized" if _family == "nvfp4_delayed_fwd" else "dynamic"
+        ),
+    }
     return DiscreteKernelAdapter(
         context=_context(
-            "nvfp4_dynamic_fwd",
-            NVFP4_DYNAMIC_KERNEL_REVISION,
+            _family,
+            revision,
             problem,
             device,
             regime,
@@ -1149,6 +1157,39 @@ def make_nvfp4_dynamic_adapter(
         evaluator=evaluator,
         rejection_fn=rejection,
         extra_features_fn=derived,
+    )
+
+
+def make_nvfp4_delayed_adapter(
+    problem,
+    evaluator: Callable[[object], TrialOutcome],
+    *,
+    initial: object | None = None,
+    axes: Mapping[str, Iterable[Mapping[str, object]]] | None = None,
+    device: DeviceFingerprint | Mapping[str, object] | None = None,
+    regime: str = "hot",
+    tags: Mapping[str, object] | None = None,
+) -> DiscreteKernelAdapter[object]:
+    """Tune the one-launch delayed observer/quantizer plus native GEMM."""
+
+    from ..nvfp4_inference_autotune import (
+        NVFP4_DELAYED_KERNEL_REVISION,
+        NVFP4_DELAYED_SEARCH_SPACE,
+        preferred_dynamic_config,
+    )
+
+    selected_initial = preferred_dynamic_config(problem) if initial is None else initial
+    selected_initial = replace(selected_initial, quant_launches="dual")
+    return make_nvfp4_dynamic_adapter(
+        problem,
+        evaluator,
+        initial=selected_initial,
+        axes=NVFP4_DELAYED_SEARCH_SPACE if axes is None else axes,
+        device=device,
+        regime=regime,
+        tags=tags,
+        _family="nvfp4_delayed_fwd",
+        _revision=NVFP4_DELAYED_KERNEL_REVISION,
     )
 
 
@@ -1718,5 +1759,6 @@ __all__ = [
     "make_mxfp8_weight_prequant_adapter",
     "make_nvfp4_fully_prequant_adapter",
     "make_nvfp4_dynamic_adapter",
+    "make_nvfp4_delayed_adapter",
     "make_nvfp4_weight_prequant_adapter",
 ]

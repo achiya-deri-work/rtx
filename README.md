@@ -293,16 +293,17 @@ master weight.
 Both formats implement all three state boundaries. The compiled decoder
 throughput recipe uses block-only scaling by default, selecting the
 materialize-once quantizers and native NVFP4 GEMM without a tensorwide
-reduction. The general `NVFP4Linear` API retains delayed tensorwise scaling
-as its numerical default: the first call bootstraps from current amax,
-then each fused forward rotates a 16-entry history and emits X/W amax into the
-alternate non-aliasing buffer. The default scalar-atomic topology keeps one
-FP32 value per operand and history generation; an autotunable per-CTA topology
-avoids the two stream-ordered async clears and can win on small grids. X
-telemetry is observed only by `block_n == 0` work and W telemetry only by
-`block_m == 0`, removing duplicated observations across output tiles. The next
-forward prepares its power-of-two scale from the history inside each CTA,
-without a device-wide barrier or scale-preparation kernel.
+reduction. The general `NVFP4Linear` API retains delayed tensorwise scaling as
+its numerical default. The first call bootstraps from current amax; later calls
+use the configured 16-entry history while producing its successor. Delayed
+execution uses the same materialize-once architecture as block scaling: one
+persistent dual quantizer reads X and W once, computes native-layout 1x16 E4M3
+scales, observes amax during those same reads, and then launches the native
+NVFP4 GEMM. Only one atomic maximum per warp and operand is emitted, the old
+history is rotated on device, and the power-of-two X/W outer-scale product is
+published for the GEMM. The alternate history buffers are cleared with
+stream-ordered CUDA operations, so there are no eager tensor reductions or
+scale-preparation kernels in the compiled training graph.
 
 Set `scaling="current"` to recompute tensor scales just in time. Set
 `scaling="regional"` to compute independent JIT outer scales for contiguous
@@ -325,8 +326,11 @@ SM-count persistence, locality, and L2 fetch policy form the
 anchors plus a row-major fallback are measured early, then remain fully
 mutable; they prevent a learned search from spending its entire budget in the
 older consumer-staged or non-persistent basins.
-`backend="fused"`
-remains available for delayed telemetry and controlled fused-kernel studies.
+`backend="auto"` selects this materialized delayed path and its dedicated
+`nvfp4_delayed_fwd` winner family. `backend="fused"` remains available as the
+legacy CTA-local implementation for controlled kernel studies; it is not the
+production delayed backend because it redundantly quantizes shared operands
+for multiple output CTAs.
 An explicit `NVFP4FwdConfig(tensor_scale_mode="exact")` retains the exact
 TorchAO tensorwise FP32 scale for controlled studies; power-of-two is the
 default because its reciprocal is exact and cheaper. A dynamic module honors
@@ -428,11 +432,12 @@ rtx-autotune run autotune_manifests/cross_device_dataset_v2.json \
   --calibration hardware_calibration.json
 ```
 
-The same campaign engine accepts `nvfp4_fused_fwd`,
-`nvfp4_weight_prequant_fwd`, and `nvfp4_fully_prequant_fwd` jobs. Training
-measurements include fused per-CTA telemetry and next-generation scale
-reduction, while inference families exclude one-time AOT operand packing and
-remove inactive quantizer coordinates.
+The same campaign engine accepts `nvfp4_fused_fwd`, `nvfp4_dynamic_fwd`,
+`nvfp4_delayed_fwd`, `nvfp4_weight_prequant_fwd`, and
+`nvfp4_fully_prequant_fwd` jobs. The delayed family measures the full stateful
+observer/quantizer plus GEMM path and always uses one dual quantization launch;
+block dynamic and inference families exclude inactive policy coordinates and
+one-time AOT operand packing.
 
 New campaigns can exercise the same portable lease/worker boundary used by
 external projects while retaining the existing residual stores and campaign
@@ -756,8 +761,9 @@ count:
 
 Supported families are `mxfp8_fused_fwd`, `mxfp8_prequant_fwd`,
 `mxfp8_weight_prequant_fwd`, `mxfp8_fully_prequant_fwd`, `mxfp8_bwd`,
-`nvfp4_fused_fwd`, `nvfp4_dynamic_fwd`, `nvfp4_weight_prequant_fwd`, and
-`nvfp4_fully_prequant_fwd`. Persistent inference families never time their AOT
+`nvfp4_fused_fwd`, `nvfp4_dynamic_fwd`, `nvfp4_delayed_fwd`,
+`nvfp4_weight_prequant_fwd`, and `nvfp4_fully_prequant_fwd`. Persistent
+inference families never time their AOT
 packing work and do not expose inactive quantizer coordinates. Additional
 kernel families can register a `DatasetBackend` with
 `rtx.autotune.register_dataset_backend`; campaign orchestration, persistence,

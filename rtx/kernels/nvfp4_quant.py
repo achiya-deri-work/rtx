@@ -115,6 +115,34 @@ class NVFP4QuantKernel:
         )
 
     @cute.jit
+    def _tensor_scale_from_amax(
+        self,
+        amax: Float32,
+        tensor_scale_mode: cutlass.Constexpr,
+    ):
+        """Return the delayed outer scale without logarithms or division."""
+
+        if cutlass.const_expr(tensor_scale_mode == "exact"):
+            scale = amax * Float32(1.0 / 2688.0)
+            if amax == Float32(0.0):
+                scale = Float32(1.0)
+            return scale
+
+        target = cute.arch.fmax(
+            amax * Float32(1.0 / 2688.0),
+            Float32(2.0**-126),
+            nan=True,
+        )
+        bits = target.bitcast(Int32)
+        exponent_bits = bits & Int32(0x7F800000)
+        if (bits & Int32(0x007FFFFF)) != 0:
+            exponent_bits += Int32(1 << 23)
+        scale = exponent_bits.bitcast(Float32)
+        if amax == Float32(0.0):
+            scale = Float32(1.0)
+        return scale
+
+    @cute.jit
     def _block_reciprocal(
         self,
         block_scale: Float8E4M3FN,
@@ -280,6 +308,7 @@ class NVFP4QuantKernel:
                     + (scale_in_tile // 4) * 512
                 )
                 scales[row // 128, scale_block // 8, physical] = block_scale
+        return block_amax
 
     @cute.kernel
     def kernel(
@@ -443,6 +472,200 @@ class NVFP4DualQuantKernel(NVFP4QuantKernel):
                         linear_block % blocks_per_row,
                         lane_in_scale,
                     )
+
+
+class NVFP4DelayedDualQuantKernel(NVFP4DualQuantKernel):
+    """Dual quantizer using prior amax history and emitting its successor.
+
+    Quantization and current-amax observation share the single BF16 read. Each
+    warp contributes at most one atomic maximum per operand, while CTA zero
+    rotates the immutable older history and publishes the GEMM output scale.
+    """
+
+    def __init__(
+        self,
+        x_rows: int,
+        weight_rows: int,
+        k: int,
+        config: NVFP4QuantConfig,
+        history_len: int,
+        history_algo: str,
+        tensor_scale_mode: str,
+    ):
+        super().__init__(x_rows, weight_rows, k, config)
+        if history_len not in (1, 4, 16, 64):
+            raise ValueError("delayed NVFP4 history must have 1, 4, 16, or 64 values")
+        if history_algo not in ("most_recent", "window_max"):
+            raise ValueError("unknown delayed NVFP4 history algorithm")
+        if tensor_scale_mode not in ("power2", "exact"):
+            raise ValueError("unknown delayed NVFP4 tensor-scale mode")
+        self.history_len = history_len
+        self.history_algo = history_algo
+        self.tensor_scale_mode = tensor_scale_mode
+
+    @cute.jit
+    def __call__(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        qx: cute.Tensor,
+        qw: cute.Tensor,
+        sx: cute.Tensor,
+        sw: cute.Tensor,
+        x_history: cute.Tensor,
+        weight_history: cute.Tensor,
+        next_x_history: cute.Tensor,
+        next_weight_history: cute.Tensor,
+        output_scale: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.delayed_dual_kernel(
+            x,
+            weight,
+            qx,
+            qw,
+            sx,
+            sw,
+            x_history,
+            weight_history,
+            next_x_history,
+            next_weight_history,
+            output_scale,
+        ).launch(
+            grid=(self.grid_ctas, 1, 1),
+            block=(self.config.num_warps * 32, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def delayed_dual_kernel(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        qx: cute.Tensor,
+        qw: cute.Tensor,
+        sx: cute.Tensor,
+        sw: cute.Tensor,
+        x_history: cute.Tensor,
+        weight_history: cute.Tensor,
+        next_x_history: cute.Tensor,
+        next_weight_history: cute.Tensor,
+        output_scale: cute.Tensor,
+    ):
+        cfg = self.config
+        lane_idx = cute.arch.lane_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        block_idx, _, _ = cute.arch.block_idx()
+
+        history_entries = self.history_len
+        if cutlass.const_expr(self.history_algo == "most_recent"):
+            history_entries = 1
+        prior_x_amax = Float32(0.0)
+        prior_weight_amax = Float32(0.0)
+        for history_idx in cutlass.range(
+            lane_idx, history_entries, 32, unroll=1
+        ):
+            prior_x_amax = cute.arch.fmax(
+                prior_x_amax, Float32(x_history[history_idx]), nan=True
+            )
+            prior_weight_amax = cute.arch.fmax(
+                prior_weight_amax,
+                Float32(weight_history[history_idx]),
+                nan=True,
+            )
+        prior_x_amax = nvvm.redux_sync(
+            prior_x_amax.bitcast(Int32),
+            nvvm.ReductionKind.UMAX,
+            Int32(0xFFFFFFFF),
+        ).bitcast(Float32)
+        prior_weight_amax = nvvm.redux_sync(
+            prior_weight_amax.bitcast(Int32),
+            nvvm.ReductionKind.UMAX,
+            Int32(0xFFFFFFFF),
+        ).bitcast(Float32)
+        x_global_scale = self._tensor_scale_from_amax(
+            prior_x_amax, self.tensor_scale_mode
+        )
+        weight_global_scale = self._tensor_scale_from_amax(
+            prior_weight_amax, self.tensor_scale_mode
+        )
+
+        if block_idx == 0 and warp_idx == 0:
+            if lane_idx == 0:
+                output_scale[0] = x_global_scale * weight_global_scale
+            for history_idx in cutlass.range(
+                lane_idx + 1, self.history_len, 32, unroll=1
+            ):
+                next_x_history[history_idx] = x_history[history_idx - 1]
+                next_weight_history[history_idx] = weight_history[
+                    history_idx - 1
+                ]
+
+        warp_linear = block_idx * cfg.num_warps + warp_idx
+        warp_stride = self.grid_ctas * cfg.num_warps
+        block_in_warp = lane_idx // cfg.threads_per_scale
+        lane_in_scale = lane_idx % cfg.threads_per_scale
+        blocks_per_row = self.storage_k // NVFP4_SF_VEC_SIZE
+        observed_x_amax = Float32(0.0)
+        observed_weight_amax = Float32(0.0)
+        for task_group in cutlass.range(
+            warp_linear, self.task_groups, warp_stride, unroll=1
+        ):
+            if task_group < self.x_task_groups:
+                linear_block = task_group * cfg.blocks_per_warp + block_in_warp
+                if linear_block < self.x_rows * blocks_per_row:
+                    block_amax = self._quantize_task(
+                        x,
+                        qx,
+                        sx,
+                        x_global_scale,
+                        linear_block // blocks_per_row,
+                        linear_block % blocks_per_row,
+                        lane_in_scale,
+                    )
+                    observed_x_amax = cute.arch.fmax(
+                        observed_x_amax, block_amax, nan=True
+                    )
+            else:
+                local_group = task_group - self.x_task_groups
+                linear_block = local_group * cfg.blocks_per_warp + block_in_warp
+                if linear_block < self.weight_rows * blocks_per_row:
+                    block_amax = self._quantize_task(
+                        weight,
+                        qw,
+                        sw,
+                        weight_global_scale,
+                        linear_block // blocks_per_row,
+                        linear_block % blocks_per_row,
+                        lane_in_scale,
+                    )
+                    observed_weight_amax = cute.arch.fmax(
+                        observed_weight_amax, block_amax, nan=True
+                    )
+
+        observed_x_amax = nvvm.redux_sync(
+            observed_x_amax.bitcast(Int32),
+            nvvm.ReductionKind.UMAX,
+            Int32(0xFFFFFFFF),
+        ).bitcast(Float32)
+        observed_weight_amax = nvvm.redux_sync(
+            observed_weight_amax.bitcast(Int32),
+            nvvm.ReductionKind.UMAX,
+            Int32(0xFFFFFFFF),
+        ).bitcast(Float32)
+        if lane_idx == 0:
+            cute.arch.atomic_fmax(
+                next_x_history.iterator + next_x_history.layout(0),
+                observed_x_amax,
+                sign_bit=False,
+                scope="gpu",
+            )
+            cute.arch.atomic_fmax(
+                next_weight_history.iterator + next_weight_history.layout(0),
+                observed_weight_amax,
+                sign_bit=False,
+                scope="gpu",
+            )
 
 
 class NVFP4BlockQuantKernel(NVFP4QuantKernel):
@@ -610,6 +833,12 @@ def _fake_tensor_scale():
     )
 
 
+def _fake_amax_history(values: int):
+    return cute.runtime.make_fake_tensor(
+        Float32, (values,), stride=(1,), assumed_align=4
+    )
+
+
 @lru_cache(maxsize=None)
 def compile_nvfp4_quant(
     rows: int,
@@ -650,6 +879,48 @@ def compile_nvfp4_dual_quant(
         _fake_scales(x_rows, k, config.scale_layout),
         _fake_scales(weight_rows, k, config.scale_layout),
         _fake_tensor_scale(),
+        _fake_tensor_scale(),
+        stream,
+        options=(
+            "--enable-tvm-ffi --opt-level 3 "
+            f"--ptxas-options '-O3 -v --maxrregcount={config.maxrregcount}'"
+        ),
+    )
+
+
+@lru_cache(maxsize=None)
+def compile_nvfp4_delayed_dual_quant(
+    x_rows: int,
+    weight_rows: int,
+    k: int,
+    config: NVFP4QuantConfig = NVFP4QuantConfig(),
+    history_len: int = 16,
+    history_algo: str = "window_max",
+    tensor_scale_mode: str = "power2",
+):
+    kernel = NVFP4DelayedDualQuantKernel(
+        x_rows,
+        weight_rows,
+        k,
+        config,
+        history_len,
+        history_algo,
+        tensor_scale_mode,
+    )
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    history = _fake_amax_history(history_len)
+    return cute.compile(
+        kernel,
+        _fake_bf16(x_rows, k),
+        _fake_bf16(weight_rows, k),
+        _fake_packed(x_rows, k),
+        _fake_packed(weight_rows, k),
+        _fake_scales(x_rows, k, config.scale_layout),
+        _fake_scales(weight_rows, k, config.scale_layout),
+        history,
+        history,
+        history,
+        history,
         _fake_tensor_scale(),
         stream,
         options=(
@@ -706,10 +977,12 @@ def compile_nvfp4_block_dual_quant(
 
 
 __all__ = [
+    "NVFP4DelayedDualQuantKernel",
     "NVFP4DualQuantKernel",
     "NVFP4QuantConfig",
     "NVFP4QuantKernel",
     "compile_nvfp4_dual_quant",
+    "compile_nvfp4_delayed_dual_quant",
     "compile_nvfp4_block_dual_quant",
     "compile_nvfp4_block_quant",
     "compile_nvfp4_quant",

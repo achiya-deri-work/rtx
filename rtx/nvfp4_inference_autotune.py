@@ -23,6 +23,7 @@ from .prequant_autotune import PREQUANT_SEARCH_SPACE
 
 NVFP4_INFERENCE_KERNEL_REVISION = 3
 NVFP4_DYNAMIC_KERNEL_REVISION = 6
+NVFP4_DELAYED_KERNEL_REVISION = 1
 
 
 def _gemm_axes() -> dict[str, tuple[dict[str, object], ...]]:
@@ -298,6 +299,11 @@ NVFP4_DYNAMIC_SEARCH_SPACE = {
     ),
     **_gemm_axes(),
 }
+NVFP4_DELAYED_SEARCH_SPACE = {
+    name: values
+    for name, values in NVFP4_DYNAMIC_SEARCH_SPACE.items()
+    if name != "quant_launches"
+}
 
 
 def _identifier(value: Mapping[str, object]) -> str:
@@ -555,6 +561,8 @@ def tune_nvfp4_inference_state(
 __all__ = [
     "NVFP4_DYNAMIC_KERNEL_REVISION",
     "NVFP4_DYNAMIC_SEARCH_SPACE",
+    "NVFP4_DELAYED_KERNEL_REVISION",
+    "NVFP4_DELAYED_SEARCH_SPACE",
     "NVFP4_FULLY_PREQUANT_SEARCH_SPACE",
     "NVFP4_INFERENCE_KERNEL_REVISION",
     "NVFP4_WEIGHT_PREQUANT_SEARCH_SPACE",

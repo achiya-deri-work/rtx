@@ -7,6 +7,7 @@ import torch
 
 import rtx
 from rtx.autotune.adapters import (
+    make_nvfp4_delayed_adapter,
     make_nvfp4_dynamic_adapter,
     make_nvfp4_fully_prequant_adapter,
     make_nvfp4_fwd_adapter,
@@ -26,6 +27,7 @@ from rtx.configs.nvfp4 import (
     normalize_nvfp4_fwd_config,
 )
 from rtx.nvfp4_inference_autotune import (
+    NVFP4_DELAYED_SEARCH_SPACE,
     NVFP4_DYNAMIC_SEARCH_SPACE,
     preferred_dynamic_config,
     update_dynamic_config,
@@ -145,13 +147,20 @@ class NVFP4ConfigTests(unittest.TestCase):
         )
         for family, inference_config in (
             ("nvfp4_dynamic_fwd", NVFP4DynamicConfig()),
+            ("nvfp4_delayed_fwd", NVFP4DynamicConfig()),
             ("nvfp4_weight_prequant_fwd", NVFP4WeightPrequantConfig()),
             ("nvfp4_fully_prequant_fwd", NVFP4FullyPrequantConfig()),
         ):
             with self.subTest(family=family):
+                expected_revision = {
+                    "nvfp4_dynamic_fwd": 6,
+                    "nvfp4_delayed_fwd": 1,
+                    "nvfp4_weight_prequant_fwd": 3,
+                    "nvfp4_fully_prequant_fwd": 3,
+                }[family]
                 self.assertEqual(
                     _current_revision(family),
-                    6 if family == "nvfp4_dynamic_fwd" else 3,
+                    expected_revision,
                 )
                 self.assertIsNone(
                     _config_rejection(
@@ -190,7 +199,11 @@ class NVFP4ConfigTests(unittest.TestCase):
             initial=NVFP4DynamicConfig(),
             axes={"quant_launches": ({"quant_launches": "dual"},)},
         )
+        delayed = make_nvfp4_delayed_adapter(problem, evaluator)
         self.assertEqual(dynamic.context.family, "nvfp4_dynamic_fwd")
+        self.assertEqual(delayed.context.family, "nvfp4_delayed_fwd")
+        self.assertEqual(delayed.initial_config.quant_launches, "dual")
+        self.assertNotIn("quant_launches", NVFP4_DELAYED_SEARCH_SPACE)
         self.assertEqual(weight.context.family, "nvfp4_weight_prequant_fwd")
         self.assertEqual(fully.context.family, "nvfp4_fully_prequant_fwd")
         weight_features = weight.features(weight.initial_config)
@@ -798,7 +811,7 @@ class NVFP4CudaTests(unittest.TestCase):
                     jumped,
                     layer.weight,
                     forward_config=config,
-                    backend="fused",
+                    backend="materialized",
                 )
                 torch.cuda.synchronize()
                 self.assertTrue(bool(torch.isfinite(stale).all()))
