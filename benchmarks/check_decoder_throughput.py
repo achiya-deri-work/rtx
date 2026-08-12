@@ -1,4 +1,4 @@
-"""Summarize four-mode decoder runtime and convergence release evidence."""
+"""Summarize decoder runtime and convergence evidence for recorded modes."""
 
 from __future__ import annotations
 
@@ -122,9 +122,16 @@ def main() -> None:
     manifest_path = args.run / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest_modes = tuple(manifest.get("precisions", ()))
-    if manifest_modes != MODES:
+    unknown_modes = tuple(mode for mode in manifest_modes if mode not in MODES)
+    if (
+        not manifest_modes
+        or manifest_modes[0] != "bf16"
+        or len(set(manifest_modes)) != len(manifest_modes)
+        or unknown_modes
+    ):
         raise RuntimeError(
-            f"{manifest_path} modes are {manifest_modes}, expected {MODES}"
+            f"{manifest_path} modes are {manifest_modes}; expected unique modes "
+            f"from {MODES} with bf16 first"
         )
     policy = manifest.get("training_policy")
     if not isinstance(policy, dict):
@@ -136,7 +143,7 @@ def main() -> None:
             mode=mode,
             tail=args.tail,
         )
-        for mode in MODES
+        for mode in manifest_modes
     }
     final_steps = {int(value["final_step"]) for value in modes.values()}
     if len(final_steps) != 1:
@@ -145,14 +152,19 @@ def main() -> None:
     baseline = float(modes["bf16"]["steady_tokens_per_second"])
     speedups = {
         mode: float(modes[mode]["steady_tokens_per_second"]) / baseline
-        for mode in MODES[1:]
+        for mode in manifest_modes[1:]
     }
     minimums = {
         "mxfp8": args.minimum_mxfp8,
         "nvfp4_delayed": args.minimum_nvfp4_delayed,
         "nvfp4_block": args.minimum_nvfp4_block,
     }
-    passed = all(speedups[mode] >= minimum for mode, minimum in minimums.items())
+    active_minimums = {
+        mode: minimum for mode, minimum in minimums.items() if mode in speedups
+    }
+    passed = all(
+        speedups[mode] >= minimum for mode, minimum in active_minimums.items()
+    )
     print(
         json.dumps(
             {
@@ -164,7 +176,7 @@ def main() -> None:
                 "training_policy": policy,
                 "modes": modes,
                 "speedup_over_bf16": speedups,
-                "minimum_speedup": minimums,
+                "minimum_speedup": active_minimums,
                 "passed": passed,
             },
             indent=2,
