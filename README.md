@@ -1,9 +1,12 @@
-# RTX low-precision linear layers
+# rtx-blackwell low-precision linear layers
 
-`rtx` is an experimental Python library for low-precision training and
+`rtx-blackwell` is an experimental Python distribution, imported as `rtx`,
+for low-precision training and
 inference on NVIDIA RTX Blackwell GPUs. Its two public linear
 frontends are `rtx.MXFP8Linear` and `rtx.NVFP4Linear`. The
-current implementation contains:
+project's normative numerical and benchmarking contract is documented in
+[`PRECISION_POLICY.md`](PRECISION_POLICY.md). The current implementation
+contains:
 
 - fused BF16 input/weight quantization and MXFP8 forward GEMM, including
   persistent three-role TMA producer/quantizer/MMA schedules and staged async
@@ -51,14 +54,14 @@ change.
 - Linux
 - Python 3.11+
 - an RTX Blackwell GPU and a compatible NVIDIA driver
-- a CUDA 13.x-enabled PyTorch build with Blackwell support (CUDA 13.2 preferred)
-- TorchAO 0.18.0 or newer
+- PyTorch 2.12.1 or 2.13.0 built for CUDA 13.2
+- TorchAO 0.18.0
 - CUDA Python 13.x
-- NVIDIA CUTLASS Python DSL 4.7.x with its `cu13` runtime extra
+- NVIDIA CUTLASS Python DSL 4.7.0 with its `cu13` runtime extra
 - PyArrow, Apache TVM FFI 0.1.13.post2, and Einops
 
-For discrete Blackwell GPUs, `requirements.txt` selects PyTorch's official
-CUDA 13.2 wheel channel and installs the full runtime:
+`requirements.txt` selects the supported PyTorch 2.13.0 CUDA 13.2 stack and
+installs the full runtime:
 
 ```bash
 python -m venv .venv
@@ -68,12 +71,15 @@ python -m pip install -r requirements.txt
 python -m pip install -e .
 ```
 
-CUDA 13.0 is available as a fallback for machines which cannot yet use 13.2:
+The alternate supported PyTorch 2.12.1 stack is explicit:
 
 ```bash
-python -m pip install -r requirements-cu130.txt
+python -m pip install -r requirements-torch212-cu132.txt
 python -m pip install -e .
 ```
+
+Other PyTorch or CUDA minor versions are intentionally rejected when a native
+kernel is first loaded. The top-level `import rtx` remains architecture-neutral.
 
 PyArrow is a core dependency, so CSV and Parquet export are available in every
 supported install.
@@ -187,16 +193,19 @@ consume verified device-local winners when available and do not launch a fresh
 coordinate search in the training process. The model is a validation scaffold,
 not a pretrained architecture or checkpoint format.
 
-The convergence trainer defaults to FP32 AdamW master parameters and moments,
-refreshing the BF16 execution weights after each optimizer step. This preserves
-sub-BF16 updates without changing the BF16 inputs consumed by RTX kernels.
-`--optimizer bf16` is retained only for controlled ablations. Use
+Production convergence and throughput runs use BF16 model parameters,
+gradients, and activations for all four training modes. FP32 is retained
+locally for sensitive reductions, RoPE, softmax, selected transcendentals, and
+accumulation. Optimizer-state precision is recorded independently: the
+production convergence/runtime comparison uses FP32 AdamW moments and master
+parameters, while `--optimizer bf16` is retained as a separately labelled
+kernel-isolation throughput ablation. Neither policy is an all-FP32 model
+baseline. See
+[`PRECISION_POLICY.md`](PRECISION_POLICY.md) for the complete contract. Use
 `--stop-after-step N` to pause a run at an absolute checkpoint while preserving
 the original `--steps` learning-rate schedule and resume contract.
 
-Kernel/model throughput gates use the fused BF16 optimizer for all three
-precisions so FP32-master refresh bandwidth does not hide the linear-kernel
-delta. Check a completed run with:
+Check a completed production-policy run with:
 
 ```bash
 python benchmarks/check_decoder_throughput.py <run-directory>
@@ -205,12 +214,18 @@ python benchmarks/check_decoder_throughput.py <run-directory>
 The default thresholds are MXFP8 >= 1.30x and NVFP4 >= 1.35x BF16. On the
 70-SM RTX 5070 Ti decoder run used for this change, the measured steady-state
 rates were 186.8k BF16, 243.3k MXFP8, and 255.1k NVFP4 tokens/s: 1.302x and
-1.365x. These are exact-shape, device-local results rather than portable
-guarantees; convergence studies continue to use the FP32-master default.
+1.365x. That ratio is the explicitly labelled BF16-optimizer kernel-isolation
+ablation; the four-mode production run reports end-to-end behavior with FP32
+AdamW state/master weights. These are exact-shape, device-local results rather
+than portable guarantees. BF16 is also the convergence baseline; FP32
+references are local numerical oracles, not a separate production training
+configuration.
 
 [`benchmarks/train_decoder.py`](benchmarks/train_decoder.py) provides the
-resumable fixed-token TinyStories convergence run for BF16, MXFP8, and NVFP4;
-the exact one-shard-equivalent invocation and artifact contract are documented
+resumable fixed-token TinyStories comparison for BF16, MXFP8, NVFP4 delayed
+scaling, and NVFP4 block-only scaling. Scaling policy is part of each run's
+checkpoint identity, so the two NVFP4 results cannot overwrite one another.
+The exact one-shard-equivalent invocation and artifact contract are documented
 in [`benchmarks/README.md`](benchmarks/README.md).
 
 Shape/stream-specific dynamic runners retain quantized workspaces for reuse.

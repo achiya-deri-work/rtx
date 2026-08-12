@@ -1,6 +1,6 @@
-# Preferred discrete-Blackwell install: official PyTorch CUDA 13.2 wheels.
+# Alternate supported stack: PyTorch 2.12.1 with CUDA 13.2.
 --extra-index-url https://download.pytorch.org/whl/cu132
-torch==2.13.0+cu132
+torch==2.12.1+cu132
 torchao==0.18.0
 numpy>=2.0,<3
 cuda-python>=13.0,<14

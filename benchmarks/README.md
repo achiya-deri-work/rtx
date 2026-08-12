@@ -5,7 +5,8 @@ repository root so imports and output paths are predictable.
 
 | Script | Purpose |
 | --- | --- |
-| `train_decoder.py` | Resumable byte-level TinyStories BF16/MXFP8/NVFP4 decoder convergence comparison |
+| `train_decoder.py` | Resumable byte-level TinyStories BF16/MXFP8/NVFP4-delayed/NVFP4-block decoder comparison |
+| `run_decoder_four_mode.sh` | Exact 300k-step four-mode release convergence/runtime launcher |
 | `benchmark_mxfp8_frontend.py` | End-to-end `torch.compile` MXFP8 frontend benchmark |
 | `benchmark_nvfp4_training.py` | Paired full delayed-scale NVFP4 training-forward versus fused MXFP8 performance gate |
 | `benchmark_nvfp4_end_to_end.py` | Paired forward-plus-MXFP8-backward layer benchmark |
@@ -54,7 +55,8 @@ Run the fixed-token decoder convergence comparison with:
 
 ```bash
 python benchmarks/train_decoder.py \
-  --precision bf16 mxfp8 nvfp4 \
+  --precision bf16 mxfp8 nvfp4_delayed nvfp4_block \
+  --optimizer fp32_master \
   --steps 300000 \
   --warmup-steps 3000 \
   --log-interval 100 \
@@ -62,22 +64,33 @@ python benchmarks/train_decoder.py \
   --checkpoint-interval 5000
 ```
 
-The default optimizer keeps master parameters and AdamW moments in FP32, then
-copies each update to the BF16 execution model. `--optimizer bf16` is an
-explicit reduced-state-precision ablation. A bounded study can use
+The equivalent reproducible launcher is
+`./benchmarks/run_decoder_four_mode.sh`. Set `RTX_DECODER_OUTPUT` to choose a
+new artifact directory; additional CLI arguments are forwarded verbatim. A
+completed run writes `summary.json` with per-mode runtimes, speedups, final
+losses, and the complete validation-loss curves.
+
+Production model execution uses BF16 parameters, gradients, and activations.
+FP32 is reserved for sensitive reductions and calculations as defined by
+[`PRECISION_POLICY.md`](../PRECISION_POLICY.md). Optimizer-state precision is
+reported separately: the production convergence/runtime comparison uses FP32
+AdamW moments and master parameters uniformly across all four modes. The
+`--optimizer bf16` path is a kernel-isolation throughput ablation and must be
+reported as such. A bounded study can use
 `--stop-after-step 5000` without changing the 300,000-step cosine schedule;
 rerunning the same command without that bound resumes from its atomic
 checkpoint.
 
-For a throughput-only comparison, pass `--optimizer bf16` uniformly to all
-three precisions and check the append-only results with:
+Check the append-only convergence and runtime results with:
 
 ```bash
 python benchmarks/check_decoder_throughput.py <run-directory>
 ```
 
-This enforces the default 1.30x MXFP8 and 1.35x NVFP4 speedup thresholds. The
-convergence run above intentionally retains FP32 master parameters.
+This reports final convergence and steady-state runtime for all four modes. It
+enforces the default 1.30x MXFP8 and 1.35x NVFP4-block speedup thresholds
+against the otherwise identical BF16 production baseline; delayed scaling is
+reported without a default speed gate.
 
 The first invocation downloads one official TinyStories training parquet
 shard and creates a byte-token cache. All precisions receive the same initial

@@ -2,8 +2,8 @@
 
 This is intentionally a comparison harness rather than a general trainer. It
 feeds identical initialization and step-indexed corpus windows to BF16,
-MXFP8, and NVFP4 models, while preserving raw per-step evidence in append-only
-JSONL files and atomically replacing checkpoints.
+MXFP8, NVFP4-delayed, and NVFP4-block models, while preserving raw per-step
+evidence in append-only JSONL files and atomically replacing checkpoints.
 """
 
 from __future__ import annotations
@@ -36,8 +36,15 @@ TINYSTORIES_TRAIN_SHARD = (
 )
 BYTE_VOCAB_SIZE = 257
 DOCUMENT_SEPARATOR = 256
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 _STOP_REQUESTED = False
+
+TRAINING_MODES = (
+    "bf16",
+    "mxfp8",
+    "nvfp4_delayed",
+    "nvfp4_block",
+)
 
 
 class FP32MasterAdamW:
@@ -298,7 +305,20 @@ def _git_commit() -> str | None:
         return None
 
 
-def _model_config(args: argparse.Namespace, precision: str) -> DecoderConfig:
+def _linear_policy(training_mode: str) -> tuple[str, str]:
+    if training_mode == "bf16":
+        return "bf16", "block"
+    if training_mode == "mxfp8":
+        return "mxfp8", "block"
+    if training_mode == "nvfp4_delayed":
+        return "nvfp4", "delayed"
+    if training_mode == "nvfp4_block":
+        return "nvfp4", "block"
+    raise ValueError(f"unknown training mode {training_mode!r}")
+
+
+def _model_config(args: argparse.Namespace, training_mode: str) -> DecoderConfig:
+    linear_precision, nvfp4_scaling = _linear_policy(training_mode)
     return DecoderConfig(
         vocab_size=BYTE_VOCAB_SIZE,
         max_seq_len=args.sequence_length,
@@ -309,13 +329,35 @@ def _model_config(args: argparse.Namespace, precision: str) -> DecoderConfig:
         gradient_checkpointing=args.gradient_checkpointing,
         dtype=torch.bfloat16,
         linear=LinearSpec(
-            precision=precision,
+            precision=linear_precision,
             autotune=args.autotune,
             mxfp8_backend=args.mxfp8_backend,
-            nvfp4_scaling=args.nvfp4_scaling,
+            nvfp4_scaling=nvfp4_scaling,
             nvfp4_backend=args.nvfp4_backend,
         ),
     )
+
+
+def _training_signature(args: argparse.Namespace) -> dict[str, object]:
+    """Fields which must remain identical when resuming model/optimizer state."""
+
+    return {
+        "steps": args.steps,
+        "batch_size": args.batch_size,
+        "sequence_length": args.sequence_length,
+        "gradient_accumulation": args.gradient_accumulation,
+        "learning_rate": args.learning_rate,
+        "minimum_lr_ratio": args.minimum_lr_ratio,
+        "warmup_steps": args.warmup_steps,
+        "beta1": args.beta1,
+        "beta2": args.beta2,
+        "eps": args.eps,
+        "weight_decay": args.weight_decay,
+        "max_grad_norm": args.max_grad_norm,
+        "validation_fraction": args.validation_fraction,
+        "seed": args.seed,
+        "compiled": args.compile,
+    }
 
 
 @torch.no_grad()
@@ -368,6 +410,7 @@ def _checkpoint(
     optimizer_mode: str,
     config: DecoderConfig,
     corpus_hash: str,
+    training_signature: dict[str, object],
 ) -> None:
     _atomic_torch_save(
         path,
@@ -380,6 +423,7 @@ def _checkpoint(
             "optimizer": optimizer.state_dict(),
             "optimizer_mode": optimizer_mode,
             "corpus_sha256": corpus_hash,
+            "training_signature": training_signature,
         },
     )
 
@@ -417,7 +461,14 @@ def _train_precision(
         )
     output = args.output / precision
     checkpoint_path = output / "checkpoint.pt"
+    metrics_path = output / "metrics.jsonl"
+    training_signature = _training_signature(args)
     start_step = 0
+    if not args.resume and (checkpoint_path.exists() or metrics_path.exists()):
+        raise RuntimeError(
+            f"--no-resume refuses to append to existing artifacts in {output}; "
+            "choose a new --output directory"
+        )
     if args.resume and checkpoint_path.exists():
         saved = torch.load(checkpoint_path, map_location=device, weights_only=False)
         if saved.get("precision") != precision:
@@ -430,9 +481,26 @@ def _train_precision(
                 f"checkpoint optimizer mismatch in {checkpoint_path}: "
                 f"saved={saved_optimizer!r}, requested={args.optimizer!r}"
             )
+        if saved.get("model_config") != asdict(config):
+            raise RuntimeError(f"checkpoint model config mismatch in {checkpoint_path}")
+        if saved.get("training_signature") != training_signature:
+            raise RuntimeError(
+                f"checkpoint training schedule mismatch in {checkpoint_path}"
+            )
         model.load_state_dict(saved["model"], strict=True)
         optimizer.load_state_dict(saved["optimizer"])
         start_step = int(saved["step"])
+        _append_jsonl(
+            metrics_path,
+            (
+                {
+                    "record_type": "resume_boundary",
+                    "precision": precision,
+                    "checkpoint_step": start_step,
+                    "timestamp": time.time(),
+                },
+            ),
+        )
         print(f"RESUME {precision} step={start_step}", flush=True)
     if start_step >= args.steps:
         print(f"DONE {precision} already reached step={start_step}", flush=True)
@@ -478,7 +546,6 @@ def _train_precision(
         if args.compile
         else training_loss
     )
-    metrics_path = output / "metrics.jsonl"
     interval_started = time.perf_counter()
     interval_tokens = 0
     recent_losses: list[torch.Tensor] = []
@@ -568,6 +635,10 @@ def _train_precision(
             record = {
                 "record_type": "training_step",
                 "precision": precision,
+                "linear_precision": config.linear.precision,
+                "nvfp4_scaling": config.linear.nvfp4_scaling,
+                "optimizer_mode": args.optimizer,
+                "compiled": args.compile,
                 "step": step,
                 "train_loss": float(torch.stack(recent_losses).mean()),
                 "validation_loss": validation,
@@ -610,6 +681,7 @@ def _train_precision(
                 optimizer_mode=args.optimizer,
                 config=config,
                 corpus_hash=corpus_hash,
+                training_signature=training_signature,
             )
             # Checkpoint I/O is operational overhead, not model throughput.
             interval_started += time.perf_counter() - checkpoint_started
@@ -626,8 +698,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--precision",
         nargs="+",
-        choices=("bf16", "mxfp8", "nvfp4"),
-        default=("bf16", "mxfp8", "nvfp4"),
+        choices=TRAINING_MODES,
+        default=TRAINING_MODES,
+        help=(
+            "training modes; NVFP4 scale policy is part of the mode identity "
+            "so delayed and block runs checkpoint independently"
+        ),
     )
     parser.add_argument(
         "--data",
@@ -687,11 +763,6 @@ def _parse_args() -> argparse.Namespace:
         "--mxfp8-backend",
         choices=("auto", "fused", "materialized"),
         default="auto",
-    )
-    parser.add_argument(
-        "--nvfp4-scaling",
-        choices=("delayed", "current", "regional", "block"),
-        default="block",
     )
     parser.add_argument(
         "--nvfp4-backend",
@@ -765,6 +836,34 @@ def main() -> None:
         "corpus_sha256": corpus_hash,
         "tokens": int(tokens.size),
         "precisions": list(args.precision),
+        "mode_policies": {
+            mode: {
+                "linear_precision": _linear_policy(mode)[0],
+                "nvfp4_scaling": _linear_policy(mode)[1],
+            }
+            for mode in args.precision
+        },
+        "training_policy": {
+            "optimizer_mode": args.optimizer,
+            "model_parameter_dtype": "torch.bfloat16",
+            "gradient_dtype": "torch.bfloat16",
+            "activation_dtype": "torch.bfloat16",
+            "optimizer_state_dtype": (
+                "torch.float32" if args.optimizer == "fp32_master"
+                else "torch.bfloat16"
+            ),
+            "master_parameter_dtype": (
+                "torch.float32" if args.optimizer == "fp32_master" else None
+            ),
+            "compiled": args.compile,
+            "batch_size": args.batch_size,
+            "sequence_length": args.sequence_length,
+            "gradient_accumulation": args.gradient_accumulation,
+            "steps": args.steps,
+            "warmup_steps": args.warmup_steps,
+            "seed": args.seed,
+            "training_signature": _training_signature(args),
+        },
         "base_model_config": base_model_config,
     }
     _atomic_json(args.output / "manifest.json", manifest)

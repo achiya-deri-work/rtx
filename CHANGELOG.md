@@ -3,6 +3,24 @@
 All notable public API and dataset-schema changes are recorded here. This
 project follows semantic versioning while it is in active alpha development.
 
+## 0.18.0
+
+- Rename the installable distribution to `rtx-blackwell` while preserving the
+  public `import rtx` namespace and the `rtx.MXFP8Linear` / `rtx.NVFP4Linear`
+  API.
+- Freeze the native runtime support matrix at PyTorch 2.12.1 or 2.13.0 with
+  CUDA 13.2, TorchAO 0.18.0, CUTLASS DSL 4.7.0 with the `cu13` extra, and
+  Apache TVM FFI 0.1.13.post2. Validate this contract lazily before the first
+  native kernel load so CPU-only imports remain safe.
+- Split decoder training evidence into four independently checkpointed modes:
+  BF16, MXFP8, NVFP4 delayed scaling, and NVFP4 block-only scaling. Record the
+  exact linear/scaling and model/optimizer dtype policy in every manifest and
+  report both steady runtime and final train/validation convergence.
+- Define the production precision contract explicitly: BF16 is the model and
+  convergence baseline, sensitive reductions remain FP32, and production
+  comparisons use FP32 optimizer state/master weights as an independently
+  labelled policy axis.
+
 ## 0.17.0
 
 - Support every positive logical M/N/K shape in the MXFP8 and NVFP4

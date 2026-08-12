@@ -40,6 +40,7 @@ _LAZY_EXPORTS = {
     "MXFP8BwdMatmulConfig": ("fp8_bwd", "MXFP8BwdMatmulConfig"),
     "mxfp8_linear_backward": ("fp8_bwd", "mxfp8_linear_backward"),
     "clear_runtime_caches": ("runtime", "clear_runtime_caches"),
+    "validate_runtime_environment": ("runtime", "validate_runtime_environment"),
     # Compatibility exports for the legacy production tuners.
     "CoordinateDescentPolicy": ("autotune", "CoordinateDescentPolicy"),
     "load_cached_mxfp8_fwd_config": ("autotune", "load_cached_mxfp8_fwd_config"),

@@ -10,6 +10,8 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Iterator, MutableMapping
 from importlib import import_module
+from importlib.metadata import PackageNotFoundError, version as package_version
+from functools import lru_cache
 import os
 from threading import RLock
 from typing import Generic, TypeVar
@@ -23,6 +25,61 @@ _CUTE_TARGETS = {
     # SM121 uses the same architecture-accelerated SM120a instruction family.
     "sm120": "sm_120a",
 }
+
+_SUPPORTED_TORCH = frozenset({"2.12.1", "2.13.0"})
+_SUPPORTED_CUDA = "13.2"
+_REQUIRED_PACKAGES = {
+    "torchao": "0.18.0",
+    "nvidia-cutlass-dsl": "4.7.0",
+    "apache-tvm-ffi": "0.1.13.post2",
+}
+
+
+@lru_cache(maxsize=1)
+def validate_runtime_environment() -> dict[str, str]:
+    """Validate the deliberately narrow native-kernel software contract.
+
+    Importing :mod:`rtx` remains safe on CPU-only hosts. Validation happens
+    when callers explicitly request it or immediately before the first CuTe
+    kernel module is loaded.
+    """
+
+    import torch
+
+    torch_version = str(torch.__version__).split("+", 1)[0]
+    cuda_version = str(torch.version.cuda)
+    errors: list[str] = []
+    if torch_version not in _SUPPORTED_TORCH:
+        errors.append(
+            f"PyTorch {torch_version} is unsupported; expected exactly "
+            "2.12.1 or 2.13.0"
+        )
+    if cuda_version != _SUPPORTED_CUDA:
+        errors.append(
+            f"PyTorch CUDA {cuda_version} is unsupported; expected CUDA 13.2"
+        )
+
+    resolved = {
+        "torch": str(torch.__version__),
+        "cuda": cuda_version,
+    }
+    for distribution, expected in _REQUIRED_PACKAGES.items():
+        try:
+            installed = package_version(distribution)
+        except PackageNotFoundError:
+            errors.append(f"required distribution {distribution} is not installed")
+            continue
+        resolved[distribution] = installed
+        if installed != expected:
+            errors.append(
+                f"{distribution} {installed} is unsupported; expected {expected}"
+            )
+    if errors:
+        raise RuntimeError(
+            "rtx-blackwell native runtime contract is not satisfied:\n- "
+            + "\n- ".join(errors)
+        )
+    return resolved
 
 
 class BoundedCache(MutableMapping[KeyT, ValueT], Generic[KeyT, ValueT]):
@@ -122,6 +179,7 @@ def runner_cache_limit(
 def load_kernel_symbol(module: str, symbol: str, *, family: str = "sm120"):
     """Load one kernel symbol after selecting its CuTe target family."""
 
+    validate_runtime_environment()
     try:
         target = _CUTE_TARGETS[family]
     except KeyError as exc:
@@ -167,4 +225,5 @@ __all__ = [
     "clear_runtime_caches",
     "load_kernel_symbol",
     "runner_cache_limit",
+    "validate_runtime_environment",
 ]

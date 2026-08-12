@@ -1,13 +1,15 @@
 include README.md
+include PRECISION_POLICY.md
 include LICENSE
 include AUTOTUNING.md
 include sm120_hardware.md
 include CHANGELOG.md
 include requirements.txt
-include requirements-cu130.txt
+include requirements-torch212-cu132.txt
 include requirements-dev.txt
 recursive-include autotune_manifests *.json
 recursive-include autotune_manifests *.md
 recursive-include benchmarks *.py
 recursive-include benchmarks *.md
+recursive-include benchmarks *.sh
 recursive-include tests *.py
