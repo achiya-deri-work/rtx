@@ -10,7 +10,7 @@ output_root="${RTX_BATCH64_TUNE_OUTPUT:-autotune_datasets/decoder_batch64_tuning
 pretrained="${RTX_BATCH64_PRETRAINED:-autotune_models/blackwell_release_5070ti_train_v1}"
 mx_seconds="${RTX_BATCH64_MX_SECONDS:-720}"
 nv_seconds="${RTX_BATCH64_NV_SECONDS:-720}"
-stall_timeout="${RTX_BATCH64_STALL_TIMEOUT:-120s}"
+stall_seconds="${RTX_BATCH64_STALL_SECONDS:-120}"
 
 run_campaign() {
   local manifest="$1"
@@ -18,6 +18,7 @@ run_campaign() {
   local deadline_epoch=$(( $(date +%s) + budget_seconds ))
   local attempt=0
   local remaining_seconds
+  local attempt_stall_seconds
   local status
 
   # Exit 75 is a deliberate worker recycle after a CUDA fault or a compiler
@@ -30,7 +31,13 @@ run_campaign() {
       break
     fi
     attempt=$((attempt + 1))
-    echo "CAMPAIGN $manifest attempt=$attempt remaining=${remaining_seconds}s"
+    attempt_stall_seconds="$stall_seconds"
+    if ((attempt_stall_seconds > remaining_seconds)); then
+      attempt_stall_seconds="$remaining_seconds"
+    fi
+    echo \
+      "CAMPAIGN $manifest attempt=$attempt remaining=${remaining_seconds}s "\
+      "stall=${attempt_stall_seconds}s"
     set +e
     "$autotune_bin" run "$manifest" \
       --device cuda:0 \
@@ -45,7 +52,7 @@ run_campaign() {
       --pretrained-artifact "$pretrained" \
       --reuse-deterministic-failures \
       --adopt-existing-context-identity-if-present \
-      --stall-timeout "$stall_timeout"
+      --stall-timeout "${attempt_stall_seconds}s"
     status=$?
     set -e
     if ((status == 0)); then
