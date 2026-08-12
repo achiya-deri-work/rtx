@@ -9,16 +9,23 @@ from rtx.kernels.mxfp8 import MXFP8FwdConfig, MXFP8Problem, normalize_fwd_config
 from rtx.kernels.mxfp8_fwd import compile_mxfp8_fwd
 
 
-def _reference_to_mx(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Independent FLOOR-mode E4M3/E8M0 reference (scale-vector size 32)."""
+def _reference_to_mx(
+    x: torch.Tensor, *, scale_rounding: str = "infinity"
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Independent E4M3/E8M0 reference (scale-vector size 32)."""
 
     shape = x.shape
     storage_k = (shape[-1] + 31) // 32 * 32
     padded = torch.nn.functional.pad(x, (0, storage_k - shape[-1]))
     blocks = padded.reshape(*shape[:-1], storage_k // 32, 32)
     amax = blocks.abs().amax(dim=-1, keepdim=True).float()
-    exponent = ((amax.view(torch.int32) >> 23) & 0xFF) - 127
-    scale_code = ((exponent - 8).clamp(-127, 128) + 127).to(torch.uint8)
+    amax_bits = amax.view(torch.int32)
+    exponent = ((amax_bits >> 23) & 0xFF) - 127 - 8
+    if scale_rounding == "infinity":
+        exponent += (amax_bits & 0x7FFFFF) > 0x600000
+    elif scale_rounding != "floor":
+        raise ValueError(f"unknown scale rounding {scale_rounding!r}")
+    scale_code = (exponent.clamp(-127, 128) + 127).to(torch.uint8)
     scale_code = torch.where(
         torch.isnan(amax), torch.full_like(scale_code, 255), scale_code
     )
@@ -66,6 +73,12 @@ class MXFP8ConfigTests(unittest.TestCase):
             normalize_fwd_config(load_engine="cpasync").implementation_rejection(
                 problem
             ),
+        )
+        self.assertIn(
+            "scale_rounding",
+            normalize_fwd_config(
+                scale_rounding="nearest"
+            ).implementation_rejection(problem),
         )
 
     def test_logical_k_is_padded_only_to_the_scale_block(self) -> None:
@@ -343,7 +356,7 @@ class MXFP8CudaTests(unittest.TestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-    def test_fused_mxfp8_matches_floor_reference(self) -> None:
+    def test_fused_mxfp8_matches_round_to_infinity_reference(self) -> None:
         if torch.cuda.get_device_capability()[0] != 12:
             self.skipTest("native kernel requires SM120/SM121")
         cases = [

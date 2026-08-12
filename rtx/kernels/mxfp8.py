@@ -25,6 +25,7 @@ MmaIssue = Literal["sync"]
 Reduction = Literal["redux", "shuffle"]
 QuantMath = Literal["fp32", "bf16x2"]
 QuantAmax = Literal["fp32", "bf16_bits"]
+ScaleRounding = Literal["floor", "infinity"]
 Swizzle = Literal["none", "32b", "64b", "128b"]
 Raster = Literal["m", "n"]
 Reuse = Literal["none", "x", "weight"]
@@ -100,6 +101,9 @@ class MXFP8FwdConfig:
     # two-lane BF16 arithmetic and the SM120 BF16x2 -> E4M3x2 converter.
     quant_math: QuantMath = "fp32"
     quant_amax: QuantAmax = "fp32"
+    # Training-safe round-to-infinity is the default. It advances the E8M0
+    # exponent only when the exact E4M3 maximum (448) would otherwise clip.
+    scale_rounding: ScaleRounding = "infinity"
     # Per-thread BF16 quantizer load width. Wider choices map to explicit
     # vector loads and are independently tuned from quant_vec/math.
     quant_load_bits: int = 16
@@ -236,6 +240,8 @@ class MXFP8FwdConfig:
             return "BF16 SMEM swizzle exceeds the transport tile's contiguous bytes"
         if self.mxfp8_stages not in (1, 2, 3, 4):
             return "mxfp8_stages must be one of 1, 2, 3, 4"
+        if self.scale_rounding not in ("floor", "infinity"):
+            return "scale_rounding must be floor or infinity"
         if self.quant_load_bits not in (16, 32, 64, 128):
             return "quantizer BF16 load width must be 16, 32, 64, or 128 bits"
         if self.quant_load_bits > self.quant_vec * 16:
@@ -439,6 +445,7 @@ class MXFP8FwdConfig:
             "reduction",
             "quant_math",
             "quant_amax",
+            "scale_rounding",
             "quant_load_bits",
             "load_engine",
             "schedule",
@@ -533,7 +540,7 @@ class MXFP8FwdConfig:
 
 
 DEFAULT_MXFP8_FWD_CONFIG = MXFP8FwdConfig()
-MXFP8_FWD_KERNEL_REVISION = 21
+MXFP8_FWD_KERNEL_REVISION = 22
 
 
 # Block coordinates supplement, rather than replace, their primitive fields.

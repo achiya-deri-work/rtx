@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover - Linux/CUDA is the supported target.
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_prequant_e2e"
-KERNEL_REVISION = 8
+KERNEL_REVISION = 9
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:

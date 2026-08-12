@@ -36,8 +36,99 @@ TINYSTORIES_TRAIN_SHARD = (
 )
 BYTE_VOCAB_SIZE = 257
 DOCUMENT_SEPARATOR = 256
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 _STOP_REQUESTED = False
+
+
+class FP32MasterAdamW:
+    """AdamW with FP32 master parameters for a BF16 execution model.
+
+    Gradients remain BF16 at the RTX linear boundary, but optimizer moments,
+    weight decay, and sub-BF16 parameter updates are accumulated in FP32.  A
+    BF16 execution copy is refreshed after each step.
+    """
+
+    def __init__(
+        self,
+        parameters: Iterable[torch.nn.Parameter],
+        *,
+        lr: float,
+        betas: tuple[float, float],
+        eps: float,
+        weight_decay: float,
+    ) -> None:
+        self.model_parameters = list(parameters)
+        self.master_parameters = [
+            torch.nn.Parameter(
+                parameter.detach().to(dtype=torch.float32, copy=True),
+                requires_grad=True,
+            )
+            for parameter in self.model_parameters
+        ]
+        self.optimizer = torch.optim.AdamW(
+            self.master_parameters,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            fused=True,
+        )
+
+    @property
+    def param_groups(self) -> list[dict[str, object]]:
+        return self.optimizer.param_groups
+
+    def zero_grad(self, *, set_to_none: bool = True) -> None:
+        self.optimizer.zero_grad(set_to_none=set_to_none)
+        for parameter in self.model_parameters:
+            parameter.grad = None
+
+    @torch.no_grad()
+    def step(self) -> None:
+        for model_parameter, master_parameter in zip(
+            self.model_parameters, self.master_parameters, strict=True
+        ):
+            if model_parameter.grad is None:
+                master_parameter.grad = None
+                continue
+            if master_parameter.grad is None:
+                master_parameter.grad = torch.empty_like(master_parameter)
+            master_parameter.grad.copy_(model_parameter.grad)
+        self.optimizer.step()
+        for model_parameter, master_parameter in zip(
+            self.model_parameters, self.master_parameters, strict=True
+        ):
+            model_parameter.copy_(master_parameter)
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "optimizer": self.optimizer.state_dict(),
+            "master_parameters": [
+                parameter.detach() for parameter in self.master_parameters
+            ],
+        }
+
+    @torch.no_grad()
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        values = state.get("master_parameters")
+        if not isinstance(values, list) or len(values) != len(
+            self.master_parameters
+        ):
+            raise RuntimeError("invalid FP32 master-parameter checkpoint")
+        for destination, source in zip(
+            self.master_parameters, values, strict=True
+        ):
+            if not isinstance(source, torch.Tensor):
+                raise RuntimeError("invalid FP32 master-parameter checkpoint")
+            destination.copy_(source)
+        optimizer_state = state.get("optimizer")
+        if not isinstance(optimizer_state, dict):
+            raise RuntimeError("invalid FP32 AdamW checkpoint")
+        self.optimizer.load_state_dict(optimizer_state)
+        for model_parameter, master_parameter in zip(
+            self.model_parameters, self.master_parameters, strict=True
+        ):
+            model_parameter.copy_(master_parameter)
 
 
 def _request_stop(signum: int, _frame: object) -> None:
@@ -254,7 +345,8 @@ def _checkpoint(
     precision: str,
     step: int,
     model: DecoderOnlyTransformer,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | FP32MasterAdamW,
+    optimizer_mode: str,
     config: DecoderConfig,
     corpus_hash: str,
 ) -> None:
@@ -267,6 +359,7 @@ def _checkpoint(
             "model_config": asdict(config),
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "optimizer_mode": optimizer_mode,
             "corpus_sha256": corpus_hash,
         },
     )
@@ -285,14 +378,24 @@ def _train_precision(
     model = DecoderOnlyTransformer(config, device=device)
     model.load_state_dict(initial_state, strict=True)
     model.train()
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        betas=(args.beta1, args.beta2),
-        eps=args.eps,
-        weight_decay=args.weight_decay,
-        fused=True,
-    )
+    optimizer: torch.optim.Optimizer | FP32MasterAdamW
+    if args.optimizer == "fp32_master":
+        optimizer = FP32MasterAdamW(
+            model.parameters(),
+            lr=args.learning_rate,
+            betas=(args.beta1, args.beta2),
+            eps=args.eps,
+            weight_decay=args.weight_decay,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.learning_rate,
+            betas=(args.beta1, args.beta2),
+            eps=args.eps,
+            weight_decay=args.weight_decay,
+            fused=True,
+        )
     output = args.output / precision
     checkpoint_path = output / "checkpoint.pt"
     start_step = 0
@@ -302,12 +405,26 @@ def _train_precision(
             raise RuntimeError(f"checkpoint precision mismatch in {checkpoint_path}")
         if saved.get("corpus_sha256") != corpus_hash:
             raise RuntimeError(f"checkpoint corpus mismatch in {checkpoint_path}")
+        saved_optimizer = saved.get("optimizer_mode", "bf16")
+        if saved_optimizer != args.optimizer:
+            raise RuntimeError(
+                f"checkpoint optimizer mismatch in {checkpoint_path}: "
+                f"saved={saved_optimizer!r}, requested={args.optimizer!r}"
+            )
         model.load_state_dict(saved["model"], strict=True)
         optimizer.load_state_dict(saved["optimizer"])
         start_step = int(saved["step"])
         print(f"RESUME {precision} step={start_step}", flush=True)
     if start_step >= args.steps:
         print(f"DONE {precision} already reached step={start_step}", flush=True)
+        return
+    run_stop = min(args.steps, args.stop_after_step or args.steps)
+    if start_step >= run_stop:
+        print(
+            f"PAUSE {precision} checkpoint={start_step} "
+            f"stop-after-step={run_stop}",
+            flush=True,
+        )
         return
 
     train_stop = int(tokens.size * (1.0 - args.validation_fraction))
@@ -327,11 +444,11 @@ def _train_precision(
     interval_tokens = 0
     recent_losses: list[torch.Tensor] = []
     print(
-        f"START {precision} step={start_step}->{args.steps} "
+        f"START {precision} step={start_step}->{run_stop} target={args.steps} "
         f"params={model.num_parameters():,} compile={args.compile}",
         flush=True,
     )
-    for step in range(start_step + 1, args.steps + 1):
+    for step in range(start_step + 1, run_stop + 1):
         learning_rate = _learning_rate(
             step,
             base=args.learning_rate,
@@ -371,7 +488,7 @@ def _train_precision(
         should_log = (
             step == 1
             or step % args.log_interval == 0
-            or step == args.steps
+            or step == run_stop
         )
         interval_tokens += (
             args.batch_size * args.sequence_length * args.gradient_accumulation
@@ -382,7 +499,7 @@ def _train_precision(
             now = time.perf_counter()
             elapsed = now - interval_started
             validation = None
-            if step % args.validation_interval == 0 or step == args.steps:
+            if step % args.validation_interval == 0 or step == run_stop:
                 validation = _validation_loss(
                     model,
                     tokens,
@@ -426,7 +543,7 @@ def _train_precision(
             recent_losses.clear()
         if (
             step % args.checkpoint_interval == 0
-            or step == args.steps
+            or step == run_stop
             or _STOP_REQUESTED
         ):
             checkpoint_started = time.perf_counter()
@@ -436,6 +553,7 @@ def _train_precision(
                 step=step,
                 model=model,
                 optimizer=optimizer,
+                optimizer_mode=args.optimizer,
                 config=config,
                 corpus_hash=corpus_hash,
             )
@@ -470,6 +588,15 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--steps", type=int, default=1_000)
+    parser.add_argument(
+        "--stop-after-step",
+        type=int,
+        default=None,
+        help=(
+            "pause this invocation at an absolute step while preserving "
+            "--steps as the learning-rate schedule target"
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=3)
     parser.add_argument("--sequence-length", type=int, default=512)
     parser.add_argument("--gradient-accumulation", type=int, default=1)
@@ -484,6 +611,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--eps", type=float, default=1.0e-8)
     parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument(
+        "--optimizer",
+        choices=("fp32_master", "bf16"),
+        default="fp32_master",
+        help="optimizer state/parameter-update precision",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--validation-fraction", type=float, default=0.01)
     parser.add_argument("--validation-batches", type=int, default=8)
@@ -542,6 +675,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error("validation-fraction must be between zero and 0.5")
     if args.warmup_steps < 0 or args.warmup_steps >= args.steps:
         parser.error("warmup-steps must be nonnegative and smaller than steps")
+    if args.stop_after_step is not None and not 0 < args.stop_after_step <= args.steps:
+        parser.error("stop-after-step must be positive and no larger than steps")
     if args.hidden_size % args.heads:
         parser.error("hidden-size must be divisible by heads")
     return args

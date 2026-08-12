@@ -517,6 +517,77 @@ class TestMXFP8BwdConfiguration(unittest.TestCase):
 
 @unittest.skipUnless(_has_sm120(), "requires an SM120/SM121 CUDA GPU")
 class TestMXFP8BwdCuda(unittest.TestCase):
+    def test_compiled_functional_full_backward_uses_unaliased_outputs(self) -> None:
+        torch.compiler.reset()
+        torch.manual_seed(1897)
+        grad_output = torch.randn(
+            128, 128, device="cuda", dtype=torch.bfloat16
+        )
+        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+
+        def backward(a, b, c):
+            return mxfp8_linear_backward(a, b, c, autotune="off")
+
+        expected = backward(grad_output, x, weight)
+        compiled = torch.compile(backward, fullgraph=True, dynamic=False)
+        actual = compiled(grad_output, x, weight)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+        torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+    def test_repeated_fullgraph_linears_preserve_every_weight_gradient(self) -> None:
+        """Guard dW lifetimes across repeated direct Inductor lowerings."""
+
+        torch.compiler.reset()
+        torch.manual_seed(1899)
+
+        def make_stack() -> torch.nn.Sequential:
+            return torch.nn.Sequential(
+                *(
+                    MXFP8Linear(
+                        128,
+                        128,
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                        backend="materialized",
+                        autotune="off",
+                    )
+                    for _ in range(4)
+                )
+            )
+
+        eager = make_stack()
+        compiled_model = make_stack()
+        compiled_model.load_state_dict(eager.state_dict())
+        compiled = torch.compile(
+            compiled_model,
+            fullgraph=True,
+            dynamic=False,
+            options={"triton.cudagraphs": False},
+        )
+        eager_x = torch.randn(
+            128, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        compiled_x = eager_x.detach().clone().requires_grad_(True)
+        grad_output = torch.randn_like(eager_x)
+        expected = eager(eager_x)
+        actual = compiled(compiled_x)
+        expected.backward(grad_output)
+        actual.backward(grad_output)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(compiled_x.grad, eager_x.grad, rtol=0, atol=0)
+        for expected_parameter, actual_parameter in zip(
+            eager.parameters(), compiled_model.parameters(), strict=True
+        ):
+            torch.testing.assert_close(
+                actual_parameter.grad,
+                expected_parameter.grad,
+                rtol=0,
+                atol=0,
+            )
+
     def test_training_frontends_use_direct_fullgraph_lowerings(self) -> None:
         for seed, backend in enumerate(("fused", "prequant"), start=1901):
             with self.subTest(backend=backend):

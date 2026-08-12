@@ -776,8 +776,10 @@ def _torch_mxfp8_reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tenso
         shape = value.shape
         blocks = value.reshape(*shape[:-1], shape[-1] // 32, 32)
         amax = blocks.abs().amax(dim=-1, keepdim=True).float()
-        exponent = ((amax.view(torch.int32) >> 23) & 0xFF) - 127
-        scale_code = ((exponent - 8).clamp(-127, 128) + 127).to(torch.uint8)
+        amax_bits = amax.view(torch.int32)
+        exponent = ((amax_bits >> 23) & 0xFF) - 127 - 8
+        exponent += (amax_bits & 0x7FFFFF) > 0x600000
+        scale_code = (exponent.clamp(-127, 128) + 127).to(torch.uint8)
         scale_code = torch.where(
             torch.isnan(amax), torch.full_like(scale_code, 255), scale_code
         )

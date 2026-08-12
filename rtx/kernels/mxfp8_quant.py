@@ -86,9 +86,17 @@ class MXFP8QuantKernel:
 
     @cute.jit
     def _scale_from_amax(self, amax: Float32):
-        exponent = ((amax.bitcast(Int32) >> F32_MANTISSA_BITS) & 0xFF) - (
+        amax_bits = amax.bitcast(Int32)
+        exponent = ((amax_bits >> F32_MANTISSA_BITS) & 0xFF) - (
             F32_EXPONENT_BIAS + F8_MAX_POW2
         )
+        # E4M3's maximum is 448 = 1.75 * 2^8, rather than 2^9.  The OCP
+        # floor conversion clips whenever the source mantissa is greater than
+        # 1.75.  Round-to-infinity advances the power-of-two scale precisely
+        # for those blocks, with one integer compare and no FP32 division.
+        if cutlass.const_expr(self.config.scale_rounding == "infinity"):
+            if (amax_bits & Int32(0x7FFFFF)) > Int32(0x600000):
+                exponent = exponent + 1
         exponent = cutlass.max(exponent, E8M0_MIN_UNBIASED)
         exponent = cutlass.min(exponent, E8M0_MAX_UNBIASED)
         biased = exponent + F32_EXPONENT_BIAS

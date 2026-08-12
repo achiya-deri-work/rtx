@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 20
+KERNEL_REVISION = 22
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:

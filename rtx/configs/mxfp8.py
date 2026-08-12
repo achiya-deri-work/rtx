@@ -21,6 +21,10 @@ class MXFP8QuantConfig:
     quant_store_bits: int = 8
     quant_math: str = "bf16x2"
     quant_amax: str = "bf16_bits"
+    # ``infinity`` selects the smallest E8M0 power of two that keeps E4M3's
+    # finite 448 maximum in range.  ``floor`` retains the minimally required
+    # OCP conversion for controlled experiments, but can clip training values.
+    scale_rounding: str = "infinity"
     reduction: str = "shuffle"
     num_warps: int = 8
     persistent_waves: int = 4
@@ -53,6 +57,8 @@ class MXFP8QuantConfig:
             return "quant_math must be fp32 or bf16x2"
         if self.quant_amax not in ("fp32", "bf16_bits"):
             return "quant_amax must be fp32 or bf16_bits"
+        if self.scale_rounding not in ("floor", "infinity"):
+            return "scale_rounding must be floor or infinity"
         if self.reduction not in ("shuffle", "redux"):
             return "reduction must be shuffle or redux"
         if self.num_warps not in (4, 8, 16):

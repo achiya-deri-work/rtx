@@ -748,11 +748,18 @@ class MXFP8LinearFwdKernel:
 
     @cute.jit
     def _scale_from_amax(self, amax: Float32):
-        """Return FLOOR-mode E8M0 and its exact FP32 power-of-two inverse."""
+        """Return configured E8M0 and its exact FP32 power-of-two inverse."""
 
-        exponent = ((amax.bitcast(Int32) >> F32_MANTISSA_BITS) & 0xFF) - (
+        amax_bits = amax.bitcast(Int32)
+        exponent = ((amax_bits >> F32_MANTISSA_BITS) & 0xFF) - (
             F32_EXPONENT_BIAS + F8_MAX_POW2
         )
+        # E4M3's finite maximum is 448 = 1.75 * 2^8.  Advancing only when the
+        # amax mantissa exceeds 1.75 implements training-safe scale
+        # round-to-infinity without a logarithm or division.
+        if cutlass.const_expr(self.config.scale_rounding == "infinity"):
+            if (amax_bits & Int32(0x7FFFFF)) > Int32(0x600000):
+                exponent = exponent + 1
         exponent = cutlass.max(exponent, E8M0_MIN_UNBIASED)
         exponent = cutlass.min(exponent, E8M0_MAX_UNBIASED)
         biased = exponent + F32_EXPONENT_BIAS

@@ -62,6 +62,13 @@ python benchmarks/train_decoder.py \
   --checkpoint-interval 5000
 ```
 
+The default optimizer keeps master parameters and AdamW moments in FP32, then
+copies each update to the BF16 execution model. `--optimizer bf16` is an
+explicit reduced-state-precision ablation. A bounded study can use
+`--stop-after-step 5000` without changing the 300,000-step cosine schedule;
+rerunning the same command without that bound resumes from its atomic
+checkpoint.
+
 The first invocation downloads one official TinyStories training parquet
 shard and creates a byte-token cache. All precisions receive the same initial
 state and deterministic step-indexed windows. Metrics are append-only JSONL;

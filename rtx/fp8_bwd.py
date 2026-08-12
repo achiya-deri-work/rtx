@@ -1142,22 +1142,12 @@ def _mxfp8_bwd_compiler_visible(
     weight: torch.Tensor,
     config_key: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Expose copies/allocations to AOTAutograd, then run launch-only code."""
+    """Represent a full backward as two unaliased functional graph nodes."""
 
-    grad_output_c = grad_output.contiguous()
-    x_c = x.contiguous()
-    weight_c = weight.contiguous()
-    grad_x = torch.empty_like(x_c)
-    grad_weight = torch.empty_like(weight_c)
-    torch.ops.rtx.mxfp8_linear_bwd.out(
-        grad_output_c,
-        x_c,
-        weight_c,
-        config_key,
-        grad_x=grad_x,
-        grad_weight=grad_weight,
+    return (
+        _mxfp8_linear_dx_op(grad_output, x, weight, config_key),
+        _mxfp8_linear_dw_op(grad_output, x, weight, config_key),
     )
-    return grad_x, grad_weight
 
 
 def _mxfp8_dx_compiler_visible(
@@ -1166,14 +1156,9 @@ def _mxfp8_dx_compiler_visible(
     weight: torch.Tensor,
     config_key: str,
 ) -> torch.Tensor:
-    grad_output_c = grad_output.contiguous()
-    x_c = x.contiguous()
-    weight_c = weight.contiguous()
-    grad_x = torch.empty_like(x_c)
-    torch.ops.rtx.mxfp8_linear_dx.out(
-        grad_output_c, x_c, weight_c, config_key, grad_x=grad_x
-    )
-    return grad_x
+    # Keep the functional op in the AOT graph. Its direct Inductor lowering
+    # realizes contiguous inputs and owns one unaliased ExternKernelOut.
+    return _mxfp8_linear_dx_op(grad_output, x, weight, config_key)
 
 
 def _mxfp8_dw_compiler_visible(
@@ -1182,18 +1167,7 @@ def _mxfp8_dw_compiler_visible(
     weight: torch.Tensor,
     config_key: str,
 ) -> torch.Tensor:
-    grad_output_c = grad_output.contiguous()
-    x_c = x.contiguous()
-    weight_c = weight.contiguous()
-    grad_weight = torch.empty_like(weight_c)
-    torch.ops.rtx.mxfp8_linear_dw.out(
-        grad_output_c,
-        x_c,
-        weight_c,
-        config_key,
-        grad_weight=grad_weight,
-    )
-    return grad_weight
+    return _mxfp8_linear_dw_op(grad_output, x, weight, config_key)
 
 
 class _InductorMXFP8BwdLauncher:
@@ -1272,25 +1246,13 @@ def _register_bwd_inductor_lowerings() -> None:
         type_promotion_kind=None,
     )
     def lower_bwd(grad_output, x, weight, config_key):
-        # Reuse Inductor's native multi-output allocation machinery, but point
-        # its generated call directly at our launch-only registry instead of
-        # taking another dispatcher/Python custom-op round trip.
-        raw_outputs = ir.FallbackKernel.create(
-            torch.ops.rtx.mxfp8_linear_bwd.default,
-            grad_output,
-            x,
-            weight,
-            config_key,
+        # Two independent output nodes make dataflow/lifetimes explicit to
+        # Inductor. Generic multi-output fallback allocation can alias dW
+        # across repeated calls in a large AOTAutograd graph.
+        return (
+            lower_partial("dx", grad_output, x, weight, config_key),
+            lower_partial("dw", grad_output, x, weight, config_key),
         )
-        if not isinstance(raw_outputs, tuple) or len(raw_outputs) != 2:
-            raise RuntimeError("Inductor did not construct MXFP8 bwd out buffers")
-        packed = raw_outputs[0].inputs[0]
-        if not isinstance(packed, ir.ExternKernelMultiOut):
-            raise RuntimeError("MXFP8 bwd requires Inductor multi-out lowering")
-        packed.python_kernel_name = (
-            f"torch._rtx_mxfp8_bwd_launchers[{config_key!r}]"
-        )
-        return tuple(output.wrap_for_lowering() for output in raw_outputs)
 
     def lower_partial(gradient, grad_output, x, weight, config_key):
         inputs = [
@@ -1435,7 +1397,16 @@ def _train_backward(ctx, grad_output: torch.Tensor):
     need_x, need_weight = ctx.needs_input_grad[:2]
     grad_x = grad_weight = None
     if need_x and need_weight:
-        grad_x, grad_weight = _mxfp8_bwd_compiler_visible(
+        # Keep the two output buffers as independent ExternKernelOut nodes.
+        # Inductor's generic multi-output fallback can reuse/overwrite dW
+        # buffers when many identical linear calls appear in one full graph;
+        # a single-layer test does not expose that lifetime bug.  The backend
+        # already executes distinct dX and dW matmuls, so this does not split a
+        # genuinely joint tensor-core kernel.
+        grad_x = _mxfp8_dx_compiler_visible(
+            grad_output, x, weight, ctx.backward_config_key
+        )
+        grad_weight = _mxfp8_dw_compiler_visible(
             grad_output, x, weight, ctx.backward_config_key
         )
     elif need_x:

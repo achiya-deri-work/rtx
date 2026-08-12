@@ -22,12 +22,19 @@ from rtx.kernels.mxfp8_reduce import compile_mxfp8_workspace_reduce
 from rtx.prequant_experiments import BenchmarkProtocol, ShapeSpec
 
 
-def _reference(src: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _reference(
+    src: torch.Tensor, *, scale_rounding: str = "infinity"
+) -> tuple[torch.Tensor, torch.Tensor]:
     rows, k = src.shape
     blocks = src.reshape(rows, k // 32, 32)
     amax = blocks.abs().amax(dim=-1, keepdim=True).float()
-    exponent = ((amax.view(torch.int32) >> 23) & 0xFF) - 127
-    scale_code = ((exponent - 8).clamp(-127, 128) + 127).to(torch.uint8)
+    amax_bits = amax.view(torch.int32)
+    exponent = ((amax_bits >> 23) & 0xFF) - 127 - 8
+    if scale_rounding == "infinity":
+        exponent += (amax_bits & 0x7FFFFF) > 0x600000
+    elif scale_rounding != "floor":
+        raise ValueError(f"unknown scale rounding {scale_rounding!r}")
+    scale_code = (exponent.clamp(-127, 128) + 127).to(torch.uint8)
     scale_code = torch.where(
         torch.isnan(amax), torch.full_like(scale_code, 255), scale_code
     )
@@ -48,6 +55,10 @@ class MXFP8QuantConfigTests(unittest.TestCase):
         self.assertIn(
             "load width exceeds",
             MXFP8QuantConfig(quant_vec=2, load_bits=128).rejection(128, 256),
+        )
+        self.assertIn(
+            "scale_rounding",
+            MXFP8QuantConfig(scale_rounding="nearest").rejection(128, 256),
         )
         self.assertIsNone(
             MXFP8QuantConfig(quant_vec=4, quant_store_bits=32).rejection(
@@ -171,6 +182,42 @@ class MXFP8QuantCudaTests(unittest.TestCase):
                 torch.cuda.synchronize()
                 torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
                 torch.testing.assert_close(actual_s, expected_s, rtol=0, atol=0)
+
+    def test_round_to_infinity_avoids_floor_saturation(self) -> None:
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("native kernel requires SM120/SM121")
+        # 480 has mantissa 1.875. A floor scale of one clips it to E4M3's
+        # maximum 448, while round-to-infinity selects scale two exactly.
+        src = torch.zeros((1, 32), device="cuda", dtype=torch.bfloat16)
+        src[0, 0] = 480.0
+        for rounding in ("floor", "infinity"):
+            with self.subTest(rounding=rounding):
+                config = MXFP8QuantConfig(
+                    quant_vec=1,
+                    load_bits=16,
+                    scale_rounding=rounding,
+                    num_warps=4,
+                    persistent_waves=1,
+                )
+                expected_q, expected_s = _reference(
+                    src, scale_rounding=rounding
+                )
+                actual_q = torch.empty_like(expected_q)
+                actual_s = torch.empty_like(expected_s)
+                compile_mxfp8_quant(1, 32, config)(src, actual_q, actual_s)
+                torch.cuda.synchronize()
+                torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+                torch.testing.assert_close(actual_s, expected_s, rtol=0, atol=0)
+        self.assertEqual(
+            float(_reference(src, scale_rounding="floor")[0].float().max()),
+            448.0,
+        )
+        self.assertEqual(
+            float(
+                _reference(src, scale_rounding="infinity")[0].float().max()
+            ),
+            240.0,
+        )
 
     def test_prequantized_gemm_matches_dequantized_reference(self) -> None:
         if torch.cuda.get_device_capability()[0] != 12:

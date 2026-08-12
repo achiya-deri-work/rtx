@@ -7,7 +7,8 @@ current implementation contains:
 
 - fused BF16 input/weight quantization and MXFP8 forward GEMM, including
   persistent three-role TMA producer/quantizer/MMA schedules and staged async
-  TMA epilogues;
+  TMA epilogues; E8M0 scales use training-safe round-to-infinity by default,
+  while the clipping-prone OCP floor conversion remains an explicit ablation;
 - fused BF16-to-NVFP4 training forward with packed E2M1 operands, E4M3
   block scales, block-only/current/row-region-JIT/delayed FP32 outer-scale
   policies,
@@ -185,6 +186,13 @@ The low-precision default is `autotune="cache"`; convergence runs therefore
 consume verified device-local winners when available and do not launch a fresh
 coordinate search in the training process. The model is a validation scaffold,
 not a pretrained architecture or checkpoint format.
+
+The convergence trainer defaults to FP32 AdamW master parameters and moments,
+refreshing the BF16 execution weights after each optimizer step. This preserves
+sub-BF16 updates without changing the BF16 inputs consumed by RTX kernels.
+`--optimizer bf16` is retained only for controlled ablations. Use
+`--stop-after-step N` to pause a run at an absolute checkpoint while preserving
+the original `--steps` learning-rate schedule and resume contract.
 
 [`benchmarks/train_decoder.py`](benchmarks/train_decoder.py) provides the
 resumable fixed-token TinyStories convergence run for BF16, MXFP8, and NVFP4;

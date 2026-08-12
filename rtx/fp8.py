@@ -49,7 +49,7 @@ WeightMode = Literal["dynamic", "prequantized"]
 # This revision is part of every compiler-visible forward token. Increment it
 # whenever lowering/ABI behavior changes so AOTInductor cannot revive a stale
 # generated wrapper whose graph otherwise has identical tensor guards.
-MXFP8_FRONTEND_REVISION = 3
+MXFP8_FRONTEND_REVISION = 6
 
 
 def _normalize_mxfp8_backend(backend: MXFP8Backend) -> Literal[

@@ -49,7 +49,7 @@ WeightMode = Literal["dynamic", "prequantized"]
 ScalingMode = Literal["delayed", "current", "regional", "block"]
 BackendMode = Literal["auto", "fused", "materialized"]
 AutotuneMode = Literal["off", "cache", "coordinate"]
-NVFP4_FRONTEND_REVISION = 2
+NVFP4_FRONTEND_REVISION = 3
 
 
 def _effective_scale_region_rows(rows: int, requested: int) -> int:
@@ -1629,7 +1629,6 @@ def _setup_nvfp4_context(ctx, inputs, output) -> None:
 
 def _nvfp4_backward(ctx, grad_output: torch.Tensor):
     from .fp8_bwd import (
-        _mxfp8_bwd_compiler_visible,
         _mxfp8_dw_compiler_visible,
         _mxfp8_dx_compiler_visible,
     )
@@ -1638,7 +1637,10 @@ def _nvfp4_backward(ctx, grad_output: torch.Tensor):
     need_x, need_weight = ctx.needs_input_grad[:2]
     grad_x = grad_weight = None
     if need_x and need_weight:
-        grad_x, grad_weight = _mxfp8_bwd_compiler_visible(
+        grad_x = _mxfp8_dx_compiler_visible(
+            grad_output, x, weight, ctx.backward_config_key
+        )
+        grad_weight = _mxfp8_dw_compiler_visible(
             grad_output, x, weight, ctx.backward_config_key
         )
     elif need_x:
@@ -2461,7 +2463,6 @@ def _nvfp4_delayed_backward(
     grad_output: torch.Tensor,
 ):
     from .fp8_bwd import (
-        _mxfp8_bwd_compiler_visible,
         _mxfp8_dw_compiler_visible,
         _mxfp8_dx_compiler_visible,
     )
@@ -2470,7 +2471,10 @@ def _nvfp4_delayed_backward(
     need_x, need_weight = ctx.needs_input_grad[:2]
     grad_x = grad_weight = None
     if need_x and need_weight:
-        grad_x, grad_weight = _mxfp8_bwd_compiler_visible(
+        grad_x = _mxfp8_dx_compiler_visible(
+            grad_output, x, weight, ctx.backward_config_key
+        )
+        grad_weight = _mxfp8_dw_compiler_visible(
             grad_output, x, weight, ctx.backward_config_key
         )
     elif need_x:
