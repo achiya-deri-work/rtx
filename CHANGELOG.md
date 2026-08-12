@@ -16,6 +16,10 @@ project follows semantic versioning while it is in active alpha development.
   BF16, MXFP8, NVFP4 delayed scaling, and NVFP4 block-only scaling. Record the
   exact linear/scaling and model/optimizer dtype policy in every manifest and
   report both steady runtime and final train/validation convergence.
+- Replace the inherited batch-3 kernel-gate geometry with a measured physical
+  batch of 24. Preserve the exact 460.8M-token budget and 4.608M-token warmup
+  by reducing the schedule to 37,500/375 steps; record peak GPU allocation and
+  token-denominated schedule fields in the artifact.
 - Define the production precision contract explicitly: BF16 is the model and
   convergence baseline, sensitive reductions remain FP32, and production
   comparisons use FP32 optimizer state/master weights as an independently

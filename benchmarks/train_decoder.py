@@ -36,7 +36,7 @@ TINYSTORIES_TRAIN_SHARD = (
 )
 BYTE_VOCAB_SIZE = 257
 DOCUMENT_SEPARATOR = 256
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 _STOP_REQUESTED = False
 
 TRAINING_MODES = (
@@ -549,6 +549,7 @@ def _train_precision(
     interval_started = time.perf_counter()
     interval_tokens = 0
     recent_losses: list[torch.Tensor] = []
+    torch.cuda.reset_peak_memory_stats(device)
     print(
         f"START {precision} step={start_step}->{run_stop} target={args.steps} "
         f"params={model.num_parameters():,} compile={args.compile}",
@@ -652,6 +653,10 @@ def _train_precision(
                     * args.gradient_accumulation
                 ),
                 "elapsed_seconds": elapsed,
+                "peak_memory_allocated_bytes": torch.cuda.max_memory_allocated(
+                    device
+                ),
+                "peak_memory_reserved_bytes": torch.cuda.max_memory_reserved(device),
                 "timestamp": time.time(),
             }
             _append_jsonl(metrics_path, (record,))
@@ -660,7 +665,8 @@ def _train_precision(
                 f"loss={record['train_loss']:.5f} "
                 f"val={validation if validation is not None else '-'} "
                 f"lr={learning_rate:.3e} grad={record['grad_norm']:.3f} "
-                f"tok/s={record['tokens_per_second']:.0f}",
+                f"tok/s={record['tokens_per_second']:.0f} "
+                f"peak={record['peak_memory_allocated_bytes'] / (1 << 30):.2f}GiB",
                 flush=True,
             )
             interval_started = time.perf_counter()
@@ -727,7 +733,7 @@ def _parse_args() -> argparse.Namespace:
             "--steps as the learning-rate schedule target"
         ),
     )
-    parser.add_argument("--batch-size", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument("--sequence-length", type=int, default=512)
     parser.add_argument("--gradient-accumulation", type=int, default=1)
     parser.add_argument("--layers", type=int, default=8)
@@ -861,6 +867,23 @@ def main() -> None:
             "gradient_accumulation": args.gradient_accumulation,
             "steps": args.steps,
             "warmup_steps": args.warmup_steps,
+            "tokens_per_optimizer_step": (
+                args.batch_size
+                * args.sequence_length
+                * args.gradient_accumulation
+            ),
+            "target_training_tokens": (
+                args.steps
+                * args.batch_size
+                * args.sequence_length
+                * args.gradient_accumulation
+            ),
+            "warmup_tokens": (
+                args.warmup_steps
+                * args.batch_size
+                * args.sequence_length
+                * args.gradient_accumulation
+            ),
             "seed": args.seed,
             "training_signature": _training_signature(args),
         },

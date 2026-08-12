@@ -57,18 +57,21 @@ Run the fixed-token decoder convergence comparison with:
 python benchmarks/train_decoder.py \
   --precision bf16 mxfp8 nvfp4_delayed nvfp4_block \
   --optimizer fp32_master \
-  --steps 300000 \
-  --warmup-steps 3000 \
-  --log-interval 100 \
-  --validation-interval 5000 \
-  --checkpoint-interval 5000
+  --batch-size 24 \
+  --steps 37500 \
+  --warmup-steps 375 \
+  --log-interval 25 \
+  --validation-interval 625 \
+  --checkpoint-interval 625
 ```
 
 The equivalent reproducible launcher is
 `./benchmarks/run_decoder_four_mode.sh`. Set `RTX_DECODER_OUTPUT` to choose a
 new artifact directory; additional CLI arguments are forwarded verbatim. A
 completed run writes `summary.json` with per-mode runtimes, speedups, final
-losses, and the complete validation-loss curves.
+losses, complete validation-loss curves, and the honest throughput-gate
+status. An unmet performance target is reported without discarding an
+otherwise valid convergence campaign.
 
 Production model execution uses BF16 parameters, gradients, and activations.
 FP32 is reserved for sensitive reductions and calculations as defined by
@@ -77,7 +80,7 @@ reported separately: the production convergence/runtime comparison uses FP32
 AdamW moments and master parameters uniformly across all four modes. The
 `--optimizer bf16` path is a kernel-isolation throughput ablation and must be
 reported as such. A bounded study can use
-`--stop-after-step 5000` without changing the 300,000-step cosine schedule;
+`--stop-after-step 5000` without changing the 37,500-step cosine schedule;
 rerunning the same command without that bound resumes from its atomic
 checkpoint.
 
@@ -96,9 +99,27 @@ The first invocation downloads one official TinyStories training parquet
 shard and creates a byte-token cache. All precisions receive the same initial
 state and deterministic step-indexed windows. Metrics are append-only JSONL;
 each precision has an atomic checkpoint and resumes by default. A clean
-300,000-step run presents 460.8 million tokens to each model, approximately
-one shard-equivalent token pass. Use a new `--output` directory when changing
-the model geometry or training schedule.
+37,500-step run at physical batch 24 presents exactly 460.8 million tokens to
+each model, approximately one shard-equivalent token pass. The 375 warmup
+steps likewise preserve the original 4.608-million-token warmup. This is a
+real 12,288-token optimizer batch, not gradient accumulation.
+
+The RTX 5070 Ti saturation sweep measured these steady-state medians with
+FP32 AdamW state/master weights (thousands of tokens/s):
+
+| Physical batch | BF16 | MXFP8 | NVFP4 delayed | NVFP4 block | Peak allocation |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 202.1 | 279.8 | 204.3 | 251.6 | 1.94 GiB |
+| 16 | 215.3 | 295.1 | 226.0 | 267.0 | 3.00 GiB |
+| 24 | 216.9 | 296.7 | 216.8 | 268.1 | 3.99 GiB |
+| 32 | 219.3 | 294.3 | 222.6 | 267.3 | 5.02 GiB |
+| 48 | 220.9 | 293.7 | 224.5 | 266.8 | 7.07 GiB |
+| 64 | 222.0 | 294.1 | 227.2 | 269.1 | 9.19 GiB |
+
+Batch 24 is the selected low-precision throughput knee: increasing to 64
+consumes another 5.2 GiB without improving MXFP8 or block-NVFP4 throughput.
+Use a new `--output` directory when changing the model geometry or training
+schedule.
 
 Run the complete frontend matrix before promoting a release:
 

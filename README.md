@@ -225,7 +225,11 @@ configuration.
 resumable fixed-token TinyStories comparison for BF16, MXFP8, NVFP4 delayed
 scaling, and NVFP4 block-only scaling. Scaling policy is part of each run's
 checkpoint identity, so the two NVFP4 results cannot overwrite one another.
-The exact one-shard-equivalent invocation and artifact contract are documented
+The production comparison uses a physical batch of 24 (12,288 tokens per
+optimizer step), 37,500 steps, and 375 warmup steps: exactly 460.8M training
+tokens and 4.608M warmup tokens. The batch was selected at the measured
+low-precision throughput knee rather than from maximum memory occupancy. The
+exact invocation and artifact contract are documented
 in [`benchmarks/README.md`](benchmarks/README.md).
 
 Shape/stream-specific dynamic runners retain quantized workspaces for reuse.

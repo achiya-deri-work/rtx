@@ -86,6 +86,12 @@ def _mode_summary(
         "measured_training_seconds": float(
             sum(float(record["elapsed_seconds"]) for record in records)
         ),
+        "peak_memory_allocated_bytes": max(
+            int(record.get("peak_memory_allocated_bytes", 0)) for record in records
+        ),
+        "peak_memory_reserved_bytes": max(
+            int(record.get("peak_memory_reserved_bytes", 0)) for record in records
+        ),
         "validation_curve": [
             {
                 "step": int(record["step"]),
@@ -104,6 +110,11 @@ def main() -> None:
     parser.add_argument("--minimum-mxfp8", type=float, default=1.30)
     parser.add_argument("--minimum-nvfp4-block", type=float, default=1.35)
     parser.add_argument("--minimum-nvfp4-delayed", type=float, default=0.0)
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="emit all evidence and gate status without exiting nonzero",
+    )
     args = parser.parse_args()
     if args.tail <= 0:
         parser.error("--tail must be positive")
@@ -160,7 +171,7 @@ def main() -> None:
             sort_keys=True,
         )
     )
-    if not passed:
+    if not passed and not args.report_only:
         raise SystemExit(1)
 
 
