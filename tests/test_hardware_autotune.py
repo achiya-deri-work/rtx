@@ -345,6 +345,37 @@ class HardwareAutotuneTests(unittest.TestCase):
             features["derived.estimated_operand_read_bytes"],
         )
 
+    def test_fused_adapter_rejects_nvvm_explosive_persistent_work(self) -> None:
+        profile = {
+            "capability": [12, 0],
+            "multiprocessor_count": 70,
+            "properties": {
+                "multiprocessor_count": 70,
+                "shared_memory_per_block_optin": 101_376,
+            },
+        }
+        adapter = make_mxfp8_fwd_adapter(
+            MXFP8Problem(32_768, 3_072, 768),
+            lambda _config: TrialOutcome("ok", median_ms=1.0),
+            device=profile,
+        )
+        explosive = normalize_fwd_config(
+            persistent_tma_pipeline=(1, 1, 1, "none")
+        )
+        boundary = normalize_fwd_config(
+            persistent_tma_pipeline=(1, 1, 2, "none")
+        )
+
+        rejection = adapter.rejection(explosive)
+        self.assertIsNotNone(rejection)
+        self.assertEqual(rejection[0], "implementation_rejected")
+        self.assertIn("192 tiles per CTA", rejection[1])
+        self.assertIsNone(adapter.rejection(boundary))
+        self.assertEqual(
+            adapter.features(boundary)["derived.work_tiles_per_cta"],
+            96.0,
+        )
+
     def test_feasibility_model_learns_compile_boundary(self) -> None:
         adapter = DiscreteKernelAdapter(
             context=KernelContext("compile", 1, {"m": 1}),

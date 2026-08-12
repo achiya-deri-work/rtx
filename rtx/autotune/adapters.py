@@ -29,6 +29,13 @@ from ..kernels.mxfp8 import (
 )
 
 
+# The fused kernel carries its persistent output sequence in a constexpr loop.
+# Empirical SM120 compiles remain bounded through 72 slots, while 192-slot
+# candidates repeatedly exceed the worker watchdog in NVVM. Keep some margin
+# for portable campaigns without hiding the useful 16--96-slot region.
+MAX_FUSED_PERSISTENT_CONSTEXPR_WORK_TILES = 96
+
+
 def _device_dict(
     device: DeviceFingerprint | Mapping[str, object] | None,
 ) -> Mapping[str, object]:
@@ -90,6 +97,26 @@ def _fused_smem_bytes(config: MXFP8FwdConfig) -> int:
     )
     delayed_scale = 32 if getattr(config, "collect_amax", False) else 0
     return operands + scales + bf16 + epilogue + delayed_scale + reserve
+
+
+def _fused_grid_geometry(
+    problem: MXFP8Problem,
+    config: MXFP8FwdConfig,
+    device: DeviceFingerprint | Mapping[str, object] | None,
+) -> tuple[int, int, int]:
+    profile = _device_dict(device)
+    natural_ctas = (
+        (problem.m + config.tile_m - 1) // config.tile_m
+    ) * ((problem.n + config.tile_n - 1) // config.tile_n)
+    grid_ctas = natural_ctas
+    if config.persistent:
+        sm_count = max(
+            1, int(profile_value(profile, "multiprocessor_count", 1) or 1)
+        )
+        grid_ctas = min(natural_ctas, sm_count * config.persistent_waves)
+        while grid_ctas > 1 and natural_ctas % grid_ctas:
+            grid_ctas -= 1
+    return natural_ctas, grid_ctas, natural_ctas // grid_ctas
 
 
 def _gemm_smem_bytes(config: object) -> int:
@@ -507,22 +534,26 @@ def make_mxfp8_fwd_adapter(
                 f"candidate requires {_fused_smem_bytes(config)} bytes of CTA SMEM, "
                 f"device limit is {smem_limit}",
             )
+        _, _, work_tiles_per_cta = _fused_grid_geometry(problem, config, device)
+        if (
+            config.persistent
+            and work_tiles_per_cta
+            > MAX_FUSED_PERSISTENT_CONSTEXPR_WORK_TILES
+        ):
+            return (
+                "implementation_rejected",
+                f"persistent constexpr work has {work_tiles_per_cta} tiles per "
+                "CTA, exceeding the compiler-safety cap of "
+                f"{MAX_FUSED_PERSISTENT_CONSTEXPR_WORK_TILES}",
+            )
         reason = config.implementation_rejection(problem)
         return None if reason is None else ("implementation_rejected", reason)
 
     def derived(config: MXFP8FwdConfig) -> Mapping[str, float]:
         profile = _device_dict(device)
-        natural_ctas = (
-            (problem.m + config.tile_m - 1) // config.tile_m
-        ) * ((problem.n + config.tile_n - 1) // config.tile_n)
-        grid_ctas = natural_ctas
-        if config.persistent:
-            sm_count = max(
-                1, int(profile_value(profile, "multiprocessor_count", 1) or 1)
-            )
-            grid_ctas = min(natural_ctas, sm_count * config.persistent_waves)
-            while grid_ctas > 1 and natural_ctas % grid_ctas:
-                grid_ctas -= 1
+        natural_ctas, grid_ctas, _ = _fused_grid_geometry(
+            problem, config, device
+        )
         values = geometry_features(
             m=problem.m,
             n=problem.n,
