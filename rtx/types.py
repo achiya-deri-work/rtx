@@ -1,0 +1,21 @@
+"""Stable user-facing policy types shared by both linear frontends."""
+
+from typing import Literal
+
+
+AutotuneMode = Literal["off", "cache", "online", "coordinate"]
+CanonicalAutotuneMode = Literal["off", "cache", "coordinate"]
+LinearBackend = Literal["auto", "fused", "materialized"]
+MXFP8Backend = Literal["auto", "fused", "materialized", "prequant"]
+NVFP4ScalingMode = Literal[
+    "delayed", "current", "jit_row_region", "regional", "block"
+]
+
+
+__all__ = [
+    "AutotuneMode",
+    "CanonicalAutotuneMode",
+    "LinearBackend",
+    "MXFP8Backend",
+    "NVFP4ScalingMode",
+]

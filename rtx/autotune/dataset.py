@@ -34,6 +34,8 @@ from .adapters import (
     make_nvfp4_fully_prequant_adapter,
     make_nvfp4_delayed_adapter,
     make_nvfp4_dynamic_adapter,
+    make_nvfp4_jit_row_region_adapter,
+    make_nvfp4_region_delayed_adapter,
     make_nvfp4_fwd_adapter,
     make_nvfp4_weight_prequant_adapter,
 )
@@ -96,6 +98,8 @@ from ..inference_experiments import (
 from ..nvfp4_inference_experiments import (
     NVFP4DelayedBenchmarkHarness,
     NVFP4DynamicBenchmarkHarness,
+    NVFP4JITRowRegionBenchmarkHarness,
+    NVFP4RegionDelayedBenchmarkHarness,
     NVFP4FullyPrequantBenchmarkHarness,
     NVFP4WeightPrequantBenchmarkHarness,
 )
@@ -757,7 +761,11 @@ class NVFP4FwdBenchmarkHarness(FusedFwdBenchmarkHarness):
             raise FusedCandidateCompileError(f"{type(exc).__name__}: {exc}") from exc
         compile_ms = (time.monotonic() - started) * 1000
         out = torch.empty_like(self._expected)
-        state_values = nvfp4_telemetry_values(self.problem, config)
+        state_values = (
+            3 * nvfp4_grid_ctas(self.problem, config)
+            if config.jit_cta_scale
+            else nvfp4_telemetry_values(self.problem, config)
+        )
         x_amax_state = _nvfp4_amax_state(self.x, state_values)
         weight_amax_state = _nvfp4_amax_state(self.weight, state_values)
         next_x_amax_state = torch.empty_like(x_amax_state)
@@ -796,6 +804,17 @@ class NVFP4FwdBenchmarkHarness(FusedFwdBenchmarkHarness):
         x: torch.Tensor,
         weight: torch.Tensor,
     ) -> None:
+        if prepared.config.jit_cta_scale:
+            prepared.launcher(
+                x,
+                weight,
+                prepared.out,
+                prepared.x_amax_state,
+                prepared.weight_amax_state,
+                prepared.next_x_amax_state,
+                prepared.next_weight_amax_state,
+            )
+            return
         if prepared.config.telemetry_layout == "scalar_atomic":
             from ..fp8_bwd import _zero_tensor_async
 
@@ -1119,6 +1138,30 @@ def _nvfp4_delayed_harness(
     )
 
 
+def _nvfp4_jit_row_region_harness(
+    campaign: "DatasetCampaign", job: DatasetJob, shape: ShapeSpec, regime: CacheRegime
+):
+    return NVFP4JITRowRegionBenchmarkHarness(
+        shape,
+        regime,
+        job.protocol,
+        device=campaign.device,
+        seed=_backend_seed(campaign, job, shape, regime),
+    )
+
+
+def _nvfp4_region_delayed_harness(
+    campaign: "DatasetCampaign", job: DatasetJob, shape: ShapeSpec, regime: CacheRegime
+):
+    return NVFP4RegionDelayedBenchmarkHarness(
+        shape,
+        regime,
+        job.protocol,
+        device=campaign.device,
+        seed=_backend_seed(campaign, job, shape, regime),
+    )
+
+
 def _nvfp4_fully_prequant_harness(
     campaign: "DatasetCampaign", job: DatasetJob, shape: ShapeSpec, regime: CacheRegime
 ):
@@ -1185,6 +1228,71 @@ def _nvfp4_fused_adapter(
         device=campaign.hardware_profile,
         regime=regime,
         tags=tags,
+    )
+
+
+def _nvfp4_jit_cta_region_adapter(
+    campaign: "DatasetCampaign",
+    job: DatasetJob,
+    shape: ShapeSpec,
+    regime: CacheRegime,
+    harness,
+    tags: Mapping[str, object],
+) -> KernelAdapter:
+    from ..configs.nvfp4 import (
+        NVFP4_FWD_SEARCH_SPACE,
+        normalize_nvfp4_fwd_config,
+    )
+
+    evaluator = CalibratedPrequantEvaluator(
+        harness, samples=job.protocol.samples, seed=campaign.manifest.seed
+    )
+    problem = NVFP4Problem(shape.m, shape.n, shape.k)
+    initial = normalize_nvfp4_fwd_config(
+        jit_cta_pipeline=(128, 128, 1, 1, "three_role")
+    )
+    if initial.implementation_rejection(problem) is not None:
+        initial = normalize_nvfp4_fwd_config(
+            jit_cta_pipeline=(128, 128, 1, 1, "cooperative")
+        )
+    names = (
+        "jit_cta_pipeline",
+        "reduction",
+        "quant_math",
+        "quant_amax",
+        "quant_load_bits",
+        "quant_vec",
+        "k_unroll",
+        "maxrregcount",
+        "producer_registers",
+        "quantizer_registers",
+        "consumer_registers",
+        "a_swizzle",
+        "b_swizzle",
+        "a_ldmatrix_matrices",
+        "b_ldmatrix_matrices",
+        "sfa_s2r_bits",
+        "sfb_s2r_bits",
+        "epilogue",
+        "epilogue_stages",
+        "store_vec",
+        "persistent",
+        "persistent_waves",
+        "raster",
+        "grid_swizzle",
+        "reuse",
+    )
+    axes = {name: NVFP4_FWD_SEARCH_SPACE[name] for name in names}
+    return make_nvfp4_fwd_adapter(
+        problem,
+        evaluator,
+        initial=initial,
+        axes=axes,
+        device=campaign.hardware_profile,
+        regime=regime,
+        tags={**dict(tags), "scale_policy": "jit_cta_region"},
+        _family="nvfp4_jit_cta_region_fwd",
+        _revision=1,
     )
 
 
@@ -1329,6 +1437,60 @@ def _nvfp4_delayed_adapter(
     )
 
 
+def _nvfp4_jit_row_region_adapter(
+    campaign: "DatasetCampaign",
+    job: DatasetJob,
+    shape: ShapeSpec,
+    regime: CacheRegime,
+    harness,
+    tags: Mapping[str, object],
+) -> KernelAdapter:
+    evaluator = CalibratedPrequantEvaluator(
+        harness, samples=job.protocol.samples, seed=campaign.manifest.seed
+    )
+    return make_nvfp4_jit_row_region_adapter(
+        NVFP4Problem(shape.m, shape.n, shape.k),
+        evaluator,
+        device=campaign.hardware_profile,
+        regime=regime,
+        tags=tags,
+    )
+
+
+def _nvfp4_region_delayed_adapter(
+    campaign: "DatasetCampaign",
+    job: DatasetJob,
+    shape: ShapeSpec,
+    regime: CacheRegime,
+    harness,
+    tags: Mapping[str, object],
+) -> KernelAdapter:
+    evaluator = CalibratedPrequantEvaluator(
+        harness, samples=job.protocol.samples, seed=campaign.manifest.seed
+    )
+    problem = NVFP4Problem(shape.m, shape.n, shape.k)
+    profile = str(tags.get("search_profile", "portable"))
+    axes = None
+    initial = None
+    if profile == "wide_v4":
+        from ..nvfp4_inference_autotune import (
+            NVFP4_REGION_DELAYED_WIDE_SEARCH_SPACE,
+            preferred_region_delayed_wide_config,
+        )
+
+        axes = NVFP4_REGION_DELAYED_WIDE_SEARCH_SPACE
+        initial = preferred_region_delayed_wide_config(problem)
+    return make_nvfp4_region_delayed_adapter(
+        problem,
+        evaluator,
+        initial=initial,
+        axes=axes,
+        device=campaign.hardware_profile,
+        regime=regime,
+        tags=tags,
+    )
+
+
 def _nvfp4_fully_prequant_adapter(
     campaign: "DatasetCampaign",
     job: DatasetJob,
@@ -1381,6 +1543,20 @@ register_dataset_backend(
 register_dataset_backend(
     "nvfp4_delayed_fwd",
     DatasetBackend(_nvfp4_delayed_harness, _nvfp4_delayed_adapter),
+)
+register_dataset_backend(
+    "nvfp4_jit_row_region_fwd",
+    DatasetBackend(
+        _nvfp4_jit_row_region_harness,
+        _nvfp4_jit_row_region_adapter,
+    ),
+)
+register_dataset_backend(
+    "nvfp4_region_delayed_fwd",
+    DatasetBackend(
+        _nvfp4_region_delayed_harness,
+        _nvfp4_region_delayed_adapter,
+    ),
 )
 register_dataset_backend(
     "nvfp4_fully_prequant_fwd",
@@ -1779,12 +1955,14 @@ class DatasetCampaign:
             "nvfp4_fused_fwd": 1,
             "nvfp4_dynamic_fwd": 2,
             "nvfp4_delayed_fwd": 3,
-            "mxfp8_prequant_fwd": 4,
-            "mxfp8_weight_prequant_fwd": 5,
-            "nvfp4_weight_prequant_fwd": 6,
-            "mxfp8_fully_prequant_fwd": 7,
-            "nvfp4_fully_prequant_fwd": 8,
-            "mxfp8_bwd": 9,
+            "nvfp4_jit_row_region_fwd": 4,
+            "nvfp4_region_delayed_fwd": 4,
+            "mxfp8_prequant_fwd": 5,
+            "mxfp8_weight_prequant_fwd": 6,
+            "nvfp4_weight_prequant_fwd": 7,
+            "mxfp8_fully_prequant_fwd": 8,
+            "nvfp4_fully_prequant_fwd": 9,
+            "mxfp8_bwd": 10,
         }
 
         def shape_priority(shape: ShapeSpec) -> int:
@@ -2877,7 +3055,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     install = subparsers.add_parser(
         "install-winners",
-        help="promote verified dataset winners into the MXFP8 runtime cache",
+        help="promote verified MXFP8/NVFP4 winners into the RTX runtime cache",
     )
     install.add_argument("paths", type=Path, nargs="+")
     install.add_argument("--cache-dir", type=Path)
@@ -2887,6 +3065,19 @@ def _build_parser() -> argparse.ArgumentParser:
     install.add_argument("--minimum-support", type=int, default=1)
     install.add_argument("--dry-run", action="store_true")
     install.add_argument("--force", action="store_true")
+
+    list_winners = subparsers.add_parser(
+        "list-winners",
+        help="inspect installed MXFP8/NVFP4 runtime winners",
+    )
+    list_winners.add_argument("--cache-dir", type=Path)
+    list_winners.add_argument("--family", action="append")
+    list_winners.add_argument("--device-id", action="append")
+    list_winners.add_argument(
+        "--summary",
+        action="store_true",
+        help="omit full configuration and metadata payloads",
+    )
 
     verify = subparsers.add_parser(
         "verify-winners",
@@ -3169,6 +3360,25 @@ def main(argv: Sequence[str] | None = None) -> None:
             force=args.force,
         )
         print(json.dumps(report, indent=2, sort_keys=True))
+        return
+    if args.command == "list-winners":
+        from .winners import list_runtime_winners
+
+        rows = list_runtime_winners(
+            root=args.cache_dir,
+            families=args.family,
+            device_ids=args.device_id,
+        )
+        if args.summary:
+            rows = [
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key not in ("config", "metadata")
+                }
+                for row in rows
+            ]
+        print(json.dumps({"count": len(rows), "winners": rows}, indent=2, sort_keys=True))
         return
     if args.command == "verify-winners":
         if not torch.cuda.is_available():

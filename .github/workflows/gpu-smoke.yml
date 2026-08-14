@@ -32,6 +32,8 @@ jobs:
           python -c "import torchao, pyarrow, cutlass"
       - name: Install this checkout without replacing CUDA dependencies
         run: python -m pip install --no-deps -e .
+      - name: Validate the exact native runtime contract
+        run: python -c "import rtx; print(rtx.validate_runtime_environment())"
       - name: Run SM120 smoke tests
         if: ${{ !inputs.full_suite }}
         run: |

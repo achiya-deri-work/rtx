@@ -5,6 +5,23 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Version installed runtime winners by kernel revision with cache schema v2;
+  schema-v1 winners remain inspectable but are deliberately invalidated.
+- Make packed NVFP4 block-only conversion use a unit FP32 tensor scale, and
+  validate the complete native dependency contract before loading CuTe.
+- Make current JIT row-region scaling the dynamic NVFP4 default with an
+  asymmetric portable X=5/W=4 seed and fully independent autotuning axes.
+  Explicit user geometry now overrides installed-winner geometry.
+- Fix `NVFP4Linear.to_quantized_weight()` so JIT/delayed dynamic modules
+  produce usable current-scaled packed modules while block-only conversion
+  preserves block scaling.
+- Add side-effect-free `MXFP8Linear.explain()` and `NVFP4Linear.explain()`,
+  stable shared policy types, the `autotune="online"` spelling, and canonical
+  MXFP8 `forward_config`/`dynamic_config` aliases.
+- Narrow star-imports to the stable runtime surface while preserving direct
+  legacy tuner imports, and add `rtx-autotune list-winners`.
+- Add complete MXFP8/NVFP4 constructor, packed inference, runtime/checkpoint,
+  distributed-boundary, and troubleshooting documentation.
 - Replace delayed NVFP4's repeated CTA-local BF16 quantization with one
   persistent dual observer/quantizer followed by the native materialized GEMM.
   Amax observation shares the quantizer's operand reads, history rotation and

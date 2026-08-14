@@ -153,6 +153,12 @@ class MXFP8FwdConfig:
         return 8
 
     @property
+    def smem_operand_bits(self) -> int:
+        """Physical staged-SMEM allocation width for one native value."""
+
+        return self.native_operand_bits
+
+    @property
     def scale_vector_size(self) -> int:
         """Number of native values decoded by one block-scale byte."""
 
@@ -262,7 +268,7 @@ class MXFP8FwdConfig:
             self.mxfp8_stages
             * (self.tile_m + self.tile_n)
             * self.tile_k
-            * self.native_operand_bits
+            * self.smem_operand_bits
             // 8
         )
         # SM120 scale blocks are physically padded to 128 rows/columns even

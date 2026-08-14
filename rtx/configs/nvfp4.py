@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from typing import Literal
 
 from .mxfp8 import MXFP8GemmConfig
 from ..kernels.mxfp8 import (
@@ -21,14 +22,14 @@ class NVFP4QuantConfig:
 
     values_per_lane: int = 2
     load_bits: int = 32
-    reduction: str = "redux"
-    quant_math: str = "fp32"
+    reduction: Literal["shuffle", "redux"] = "redux"
+    quant_math: Literal["fp32"] = "fp32"
     num_warps: int = 8
     persistent_waves: int = 4
     maxrregcount: int = 128
-    scale_reciprocal: str = "direct"
-    scale_compute: str = "redundant"
-    scale_layout: str = "row_major"
+    scale_reciprocal: Literal["direct", "e4m3_lut", "rcp_approx"] = "direct"
+    scale_compute: Literal["redundant", "leader_broadcast"] = "redundant"
+    scale_layout: Literal["row_major", "mma128"] = "row_major"
 
     @property
     def threads_per_scale(self) -> int:
@@ -133,10 +134,25 @@ class NVFP4FwdConfig(MXFP8FwdConfig):
     telemetry_ownership: str = "operand_owner"
     amax_history_len: int = 16
     amax_history_algo: str = "window_max"
+    # Compute current outer scales cooperatively from the exact BF16 operand
+    # tiles owned by this output CTA.  This removes the launch-wide
+    # observe/quantize -> GEMM dependency of the materialized JIT path and
+    # lets the existing BF16/native pipelines overlap quantization and MMA.
+    # It is intentionally a separate implementation coordinate because X/W
+    # observation is duplicated across output CTAs.
+    jit_cta_scale: bool = False
 
     @property
     def native_operand_bits(self) -> int:
         return 4
+
+    @property
+    def smem_operand_bits(self) -> int:
+        # E2M1 values are logically four bits, but the fused kernel's staged
+        # CuTe SMEM allocation uses byte-addressable packed storage.  Capacity
+        # accounting must model the physical byte or it admits kernels that
+        # compile but fail launch with 130+ KiB dynamic SMEM.
+        return 8
 
     @property
     def scale_vector_size(self) -> int:
@@ -182,11 +198,6 @@ class NVFP4FwdConfig(MXFP8FwdConfig):
                         f"NVFP4 {name} rows must be divisible by its scale region; "
                         f"got {problem_rows} and {rows}"
                     )
-                if self.epilogue != "direct":
-                    return (
-                        "row-region JIT scaling currently requires the direct "
-                        "per-element epilogue"
-                    )
         if self.telemetry_layout not in ("per_cta", "scalar_atomic"):
             return "NVFP4 telemetry_layout must be per_cta or scalar_atomic"
         if self.telemetry_ownership not in ("all", "operand_owner"):
@@ -195,6 +206,21 @@ class NVFP4FwdConfig(MXFP8FwdConfig):
             return "NVFP4 amax_history_len must be 1, 4, 16, or 64"
         if self.amax_history_algo not in ("most_recent", "window_max"):
             return "NVFP4 amax_history_algo must be most_recent or window_max"
+        if self.jit_cta_scale:
+            if self.collect_amax:
+                return "current CTA scaling and delayed scaling are distinct policies"
+            if self.x_scale_region_rows != self.tile_m:
+                return "current CTA X region must equal tile_m"
+            if self.weight_scale_region_rows != self.tile_n:
+                return "current CTA weight region must equal tile_n"
+            output_tiles = (
+                (problem.m + self.tile_m - 1) // self.tile_m
+            ) * ((problem.n + self.tile_n - 1) // self.tile_n)
+            if output_tiles != 1:
+                return (
+                    "experimental fused current-region scaling is not yet "
+                    "multi-tile correct"
+                )
         if self.bf16_tile_k < 64:
             return "NVFP4 staged transport tiles must cover a complete K=64 MMA"
         return None
@@ -320,6 +346,27 @@ class NVFP4DynamicConfig:
     )
     quant_launches: str = "dual"
     l2_fetch_granularity: int | None = None
+    # A positive pair selects current, JIT-computed FP32 outer scales for
+    # bounded row regions.  Zero on both operands selects the ordinary
+    # tensor-scale/block-only materialized paths.  Keeping the policy in the
+    # compound config makes region geometry a measured autotuning coordinate.
+    x_scale_region_rows: int = 0
+    weight_scale_region_rows: int = 0
+    tensor_scale_mode: str = "power2"
+    region_amax_load_bits: int = 128
+    region_amax_unroll: int = 1
+    region_waves: int = 4
+    region_order: str = "x_first"
+    region_ownership: str = "warp"
+    # CUDA Programmatic Dependent Launch lets the native GEMM grid become
+    # schedulable before the producer grid has completely retired.  The GEMM
+    # still waits for all quantized operands to become visible, so this is a
+    # schedule-only coordinate and never changes JIT row-region numerics.
+    programmatic_dependent_launch: bool = False
+
+    @property
+    def jit_row_region(self) -> bool:
+        return bool(self.x_scale_region_rows or self.weight_scale_region_rows)
 
     def rejection(self, problem: NVFP4Problem) -> str | None:
         if self.quant_launches not in ("dual", "independent", "concurrent"):
@@ -331,6 +378,32 @@ class NVFP4DynamicConfig:
         # out of the compiler rather than learning the same failure per shape.
         if self.gemm.a_swizzle == "128b" or self.gemm.b_swizzle == "128b":
             return "dynamic NVFP4 block GEMM does not support 128-byte swizzles"
+        if bool(self.x_scale_region_rows) != bool(self.weight_scale_region_rows):
+            return "JIT row-region scaling requires regions for both operands"
+        if self.jit_row_region:
+            if self.x_scale_region_rows < 1 or self.weight_scale_region_rows < 1:
+                return "JIT row-region sizes must be positive"
+            if self.tensor_scale_mode not in ("power2", "exact"):
+                return "JIT row-region tensor_scale_mode must be power2 or exact"
+            if self.region_amax_load_bits not in (16, 32, 64, 128):
+                return "region_amax_load_bits must be 16, 32, 64, or 128"
+            if self.region_amax_unroll not in (1, 2, 4, 8):
+                return "region_amax_unroll must be 1, 2, 4, or 8"
+            if self.region_waves not in (1, 2, 3, 4, 6, 8):
+                return "region_waves must be 1, 2, 3, 4, 6, or 8"
+            if self.region_order not in ("x_first", "weight_first"):
+                return "region_order must be x_first or weight_first"
+            if self.region_ownership not in ("warp", "cta"):
+                return "region_ownership must be warp or cta"
+            if self.quant_launches != "dual":
+                return "the first JIT row-region implementation uses one dual launch"
+            if self.gemm.epilogue == "tma" and problem.k < 256:
+                return (
+                    "regional TMA epilogue requires K >= 256; small K uses "
+                    "the direct epilogue to avoid disproportionate compilation"
+                )
+        elif self.programmatic_dependent_launch:
+            return "programmatic dependent launch is implemented for JIT regions"
         native_scales = self.quant.scale_layout == "mma128"
         if native_scales != (
             self.gemm.scale_layout == "mma128" and self.gemm.scale_role == "tma"
@@ -390,6 +463,16 @@ NVFP4_FWD_SEARCH_SPACE.update(
     # these axes without conflating quality and schedule performance.
     amax_history_len=(16,),
     amax_history_algo=("window_max",),
+    # One fused current-scale implementation coordinate.  Tile geometry and
+    # both real pipeline depths move together so every proposed candidate is
+    # immediately legal rather than requiring a lucky sequence of mutations.
+    jit_cta_pipeline=tuple(
+        (tile_m, tile_n, bf16_stages, native_stages, schedule)
+        for tile_m, tile_n in ((64, 128), (128, 128), (256, 256))
+        for bf16_stages in (1, 2, 3)
+        for native_stages in (1, 2, 3)
+        for schedule in ("cooperative", "three_role")
+    ),
 )
 
 
@@ -401,6 +484,32 @@ def normalize_nvfp4_fwd_config(
     """Apply common compound coordinates while preserving NVFP4 fields."""
 
     selected = base or DEFAULT_NVFP4_FWD_CONFIG
+    jit_cta_pipeline = updates.pop("jit_cta_pipeline", None)
+    if jit_cta_pipeline is not None:
+        tile_m, tile_n, bf16_stages, native_stages, schedule = (
+            jit_cta_pipeline
+        )
+        updates.update(
+            tile_m=int(tile_m),
+            tile_n=int(tile_n),
+            tile_k=128,
+            bf16_stages=int(bf16_stages),
+            mxfp8_stages=int(native_stages),
+            schedule=str(schedule),
+            load_engine=("tma" if schedule == "three_role" else "scalar"),
+            bf16_tile_k=(64 if schedule == "three_role" else 128),
+            bf16_swizzle=("none" if schedule == "three_role" else "128b"),
+            quantizer_warps=(4 if schedule == "three_role" else 16),
+            x_scale_region_rows=int(tile_m),
+            weight_scale_region_rows=int(tile_n),
+            collect_amax=False,
+            jit_cta_scale=True,
+            # CTA-derived reciprocals are runtime shared values.  The
+            # supplied PTX paths were designed for compiler-visible scale
+            # packs and produced non-dominating per-CTA values beyond block
+            # zero; direct division is the correct initial implementation.
+            scale_reciprocal="direct",
+        )
     values = asdict(selected)
     scale_reciprocal = updates.pop(
         "scale_reciprocal", values.pop("scale_reciprocal")
@@ -427,6 +536,9 @@ def normalize_nvfp4_fwd_config(
     amax_history_algo = updates.pop(
         "amax_history_algo", values.pop("amax_history_algo")
     )
+    jit_cta_scale = updates.pop(
+        "jit_cta_scale", values.pop("jit_cta_scale")
+    )
     common = MXFP8FwdConfig(**values)
     normalized = normalize_fwd_config(common, **updates)
     return NVFP4FwdConfig(
@@ -440,6 +552,7 @@ def normalize_nvfp4_fwd_config(
         telemetry_ownership=str(telemetry_ownership),
         amax_history_len=int(amax_history_len),
         amax_history_algo=str(amax_history_algo),
+        jit_cta_scale=bool(jit_cta_scale),
     )
 
 

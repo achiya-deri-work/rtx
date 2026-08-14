@@ -231,6 +231,19 @@ rtx-autotune run manifest.json --device cuda:0 \
   --calibration hardware_calibration.json
 ```
 
+Inspect installed runtime winners without loading CuTe or launching kernels:
+
+```bash
+rtx-autotune list-winners --summary
+rtx-autotune list-winners --family nvfp4_jit_row_region_fwd
+```
+
+Installed winners use runtime schema v2 and include the kernel-family revision
+in both their identity and document. Schema-v1 entries remain visible to
+`list-winners` as `schema_v1_invalidated`, but runtime selection never loads
+them. Re-run `install-winners` from an audited bundle to republish a verified
+configuration under the current revision.
+
 Set `confirmation_repeats` to make apparent incumbents earn promotion through
 additional independent evaluator runs. Their raw samples are merged into one
 median and every screen/confirmation outcome is retained in observation

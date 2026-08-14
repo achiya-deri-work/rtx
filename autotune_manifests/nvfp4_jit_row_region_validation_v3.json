@@ -1,0 +1,57 @@
+{
+  "schema_version": 2,
+  "name": "nvfp4_jit_row_region_validation_v3",
+  "seed": 20260814,
+  "storage_mode": "residual_context",
+  "rotation_mode": "balanced_categories",
+  "jobs": [
+    {
+      "family": "nvfp4_jit_row_region_fwd",
+      "shapes": [
+        {"m": 1024, "n": 768, "k": 768, "name": "numerical_validation"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "decoder_qkv_b64"}
+      ],
+      "regimes": ["hot"],
+      "promote": 5,
+      "tags": {
+        "purpose": "revision2_pdl_and_tma_basin_validation",
+        "frontend": "nvfp4_jit_row_region",
+        "operand_state": "dynamic",
+        "scale_policy": "current_local_fp32_outer_plus_e4m3_1x16"
+      },
+      "tuning": {
+        "portfolio": "hybrid",
+        "orchestration": "bandit",
+        "max_trials": 48,
+        "time_budget_s": 300.0,
+        "cost_model_trials": 32,
+        "model_warmup": 12,
+        "model_pool_size": 8192,
+        "model_refit_interval": 8,
+        "bandit_exploration": 0.35,
+        "model_estimators": 48,
+        "model_ensembles": 3,
+        "model_max_depth": 4,
+        "model_min_leaf": 3,
+        "model_max_features": 192,
+        "local_beam_width": 8,
+        "confirmation_repeats": 2,
+        "confirmation_ratio": 0.02,
+        "confirm_initial": true,
+        "seed": 20260814
+      },
+      "protocol": {
+        "warmup_calls": 8,
+        "samples": 9,
+        "confirm_samples": 21,
+        "race_rounds": 21,
+        "target_batch_ms": 30.0,
+        "practical_threshold": 0.002,
+        "bootstrap_resamples": 1000,
+        "correctness_rtol": 0.05,
+        "correctness_atol": 0.5,
+        "telemetry": true
+      }
+    }
+  ]
+}

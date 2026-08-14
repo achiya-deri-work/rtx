@@ -21,6 +21,10 @@ class RuntimeContractTests(unittest.TestCase):
             "torchao": "0.18.0",
             "nvidia-cutlass-dsl": "4.7.0",
             "apache-tvm-ffi": "0.1.13.post2",
+            "cuda-python": "13.3.1",
+            "numpy": "2.3.2",
+            "pyarrow": "25.0.0",
+            "einops": "0.8.2",
         }
         with (
             patch.object(torch, "__version__", "2.13.0+cu132"),
@@ -30,6 +34,7 @@ class RuntimeContractTests(unittest.TestCase):
             resolved = runtime.validate_runtime_environment()
         self.assertEqual(resolved["cuda"], "13.2")
         self.assertEqual(resolved["nvidia-cutlass-dsl"], "4.7.0")
+        self.assertEqual(resolved["cuda-python"], "13.3.1")
 
     def test_reports_every_stack_mismatch_together(self) -> None:
         def missing_or_old(distribution: str) -> str:
@@ -49,6 +54,8 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertIn("torchao 0.0.0", message)
         self.assertIn("nvidia-cutlass-dsl 0.0.0", message)
         self.assertIn("apache-tvm-ffi is not installed", message)
+        self.assertIn("cuda-python 0.0.0", message)
+        self.assertIn("pyarrow 0.0.0", message)
 
 
 if __name__ == "__main__":

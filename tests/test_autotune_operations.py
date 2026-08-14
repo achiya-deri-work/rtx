@@ -7,8 +7,14 @@ import unittest
 
 from rtx.autotune.audit import audit_bundles
 from rtx.autotune.promotion import install_verified_winners
+from rtx.autotune.winners import (
+    RuntimeWinnerKey,
+    list_runtime_winners,
+    save_runtime_winner,
+)
 from rtx.kernels.mxfp8 import (
     MXFP8_FWD_KERNEL_REVISION,
+    MXFP8Problem,
     fwd_config_to_dict,
     normalize_fwd_config,
 )
@@ -20,6 +26,59 @@ def _write(path: Path, value: object) -> None:
 
 
 class AutotuneOperationsTests(unittest.TestCase):
+    def test_runtime_winners_are_inspectable_without_deserialization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = RuntimeWinnerKey(
+                "mxfp8_fused_fwd",
+                MXFP8Problem(64, 128, 128),
+                "hot",
+                "device-id",
+                MXFP8_FWD_KERNEL_REVISION,
+            )
+            path = save_runtime_winner(
+                key,
+                {"tile_m": 64},
+                config_id="candidate-id",
+                root=root,
+                median_ms=0.01,
+            )
+            rows = list_runtime_winners(
+                root=root,
+                families=("mxfp8_fused_fwd",),
+                device_ids=("device-id",),
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertTrue(rows[0]["valid"])
+            self.assertEqual(rows[0]["path"], str(path))
+            self.assertEqual(rows[0]["config_id"], "candidate-id")
+            self.assertEqual(rows[0]["kernel_revision"], MXFP8_FWD_KERNEL_REVISION)
+            self.assertEqual(rows[0]["compatibility"], "compatible")
+
+    def test_schema_v1_runtime_winner_is_visible_but_invalidated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = (
+                root
+                / "runtime_winners"
+                / "mxfp8_fused_fwd"
+                / "device-id"
+                / "m64_n128_k128_hot_default.json"
+            )
+            _write(
+                path,
+                {
+                    "schema_version": 1,
+                    "family": "mxfp8_fused_fwd",
+                    "device_id": "device-id",
+                    "config": {"tile_m": 64},
+                },
+            )
+            rows = list_runtime_winners(root=root)
+            self.assertEqual(len(rows), 1)
+            self.assertFalse(rows[0]["valid"])
+            self.assertEqual(rows[0]["compatibility"], "schema_v1_invalidated")
+
     def _bundle(self, root: Path) -> Path:
         bundle = root / "campaign" / "machine" / "shard-000-of-001"
         machine = {

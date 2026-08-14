@@ -29,7 +29,7 @@ class LinearSpec:
     precision: LinearPrecision = "bf16"
     autotune: str | bool | None = "cache"
     mxfp8_backend: str = "auto"
-    nvfp4_scaling: str = "block"
+    nvfp4_scaling: str = "jit_row_region"
     nvfp4_backend: str = "auto"
 
     def __post_init__(self) -> None:
@@ -37,9 +37,15 @@ class LinearSpec:
             raise ValueError("linear precision must be bf16, mxfp8, or nvfp4")
         if self.mxfp8_backend not in ("auto", "fused", "materialized"):
             raise ValueError("MXFP8 backend must be auto, fused, or materialized")
-        if self.nvfp4_scaling not in ("delayed", "current", "regional", "block"):
+        if self.nvfp4_scaling not in (
+            "delayed",
+            "current",
+            "jit_row_region",
+            "regional",
+            "block",
+        ):
             raise ValueError(
-                "NVFP4 scaling must be delayed, current, regional, or block"
+                "NVFP4 scaling must be delayed, current, jit_row_region, or block"
             )
         if self.nvfp4_backend not in ("auto", "fused", "materialized"):
             raise ValueError("NVFP4 backend must be auto, fused, or materialized")

@@ -51,6 +51,7 @@ class MXFP8GemmKernel:
         reduction_tile: int = 0,
         atomic_output: bool = False,
         cluster_output: bool = False,
+        use_pdl: bool = False,
     ):
         if problem.k % config.tile_k:
             # Qdata TMA naturally zero-fills a short K tile. Scale vectors are
@@ -71,6 +72,20 @@ class MXFP8GemmKernel:
         self.sf_vec_size = SF_VEC_SIZE
         self.use_mxf8f6f4 = True
         self.apply_output_scale = False
+        if not hasattr(self, "cache_regional_output_scales"):
+            self.cache_regional_output_scales = False
+        if not hasattr(self, "output_x_scale_cache_elems"):
+            self.output_x_scale_cache_elems = 0
+        if not hasattr(self, "output_w_scale_cache_elems"):
+            self.output_w_scale_cache_elems = 0
+        if not hasattr(self, "output_scale_product_cache_elems"):
+            self.output_scale_product_cache_elems = 0
+        if not hasattr(self, "cache_output_scale_products"):
+            self.cache_output_scale_products = False
+        if not hasattr(self, "tile_uniform_regional_output_scale"):
+            self.tile_uniform_regional_output_scale = False
+        if not hasattr(self, "direct_regional_output_scales"):
+            self.direct_regional_output_scales = False
         rejection = config.rejection(problem)
         if rejection is not None:
             raise ValueError(f"illegal prequantized MXFP8 GEMM: {rejection}")
@@ -80,6 +95,7 @@ class MXFP8GemmKernel:
         self.reduction_tile = reduction_tile
         self.atomic_output = atomic_output
         self.cluster_output = cluster_output
+        self.use_pdl = use_pdl
         if split_reduction < 1:
             raise ValueError("split_reduction must be positive")
         if split_reduction == 1 and (
@@ -249,6 +265,62 @@ class MXFP8GemmKernel:
 
     def _make_mma_op(self):
         return warp.MmaMXF8Op(self.ab_dtype, Float32, self.sf_dtype)
+
+    @cute.jit
+    def _epilogue_output_scale(
+        self,
+        output_scale: cute.Tensor,
+        row: Int32,
+        column: Int32,
+        global_output_scale: Float32,
+        cached_x_scales: cute.Tensor,
+        cached_weight_scales: cute.Tensor,
+        cached_scale_products: cute.Tensor,
+        tile_row: Int32,
+        tile_column: Int32,
+    ):
+        """Resolve an output element's outer scale.
+
+        MXFP8 and ordinary NVFP4 use a scalar.  NVFP4 JIT row-region scaling
+        overrides this hook so the native GEMM can apply the product of its X
+        and weight region scales without a separate pointwise kernel.
+        """
+
+        return global_output_scale
+
+    @cute.jit
+    def _load_x_output_scale(self, output_scale: cute.Tensor, row: Int32):
+        return Float32(output_scale[0])
+
+    @cute.jit
+    def _load_weight_output_scale(
+        self, output_scale: cute.Tensor, column: Int32
+    ):
+        return Float32(output_scale[0])
+
+    @cute.jit
+    def _x_output_scale_cache_offset(self, cache_index: Int32):
+        return cache_index
+
+    @cute.jit
+    def _w_output_scale_cache_offset(self, cache_index: Int32):
+        return cache_index
+
+    @cute.jit
+    def _scale_tma_accumulator(
+        self,
+        value: Float32,
+        cached_x_scales: cute.Tensor,
+        cached_weight_scales: cute.Tensor,
+        cached_scale_products: cute.Tensor,
+        tile_output_scale: Float32,
+        output_scale: cute.Tensor,
+        global_row: Int32,
+        global_column: Int32,
+        local_row: Int32,
+        local_column: Int32,
+    ):
+        return value
 
     @cute.jit
     def _stage_scales(
@@ -524,6 +596,20 @@ class MXFP8GemmKernel:
                 cute.struct.MemRange[Int64, 2 if self.cluster_output else 0],
                 8,
             ]
+            outer_x: cute.struct.Align[
+                cute.struct.MemRange[
+                    Float32,
+                    self.output_x_scale_cache_elems,
+                ],
+                16,
+            ]
+            outer_w: cute.struct.Align[
+                cute.struct.MemRange[
+                    Float32,
+                    self.output_w_scale_cache_elems,
+                ],
+                16,
+            ]
 
         self.shared_storage = SharedStorage
         m_tiles = cute.ceil_div(self.problem.m, cfg.tile_m)
@@ -564,12 +650,14 @@ class MXFP8GemmKernel:
                     block=(cfg.num_threads, 1, 1),
                     cluster=(self.split_reduction, 1, 1),
                     stream=stream,
+                    use_pdl=self.use_pdl,
                 )
             else:
                 launch.launch(
                     grid=(self.grid_ctas, 1, 1),
                     block=(cfg.num_threads, 1, 1),
                     stream=stream,
+                    use_pdl=self.use_pdl,
                 )
         else:
             launch = self.kernel(
@@ -587,12 +675,14 @@ class MXFP8GemmKernel:
                     block=(cfg.num_threads, 1, 1),
                     cluster=(self.split_reduction, 1, 1),
                     stream=stream,
+                    use_pdl=self.use_pdl,
                 )
             else:
                 launch.launch(
                     grid=(self.grid_ctas, 1, 1),
                     block=(cfg.num_threads, 1, 1),
                     stream=stream,
+                    use_pdl=self.use_pdl,
                 )
 
     @cute.kernel
@@ -624,6 +714,9 @@ class MXFP8GemmKernel:
         out_layout: cute.ComposedLayout,
     ):
         cfg = self.config
+        if cutlass.const_expr(self.use_pdl):
+            if nvvm.elect_sync():
+                nvvm.griddepcontrol("wait")
         scale_prefetch = {
             "none": None,
             "64b": nvvm.L2PrefetchSize.SIZE_64B,
@@ -673,6 +766,28 @@ class MXFP8GemmKernel:
         s_sfb = storage.sfb.get_tensor(sfb_layout)
         s_sfa_flat = cute.make_tensor(s_sfa.iterator, scale_a_flat_layout)
         s_sfb_flat = cute.make_tensor(s_sfb.iterator, scale_b_flat_layout)
+        # Typed placeholders for ordinary GEMMs; regional specializations
+        # replace them with their non-empty FP32 cache tensors below.
+        s_outer_x = s_sfa_flat
+        s_outer_w = s_sfa_flat
+        if cutlass.const_expr(self.cache_regional_output_scales):
+            s_outer_x = storage.outer_x.get_tensor(
+                cute.make_layout(
+                    (self.output_x_scale_cache_elems,),
+                    stride=(1,),
+                )
+            )
+            s_outer_w = storage.outer_w.get_tensor(
+                cute.make_layout(
+                    (self.output_w_scale_cache_elems,),
+                    stride=(1,),
+                )
+            )
+        # Product caching is an optional specialization hook.  Alias the X
+        # cache as a typed placeholder so ordinary MXFP8/NVFP4 kernels pay no
+        # additional shared-memory allocation (even one byte can round the
+        # launch above SM120's allocation quantum).
+        s_outer_product = s_outer_x
         if cutlass.const_expr(self.cluster_output):
             s_cluster_barrier = storage.cluster_barrier.get_tensor(
                 cute.make_layout((2,), stride=(1,))
@@ -892,6 +1007,52 @@ class MXFP8GemmKernel:
                 block_n = (
                     group * cfg.grid_swizzle + offset % cols_in_group
                 )
+
+            tile_output_scale = global_output_scale
+            if cutlass.const_expr(self.tile_uniform_regional_output_scale):
+                tile_output_scale = (
+                    self._load_x_output_scale(
+                        output_scale, block_m * cfg.tile_m
+                    )
+                    * self._load_weight_output_scale(
+                        output_scale, block_n * cfg.tile_n
+                    )
+                )
+
+            if cutlass.const_expr(
+                self.cache_regional_output_scales
+                and not self.tile_uniform_regional_output_scale
+                and not self.direct_regional_output_scales
+            ):
+                for local_row in cutlass.range(
+                    tidx,
+                    self.output_x_scale_cache_elems,
+                    cfg.num_threads,
+                    unroll=1,
+                ):
+                    global_row = cutlass.min(
+                        block_m * cfg.tile_m
+                        + self._x_output_scale_cache_offset(local_row),
+                        self.problem.m - 1,
+                    )
+                    s_outer_x[local_row] = self._load_x_output_scale(
+                        output_scale, global_row
+                    )
+                for local_column in cutlass.range(
+                    tidx,
+                    self.output_w_scale_cache_elems,
+                    cfg.num_threads,
+                    unroll=1,
+                ):
+                    global_column = cutlass.min(
+                        block_n * cfg.tile_n
+                        + self._w_output_scale_cache_offset(local_column),
+                        self.problem.n - 1,
+                    )
+                    s_outer_w[local_column] = self._load_weight_output_scale(
+                        output_scale, global_column
+                    )
+                cute.arch.sync_threads()
 
             # Reconstruct the exact circular-pipeline phase for this unrolled
             # output tile. Carrying the mutable PipelineState Python object
@@ -1286,6 +1447,31 @@ class MXFP8GemmKernel:
                 if warp_idx == cfg.num_mma_warps:
                     tma_pipeline.producer_tail(producer_state)
 
+            if cutlass.const_expr(
+                cfg.epilogue == "tma" and self.cache_regional_output_scales
+            ):
+                if warp_idx < cfg.num_mma_warps:
+                    for elem in cutlass.range(
+                        cute.size(accumulators), unroll_full=True
+                    ):
+                        coord = t_cc_out[elem]
+                        if (
+                            coord[0] < self.problem.m
+                            and coord[1] < self.problem.n
+                        ):
+                            accumulators[elem] = self._scale_tma_accumulator(
+                                accumulators[elem],
+                                s_outer_x,
+                                s_outer_w,
+                                s_outer_product,
+                                tile_output_scale,
+                                output_scale,
+                                coord[0],
+                                coord[1],
+                                coord[0] - block_m * cfg.tile_m,
+                                coord[1] - block_n * cfg.tile_n,
+                            )
+
             if cutlass.const_expr(cfg.epilogue == "direct"):
                 if cutlass.const_expr(self.cluster_output):
                     # Reuse the now-dead A pipeline storage as a contiguous
@@ -1363,8 +1549,19 @@ class MXFP8GemmKernel:
                                     and coord[0] < self.problem.m
                                     and coord[1] < self.problem.n
                                 ):
+                                    element_scale = self._epilogue_output_scale(
+                                        output_scale,
+                                        coord[0],
+                                        coord[1],
+                                        global_output_scale,
+                                        s_outer_x,
+                                        s_outer_w,
+                                        s_outer_product,
+                                        block_m * cfg.tile_m,
+                                        block_n * cfg.tile_n,
+                                    )
                                     t_cg_out[elem] = BFloat16(
-                                        global_output_scale * scratch[
+                                        element_scale * scratch[
                                             tidx * chunk_elements
                                             + elem
                                             - first_elem
@@ -1398,8 +1595,19 @@ class MXFP8GemmKernel:
                                 elif cutlass.const_expr(self.split_reduction > 1):
                                     t_cg_out[elem] = accumulators[elem]
                                 else:
+                                    element_scale = self._epilogue_output_scale(
+                                        output_scale,
+                                        coord[0],
+                                        coord[1],
+                                        global_output_scale,
+                                        s_outer_x,
+                                        s_outer_w,
+                                        s_outer_product,
+                                        block_m * cfg.tile_m,
+                                        block_n * cfg.tile_n,
+                                    )
                                     t_cg_out[elem] = BFloat16(
-                                        global_output_scale * accumulators[elem]
+                                        element_scale * accumulators[elem]
                                     )
             else:
                 if active_tile:
@@ -1429,6 +1637,15 @@ class MXFP8GemmKernel:
                             )
                             out_pipeline.producer_commit()
                             out_pipeline.producer_acquire()
+
+            if cutlass.const_expr(
+                self.cache_regional_output_scales
+                and not self.tile_uniform_regional_output_scale
+                and not self.direct_regional_output_scales
+            ):
+                # The next persistent tile reuses the scale cache. Ensure all
+                # MMA warps have consumed this tile's values first.
+                cute.arch.sync_threads()
 
         if cutlass.const_expr(self.split_reduction == 1):
             # Balanced persistence may raise the launch grid above the

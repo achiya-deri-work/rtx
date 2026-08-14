@@ -1,0 +1,62 @@
+{
+  "schema_version": 2,
+  "name": "nvfp4_region_delayed_v2_cta_owned",
+  "seed": 20260824,
+  "storage_mode": "residual_context",
+  "rotation_mode": "balanced_categories",
+  "jobs": [
+    {
+      "family": "nvfp4_region_delayed_fwd",
+      "shapes": [
+        {"m": 512, "n": 1536, "k": 1536, "name": "medium_square"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced_square"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "long_sequence"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "decoder_qkv_b64"},
+        {"m": 32768, "n": 768, "k": 768, "name": "decoder_attention_out_b64"},
+        {"m": 32768, "n": 3072, "k": 768, "name": "decoder_gate_up_b64"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "decoder_down_b64"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 5,
+      "tags": {
+        "purpose": "cta_owned_region_delayed_runtime_search",
+        "frontend": "nvfp4_region_delayed",
+        "kernel_revision": "2",
+        "scale_policy": "prior_local_fp32_outer_plus_e4m3_1x16"
+      },
+      "tuning": {
+        "portfolio": "hybrid",
+        "orchestration": "bandit",
+        "max_trials": 256,
+        "time_budget_s": 1200.0,
+        "cost_model_trials": 192,
+        "model_warmup": 24,
+        "model_pool_size": 32768,
+        "model_refit_interval": 8,
+        "bandit_exploration": 0.4,
+        "model_estimators": 64,
+        "model_ensembles": 3,
+        "model_max_depth": 5,
+        "model_min_leaf": 3,
+        "model_max_features": 256,
+        "local_beam_width": 12,
+        "confirmation_repeats": 3,
+        "confirmation_ratio": 0.02,
+        "confirm_initial": true,
+        "seed": 20260824
+      },
+      "protocol": {
+        "warmup_calls": 4,
+        "samples": 5,
+        "confirm_samples": 21,
+        "race_rounds": 21,
+        "target_batch_ms": 30.0,
+        "practical_threshold": 0.002,
+        "bootstrap_resamples": 1000,
+        "correctness_rtol": 0.05,
+        "correctness_atol": 0.5,
+        "telemetry": true
+      }
+    }
+  ]
+}

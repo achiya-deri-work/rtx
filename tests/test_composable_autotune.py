@@ -779,6 +779,7 @@ class ComposableAutotuneTests(unittest.TestCase):
             problem,
             "hot",
             "synthetic-device",
+            adapter.context.kernel_revision,
             "x-row_major_w-row_major",
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -801,6 +802,15 @@ class ComposableAutotuneTests(unittest.TestCase):
             self.assertIsNone(
                 load_runtime_winner(
                     wrong_layout, adapter.deserialize, root=directory
+                )
+            )
+
+            wrong_revision = replace(
+                key, kernel_revision=key.kernel_revision + 1
+            )
+            self.assertIsNone(
+                load_runtime_winner(
+                    wrong_revision, adapter.deserialize, root=directory
                 )
             )
 

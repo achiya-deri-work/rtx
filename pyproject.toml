@@ -15,7 +15,7 @@ authors = [
 ]
 dependencies = [
   "numpy>=2.0,<3",
-  "torch>=2.12.1,<2.13.1",
+  "torch>=2.12.1,<=2.13.0",
   "torchao==0.18.0",
   "cuda-python>=13.0,<14",
   "nvidia-cutlass-dsl[cu13]==4.7.0",
@@ -39,6 +39,7 @@ classifiers = [
 [project.urls]
 Repository = "https://github.com/achiya-deri-work/rtx"
 Issues = "https://github.com/achiya-deri-work/rtx/issues"
+Documentation = "https://github.com/achiya-deri-work/rtx/tree/main/docs"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "build>=1.2", "twine>=5"]

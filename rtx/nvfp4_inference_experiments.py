@@ -22,6 +22,8 @@ from .fp4 import (
     NVFP4ForwardConfig,
     _delayed_amax_state,
     _make_delayed_dynamic_runner,
+    _make_jit_region_dynamic_runner,
+    _make_region_delayed_dynamic_runner,
     _make_block_dynamic_runner,
     _current_tensor_scale,
     _packed_fp4_view,
@@ -105,6 +107,20 @@ class NVFP4DynamicBenchmarkHarness(PrequantBenchmarkHarness):
             self.device,
         )
 
+    def _validate_output(
+        self, out: torch.Tensor, max_abs_error: float
+    ) -> None:
+        if not torch.allclose(
+            out,
+            self._expected,
+            rtol=self.protocol.correctness_rtol,
+            atol=self.protocol.correctness_atol,
+            equal_nan=True,
+        ):
+            raise CandidateCorrectnessError(
+                f"candidate differs from reference (max abs {max_abs_error})"
+            )
+
     def prepare(self, config: NVFP4DynamicConfig) -> _PreparedNVFP4Dynamic:
         rejection = config.rejection(self.problem)
         if rejection is not None:
@@ -128,16 +144,7 @@ class NVFP4DynamicBenchmarkHarness(PrequantBenchmarkHarness):
             max_abs_error = float(
                 (out.float() - self._expected.float()).abs().max()
             )
-            if not torch.allclose(
-                out,
-                self._expected,
-                rtol=self.protocol.correctness_rtol,
-                atol=self.protocol.correctness_atol,
-                equal_nan=True,
-            ):
-                raise CandidateCorrectnessError(
-                    f"candidate differs from reference (max abs {max_abs_error})"
-                )
+            self._validate_output(out, max_abs_error)
             return _PreparedNVFP4Dynamic(
                 config,
                 runner,
@@ -272,6 +279,129 @@ class NVFP4DelayedBenchmarkHarness(NVFP4DynamicBenchmarkHarness):
         # The observer is fused into quantization; timing it independently
         # would change the state-generation semantics. E2E timing remains the
         # authoritative objective for this family.
+        return {}
+
+
+class NVFP4JITRowRegionBenchmarkHarness(NVFP4DynamicBenchmarkHarness):
+    """Measure current local outer-scale quantization plus native GEMM."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Region geometry is a numerical coordinate, so use BF16 GEMM as the
+        # common correctness oracle rather than one arbitrary region policy.
+        self._expected = torch.matmul(
+            self.x.float(), self.weight.float().transpose(0, 1)
+        ).to(torch.bfloat16)
+
+    def _build_runner(self, config: NVFP4DynamicConfig) -> object:
+        from .nvfp4_inference_autotune import preferred_jit_row_region_config
+
+        selected = (
+            config
+            if config.jit_row_region
+            else preferred_jit_row_region_config(self.problem)
+        )
+        return _make_jit_region_dynamic_runner(
+            self.problem,
+            NVFP4ForwardConfig.from_materialized(selected),
+            self.device,
+        )
+
+    def _validate_output(
+        self, out: torch.Tensor, max_abs_error: float
+    ) -> None:
+        actual = out.float()
+        expected = self._expected.float()
+        if not bool(torch.isfinite(actual).all()):
+            raise CandidateCorrectnessError("candidate produced non-finite output")
+        error_rms = (actual - expected).square().mean().sqrt()
+        reference_rms = expected.square().mean().sqrt().clamp_min(1.0e-20)
+        normalized_rmse = float(error_rms / reference_rms)
+        cosine = float(
+            torch.nn.functional.cosine_similarity(
+                actual.reshape(-1), expected.reshape(-1), dim=0
+            )
+        )
+        # NVFP4's expected quantization noise is not elementwise-relative:
+        # near-zero GEMM outputs make allclose reject otherwise healthy
+        # candidates. These distribution-level guards accept the measured
+        # ~0.135 NRMSE baseline while still rejecting scale-layout corruption,
+        # missing epilogue factors, saturation, and indexing failures.
+        if normalized_rmse > 0.25 or cosine < 0.95:
+            raise CandidateCorrectnessError(
+                "candidate exceeds NVFP4 numerical guard "
+                f"(max abs {max_abs_error}, nrmse {normalized_rmse:.6f}, "
+                f"cosine {cosine:.6f})"
+            )
+
+    def _measure_components(self, prepared, calls: int, samples: int):
+        runner = prepared.runner
+        component_calls = max(1, min(calls, 1024))
+        component_samples = max(3, min(samples, 5))
+        components = {
+            "jit_region_observe_quant": [
+                self._time_callable(
+                    lambda index: runner.quant(
+                        *self._inputs[index % len(self._inputs)],
+                        runner.qx,
+                        runner.qw,
+                        runner.sx,
+                        runner.sw,
+                        runner.region_scales,
+                    ),
+                    component_calls,
+                )
+                for _ in range(component_samples)
+            ],
+            "gemm_region_epilogue": [
+                self._time_callable(
+                    lambda _index: runner.gemm(
+                        runner.qx_packed,
+                        runner.qw_packed,
+                        runner.sx,
+                        runner.sw,
+                        prepared.out,
+                        runner.region_scales,
+                    ),
+                    component_calls,
+                )
+                for _ in range(component_samples)
+            ],
+        }
+        return {
+            name: {
+                "timings_ms": timings,
+                "summary_ms": robust_summary(
+                    timings,
+                    seed=len(name) ^ calls,
+                    bootstrap_resamples=self.protocol.bootstrap_resamples,
+                ).as_dict(),
+            }
+            for name, timings in components.items()
+        }
+
+
+class NVFP4RegionDelayedBenchmarkHarness(NVFP4JITRowRegionBenchmarkHarness):
+    """Measure one-pass steady-state regional delayed scaling."""
+
+    def _build_runner(self, config: NVFP4DynamicConfig) -> object:
+        from .nvfp4_inference_autotune import preferred_jit_row_region_config
+
+        selected = (
+            config
+            if config.jit_row_region
+            else preferred_jit_row_region_config(self.problem)
+        )
+        return _make_region_delayed_dynamic_runner(
+            self.problem,
+            NVFP4ForwardConfig.from_materialized(selected),
+            self.device,
+        )
+
+    def _measure_components(self, prepared, calls: int, samples: int):
+        # State buffers alternate every call; isolated measurements would need
+        # to preserve that sequencing and are intentionally deferred to the
+        # dedicated component profiler.
         return {}
 
 
@@ -503,6 +633,8 @@ class NVFP4FullyPrequantBenchmarkHarness(NVFP4InferenceBenchmarkHarness):
 
 __all__ = [
     "NVFP4DelayedBenchmarkHarness",
+    "NVFP4JITRowRegionBenchmarkHarness",
+    "NVFP4RegionDelayedBenchmarkHarness",
     "NVFP4DynamicBenchmarkHarness",
     "NVFP4FullyPrequantBenchmarkHarness",
     "NVFP4InferenceBenchmarkHarness",

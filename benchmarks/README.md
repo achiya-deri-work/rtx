@@ -12,6 +12,7 @@ repository root so imports and output paths are predictable.
 | `benchmark_nvfp4_training.py` | Legacy CTA-local fused NVFP4 study retained for implementation comparisons |
 | `benchmark_nvfp4_end_to_end.py` | Production backend paired forward-plus-MXFP8-backward layer benchmark |
 | `benchmark_nvfp4_frontend.py` | Paired fullgraph dynamic-forward latency and normalized numerical-error comparison against MXFP8 |
+| `validate_nvfp4_regional_scaling.py` | Matched current-JIT versus regional-delayed scaling study with distribution shifts, scale staleness, gradient impact, and stable latency statistics |
 | `validate_nvfp4_convergence.py` | Controlled BF16/current/rowwise-JIT/delayed/exact scale-policy convergence study |
 | `benchmark_mxfp8_prequant.py` | Dynamic BF16 quantization plus native-scale MXFP8 GEMM, with mainloop/epilogue stage and persistent-locality controls |
 | `benchmark_torchao_fp8_rowwise.py` | TorchAO rowwise FP8 comparison baseline |

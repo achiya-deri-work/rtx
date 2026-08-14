@@ -54,6 +54,17 @@ class DecoderConfigurationTests(unittest.TestCase):
         )
         self.assertEqual(config.intermediate_size, 225)
 
+    def test_decoder_accepts_jit_row_region_nvfp4_policy(self) -> None:
+        spec = LinearSpec(
+            precision="nvfp4",
+            nvfp4_scaling="jit_row_region",
+            autotune="off",
+        )
+        config = replace(
+            _small_config("nvfp4", dtype=torch.bfloat16), linear=spec
+        )
+        self.assertEqual(config.linear.nvfp4_scaling, "jit_row_region")
+
 
 class DecoderNumericsTests(unittest.TestCase):
     def test_fp32_norm_returns_activation_dtype_and_unit_rms(self) -> None:

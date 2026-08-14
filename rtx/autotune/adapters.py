@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 from typing import Callable, Iterable, Mapping
 
 from .core import DiscreteKernelAdapter, KernelContext
@@ -72,7 +73,7 @@ def _sm120_scale_bytes(tile_m: int, tile_n: int, tile_k: int, stages: int) -> in
 def _fused_smem_bytes(config: MXFP8FwdConfig) -> int:
     operands = config.mxfp8_stages * (
         config.tile_m + config.tile_n
-    ) * config.tile_k * config.native_operand_bits // 8
+    ) * config.tile_k * config.smem_operand_bits // 8
     scales = config.mxfp8_stages * (
         ((config.tile_m + 127) // 128) * 128
         + ((config.tile_n + 127) // 128) * 128
@@ -681,6 +682,12 @@ def make_mxfp8_fwd_adapter(
                 telemetry_slots if delayed_enabled else 0
             ),
             delayed_scale_prepare_launches=0.0,
+            jit_cta_scale=float(getattr(config, "jit_cta_scale", False)),
+            jit_cta_observer_bf16_bytes=float(
+                (config.tile_m + config.tile_n) * problem.k * 2
+                if getattr(config, "jit_cta_scale", False)
+                else 0
+            ),
             total_kernel_launches=1.0,
         )
         return values
@@ -717,6 +724,8 @@ def make_nvfp4_fwd_adapter(
     device: DeviceFingerprint | Mapping[str, object] | None = None,
     regime: str = "hot",
     tags: Mapping[str, object] | None = None,
+    _family: str = "nvfp4_fused_fwd",
+    _revision: int | None = None,
 ):
     from ..configs.nvfp4 import (
         DEFAULT_NVFP4_FWD_CONFIG,
@@ -741,8 +750,8 @@ def make_nvfp4_fwd_adapter(
         device=device,
         regime=regime,
         tags=tags,
-        _family="nvfp4_fused_fwd",
-        _revision=NVFP4_KERNEL_REVISION,
+        _family=_family,
+        _revision=NVFP4_KERNEL_REVISION if _revision is None else _revision,
         _allowed_axes=NVFP4_FWD_SEARCH_SPACE,
         _normalizer=normalize_nvfp4_fwd_config,
         _deserialize=deserialize,
@@ -1067,6 +1076,7 @@ def make_nvfp4_dynamic_adapter(
     tags: Mapping[str, object] | None = None,
     _family: str = "nvfp4_dynamic_fwd",
     _revision: int | None = None,
+    _allowed_axes: Mapping[str, Iterable[Mapping[str, object]]] | None = None,
 ) -> DiscreteKernelAdapter[object]:
     """Jointly tune both dynamic quantizers and the materialized NVFP4 GEMM."""
 
@@ -1085,7 +1095,10 @@ def make_nvfp4_dynamic_adapter(
     revision = NVFP4_DYNAMIC_KERNEL_REVISION if _revision is None else _revision
     selected_axes = NVFP4_DYNAMIC_SEARCH_SPACE if axes is None else axes
     axis_values = {name: tuple(values) for name, values in selected_axes.items()}
-    unknown = set(axis_values).difference(NVFP4_DYNAMIC_SEARCH_SPACE)
+    allowed_axes = (
+        NVFP4_DYNAMIC_SEARCH_SPACE if _allowed_axes is None else _allowed_axes
+    )
+    unknown = set(axis_values).difference(allowed_axes)
     if unknown:
         raise ValueError(f"unknown dynamic NVFP4 tuning axes: {sorted(unknown)}")
 
@@ -1113,6 +1126,31 @@ def make_nvfp4_dynamic_adapter(
         )
         qx = problem.m * problem.k / 2 + problem.m * (problem.k // 16)
         qw = problem.n * problem.k / 2 + problem.n * (problem.k // 16)
+        x_region_rows = int(getattr(config, "x_scale_region_rows", 0))
+        weight_region_rows = int(
+            getattr(config, "weight_scale_region_rows", 0)
+        )
+        region_scale_values = (
+            math.ceil(problem.m / x_region_rows)
+            + math.ceil(problem.n / weight_region_rows)
+            if x_region_rows and weight_region_rows
+            else 0
+        )
+        tile_m = int(gemm.tile_m)
+        tile_n = int(gemm.tile_n)
+        output_tiles = math.ceil(problem.m / tile_m) * math.ceil(
+            problem.n / tile_n
+        )
+        cached_region_scale_reads = (
+            output_tiles
+            * (
+                math.ceil(tile_m / x_region_rows)
+                + math.ceil(tile_n / weight_region_rows)
+            )
+            * 4
+            if region_scale_values
+            else 0
+        )
         values.update(
             operand_state_dynamic=1.0,
             native_scale_transport=(
@@ -1128,13 +1166,77 @@ def make_nvfp4_dynamic_adapter(
                 2.0 if config.quant_launches == "dual" else 3.0  # type: ignore[attr-defined]
             ),
             quantized_materialization_bytes=float(qx + qw),
+            jit_row_region=float(
+                bool(getattr(config, "x_scale_region_rows", 0))
+            ),
+            x_scale_region_rows=float(
+                getattr(config, "x_scale_region_rows", 0)
+            ),
+            weight_scale_region_rows=float(
+                getattr(config, "weight_scale_region_rows", 0)
+            ),
+            x_scale_regions=float(
+                math.ceil(
+                    problem.m
+                    / max(1, getattr(config, "x_scale_region_rows", 0))
+                )
+                if getattr(config, "x_scale_region_rows", 0)
+                else 0
+            ),
+            weight_scale_regions=float(
+                math.ceil(
+                    problem.n
+                    / max(1, getattr(config, "weight_scale_region_rows", 0))
+                )
+                if getattr(config, "weight_scale_region_rows", 0)
+                else 0
+            ),
+            region_amax_load_bits=float(
+                getattr(config, "region_amax_load_bits", 0)
+            ),
+            region_amax_unroll=float(
+                getattr(config, "region_amax_unroll", 0)
+            ),
+            region_waves=float(getattr(config, "region_waves", 0)),
+            region_weight_first=float(
+                getattr(config, "region_order", "x_first") == "weight_first"
+            ),
+            region_warp_owned=float(
+                getattr(config, "region_ownership", "warp") == "warp"
+            ),
+            region_scale_power2=float(
+                getattr(config, "tensor_scale_mode", "power2") == "power2"
+            ),
+            programmatic_dependent_launch=float(
+                getattr(config, "programmatic_dependent_launch", False)
+            ),
+            region_observer_read_bytes=float(
+                # Current/JIT scaling must observe BF16 once before it can
+                # quantize with that scale. Regional delayed scaling observes
+                # values during its ordinary quantization read instead.
+                2 * problem.k * (problem.m + problem.n)
+                if _family == "nvfp4_jit_row_region_fwd"
+                else 0
+            ),
+            region_scale_state_bytes=float(4 * region_scale_values),
+            region_scale_epilogue_reads=float(
+                # Each output CTA stages one value per distinct row region,
+                # not one redundant value per output element.
+                cached_region_scale_reads
+            ),
         )
         return values
 
     state_tags = {
         **dict(tags or {}),
         "operand_state": (
-            "delayed_materialized" if _family == "nvfp4_delayed_fwd" else "dynamic"
+            "delayed_materialized"
+            if _family == "nvfp4_delayed_fwd"
+            else "region_delayed"
+            if _family == "nvfp4_region_delayed_fwd"
+            else "jit_row_region"
+            if _family == "nvfp4_jit_row_region_fwd"
+            else "dynamic"
         ),
     }
     return DiscreteKernelAdapter(
@@ -1192,6 +1294,86 @@ def make_nvfp4_delayed_adapter(
         _revision=NVFP4_DELAYED_KERNEL_REVISION,
     )
 
+
+def make_nvfp4_jit_row_region_adapter(
+    problem,
+    evaluator: Callable[[object], TrialOutcome],
+    *,
+    initial: object | None = None,
+    axes: Mapping[str, Iterable[Mapping[str, object]]] | None = None,
+    device: DeviceFingerprint | Mapping[str, object] | None = None,
+    regime: str = "hot",
+    tags: Mapping[str, object] | None = None,
+) -> DiscreteKernelAdapter[object]:
+    """Tune current row-region observation, quantization, and GEMM jointly."""
+
+    from ..nvfp4_inference_autotune import (
+        NVFP4_JIT_ROW_REGION_KERNEL_REVISION,
+        NVFP4_JIT_ROW_REGION_SEARCH_SPACE,
+        preferred_jit_row_region_config,
+    )
+
+    selected_initial = (
+        preferred_jit_row_region_config(problem) if initial is None else initial
+    )
+    return make_nvfp4_dynamic_adapter(
+        problem,
+        evaluator,
+        initial=selected_initial,
+        axes=(
+            NVFP4_JIT_ROW_REGION_SEARCH_SPACE if axes is None else axes
+        ),
+        device=device,
+        regime=regime,
+        tags={
+            **dict(tags or {}),
+            "scale_policy": "jit_row_region",
+            "outer_scale_scope": "row_region",
+        },
+        _family="nvfp4_jit_row_region_fwd",
+        _revision=NVFP4_JIT_ROW_REGION_KERNEL_REVISION,
+        _allowed_axes=NVFP4_JIT_ROW_REGION_SEARCH_SPACE,
+    )
+
+
+def make_nvfp4_region_delayed_adapter(
+    problem,
+    evaluator: Callable[[object], TrialOutcome],
+    *,
+    initial: object | None = None,
+    axes: Mapping[str, Iterable[Mapping[str, object]]] | None = None,
+    device: DeviceFingerprint | Mapping[str, object] | None = None,
+    regime: str = "hot",
+    tags: Mapping[str, object] | None = None,
+) -> DiscreteKernelAdapter[object]:
+    """Tune one-pass regional delayed scaling plus cached TMA epilogue."""
+
+    from ..nvfp4_inference_autotune import (
+        NVFP4_REGION_DELAYED_KERNEL_REVISION,
+        NVFP4_REGION_DELAYED_SEARCH_SPACE,
+        preferred_region_delayed_config,
+    )
+
+    selected = preferred_region_delayed_config(problem) if initial is None else initial
+    return make_nvfp4_dynamic_adapter(
+        problem,
+        evaluator,
+        initial=selected,
+        axes=NVFP4_REGION_DELAYED_SEARCH_SPACE if axes is None else axes,
+        device=device,
+        regime=regime,
+        tags={
+            **dict(tags or {}),
+            "scale_policy": "region_delayed",
+            "outer_scale_scope": "row_region",
+        },
+        _family="nvfp4_region_delayed_fwd",
+        _revision=NVFP4_REGION_DELAYED_KERNEL_REVISION,
+        _allowed_axes={
+            **NVFP4_REGION_DELAYED_SEARCH_SPACE,
+            **({} if axes is None else dict(axes)),
+        },
+    )
 
 def make_nvfp4_fully_prequant_adapter(
     problem,
@@ -1759,6 +1941,8 @@ __all__ = [
     "make_mxfp8_weight_prequant_adapter",
     "make_nvfp4_fully_prequant_adapter",
     "make_nvfp4_dynamic_adapter",
+    "make_nvfp4_jit_row_region_adapter",
+    "make_nvfp4_region_delayed_adapter",
     "make_nvfp4_delayed_adapter",
     "make_nvfp4_weight_prequant_adapter",
 ]

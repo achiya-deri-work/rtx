@@ -9,6 +9,8 @@ from .adapters import (
     make_mxfp8_weight_prequant_adapter,
     make_nvfp4_fully_prequant_adapter,
     make_nvfp4_dynamic_adapter,
+    make_nvfp4_jit_row_region_adapter,
+    make_nvfp4_region_delayed_adapter,
     make_nvfp4_fwd_adapter,
     make_nvfp4_weight_prequant_adapter,
 )
@@ -119,6 +121,7 @@ from .task import (
 )
 from .winners import (
     RuntimeWinnerKey,
+    list_runtime_winners,
     load_runtime_winner,
     runtime_winner_key,
     save_runtime_winner,
@@ -256,6 +259,7 @@ __all__ = [
     "load_offline_observations",
     "load_pretrained_family",
     "load_runtime_winner",
+    "list_runtime_winners",
     "import_legacy_json_database",
     "install_verified_winners",
     "is_fatal_device_context_error",
@@ -264,6 +268,8 @@ __all__ = [
     "make_mxfp8_fwd_adapter",
     "make_nvfp4_fwd_adapter",
     "make_nvfp4_dynamic_adapter",
+    "make_nvfp4_jit_row_region_adapter",
+    "make_nvfp4_region_delayed_adapter",
     "make_nvfp4_fully_prequant_adapter",
     "make_nvfp4_weight_prequant_adapter",
     "make_mxfp8_prequant_adapter",

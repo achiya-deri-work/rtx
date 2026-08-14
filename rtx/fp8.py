@@ -37,13 +37,12 @@ from .kernels.mxfp8 import (
     fwd_config_from_dict,
 )
 from .runtime import BoundedCache, load_kernel_symbol, runner_cache_limit
+from .types import AutotuneMode, CanonicalAutotuneMode, MXFP8Backend
 
 if TYPE_CHECKING:
     from .autotune import CoordinateDescentPolicy
     from .kernels.mxfp8_bwd import MXFP8BwdConfig
 
-AutotuneMode = Literal["off", "cache", "coordinate"]
-MXFP8Backend = Literal["auto", "fused", "materialized", "prequant"]
 WeightMode = Literal["dynamic", "prequantized"]
 
 # This revision is part of every compiler-visible forward token. Increment it
@@ -1926,11 +1925,13 @@ def mxfp8_linear(
     x: torch.Tensor | MXFP8Tensor,
     weight: torch.Tensor | MXFP8Tensor,
     *,
+    forward_config: MXFP8FwdConfig | None = None,
     config: MXFP8FwdConfig | None = None,
     autotune: AutotuneMode | bool | None = None,
-    tuning_policy: "CoordinateDescentPolicy | None" = None,
+    tuning_policy: object | None = None,
     autotune_cache_dir: Path | str | None = None,
     backend: MXFP8Backend = "auto",
+    dynamic_config: MXFP8PrequantConfig | None = None,
     prequant_config: MXFP8PrequantConfig | None = None,
     backward_config: "MXFP8BwdConfig | None" = None,
 ) -> torch.Tensor:
@@ -1941,6 +1942,16 @@ def mxfp8_linear(
     packed activation additionally skips all quantization in this invocation.
     """
 
+    if config is not None and forward_config is not None:
+        raise ValueError("pass only forward_config, not both config aliases")
+    if prequant_config is not None and dynamic_config is not None:
+        raise ValueError(
+            "pass only dynamic_config, not both materialized config aliases"
+        )
+    config = forward_config if forward_config is not None else config
+    prequant_config = (
+        dynamic_config if dynamic_config is not None else prequant_config
+    )
     backend = _normalize_mxfp8_backend(backend)
     if isinstance(weight, MXFP8Tensor):
         validate_mxfp8_tensor(weight)
@@ -2087,13 +2098,17 @@ def mxfp8_linear(
     return out.reshape(*leading_shape, weight.shape[0])
 
 
-def _autotune_mode(value: AutotuneMode | bool | None) -> AutotuneMode:
+def _autotune_mode(
+    value: AutotuneMode | bool | None,
+) -> CanonicalAutotuneMode:
     if isinstance(value, bool):
         return "coordinate" if value else "off"
     selected = os.getenv("RTX_MXFP8_AUTOTUNE", "cache") if value is None else value
+    if selected == "online":
+        selected = "coordinate"
     if selected not in ("off", "cache", "coordinate"):
         raise ValueError(
-            "autotune must be off, cache, or coordinate; "
+            "autotune must be off, cache, online, or coordinate; "
             f"got {selected!r}"
         )
     return selected
@@ -2238,7 +2253,13 @@ def _resolve_fwd_config(
 
 
 class MXFP8Linear(nn.Module):
-    """No-bias MXFP8 linear supporting dynamic and packed inference operands."""
+    """No-bias BF16-master linear with MXFP8 forward and backward GEMMs.
+
+    ``forward_config`` and ``dynamic_config`` are the canonical low-level
+    overrides. ``config`` and ``prequant_config`` remain compatibility aliases.
+    Leave all four unset for runtime winner selection. See
+    https://github.com/achiya-deri-work/rtx/blob/main/docs/mxfp8_linear.md.
+    """
 
     __constants__ = ["in_features", "out_features", "backend", "weight_mode"]
 
@@ -2250,11 +2271,13 @@ class MXFP8Linear(nn.Module):
         *,
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        forward_config: MXFP8FwdConfig | None = None,
         config: MXFP8FwdConfig | None = None,
         autotune: AutotuneMode | bool | None = None,
-        tuning_policy: "CoordinateDescentPolicy | None" = None,
+        tuning_policy: object | None = None,
         autotune_cache_dir: Path | str | None = None,
         backend: MXFP8Backend = "auto",
+        dynamic_config: MXFP8PrequantConfig | None = None,
         prequant_config: MXFP8PrequantConfig | None = None,
         backward_config: "MXFP8BwdConfig | None" = None,
         packed_weight: MXFP8Tensor | None = None,
@@ -2266,8 +2289,21 @@ class MXFP8Linear(nn.Module):
             )
         if dtype is not torch.bfloat16:
             raise TypeError(f"MXFP8Linear parameters must be BF16, got {dtype}")
+        if config is not None and forward_config is not None:
+            raise ValueError("pass only forward_config, not both config aliases")
+        if prequant_config is not None and dynamic_config is not None:
+            raise ValueError(
+                "pass only dynamic_config, not both materialized config aliases"
+            )
+        config = forward_config if forward_config is not None else config
+        prequant_config = (
+            dynamic_config if dynamic_config is not None else prequant_config
+        )
         self.in_features = int(in_features)
         self.out_features = int(out_features)
+        self.forward_config = config
+        self.dynamic_config = prequant_config
+        # Compatibility attributes retained through the 1.x transition.
         self.config = config
         self.autotune = autotune
         self.tuning_policy = tuning_policy
@@ -2523,6 +2559,78 @@ class MXFP8Linear(nn.Module):
             backend=self.backend,
             prequant_config=self.prequant_config,
             backward_config=self.backward_config,
+        )
+
+    def explain(self, x: torch.Tensor | MXFP8Tensor) -> "LinearExecutionDecision":
+        """Describe routing for ``x`` without compiling, benchmarking, or tuning."""
+
+        from dataclasses import asdict
+
+        from .selection import LinearExecutionDecision
+
+        if isinstance(x, MXFP8Tensor):
+            if self.weight_mode != "prequantized":
+                raise TypeError(
+                    "a prequantized activation requires a prequantized module weight"
+                )
+            m, k = mxfp8_matrix_shape(x)
+            state = "fully_prequantized"
+            family = "mxfp8_fully_prequant_fwd"
+            backend = "materialized"
+            config = self.prequant_config
+        else:
+            if x.ndim < 1 or x.shape[-1] != self.in_features:
+                raise ValueError(
+                    f"expected activation [..., {self.in_features}], got {x.shape}"
+                )
+            m, k = int(x.numel() // x.shape[-1]), int(x.shape[-1])
+            if self.weight_mode == "prequantized":
+                state = "weight_prequantized"
+                family = "mxfp8_weight_prequant_fwd"
+                backend = "materialized"
+                config = self.prequant_config
+            else:
+                state = "dynamic"
+                problem = MXFP8Problem(m, self.out_features, k)
+                candidate = self.prequant_config or DEFAULT_MXFP8_PREQUANT_CONFIG
+                materialized = self.backend == "materialized" or (
+                    self.backend == "auto"
+                    and self.config is None
+                    and candidate.rejection(problem) is None
+                )
+                backend = "materialized" if materialized else "fused"
+                family = (
+                    "mxfp8_prequant_fwd"
+                    if materialized
+                    else "mxfp8_fused_fwd"
+                )
+                config = candidate if materialized else self.config
+        mode = _autotune_mode(self.autotune)
+        explicit = config is not None and (
+            self.prequant_config is not None
+            or (backend == "fused" and self.config is not None)
+        )
+        source = (
+            "explicit"
+            if explicit
+            else "portable"
+            if mode == "off"
+            else "deferred_runtime"
+        )
+        return LinearExecutionDecision(
+            format="mxfp8",
+            operand_state=state,
+            problem=(m, self.out_features, k),
+            backend=backend,
+            family=family,
+            selection_source=source,
+            autotune=mode,
+            config={} if config is None else asdict(config),
+            notes=(
+                "Exact winner resolution is deferred to the registered runtime launcher."
+                if source == "deferred_runtime"
+                else "No compile or benchmark was performed."
+            ,),
         )
 
     def extra_repr(self) -> str:

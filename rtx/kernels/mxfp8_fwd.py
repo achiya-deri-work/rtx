@@ -148,6 +148,11 @@ class MXFP8LinearFwdKernel:
         self.atomic_output = atomic_output
         self.cluster_output = cluster_output
         self.nvfp4 = nvfp4
+        self.delayed_scale_elems = 0
+        if nvfp4 and getattr(config, "jit_cta_scale", False):
+            self.delayed_scale_elems = 6 + 2 * (config.num_threads // 32)
+        elif nvfp4 and getattr(config, "collect_amax", False):
+            self.delayed_scale_elems = 6
         if split_reduction < 1:
             raise ValueError("split_reduction must be positive")
         if split_reduction == 1 and (
@@ -635,7 +640,7 @@ class MXFP8LinearFwdKernel:
                 delayed_scale: cute.struct.Align[
                     cute.struct.MemRange[
                         Float32,
-                        6 if self.nvfp4 and cfg.collect_amax else 0,
+                        self.delayed_scale_elems,
                     ],
                     16,
                 ]
@@ -687,7 +692,7 @@ class MXFP8LinearFwdKernel:
                 delayed_scale: cute.struct.Align[
                     cute.struct.MemRange[
                         Float32,
-                        6 if self.nvfp4 and cfg.collect_amax else 0,
+                        self.delayed_scale_elems,
                     ],
                     16,
                 ]
@@ -999,6 +1004,12 @@ class MXFP8LinearFwdKernel:
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+        if cutlass.const_expr(self.nvfp4 and cfg.jit_cta_scale):
+            s_jit_scale = storage.delayed_scale.get_tensor(
+                cute.make_layout(
+                    (6 + 2 * (cfg.num_threads // 32),), stride=(1,)
+                )
+            )
         if cutlass.const_expr(
             self.nvfp4 and self.config.collect_amax
         ):
@@ -1391,12 +1402,121 @@ class MXFP8LinearFwdKernel:
                     group * cfg.grid_swizzle + offset % cols_in_group
                 )
 
+            if cutlass.const_expr(self.nvfp4 and cfg.jit_cta_scale):
+                # Observe exactly the two logical BF16 row tiles consumed by
+                # this output CTA. This is a genuine current-scale fused path:
+                # no scale tensor is produced by another launch and the
+                # staged TMA mainloop below rereads the now-warm operands.
+                threads = cfg.num_threads
+                warp_count = cfg.num_threads // 32
+                local_x_amax = Float32(0.0)
+                local_weight_amax = Float32(0.0)
+                x_values = cfg.tile_m * self.problem.k
+                weight_values = cfg.tile_n * self.problem.k
+                for linear_value in cutlass.range(
+                    tidx, x_values, threads, unroll=1
+                ):
+                    local_row = linear_value // self.problem.k
+                    value_k = linear_value % self.problem.k
+                    global_row = block_m * cfg.tile_m + local_row
+                    if global_row < self.problem.m:
+                        magnitude = (
+                            Float32(x[global_row, value_k]).bitcast(Int32)
+                            & Int32(0x7FFFFFFF)
+                        ).bitcast(Float32)
+                        local_x_amax = cute.arch.fmax(
+                            local_x_amax, magnitude, nan=True
+                        )
+                for linear_value in cutlass.range(
+                    tidx, weight_values, threads, unroll=1
+                ):
+                    local_row = linear_value // self.problem.k
+                    value_k = linear_value % self.problem.k
+                    global_row = block_n * cfg.tile_n + local_row
+                    if global_row < self.problem.n:
+                        magnitude = (
+                            Float32(weight[global_row, value_k]).bitcast(Int32)
+                            & Int32(0x7FFFFFFF)
+                        ).bitcast(Float32)
+                        local_weight_amax = cute.arch.fmax(
+                            local_weight_amax, magnitude, nan=True
+                        )
+                local_x_amax = nvvm.redux_sync(
+                    local_x_amax.bitcast(Int32),
+                    nvvm.ReductionKind.UMAX,
+                    Int32(0xFFFFFFFF),
+                ).bitcast(Float32)
+                local_weight_amax = nvvm.redux_sync(
+                    local_weight_amax.bitcast(Int32),
+                    nvvm.ReductionKind.UMAX,
+                    Int32(0xFFFFFFFF),
+                ).bitcast(Float32)
+                if lane_idx == 0:
+                    s_jit_scale[6 + warp_idx] = local_x_amax
+                    s_jit_scale[6 + warp_count + warp_idx] = (
+                        local_weight_amax
+                    )
+                cute.arch.sync_threads()
+                if warp_idx == 0:
+                    cta_x_amax = Float32(0.0)
+                    cta_weight_amax = Float32(0.0)
+                    if lane_idx < warp_count:
+                        cta_x_amax = Float32(
+                            s_jit_scale[6 + lane_idx]
+                        )
+                        cta_weight_amax = Float32(
+                            s_jit_scale[6 + warp_count + lane_idx]
+                        )
+                    cta_x_amax = nvvm.redux_sync(
+                        cta_x_amax.bitcast(Int32),
+                        nvvm.ReductionKind.UMAX,
+                        Int32(0xFFFFFFFF),
+                    ).bitcast(Float32)
+                    cta_weight_amax = nvvm.redux_sync(
+                        cta_weight_amax.bitcast(Int32),
+                        nvvm.ReductionKind.UMAX,
+                        Int32(0xFFFFFFFF),
+                    ).bitcast(Float32)
+                    if lane_idx == 0:
+                        x_scale, x_inverse, x_multiplier = (
+                            self._nvfp4_tensor_scale_from_amax(cta_x_amax)
+                        )
+                        weight_scale, weight_inverse, weight_multiplier = (
+                            self._nvfp4_tensor_scale_from_amax(
+                                cta_weight_amax
+                            )
+                        )
+                        s_jit_scale[0] = x_scale
+                        s_jit_scale[1] = x_inverse
+                        s_jit_scale[2] = x_multiplier
+                        s_jit_scale[3] = weight_scale
+                        s_jit_scale[4] = weight_inverse
+                        s_jit_scale[5] = weight_multiplier
+                        scratch_base = linear_tile * 3
+                        x_amax_out[scratch_base] = x_scale
+                        x_amax_out[scratch_base + 1] = x_inverse
+                        x_amax_out[scratch_base + 2] = x_multiplier
+                        weight_amax_out[scratch_base] = weight_scale
+                        weight_amax_out[scratch_base + 1] = weight_inverse
+                        weight_amax_out[scratch_base + 2] = weight_multiplier
+                cute.arch.sync_threads()
+                x_tensor_scale_value = Float32(s_jit_scale[0])
+                x_inv_tensor_scale = Float32(s_jit_scale[1])
+                x_quant_multiplier = Float32(s_jit_scale[2])
+                weight_tensor_scale_value = Float32(s_jit_scale[3])
+                weight_inv_tensor_scale = Float32(s_jit_scale[4])
+                weight_quant_multiplier = Float32(s_jit_scale[5])
+                output_scale = (
+                    x_tensor_scale_value * weight_tensor_scale_value
+                )
+
             # Regional outer scaling is selected only after the logical work
             # tile is known.  This is required for rasterized and persistent
             # schedules: physical CTA id is not an operand-row coordinate.
             if cutlass.const_expr(
                 self.apply_output_scale
                 and not cfg.collect_amax
+                and not cfg.jit_cta_scale
                 and (
                     cfg.x_scale_region_rows != 0
                     or cfg.weight_scale_region_rows != 0
@@ -1559,6 +1679,23 @@ class MXFP8LinearFwdKernel:
                 final_k_tile,
                 unroll=cfg.k_unroll,
             ):
+                if cutlass.const_expr(self.nvfp4 and cfg.jit_cta_scale):
+                    scratch_base = linear_tile * 3
+                    x_tensor_scale_value = Float32(x_amax_out[scratch_base])
+                    x_inv_tensor_scale = Float32(x_amax_out[scratch_base + 1])
+                    x_quant_multiplier = Float32(x_amax_out[scratch_base + 2])
+                    weight_tensor_scale_value = Float32(
+                        weight_amax_out[scratch_base]
+                    )
+                    weight_inv_tensor_scale = Float32(
+                        weight_amax_out[scratch_base + 1]
+                    )
+                    weight_quant_multiplier = Float32(
+                        weight_amax_out[scratch_base + 2]
+                    )
+                    output_scale = (
+                        x_tensor_scale_value * weight_tensor_scale_value
+                    )
                 local_k_tile = k_tile - first_k_tile
                 mma_tile_k = local_k_tile // loads_per_mma_tile
                 scale_block_base = (
@@ -2483,7 +2620,14 @@ class MXFP8LinearFwdKernel:
                         self.mma_sync_barrier.arrive_and_wait()
                 else:
                     cute.arch.sync_threads()
-    
+
+            if cutlass.const_expr(self.nvfp4 and cfg.jit_cta_scale):
+                scratch_base = linear_tile * 3
+                output_scale = (
+                    Float32(x_amax_out[scratch_base])
+                    * Float32(weight_amax_out[scratch_base])
+                )
+
             if cutlass.const_expr(
                 self.split_reduction > 1 and not cfg.persistent
             ):

@@ -68,18 +68,21 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python -m pip install -e .
+python -m pip install --no-deps -e .
 ```
 
 The alternate supported PyTorch 2.12.1 stack is explicit:
 
 ```bash
 python -m pip install -r requirements-torch212-cu132.txt
-python -m pip install -e .
+python -m pip install --no-deps -e .
 ```
 
 Other PyTorch or CUDA minor versions are intentionally rejected when a native
 kernel is first loaded. The top-level `import rtx` remains architecture-neutral.
+Install the CUDA 13.2 PyTorch stack before this project. A bare
+`pip install rtx-blackwell` cannot make PyPI choose a CUDA-local PyTorch wheel
+and is therefore not a supported native installation route.
 
 PyArrow is a core dependency, so CSV and Parquet export are available in every
 supported install.
@@ -114,6 +117,11 @@ importing `rtx` on a non-Blackwell or CPU-only machine does not initialize
 CuTe. Legacy coordinate tuners remain as compatibility modules; new search
 policy work belongs under `rtx.autotune`.
 
+The top-level namespace is reserved for the stable runtime, tensor, and config
+API. Legacy tuner names remain directly importable for compatibility but are
+not included by `from rtx import *`; new tuning code should import from
+`rtx.autotune`.
+
 The portable boundary is independent from CuTe and MXFP8: external projects
 define a `ConditionalSearchSpace` and `FunctionKernelTask`, then use
 `StagedTaskAdapter` with either the synchronous orchestrator or an
@@ -145,11 +153,18 @@ nv_layer = rtx.NVFP4Linear(
     bias=False,
     device="cuda",
     dtype=torch.bfloat16,
-    scaling="block",
     backend="auto",
 )
-nv_y = nv_layer(x)  # NVFP4 forward, MXFP8 backward
+nv_y = nv_layer(x)  # JIT-regional NVFP4 forward, MXFP8 backward
 ```
+
+The dynamic NVFP4 default uses asymmetric current scale regions (`X=5`,
+`W=4`). Every scaling, geometry, backend, inference, and autotuning constructor
+option is described in [the NVFP4Linear API guide](docs/nvfp4_linear.md).
+The corresponding MXFP8 states, backends, conversion methods, and tuning
+controls are described in [the MXFP8Linear API guide](docs/mxfp8_linear.md).
+See the [runtime/checkpoint contract](docs/runtime_contract.md) and
+[troubleshooting guide](docs/troubleshooting.md) for deployment behavior.
 
 ### Decoder-only convergence model
 
@@ -290,11 +305,12 @@ TorchAO's packed qdata, E4M3 block scale, and optional FP32
 Packed module weights remain persistent raw buffers and do not retain a BF16
 master weight.
 
-Both formats implement all three state boundaries. The compiled decoder
-throughput recipe uses block-only scaling by default, selecting the
-materialize-once quantizers and native NVFP4 GEMM without a tensorwide
-reduction. The general `NVFP4Linear` API retains delayed tensorwise scaling as
-its numerical default. The first call bootstraps from current amax; later calls
+Both formats implement all three state boundaries. The decoder and dynamic
+BF16 `NVFP4Linear` default to JIT row-region scaling; block-only remains an
+explicit throughput-oriented mode that selects materialize-once quantizers and
+native NVFP4 GEMM without an outer-scale reduction.
+delayed tensorwise scaling remains an explicit compatibility/performance
+policy. The first delayed call bootstraps from current amax; later calls
 use the configured 16-entry history while producing its successor. Delayed
 execution uses the same materialize-once architecture as block scaling: one
 persistent dual quantizer reads X and W once, computes native-layout 1x16 E4M3
@@ -306,12 +322,19 @@ stream-ordered CUDA operations, so there are no eager tensor reductions or
 scale-preparation kernels in the compiled training graph.
 
 Set `scaling="current"` to recompute tensor scales just in time. Set
-`scaling="regional"` to compute independent JIT outer scales for contiguous
-X and W row regions (one row by default, matching rowwise scaling). These
-reductions remain visible to Inductor, while the fused CuTe kernel selects the
-correct scale pack after its
-raster/persistent work assignment. `scale_region_rows` is a numerical-policy
-coordinate and can be varied independently of the CTA schedule. Set
+`scaling="jit_row_region"` (the dynamic default) to compute independent current
+FP32 outer scales for bounded X and W row regions. The portable seed is
+asymmetric: five X rows and four weight rows. `scale_region_rows=N` requests a
+symmetric policy, while `x_scale_region_rows` and
+`weight_scale_region_rows` tune the axes independently. The CuTe quantizer gives
+one CTA ownership of each region, performs a cooperative current-amax pass,
+then rereads warm cache lines to emit packed E2M1 values and native E4M3 1x16
+scales. The native GEMM multiplies the corresponding X and weight region
+scales directly in its BF16 epilogue. No eager Torch reduction or additional
+pointwise output kernel is present. `regional` remains a compatibility alias.
+Region sizes, warp/CTA ownership, observer vector width/unroll/grid/order, quantizer schedule,
+native scale transport, and GEMM schedule are jointly tuned by the
+`nvfp4_jit_row_region_fwd` family. Set
 `scaling="block"` to use an implicit global scale of one and rely only on the
 1x16 E4M3 block scales, eliminating both tensor-wide reductions. Block-only is
 the fastest policy when values stay inside the E4M3 scale exponent range;
@@ -350,14 +373,14 @@ Rotated-input speedups on those shapes were 1.506x, 1.360x, 1.465x, and
 three-wave anchor and measured 85.07 vs 130.15 us (1.530x). The NVFP4 output
 had cosine similarity about 0.991 and normalized RMSE about 0.134 against
 FP32. These are device/shape-specific measurements, not portable defaults;
-runtime winners remain keyed by the exact hardware/software fingerprint and
-shape.
+runtime winners remain keyed by the exact hardware/software fingerprint,
+shape, and kernel revision.
 
 All four NVFP4 runtime paths support
-`torch.compile(fullgraph=True, dynamic=False)`. Current/JIT scale arithmetic is
-deliberately outside the registered CuTe launch, so Inductor emits one fused
-reduction/scale-pack kernel per dynamic operand and calls the forward launcher
-directly. Prequantized modules pass their persistent raw qdata/scales to their
+`torch.compile(fullgraph=True, dynamic=False)`. Tensor-current scale arithmetic
+remains compiler-visible FX which Inductor may fuse; JIT-regional observation
+and quantization execute inside the registered CuTe producer. Prequantized
+modules pass their persistent raw qdata/scales to their
 launchers without rebuilding a TorchAO wrapper. AOTAutograd likewise owns the
 MXFP8 dX/dW result allocations and calls allocation-free out variants; CuTe
 constructs logical transpose layouts from the original contiguous G/W/X
@@ -433,7 +456,7 @@ rtx-autotune run autotune_manifests/cross_device_dataset_v2.json \
 ```
 
 The same campaign engine accepts `nvfp4_fused_fwd`, `nvfp4_dynamic_fwd`,
-`nvfp4_delayed_fwd`, `nvfp4_weight_prequant_fwd`, and
+`nvfp4_delayed_fwd`, `nvfp4_jit_row_region_fwd`, `nvfp4_weight_prequant_fwd`, and
 `nvfp4_fully_prequant_fwd` jobs. The delayed family measures the full stateful
 observer/quantizer plus GEMM path and always uses one dual quantization launch;
 block dynamic and inference families exclude inactive policy coordinates and

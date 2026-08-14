@@ -106,6 +106,70 @@ class LinearFrontendContractTests(unittest.TestCase):
         self.assertEqual(tuple(layer.state_dict()), ("weight",))
         self.assertIn("forward=NVFP4", layer.extra_repr())
         self.assertIn("backward=MXFP8", layer.extra_repr())
+        self.assertEqual(layer.scaling, "jit_row_region")
+        self.assertEqual(layer.x_scale_region_rows, 5)
+        self.assertEqual(layer.weight_scale_region_rows, 4)
+
+    def test_linear_explain_is_side_effect_free_and_shape_specific(self) -> None:
+        x = torch.empty(2, 3, 128, dtype=torch.bfloat16)
+        mx = rtx.MXFP8Linear(128, 64, device="cpu", autotune="cache")
+        mx_decision = mx.explain(x)
+        self.assertEqual(mx_decision.format, "mxfp8")
+        self.assertEqual(mx_decision.problem, (6, 64, 128))
+        self.assertEqual(mx_decision.operand_state, "dynamic")
+        self.assertEqual(mx_decision.selection_source, "deferred_runtime")
+
+        nv = rtx.NVFP4Linear(128, 64, device="cpu", autotune="off")
+        nv_decision = nv.explain(x)
+        self.assertEqual(nv_decision.format, "nvfp4")
+        self.assertEqual(nv_decision.family, "nvfp4_jit_row_region_fwd")
+        self.assertEqual(nv_decision.selection_source, "portable")
+        self.assertEqual(nv_decision.x_scale_region_rows, 5)
+        self.assertEqual(nv_decision.weight_scale_region_rows, 4)
+
+        online = rtx.MXFP8Linear(
+            128, 64, device="cpu", autotune="online"
+        ).explain(x)
+        self.assertEqual(online.autotune, "coordinate")
+
+    def test_nvfp4_jit_row_region_is_canonical_and_materialized(self) -> None:
+        layer = rtx.NVFP4Linear(
+            128,
+            64,
+            device="cpu",
+            scaling="jit_row_region",
+            scale_region_rows=8,
+        )
+        self.assertEqual(layer.scaling, "jit_row_region")
+        self.assertEqual(layer.scale_region_rows, 8)
+        legacy = rtx.NVFP4Linear(
+            128, 64, device="cpu", scaling="regional"
+        )
+        self.assertEqual(legacy.scaling, "jit_row_region")
+        with self.assertRaisesRegex(ValueError, "experimental"):
+            rtx.NVFP4Linear(
+                128,
+                64,
+                device="cpu",
+                scaling="jit_row_region",
+                scale_region_rows=128,
+                backend="fused",
+            )
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        if fp4_dtype is not None:
+            packed = make_nvfp4_tensor(
+                torch.empty(64, 64, dtype=fp4_dtype),
+                torch.empty(64, 8, dtype=torch.float8_e4m3fn),
+                torch.ones((), dtype=torch.float32),
+                (64, 128),
+            )
+            with self.assertRaisesRegex(ValueError, "current or block"):
+                rtx.NVFP4Linear(
+                    128,
+                    64,
+                    packed_weight=packed,
+                    scaling="jit_row_region",
+                )
 
     def test_backend_terminology_is_canonical_across_frontends(self) -> None:
         legacy = rtx.MXFP8Linear(128, 64, device="cpu", backend="prequant")
@@ -114,6 +178,37 @@ class LinearFrontendContractTests(unittest.TestCase):
             rtx.MXFP8Linear(128, 64, device="cpu", backend="materialized").backend,
             "materialized",
         )
+
+    def test_mxfp8_canonical_config_names_and_legacy_aliases(self) -> None:
+        forward = rtx.MXFP8FwdConfig()
+        dynamic = rtx.MXFP8PrequantConfig()
+        layer = rtx.MXFP8Linear(
+            128,
+            64,
+            device="cpu",
+            forward_config=forward,
+            dynamic_config=dynamic,
+        )
+        self.assertIs(layer.config, forward)
+        self.assertIs(layer.prequant_config, dynamic)
+        self.assertIs(layer.forward_config, forward)
+        self.assertIs(layer.dynamic_config, dynamic)
+        with self.assertRaisesRegex(ValueError, "forward_config"):
+            rtx.MXFP8Linear(
+                128,
+                64,
+                device="cpu",
+                config=forward,
+                forward_config=forward,
+            )
+        with self.assertRaisesRegex(ValueError, "dynamic_config"):
+            rtx.MXFP8Linear(
+                128,
+                64,
+                device="cpu",
+                prequant_config=dynamic,
+                dynamic_config=dynamic,
+            )
         self.assertEqual(
             rtx.NVFP4Linear(
                 128,
@@ -171,6 +266,61 @@ class LinearFrontendContractTests(unittest.TestCase):
             fp4.NVFP4ForwardConfig.from_materialized(config),
         )
 
+    def test_jit_row_region_requested_geometry_seeds_uncached_config(self) -> None:
+        from rtx import fp4
+
+        request_key = fp4._intern_autotune_request("off", None, None)
+        key = fp4._materialized_dynamic_config_key(
+            rtx.NVFP4Problem(128, 64, 128),
+            torch.device("cpu"),
+            request_key,
+            "nvfp4_jit_row_region_fwd",
+            8,
+            4,
+        )
+        config = fp4._resolve_forward_config(key)
+        self.assertEqual(config.x_scale_region_rows, 8)
+        self.assertEqual(config.weight_scale_region_rows, 4)
+
+    def test_jit_row_region_explicit_geometry_overrides_fixed_winner(self) -> None:
+        from dataclasses import replace
+
+        from rtx import fp4
+        from rtx.nvfp4_inference_autotune import (
+            preferred_jit_row_region_config,
+        )
+
+        problem = rtx.NVFP4Problem(128, 128, 256)
+        winner = replace(
+            preferred_jit_row_region_config(problem),
+            x_scale_region_rows=16,
+            weight_scale_region_rows=8,
+        )
+        request_key = fp4._intern_autotune_request(
+            "off", None, None, dynamic=winner
+        )
+        inherited_key = fp4._materialized_dynamic_config_key(
+            problem,
+            torch.device("cpu"),
+            request_key,
+            "nvfp4_jit_row_region_fwd",
+        )
+        inherited = fp4._resolve_forward_config(inherited_key)
+        self.assertEqual(inherited.x_scale_region_rows, 16)
+        self.assertEqual(inherited.weight_scale_region_rows, 8)
+
+        explicit_key = fp4._materialized_dynamic_config_key(
+            problem,
+            torch.device("cpu"),
+            request_key,
+            "nvfp4_jit_row_region_fwd",
+            7,
+            3,
+        )
+        explicit = fp4._resolve_forward_config(explicit_key)
+        self.assertEqual(explicit.x_scale_region_rows, 7)
+        self.assertEqual(explicit.weight_scale_region_rows, 3)
+
     def test_nvfp4_rejects_bias_and_non_bf16_parameters(self) -> None:
         with self.assertRaisesRegex(NotImplementedError, "bias=False"):
             rtx.NVFP4Linear(128, 64, bias=True, device="cpu")
@@ -222,6 +372,14 @@ class LinearFrontendContractTests(unittest.TestCase):
                 ),
                 (
                     torch.ops.rtx.nvfp4_linear_block_train,
+                    (x, weight, "fake", "fake"),
+                ),
+                (
+                    torch.ops.rtx.nvfp4_linear_jit_row_region_fwd,
+                    (x, weight, "fake"),
+                ),
+                (
+                    torch.ops.rtx.nvfp4_linear_jit_row_region_train,
                     (x, weight, "fake", "fake"),
                 ),
             )

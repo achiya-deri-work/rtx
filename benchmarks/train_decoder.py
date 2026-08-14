@@ -2,7 +2,7 @@
 
 This is intentionally a comparison harness rather than a general trainer. It
 feeds identical initialization and step-indexed corpus windows to BF16,
-MXFP8, NVFP4-delayed, and NVFP4-block models, while preserving raw per-step
+MXFP8, and each NVFP4 scaling policy, while preserving raw per-step
 evidence in append-only JSONL files and atomically replacing checkpoints.
 """
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, replace
+import gc
 import hashlib
 import json
 import math
@@ -27,6 +28,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 
+import rtx
 from rtx.models import DecoderConfig, DecoderOnlyTransformer, LinearSpec, causal_lm_loss
 
 
@@ -36,13 +38,14 @@ TINYSTORIES_TRAIN_SHARD = (
 )
 BYTE_VOCAB_SIZE = 257
 DOCUMENT_SEPARATOR = 256
-FORMAT_VERSION = 4
+FORMAT_VERSION = 5
 _STOP_REQUESTED = False
 
 TRAINING_MODES = (
     "bf16",
     "mxfp8",
     "nvfp4_delayed",
+    "nvfp4_jit_row_region",
     "nvfp4_block",
 )
 
@@ -312,6 +315,8 @@ def _linear_policy(training_mode: str) -> tuple[str, str]:
         return "mxfp8", "block"
     if training_mode == "nvfp4_delayed":
         return "nvfp4", "delayed"
+    if training_mode == "nvfp4_jit_row_region":
+        return "nvfp4", "jit_row_region"
     if training_mode == "nvfp4_block":
         return "nvfp4", "block"
     raise ValueError(f"unknown training mode {training_mode!r}")
@@ -695,6 +700,8 @@ def _train_precision(
         if _STOP_REQUESTED:
             break
     del executable, optimizer, model
+    gc.collect()
+    rtx.clear_runtime_caches()
     torch.compiler.reset()
     torch.cuda.empty_cache()
 

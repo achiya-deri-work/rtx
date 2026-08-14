@@ -33,6 +33,24 @@ _REQUIRED_PACKAGES = {
     "nvidia-cutlass-dsl": "4.7.0",
     "apache-tvm-ffi": "0.1.13.post2",
 }
+_REQUIRED_MAJOR_PACKAGES = {
+    "cuda-python": 13,
+    "numpy": 2,
+}
+_MINIMUM_PACKAGES = {
+    "pyarrow": (16, 0),
+    "einops": (0, 8),
+}
+
+
+def _numeric_version(value: str) -> tuple[int, ...]:
+    fields: list[int] = []
+    for field in value.split("."):
+        digits = "".join(character for character in field if character.isdigit())
+        if not digits:
+            break
+        fields.append(int(digits))
+    return tuple(fields)
 
 
 @lru_cache(maxsize=1)
@@ -73,6 +91,31 @@ def validate_runtime_environment() -> dict[str, str]:
         if installed != expected:
             errors.append(
                 f"{distribution} {installed} is unsupported; expected {expected}"
+            )
+    for distribution, expected_major in _REQUIRED_MAJOR_PACKAGES.items():
+        try:
+            installed = package_version(distribution)
+        except PackageNotFoundError:
+            errors.append(f"required distribution {distribution} is not installed")
+            continue
+        resolved[distribution] = installed
+        parsed = _numeric_version(installed)
+        if not parsed or parsed[0] != expected_major:
+            errors.append(
+                f"{distribution} {installed} is unsupported; expected major "
+                f"version {expected_major}"
+            )
+    for distribution, minimum in _MINIMUM_PACKAGES.items():
+        try:
+            installed = package_version(distribution)
+        except PackageNotFoundError:
+            errors.append(f"required distribution {distribution} is not installed")
+            continue
+        resolved[distribution] = installed
+        if _numeric_version(installed) < minimum:
+            errors.append(
+                f"{distribution} {installed} is unsupported; expected at least "
+                + ".".join(str(value) for value in minimum)
             )
     if errors:
         raise RuntimeError(

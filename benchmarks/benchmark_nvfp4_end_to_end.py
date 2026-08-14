@@ -203,7 +203,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--nv-scaling",
-        choices=("delayed", "current", "regional", "block"),
+        choices=(
+            "delayed",
+            "current",
+            "jit_row_region",
+            "regional",
+            "block",
+        ),
         default="block",
     )
     parser.add_argument("--profile", action="store_true")

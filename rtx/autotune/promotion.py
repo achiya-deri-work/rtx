@@ -11,12 +11,20 @@ from typing import Iterable, Mapping
 
 from .audit import _bundle_readers, audit_bundles
 from .legacy import default_cache_dir
-from .winners import RuntimeWinnerKey, save_runtime_winner
+from .winners import (
+    RuntimeWinnerKey,
+    current_kernel_revision,
+    save_runtime_winner,
+)
 from ..configs.inference import gemm_operand_scale_layouts
 from ..kernels.mxfp8 import MXFP8Problem
 
 
 _SHAPE = re.compile(r"^m(?P<m>\d+)_n(?P<n>\d+)_k(?P<k>\d+)$")
+
+# Private compatibility alias for callers/tests written before the revision
+# resolver became shared with runtime winner loading.
+_current_revision = current_kernel_revision
 
 
 def _variant(family: str, config: Mapping[str, object]) -> str:
@@ -38,45 +46,6 @@ def _problem(shape: str) -> MXFP8Problem:
     if match is None:
         raise ValueError(f"invalid dataset shape key {shape!r}")
     return MXFP8Problem(*(int(match.group(name)) for name in ("m", "n", "k")))
-
-
-def _current_revision(family: str) -> int:
-    if family == "mxfp8_fused_fwd":
-        from ..kernels.mxfp8 import MXFP8_FWD_KERNEL_REVISION
-
-        return MXFP8_FWD_KERNEL_REVISION
-    if family == "nvfp4_fused_fwd":
-        from ..configs.nvfp4 import NVFP4_KERNEL_REVISION
-
-        return NVFP4_KERNEL_REVISION
-    if family == "mxfp8_prequant_fwd":
-        from ..prequant_autotune import KERNEL_REVISION
-
-        return KERNEL_REVISION
-    if family == "mxfp8_bwd":
-        from ..bwd_autotune import KERNEL_REVISION
-
-        return KERNEL_REVISION
-    if family in ("mxfp8_weight_prequant_fwd", "mxfp8_fully_prequant_fwd"):
-        from ..inference_autotune import INFERENCE_KERNEL_REVISION
-
-        return INFERENCE_KERNEL_REVISION
-    if family in ("nvfp4_weight_prequant_fwd", "nvfp4_fully_prequant_fwd"):
-        from ..nvfp4_inference_autotune import NVFP4_INFERENCE_KERNEL_REVISION
-
-        return NVFP4_INFERENCE_KERNEL_REVISION
-    if family in ("nvfp4_dynamic_fwd", "nvfp4_delayed_fwd"):
-        from ..nvfp4_inference_autotune import (
-            NVFP4_DELAYED_KERNEL_REVISION,
-            NVFP4_DYNAMIC_KERNEL_REVISION,
-        )
-
-        return (
-            NVFP4_DELAYED_KERNEL_REVISION
-            if family == "nvfp4_delayed_fwd"
-            else NVFP4_DYNAMIC_KERNEL_REVISION
-        )
-    raise ValueError(f"unsupported runtime winner family {family!r}")
 
 
 def _config_rejection(
@@ -127,13 +96,25 @@ def _config_rejection(
             if family == "nvfp4_weight_prequant_fwd":
                 return weight_prequant_config_from_dict(config).rejection(nv_problem)
             return fully_prequant_config_from_dict(config).rejection(nv_problem)
-        if family in ("nvfp4_dynamic_fwd", "nvfp4_delayed_fwd"):
+        if family in (
+            "nvfp4_dynamic_fwd",
+            "nvfp4_delayed_fwd",
+            "nvfp4_jit_row_region_fwd",
+            "nvfp4_region_delayed_fwd",
+        ):
             from ..configs.nvfp4 import NVFP4Problem
             from ..nvfp4_inference_autotune import dynamic_config_from_dict
 
-            return dynamic_config_from_dict(config).rejection(
-                NVFP4Problem(problem.m, problem.n, problem.k)
-            )
+            parsed = dynamic_config_from_dict(config)
+            if (
+                family in (
+                    "nvfp4_jit_row_region_fwd",
+                    "nvfp4_region_delayed_fwd",
+                )
+                and not parsed.jit_row_region
+            ):
+                return "JIT row-region winner has no region geometry"
+            return parsed.rejection(NVFP4Problem(problem.m, problem.n, problem.k))
     except (KeyError, TypeError, ValueError) as exc:
         return f"cannot deserialize current config schema: {exc}"
     return f"unsupported runtime winner family {family!r}"
@@ -255,7 +236,7 @@ def install_verified_winners(
                     )
                 )
                 try:
-                    current_revision = _current_revision(family)
+                    current_revision = current_kernel_revision(family)
                 except ValueError as exc:
                     rejected_candidates.append(
                         {"context_id": context_id, "family": family, "reason": str(exc)}
@@ -325,7 +306,14 @@ def install_verified_winners(
             ),
         )
         median_ms = float(statistics.median(float(row["median_ms"]) for row in selected))
-        winner_key = RuntimeWinnerKey(family, _problem(shape), regime, device_id, variant)
+        winner_key = RuntimeWinnerKey(
+            family,
+            _problem(shape),
+            regime,
+            device_id,
+            current_kernel_revision(family),
+            variant,
+        )
         destination = root / winner_key.relative_path
         if destination.exists() and not force:
             skipped.append({"key": raw_key, "reason": "exists", "path": str(destination)})

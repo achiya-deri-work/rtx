@@ -54,7 +54,7 @@ The three questions are deliberately separated:
    individual operators, accumulations, and gradients. These tests measure
    implementation error; they do not define the training recipe.
 2. **Training convergence:** BF16 GEMMs are the baseline. BF16, MXFP8,
-   NVFP4-delayed, and NVFP4-block runs must use identical initialization, data
+   NVFP4-JIT-regional, NVFP4-delayed, and NVFP4-block runs must use identical initialization, data
    order, optimizer and optimizer-state precision, learning-rate schedule, and
    compilation settings. Comparisons against an all-FP32 model training run
    are optional diagnostics, not a release gate.

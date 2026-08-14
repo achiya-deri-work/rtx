@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from ..kernels.mxfp8 import (
     MXFP8Problem,
@@ -19,19 +20,19 @@ class MXFP8QuantConfig:
     quant_vec: int = 4
     load_bits: int = 64
     quant_store_bits: int = 8
-    quant_math: str = "bf16x2"
-    quant_amax: str = "bf16_bits"
+    quant_math: Literal["fp32", "bf16x2"] = "bf16x2"
+    quant_amax: Literal["fp32", "bf16_bits"] = "bf16_bits"
     # ``infinity`` selects the smallest E8M0 power of two that keeps E4M3's
     # finite 448 maximum in range.  ``floor`` retains the minimally required
     # OCP conversion for controlled experiments, but can clip training values.
-    scale_rounding: str = "infinity"
-    reduction: str = "shuffle"
+    scale_rounding: Literal["floor", "infinity"] = "infinity"
+    reduction: Literal["shuffle", "redux"] = "shuffle"
     num_warps: int = 8
     persistent_waves: int = 4
     maxrregcount: int = 128
-    scale_layout: str = "row_major"
-    native_scale_store: str = "scalar"
-    transposed_load_engine: str = "register"
+    scale_layout: Literal["row_major", "mma64", "mma128"] = "row_major"
+    native_scale_store: Literal["scalar", "packed"] = "scalar"
+    transposed_load_engine: Literal["register", "cp_async"] = "register"
     transposed_tile_rows: int = 128
     transposed_tile_k: int = 32
     transposed_smem_padding: int = 1
@@ -114,32 +115,38 @@ class MXFP8GemmConfig:
     atom_layout_m: int = 8
     atom_layout_n: int = 2
     stages: int = 2
-    a_swizzle: str = "64b"
-    b_swizzle: str = "64b"
+    a_swizzle: Literal["none", "32b", "64b", "128b"] = "64b"
+    b_swizzle: Literal["none", "32b", "64b", "128b"] = "64b"
     a_ldmatrix_matrices: int = 4
     b_ldmatrix_matrices: int = 4
-    mma_schedule: str = "interleaved"
+    mma_schedule: Literal["interleaved", "preload"] = "interleaved"
     sfa_s2r_bits: int = 8
     sfb_s2r_bits: int = 8
-    scale_schedule: str = "before_wait"
-    scale_recycle: str = "barrier"
+    scale_schedule: Literal["after_wait", "before_wait"] = "before_wait"
+    scale_recycle: Literal["barrier", "staged"] = "barrier"
     scale_load_vec: int = 4
-    scale_smem_store: str = "scalar"
-    scale_l2_prefetch: str = "none"
-    scale_l1_evict: str = "default"
-    scale_cache: str = "default"
-    scale_role: str = "consumers"
-    scale_layout: str = "row_major"
-    epilogue: str = "tma"
+    scale_smem_store: Literal["scalar", "packed"] = "scalar"
+    scale_l2_prefetch: Literal["none", "64b", "128b", "256b"] = "none"
+    scale_l1_evict: Literal[
+        "default", "normal", "first", "last", "noallocate"
+    ] = "default"
+    scale_cache: Literal["default", "ca", "cg", "cs"] = "default"
+    scale_role: Literal["consumers", "producer", "tma"] = "consumers"
+    scale_layout: Literal[
+        "row_major", "mma64", "mma128", "mma64x128"
+    ] = "row_major"
+    epilogue: Literal["direct", "tma"] = "tma"
     epilogue_stages: int = 1
     store_vec: int = 4
     maxrregcount: int = 255
     producer_registers: int = 48
     consumer_registers: int = 192
-    raster: str = "n"
+    raster: Literal["m", "n"] = "n"
     grid_swizzle: int = 2
     tiles_per_cta: int = 1
-    tile_locality: str = "raster"
+    tile_locality: Literal[
+        "raster", "same_a", "same_b", "serpentine_a", "serpentine_b"
+    ] = "raster"
     persistent_waves: int = 0
 
     @property
