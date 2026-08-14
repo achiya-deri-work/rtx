@@ -8,6 +8,7 @@ context identity. Add a newly versioned file instead.
 
 | Manifest | Purpose | Contexts |
 | --- | --- | ---: |
+| `blackwell_all_kernels_scaling_v1.json` | Paired release study across every MXFP8/NVFP4 forward, shared backward, scaling, cache, and packed-inference family | 144 |
 | `decoder_batch64_mxfp8_v1.json` | Batch-64 decoder MXFP8 fused-forward/shared-backward tuning | 8 |
 | `decoder_batch64_nvfp4_v1.json` | Batch-64 decoder delayed-fused and block-materialized NVFP4 tuning | 8 |
 | `nvfp4_jit_row_region_v1.json` | Current local FP32 row-region scale geometry plus NVFP4 quantizer/GEMM tuning | 16 |
@@ -42,6 +43,12 @@ rtx-autotune validate autotune_manifests/cross_device_dataset_bandit_v1.json
 After an anytime deadline, independently confirm the best candidates found at
 any completed depth with `rtx-autotune verify-winners MANIFEST ...`. This is
 required before promoting a winner discovered after the initial coverage wave.
+
+The all-kernel/scaling campaign uses six identical shapes and both cache
+regimes across all 12 production families. Its balanced-category rotation and
+4/8/16/32/64/128 milestones make every interruption a useful paired dataset.
+NVFP4 backward is represented by `mxfp8_bwd`, because that is the actual
+backward implementation shared by every NVFP4 scaling policy.
 
 The prospective 5070 manifest expands every base workload across three search
 treatments and two independent replicates. Its order balances every prefix

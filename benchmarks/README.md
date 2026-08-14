@@ -134,6 +134,27 @@ python benchmarks/validate_production.py \
 M=8192 to M=1024. Use `--frontend mxfp8` or `--frontend nvfp4` for focused
 diagnosis; the release gate uses the default `both`.
 
+Collect the paired all-kernel/all-scaling autotuning dataset in a detached,
+resumable process with:
+
+```bash
+./benchmarks/launch_all_kernel_autotune.sh 4h
+```
+
+The launcher performs `git pull --ff-only`, refreshes the editable install,
+checks SM12x and the exact runtime contract, calibrates the GPU when needed,
+then starts the campaign with `nohup` and `disown`. It prints the PID, durable
+residual dataset directory, report directory, and log path. Follow progress
+with the exact `tail -f` command it prints. Set `RTX_AUTOTUNE_NODE` to give
+each machine a stable label; rerunning with the same label resumes its residual
+contexts. Override `RTX_AUTOTUNE_OUTPUT_DIR`, `RTX_AUTOTUNE_REPORT_DIR`, or
+`RTX_AUTOTUNE_LOG_DIR` when collecting multiple independent replicates.
+
+The worker rotates breadth-first across MXFP8 forward/inference, shared MXFP8
+backward, NVFP4 current/block/delayed/JIT-region/region-delayed forward, and
+NVFP4 packed inference. On exit it audits the journals and emits both CSV and
+Parquet without automatically installing exploratory winners.
+
 Benchmark the production materialized delayed forward and its MXFP8 backward
 against `MXFP8Linear` with paired AB/BA rounds:
 

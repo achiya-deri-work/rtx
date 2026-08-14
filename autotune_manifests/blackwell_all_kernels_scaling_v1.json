@@ -1,0 +1,201 @@
+{
+  "schema_version": 2,
+  "name": "blackwell_all_kernels_scaling_v1",
+  "seed": 20260814,
+  "storage_mode": "residual_context",
+  "rotation_mode": "balanced_categories",
+  "jobs": [
+    {
+      "family": "mxfp8_fused_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "long_sequence"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "decoder_qkv_b64"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "decoder_down_b64"},
+        {"m": 1000, "n": 1537, "k": 769, "name": "ragged_all_axes"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 3,
+      "tags": {"category": "mxfp8_forward", "precision": "mxfp8", "operand_state": "dynamic", "scaling": "e8m0_block"},
+      "tuning": {"orchestration": "bandit", "max_trials": 128, "time_budget_s": 1800, "cost_model_trials": 80, "model_warmup": 8, "model_pool_size": 8192, "model_refit_interval": 8, "bandit_exploration": 0.4, "local_beam_width": 6, "confirmation_repeats": 2, "confirmation_ratio": 0.02, "confirm_initial": true},
+      "protocol": {"warmup_calls": 5, "samples": 5, "confirm_samples": 15, "race_rounds": 15, "target_batch_ms": 30, "bootstrap_resamples": 1000, "telemetry": true}
+    },
+    {
+      "family": "mxfp8_prequant_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "long_sequence"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "decoder_qkv_b64"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "decoder_down_b64"},
+        {"m": 1000, "n": 1537, "k": 769, "name": "ragged_all_axes"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 3,
+      "tags": {"category": "mxfp8_forward", "precision": "mxfp8", "operand_state": "materialized_dynamic", "scaling": "e8m0_block"},
+      "tuning": {"orchestration": "bandit", "max_trials": 128, "time_budget_s": 1800, "cost_model_trials": 80, "model_warmup": 8, "model_pool_size": 8192, "model_refit_interval": 8, "bandit_exploration": 0.4, "local_beam_width": 6, "confirmation_repeats": 2, "confirmation_ratio": 0.02, "confirm_initial": true},
+      "protocol": {"warmup_calls": 5, "samples": 5, "confirm_samples": 15, "race_rounds": 15, "target_batch_ms": 30, "bootstrap_resamples": 1000, "telemetry": true}
+    },
+    {
+      "family": "mxfp8_weight_prequant_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "long_sequence"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "decoder_qkv_b64"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "decoder_down_b64"},
+        {"m": 1000, "n": 1537, "k": 769, "name": "ragged_all_axes"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 3,
+      "tags": {"category": "mxfp8_inference", "precision": "mxfp8", "operand_state": "dynamic_x_prequant_w", "scaling": "e8m0_block"},
+      "tuning": {"orchestration": "bandit", "max_trials": 128, "time_budget_s": 1800, "cost_model_trials": 80, "model_warmup": 8, "model_pool_size": 8192, "model_refit_interval": 8, "bandit_exploration": 0.4, "local_beam_width": 6, "confirmation_repeats": 2, "confirmation_ratio": 0.02, "confirm_initial": true},
+      "protocol": {"warmup_calls": 5, "samples": 5, "confirm_samples": 15, "race_rounds": 15, "target_batch_ms": 30, "bootstrap_resamples": 1000, "telemetry": true}
+    },
+    {
+      "family": "mxfp8_fully_prequant_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "long_sequence"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "decoder_qkv_b64"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "decoder_down_b64"},
+        {"m": 1000, "n": 1537, "k": 769, "name": "ragged_all_axes"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 3,
+      "tags": {"category": "mxfp8_inference", "precision": "mxfp8", "operand_state": "fully_prequant", "scaling": "e8m0_block"},
+      "tuning": {"orchestration": "bandit", "max_trials": 128, "time_budget_s": 1800, "cost_model_trials": 80, "model_warmup": 8, "model_pool_size": 8192, "model_refit_interval": 8, "bandit_exploration": 0.4, "local_beam_width": 6, "confirmation_repeats": 2, "confirmation_ratio": 0.02, "confirm_initial": true},
+      "protocol": {"warmup_calls": 5, "samples": 5, "confirm_samples": 15, "race_rounds": 15, "target_batch_ms": 30, "bootstrap_resamples": 1000, "telemetry": true}
+    },
+    {
+      "family": "mxfp8_bwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "long_dw_reduction"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "decoder_qkv_b64"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "decoder_down_b64"},
+        {"m": 1000, "n": 1537, "k": 769, "name": "ragged_all_axes"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 3,
+      "tags": {"category": "shared_backward", "precision": "mxfp8", "operand_state": "dx_dw", "used_by": "mxfp8_and_nvfp4"},
+      "tuning": {"orchestration": "bandit", "max_trials": 128, "time_budget_s": 2400, "cost_model_trials": 88, "model_warmup": 10, "model_pool_size": 12288, "model_refit_interval": 8, "bandit_exploration": 0.45, "local_beam_width": 8, "confirmation_repeats": 2, "confirmation_ratio": 0.02, "confirm_initial": true},
+      "protocol": {"warmup_calls": 6, "samples": 5, "confirm_samples": 15, "race_rounds": 21, "target_batch_ms": 30, "correctness_rtol": 0.07, "correctness_atol": 1.0, "bootstrap_resamples": 1000, "telemetry": true}
+    },
+    {
+      "family": "nvfp4_fused_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "long_sequence"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "decoder_qkv_b64"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "decoder_down_b64"},
+        {"m": 1000, "n": 1537, "k": 769, "name": "ragged_all_axes"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 3,
+      "tags": {"category": "nvfp4_forward", "precision": "nvfp4", "operand_state": "dynamic", "scaling": "current_tensor", "backend": "legacy_fused"},
+      "tuning": {"orchestration": "bandit", "max_trials": 128, "time_budget_s": 1800, "cost_model_trials": 80, "model_warmup": 8, "model_pool_size": 8192, "model_refit_interval": 8, "bandit_exploration": 0.4, "local_beam_width": 6, "confirmation_repeats": 2, "confirmation_ratio": 0.02, "confirm_initial": true},
+      "protocol": {"warmup_calls": 5, "samples": 5, "confirm_samples": 15, "race_rounds": 15, "target_batch_ms": 30, "bootstrap_resamples": 1000, "telemetry": true}
+    },
+    {
+      "family": "nvfp4_dynamic_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "long_sequence"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "decoder_qkv_b64"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "decoder_down_b64"},
+        {"m": 1000, "n": 1537, "k": 769, "name": "ragged_all_axes"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 3,
+      "tags": {"category": "nvfp4_forward", "precision": "nvfp4", "operand_state": "materialized_dynamic", "scaling": "block_only", "backend": "materialized"},
+      "tuning": {"orchestration": "bandit", "max_trials": 128, "time_budget_s": 1800, "cost_model_trials": 80, "model_warmup": 8, "model_pool_size": 8192, "model_refit_interval": 8, "bandit_exploration": 0.4, "local_beam_width": 6, "confirmation_repeats": 2, "confirmation_ratio": 0.02, "confirm_initial": true},
+      "protocol": {"warmup_calls": 5, "samples": 5, "confirm_samples": 15, "race_rounds": 15, "target_batch_ms": 30, "bootstrap_resamples": 1000, "telemetry": true}
+    },
+    {
+      "family": "nvfp4_delayed_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "long_sequence"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "decoder_qkv_b64"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "decoder_down_b64"},
+        {"m": 1000, "n": 1537, "k": 769, "name": "ragged_all_axes"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 3,
+      "tags": {"category": "nvfp4_forward", "precision": "nvfp4", "operand_state": "materialized_dynamic", "scaling": "tensor_delayed", "backend": "materialized"},
+      "tuning": {"orchestration": "bandit", "max_trials": 128, "time_budget_s": 1800, "cost_model_trials": 80, "model_warmup": 8, "model_pool_size": 8192, "model_refit_interval": 8, "bandit_exploration": 0.4, "local_beam_width": 6, "confirmation_repeats": 2, "confirmation_ratio": 0.02, "confirm_initial": true},
+      "protocol": {"warmup_calls": 5, "samples": 5, "confirm_samples": 15, "race_rounds": 15, "target_batch_ms": 30, "bootstrap_resamples": 1000, "telemetry": true}
+    },
+    {
+      "family": "nvfp4_jit_row_region_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "long_sequence"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "decoder_qkv_b64"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "decoder_down_b64"},
+        {"m": 1000, "n": 1537, "k": 769, "name": "ragged_all_axes"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 3,
+      "tags": {"category": "nvfp4_forward", "precision": "nvfp4", "operand_state": "materialized_dynamic", "scaling": "jit_row_region_current", "backend": "materialized"},
+      "tuning": {"orchestration": "bandit", "max_trials": 128, "time_budget_s": 1800, "cost_model_trials": 80, "model_warmup": 8, "model_pool_size": 12288, "model_refit_interval": 8, "bandit_exploration": 0.5, "local_beam_width": 10, "confirmation_repeats": 2, "confirmation_ratio": 0.02, "confirm_initial": true},
+      "protocol": {"warmup_calls": 5, "samples": 5, "confirm_samples": 15, "race_rounds": 15, "target_batch_ms": 30, "bootstrap_resamples": 1000, "telemetry": true}
+    },
+    {
+      "family": "nvfp4_region_delayed_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "long_sequence"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "decoder_qkv_b64"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "decoder_down_b64"},
+        {"m": 1000, "n": 1537, "k": 769, "name": "ragged_all_axes"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 3,
+      "tags": {"category": "nvfp4_forward", "precision": "nvfp4", "operand_state": "materialized_dynamic", "scaling": "row_region_delayed", "backend": "materialized"},
+      "tuning": {"orchestration": "bandit", "max_trials": 128, "time_budget_s": 1800, "cost_model_trials": 80, "model_warmup": 8, "model_pool_size": 12288, "model_refit_interval": 8, "bandit_exploration": 0.5, "local_beam_width": 10, "confirmation_repeats": 2, "confirmation_ratio": 0.02, "confirm_initial": true},
+      "protocol": {"warmup_calls": 5, "samples": 5, "confirm_samples": 15, "race_rounds": 15, "target_batch_ms": 30, "bootstrap_resamples": 1000, "telemetry": true}
+    },
+    {
+      "family": "nvfp4_weight_prequant_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "long_sequence"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "decoder_qkv_b64"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "decoder_down_b64"},
+        {"m": 1000, "n": 1537, "k": 769, "name": "ragged_all_axes"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 3,
+      "tags": {"category": "nvfp4_inference", "precision": "nvfp4", "operand_state": "dynamic_x_prequant_w", "scaling": "current_or_block"},
+      "tuning": {"orchestration": "bandit", "max_trials": 128, "time_budget_s": 1800, "cost_model_trials": 80, "model_warmup": 8, "model_pool_size": 8192, "model_refit_interval": 8, "bandit_exploration": 0.4, "local_beam_width": 6, "confirmation_repeats": 2, "confirmation_ratio": 0.02, "confirm_initial": true},
+      "protocol": {"warmup_calls": 5, "samples": 5, "confirm_samples": 15, "race_rounds": 15, "target_batch_ms": 30, "bootstrap_resamples": 1000, "telemetry": true}
+    },
+    {
+      "family": "nvfp4_fully_prequant_fwd",
+      "shapes": [
+        {"m": 128, "n": 1536, "k": 1536, "name": "underfilled"},
+        {"m": 1536, "n": 1536, "k": 1536, "name": "balanced"},
+        {"m": 8192, "n": 1536, "k": 1536, "name": "long_sequence"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "decoder_qkv_b64"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "decoder_down_b64"},
+        {"m": 1000, "n": 1537, "k": 769, "name": "ragged_all_axes"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 3,
+      "tags": {"category": "nvfp4_inference", "precision": "nvfp4", "operand_state": "fully_prequant", "scaling": "stored"},
+      "tuning": {"orchestration": "bandit", "max_trials": 128, "time_budget_s": 1800, "cost_model_trials": 80, "model_warmup": 8, "model_pool_size": 8192, "model_refit_interval": 8, "bandit_exploration": 0.4, "local_beam_width": 6, "confirmation_repeats": 2, "confirmation_ratio": 0.02, "confirm_initial": true},
+      "protocol": {"warmup_calls": 5, "samples": 5, "confirm_samples": 15, "race_rounds": 15, "target_batch_ms": 30, "bootstrap_resamples": 1000, "telemetry": true}
+    }
+  ]
+}
