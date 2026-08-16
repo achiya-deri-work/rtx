@@ -27,6 +27,7 @@ from cutlass import (
     Int32,
     Int64,
     Uint8,
+    Uint16,
 )
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.experimental.primitives import nvvm_wrapper as nvvm
@@ -1623,14 +1624,18 @@ class MXFP8GemmKernel:
                         self.epilogue_free_barrier.arrive_and_wait()
                     self.epilogue_ready_barrier.arrive_and_wait()
                     epilogue_tidx = tidx - first_epilogue_thread
-                    for output_index in cutlass.range(
+                    epilogue_values = cfg.regional_epilogue_values
+                    packet_columns = cfg.tile_n // epilogue_values
+                    for packet_index in cutlass.range(
                         epilogue_tidx,
-                        cfg.tile_m * cfg.tile_n,
+                        cfg.tile_m * packet_columns,
                         epilogue_threads,
                         unroll=1,
                     ):
-                        local_row = output_index // cfg.tile_n
-                        local_column = output_index % cfg.tile_n
+                        local_row = packet_index // packet_columns
+                        local_column = (
+                            packet_index % packet_columns
+                        ) * epilogue_values
                         global_row = block_m * cfg.tile_m + local_row
                         global_column = block_n * cfg.tile_n + local_column
                         if (
@@ -1649,10 +1654,133 @@ class MXFP8GemmKernel:
                                 block_m * cfg.tile_m,
                                 block_n * cfg.tile_n,
                             )
-                            out_matrix[global_row, global_column] = BFloat16(
-                                element_scale
-                                * s_epilogue_accumulators[output_index]
-                            )
+                            if cutlass.const_expr(epilogue_values == 1):
+                                output_index = (
+                                    local_row * cfg.tile_n + local_column
+                                )
+                                out_matrix[
+                                    global_row, global_column
+                                ] = BFloat16(
+                                    element_scale
+                                    * s_epilogue_accumulators[output_index]
+                                )
+                            elif (
+                                global_column + epilogue_values
+                                <= self.problem.n
+                            ):
+                                # Pack converted BF16 values into naturally
+                                # aligned 64-bit transactions (or 32-bit pairs
+                                # for narrower/ragged strides) so the regional
+                                # fast path never emits scalar stores.
+                                if cutlass.const_expr(
+                                    epilogue_values >= 4
+                                    and self.problem.n % 4 == 0
+                                ):
+                                    for quad in cutlass.range_constexpr(
+                                        epilogue_values // 4
+                                    ):
+                                        first = quad * 4
+                                        output_index = (
+                                            local_row * cfg.tile_n
+                                            + local_column
+                                            + first
+                                        )
+                                        value0 = BFloat16(
+                                            element_scale
+                                            * s_epilogue_accumulators[
+                                                output_index
+                                            ]
+                                        ).bitcast(Uint16)
+                                        value1 = BFloat16(
+                                            element_scale
+                                            * s_epilogue_accumulators[
+                                                output_index + 1
+                                            ]
+                                        ).bitcast(Uint16)
+                                        value2 = BFloat16(
+                                            element_scale
+                                            * s_epilogue_accumulators[
+                                                output_index + 2
+                                            ]
+                                        ).bitcast(Uint16)
+                                        value3 = BFloat16(
+                                            element_scale
+                                            * s_epilogue_accumulators[
+                                                output_index + 3
+                                            ]
+                                        ).bitcast(Uint16)
+                                        packed = (
+                                            Int64(value0)
+                                            | (Int64(value1) << 16)
+                                            | (Int64(value2) << 32)
+                                            | (Int64(value3) << 48)
+                                        )
+                                        nvvm.store_ext(
+                                            packed,
+                                            out_matrix.iterator
+                                            + out_matrix.layout(
+                                                (
+                                                    global_row,
+                                                    global_column + first,
+                                                )
+                                            ),
+                                        )
+                                else:
+                                    for pair in cutlass.range_constexpr(
+                                        epilogue_values // 2
+                                    ):
+                                        first = pair * 2
+                                        output_index = (
+                                            local_row * cfg.tile_n
+                                            + local_column
+                                            + first
+                                        )
+                                        value0 = BFloat16(
+                                            element_scale
+                                            * s_epilogue_accumulators[
+                                                output_index
+                                            ]
+                                        ).bitcast(Uint16)
+                                        value1 = BFloat16(
+                                            element_scale
+                                            * s_epilogue_accumulators[
+                                                output_index + 1
+                                            ]
+                                        ).bitcast(Uint16)
+                                        packed = Int32(value0) | (
+                                            Int32(value1) << 16
+                                        )
+                                        nvvm.store_ext(
+                                            packed,
+                                            out_matrix.iterator
+                                            + out_matrix.layout(
+                                                (
+                                                    global_row,
+                                                    global_column + first,
+                                                )
+                                            ),
+                                        )
+                            else:
+                                # Ragged N retains the same packet-level scale
+                                # lookup but masks each final scalar store.
+                                for value in cutlass.range_constexpr(
+                                    epilogue_values
+                                ):
+                                    output_column = global_column + value
+                                    if output_column < self.problem.n:
+                                        output_index = (
+                                            local_row * cfg.tile_n
+                                            + local_column
+                                            + value
+                                        )
+                                        out_matrix[
+                                            global_row, output_column
+                                        ] = BFloat16(
+                                            element_scale
+                                            * s_epilogue_accumulators[
+                                                output_index
+                                            ]
+                                        )
             elif cutlass.const_expr(cfg.epilogue == "direct"):
                 if cutlass.const_expr(self.cluster_output):
                     # Reuse the now-dead A pipeline storage as a contiguous

@@ -24,7 +24,7 @@ from .prequant_autotune import PREQUANT_SEARCH_SPACE
 NVFP4_INFERENCE_KERNEL_REVISION = 3
 NVFP4_DYNAMIC_KERNEL_REVISION = 6
 NVFP4_DELAYED_KERNEL_REVISION = 1
-NVFP4_JIT_ROW_REGION_KERNEL_REVISION = 5
+NVFP4_JIT_ROW_REGION_KERNEL_REVISION = 6
 
 
 def _gemm_axes() -> dict[str, tuple[dict[str, object], ...]]:
@@ -315,7 +315,9 @@ def preferred_jit_row_region_config(
     base = preferred_dynamic_config(problem)
     use_regional_tma = problem.k >= 256
     use_large_output_schedule = problem.m * problem.n >= 10_000_000
-    use_epilogue_warps = use_large_output_schedule and problem.k <= 1024
+    use_epilogue_warps = (
+        use_large_output_schedule and problem.k <= 1536 and problem.n >= 4
+    )
     # Dense cross-shape sweeps found that the portable optimum is asymmetric:
     # keep a smaller weight region while amortizing each weight chunk across
     # more activation rows.  Divisibility is not required; the observer masks
@@ -329,6 +331,9 @@ def preferred_jit_row_region_config(
         min(problem.n, 4)
         if use_regional_tma
         else 1
+    )
+    epilogue_tiles_per_cta = (
+        2 if problem.n <= 1024 else 8 if problem.n >= 3072 else 4
     )
     candidate = replace(
         base,
@@ -349,22 +354,34 @@ def preferred_jit_row_region_config(
                 else base.gemm.store_vec
             ),
             regional_scale_epilogue=(
-                "factorized" if use_large_output_schedule else "direct"
+                "product" if use_epilogue_warps else "factorized"
+                if use_large_output_schedule else "direct"
             ),
             regional_epilogue_schedule=(
                 "warp_specialized" if use_epilogue_warps else "mma"
             ),
+            atom_layout_m=(4 if use_epilogue_warps else base.gemm.atom_layout_m),
             regional_epilogue_warps=8,
             regional_epilogue_registers=48,
+            regional_epilogue_values=(4 if use_epilogue_warps else 1),
             tiles_per_cta=(
-                8
+                epilogue_tiles_per_cta
                 if use_epilogue_warps
                 else 2
                 if use_large_output_schedule
                 else base.gemm.tiles_per_cta
             ),
             tile_locality=(
-                "raster" if use_large_output_schedule else base.gemm.tile_locality
+                "serpentine_b"
+                if use_epilogue_warps and problem.n >= 3072
+                else "same_b"
+                if use_epilogue_warps
+                else "raster"
+                if use_large_output_schedule
+                else base.gemm.tile_locality
+            ),
+            persistent_waves=(
+                0 if use_epilogue_warps else base.gemm.persistent_waves
             ),
         ),
         quant_launches="dual",
@@ -482,13 +499,15 @@ _JIT_REGION_IMPLEMENTATION_ANCHORS += tuple(
                 epilogue="direct",
                 epilogue_stages=1,
                 store_vec=1,
-                regional_scale_epilogue="factorized",
+                regional_scale_epilogue="product",
                 regional_epilogue_schedule="warp_specialized",
+                atom_layout_m=4,
                 regional_epilogue_warps=epilogue_warps,
                 regional_epilogue_registers=epilogue_registers,
+                regional_epilogue_values=4,
                 tiles_per_cta=tiles_per_cta,
-                tile_locality="raster",
-                persistent_waves=gemm_waves,
+                tile_locality="same_b",
+                persistent_waves=(0 if epilogue_warps == 8 else gemm_waves),
             ),
             quant_launches="dual",
             x_scale_region_rows=5,
@@ -540,6 +559,10 @@ NVFP4_JIT_ROW_REGION_SEARCH_SPACE = {
     "regional_epilogue_registers": tuple(
         {"gemm": {"regional_epilogue_registers": registers}}
         for registers in (24, 32, 40, 48, 64, 80)
+    ),
+    "regional_epilogue_values": tuple(
+        {"gemm": {"regional_epilogue_values": values}}
+        for values in (1, 2, 4, 8)
     ),
     "regional_rescale_values": tuple(
         {"regional_rescale_values": values} for values in (1, 2, 4, 8, 16)

@@ -94,6 +94,7 @@ class NVFP4ConfigTests(unittest.TestCase):
                 "regional_epilogue_schedule",
                 "regional_epilogue_warps",
                 "regional_epilogue_registers",
+                "regional_epilogue_values",
             }.issubset(NVFP4_JIT_ROW_REGION_SEARCH_SPACE)
         )
 
@@ -114,12 +115,30 @@ class NVFP4ConfigTests(unittest.TestCase):
             "warp_specialized",
         )
         self.assertEqual(bandwidth_heavy.gemm.regional_epilogue_warps, 8)
-        self.assertEqual(bandwidth_heavy.gemm.tiles_per_cta, 8)
+        self.assertEqual(bandwidth_heavy.gemm.tiles_per_cta, 4)
         self.assertEqual(bandwidth_heavy.gemm.stages, 1)
+        self.assertEqual(
+            bandwidth_heavy.gemm.regional_scale_epilogue, "product"
+        )
+        self.assertEqual(bandwidth_heavy.gemm.regional_epilogue_values, 4)
+        self.assertEqual(bandwidth_heavy.gemm.tile_locality, "same_b")
+        narrow = preferred_jit_row_region_config(
+            NVFP4Problem(32768, 768, 768)
+        )
+        self.assertEqual(narrow.gemm.tiles_per_cta, 2)
+        wide = preferred_jit_row_region_config(
+            NVFP4Problem(32768, 3072, 768)
+        )
+        self.assertEqual(wide.gemm.tiles_per_cta, 8)
+        self.assertEqual(wide.gemm.tile_locality, "serpentine_b")
         compute_heavy = preferred_jit_row_region_config(
             NVFP4Problem(32768, 768, 1536)
         )
-        self.assertEqual(compute_heavy.gemm.regional_epilogue_schedule, "mma")
+        self.assertEqual(
+            compute_heavy.gemm.regional_epilogue_schedule,
+            "warp_specialized",
+        )
+        self.assertEqual(compute_heavy.gemm.tiles_per_cta, 2)
         small_grid = preferred_jit_row_region_config(
             NVFP4Problem(512, 1536, 768)
         )
@@ -194,7 +213,7 @@ class NVFP4ConfigTests(unittest.TestCase):
                 expected_revision = {
                     "nvfp4_dynamic_fwd": 6,
                     "nvfp4_delayed_fwd": 1,
-                    "nvfp4_jit_row_region_fwd": 5,
+                    "nvfp4_jit_row_region_fwd": 6,
                     "nvfp4_weight_prequant_fwd": 3,
                     "nvfp4_fully_prequant_fwd": 3,
                 }[family]
@@ -366,12 +385,15 @@ class NVFP4CudaTests(unittest.TestCase):
                 epilogue="direct",
                 epilogue_stages=1,
                 store_vec=1,
-                regional_scale_epilogue="factorized",
+                regional_scale_epilogue="product",
                 regional_epilogue_schedule="warp_specialized",
-                regional_epilogue_warps=4,
+                atom_layout_m=4,
+                regional_epilogue_warps=8,
                 regional_epilogue_registers=48,
+                regional_epilogue_values=4,
                 tiles_per_cta=2,
-                tile_locality="raster",
+                tile_locality="same_b",
+                persistent_waves=0,
             ),
             programmatic_dependent_launch=False,
         )

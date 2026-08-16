@@ -138,6 +138,9 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
     regional_epilogue_schedule: Literal["mma", "warp_specialized"] = "mma"
     regional_epilogue_warps: Literal[1, 2, 4, 8] = 4
     regional_epilogue_registers: Literal[24, 32, 40, 48, 64, 80] = 48
+    # Adjacent BF16 outputs sharing one regional-scale lookup. The enclosing
+    # dynamic config ensures a packet cannot cross a weight-region boundary.
+    regional_epilogue_values: Literal[1, 2, 4, 8] = 1
 
     @property
     def num_epilogue_warps(self) -> int:
@@ -196,6 +199,10 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
             return "regional epilogue warps must be 1, 2, 4, or 8"
         if self.regional_epilogue_registers not in (24, 32, 40, 48, 64, 80):
             return "regional epilogue registers must be 24..80 in supported steps"
+        if self.regional_epilogue_values not in (1, 2, 4, 8):
+            return "regional epilogue values must be 1, 2, 4, or 8"
+        if self.tile_n % self.regional_epilogue_values:
+            return "regional epilogue packets must divide tile N"
         if self.num_threads > 1024:
             return "MMA, producer, and epilogue roles exceed 1024 CTA threads"
         if self.regional_epilogue_schedule == "warp_specialized":
@@ -347,6 +354,13 @@ class NVFP4DynamicConfig:
                 return "region_ownership must be warp or cta"
             if self.quant_launches != "dual":
                 return "the first JIT row-region implementation uses one dual launch"
+            if (
+                self.weight_scale_region_rows
+                % self.gemm.regional_epilogue_values
+            ):
+                return (
+                    "regional epilogue packets must divide each weight region"
+                )
             if (
                 self.gemm.regional_scale_epilogue == "expanded_factors"
                 and self.programmatic_dependent_launch
