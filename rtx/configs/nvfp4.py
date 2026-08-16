@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .mxfp8 import MXFP8GemmConfig
+from ..kernels.mxfp8 import (
+    SM120_GEMM_RUNTIME_SMEM_RESERVE_BYTES,
+    SM120_SMEM_CAPACITY_BYTES,
+)
 
 
 NVFP4_SF_VEC_SIZE = 16
@@ -126,8 +130,26 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
     scale_load_vec: int = 4
     scale_layout: str = "row_major"
     regional_scale_epilogue: Literal[
-        "direct", "expanded_factors", "factorized", "product"
+        "direct", "expanded_factors", "factorized", "product", "separate"
     ] = "direct"
+    # ``warp_specialized`` hands the completed FP32 accumulator tile to
+    # dedicated CUDA-core warps.  MMA can then start the next persistent tile
+    # while those warps apply the outer regional factors and store BF16.
+    regional_epilogue_schedule: Literal["mma", "warp_specialized"] = "mma"
+    regional_epilogue_warps: Literal[1, 2, 4, 8] = 4
+    regional_epilogue_registers: Literal[24, 32, 40, 48, 64, 80] = 48
+
+    @property
+    def num_epilogue_warps(self) -> int:
+        return (
+            self.regional_epilogue_warps
+            if self.regional_epilogue_schedule == "warp_specialized"
+            else 0
+        )
+
+    @property
+    def num_threads(self) -> int:
+        return (self.num_mma_warps + 1 + self.num_epilogue_warps) * 32
 
     @property
     def native_operand_bits(self) -> int:
@@ -162,11 +184,47 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
             "expanded_factors",
             "factorized",
             "product",
+            "separate",
         ):
             return (
                 "NVFP4 regional_scale_epilogue must be direct, "
-                "expanded_factors, factorized, or product"
+                "expanded_factors, factorized, product, or separate"
             )
+        if self.regional_epilogue_schedule not in ("mma", "warp_specialized"):
+            return "regional epilogue schedule must be mma or warp_specialized"
+        if self.regional_epilogue_warps not in (1, 2, 4, 8):
+            return "regional epilogue warps must be 1, 2, 4, or 8"
+        if self.regional_epilogue_registers not in (24, 32, 40, 48, 64, 80):
+            return "regional epilogue registers must be 24..80 in supported steps"
+        if self.num_threads > 1024:
+            return "MMA, producer, and epilogue roles exceed 1024 CTA threads"
+        if self.regional_epilogue_schedule == "warp_specialized":
+            if self.epilogue != "direct":
+                return "warp-specialized regional epilogue requires direct stores"
+            if self.stages != 1:
+                return "warp-specialized regional epilogue requires one operand stage"
+            if self.tiles_per_cta < 2:
+                return "warp-specialized regional epilogue requires 2+ tiles per CTA"
+            q_bytes = (
+                self.stages
+                * (self.tile_m + self.tile_n)
+                * self.tile_k
+                * self.native_operand_bits
+                // 8
+            )
+            scale_bytes = self.stages * (
+                ((self.tile_m + 127) // 128) * 128
+                + ((self.tile_n + 127) // 128) * 128
+            ) * (self.tile_k // self.scale_vector_size)
+            accumulator_handoff_bytes = self.tile_m * self.tile_n * 4
+            if (
+                q_bytes
+                + scale_bytes
+                + accumulator_handoff_bytes
+                + SM120_GEMM_RUNTIME_SMEM_RESERVE_BYTES
+                > SM120_SMEM_CAPACITY_BYTES
+            ):
+                return "warp-specialized FP32 handoff exceeds SM120 shared memory"
         if (self.tile_k // NVFP4_SF_VEC_SIZE) % self.scale_load_vec:
             return "scale_load_vec must divide the NVFP4 K-tile scale count"
         # The common checker uses native_operand_bits and scale_vector_size,
@@ -252,6 +310,9 @@ class NVFP4DynamicConfig:
     # still waits for all quantized operands to become visible, so this is a
     # schedule-only coordinate and never changes JIT row-region numerics.
     programmatic_dependent_launch: bool = False
+    regional_rescale_values: Literal[1, 2, 4, 8, 16] = 8
+    regional_rescale_warps: Literal[4, 8, 16] = 16
+    regional_rescale_waves: Literal[1, 2, 3, 4, 6, 8] = 8
 
     @property
     def jit_row_region(self) -> bool:
@@ -303,6 +364,22 @@ class NVFP4DynamicConfig:
                 # independently tunable factorized cache.
                 if x_cache * w_cache > 1024:
                     return "regional product cache exceeds its 4-KiB budget"
+            if (
+                self.gemm.regional_scale_epilogue == "separate"
+                and self.tensor_scale_mode != "power2"
+            ):
+                return "separate regional rescale requires power-of-two scales"
+            if (
+                self.gemm.regional_scale_epilogue == "separate"
+                and self.programmatic_dependent_launch
+            ):
+                return "separate regional rescale does not support dependent launch"
+            if self.regional_rescale_values not in (1, 2, 4, 8, 16):
+                return "regional rescale values must be 1, 2, 4, 8, or 16"
+            if self.regional_rescale_warps not in (4, 8, 16):
+                return "regional rescale warps must be 4, 8, or 16"
+            if self.regional_rescale_waves not in (1, 2, 3, 4, 6, 8):
+                return "regional rescale waves must be 1, 2, 3, 4, 6, or 8"
             if self.gemm.epilogue == "tma" and problem.k < 256:
                 return (
                     "regional TMA epilogue requires K >= 256; small K uses "

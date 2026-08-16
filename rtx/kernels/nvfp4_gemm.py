@@ -29,6 +29,18 @@ class NVFP4GemmKernel(MXFP8GemmKernel):
         *,
         use_pdl: bool = False,
     ):
+        self.warp_specialized_epilogue = (
+            config.regional_epilogue_schedule == "warp_specialized"
+        )
+        self.num_epilogue_warps = config.num_epilogue_warps
+        self.regional_scale_cache_stages = (
+            2 if self.warp_specialized_epilogue else 1
+        )
+        self.epilogue_accumulator_elements = (
+            config.tile_m * config.tile_n
+            if self.warp_specialized_epilogue
+            else 0
+        )
         super().__init__(problem, config, use_pdl=use_pdl)  # type: ignore[arg-type]
         self.ab_dtype = Float4E2M1FN
         self.sf_dtype = Float8E4M3FN
@@ -271,17 +283,24 @@ class NVFP4RegionRescaleKernel:
         thread_stride = self.grid * self.threads
         total = self.m * self.n
         for base in cutlass.range(
-            linear_thread * self.values_per_thread,
+            linear_thread,
             total,
             thread_stride * self.values_per_thread,
             unroll=1,
         ):
-            row = base // self.n
-            x_scale = Float32(region_scales[row // self.x_region_rows])
             for vec in cutlass.range_constexpr(self.values_per_thread):
-                linear = base + vec
+                # Strip-mine by the complete launch grid.  For a fixed
+                # ``vec`` adjacent lanes now touch adjacent BF16 values;
+                # the old thread-contiguous mapping made scalar instructions
+                # from neighboring lanes 16 values apart and turned a simple
+                # bandwidth pass into heavily scattered memory traffic.
+                linear = base + vec * thread_stride
                 if linear < total:
+                    row = linear // self.n
                     column = linear % self.n
+                    x_scale = Float32(
+                        region_scales[row // self.x_region_rows]
+                    )
                     weight_scale = Float32(
                         region_scales[
                             self.x_regions

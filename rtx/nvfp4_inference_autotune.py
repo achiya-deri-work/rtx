@@ -24,7 +24,7 @@ from .prequant_autotune import PREQUANT_SEARCH_SPACE
 NVFP4_INFERENCE_KERNEL_REVISION = 3
 NVFP4_DYNAMIC_KERNEL_REVISION = 6
 NVFP4_DELAYED_KERNEL_REVISION = 1
-NVFP4_JIT_ROW_REGION_KERNEL_REVISION = 3
+NVFP4_JIT_ROW_REGION_KERNEL_REVISION = 5
 
 
 def _gemm_axes() -> dict[str, tuple[dict[str, object], ...]]:
@@ -314,7 +314,8 @@ def preferred_jit_row_region_config(
 
     base = preferred_dynamic_config(problem)
     use_regional_tma = problem.k >= 256
-    use_expanded_factors = problem.m * problem.n >= 10_000_000
+    use_large_output_schedule = problem.m * problem.n >= 10_000_000
+    use_epilogue_warps = use_large_output_schedule and problem.k <= 1024
     # Dense cross-shape sweeps found that the portable optimum is asymmetric:
     # keep a smaller weight region while amortizing each weight chunk across
     # more activation rows.  Divisibility is not required; the observer masks
@@ -333,11 +334,37 @@ def preferred_jit_row_region_config(
         base,
         gemm=replace(
             base.gemm,
-            epilogue=("tma" if use_regional_tma else "direct"),
+            stages=(1 if use_epilogue_warps else base.gemm.stages),
+            epilogue=(
+                "direct"
+                if use_large_output_schedule
+                else "tma"
+                if use_regional_tma
+                else "direct"
+            ),
             epilogue_stages=1,
-            store_vec=(base.gemm.store_vec if use_regional_tma else 1),
+            store_vec=(
+                1
+                if use_large_output_schedule or not use_regional_tma
+                else base.gemm.store_vec
+            ),
             regional_scale_epilogue=(
-                "expanded_factors" if use_expanded_factors else "direct"
+                "factorized" if use_large_output_schedule else "direct"
+            ),
+            regional_epilogue_schedule=(
+                "warp_specialized" if use_epilogue_warps else "mma"
+            ),
+            regional_epilogue_warps=8,
+            regional_epilogue_registers=48,
+            tiles_per_cta=(
+                8
+                if use_epilogue_warps
+                else 2
+                if use_large_output_schedule
+                else base.gemm.tiles_per_cta
+            ),
+            tile_locality=(
+                "raster" if use_large_output_schedule else base.gemm.tile_locality
             ),
         ),
         quant_launches="dual",
@@ -350,6 +377,9 @@ def preferred_jit_row_region_config(
         region_order="x_first",
         region_ownership=("cta" if use_regional_tma else "warp"),
         programmatic_dependent_launch=False,
+        regional_rescale_values=8,
+        regional_rescale_warps=16,
+        regional_rescale_waves=8,
     )
     if candidate.rejection(problem) is None:
         return candidate
@@ -438,6 +468,46 @@ _JIT_REGION_IMPLEMENTATION_ANCHORS += tuple(
     )
 )
 
+# Dedicated CUDA-core epilogue warps consume one FP32 SMEM handoff tile while
+# the tensor-core warps accumulate the next persistent output tile.  A single
+# operand stage is intentional: it leaves enough SM120 shared memory for the
+# 64-KiB 128x128 accumulator exchange without narrowing the MMA tile.
+_JIT_REGION_IMPLEMENTATION_ANCHORS += tuple(
+    asdict(
+        replace(
+            _NATIVE_DYNAMIC_ANCHOR,
+            gemm=replace(
+                _NATIVE_DYNAMIC_ANCHOR.gemm,
+                stages=1,
+                epilogue="direct",
+                epilogue_stages=1,
+                store_vec=1,
+                regional_scale_epilogue="factorized",
+                regional_epilogue_schedule="warp_specialized",
+                regional_epilogue_warps=epilogue_warps,
+                regional_epilogue_registers=epilogue_registers,
+                tiles_per_cta=tiles_per_cta,
+                tile_locality="raster",
+                persistent_waves=gemm_waves,
+            ),
+            quant_launches="dual",
+            x_scale_region_rows=5,
+            weight_scale_region_rows=4,
+            tensor_scale_mode="power2",
+            region_waves=4,
+            region_ownership="cta",
+            programmatic_dependent_launch=False,
+        )
+    )
+    for epilogue_warps, epilogue_registers, tiles_per_cta, gemm_waves in (
+        (1, 32, 2, 1),
+        (2, 40, 2, 1),
+        (4, 48, 2, 1),
+        (8, 64, 2, 1),
+        (4, 48, 4, 2),
+    )
+)
+
 _jit_gemm_axes = _gemm_axes()
 NVFP4_JIT_ROW_REGION_SEARCH_SPACE = {
     "implementation_anchor": _JIT_REGION_IMPLEMENTATION_ANCHORS,
@@ -456,7 +526,29 @@ NVFP4_JIT_ROW_REGION_SEARCH_SPACE = {
             "expanded_factors",
             "factorized",
             "product",
+            "separate",
         )
+    ),
+    "regional_epilogue_schedule": tuple(
+        {"gemm": {"regional_epilogue_schedule": schedule}}
+        for schedule in ("mma", "warp_specialized")
+    ),
+    "regional_epilogue_warps": tuple(
+        {"gemm": {"regional_epilogue_warps": warps}}
+        for warps in (1, 2, 4, 8)
+    ),
+    "regional_epilogue_registers": tuple(
+        {"gemm": {"regional_epilogue_registers": registers}}
+        for registers in (24, 32, 40, 48, 64, 80)
+    ),
+    "regional_rescale_values": tuple(
+        {"regional_rescale_values": values} for values in (1, 2, 4, 8, 16)
+    ),
+    "regional_rescale_warps": tuple(
+        {"regional_rescale_warps": warps} for warps in (4, 8, 16)
+    ),
+    "regional_rescale_waves": tuple(
+        {"regional_rescale_waves": waves} for waves in (1, 2, 3, 4, 6, 8)
     ),
     # Stratifying the dense neighborhood by X size prevents a bandit or an
     # interrupted campaign from sampling only the diagonal.  These coordinates
@@ -527,6 +619,9 @@ def dynamic_config_to_dict(config: NVFP4DynamicConfig) -> dict[str, object]:
             "region_order",
             "region_ownership",
             "programmatic_dependent_launch",
+            "regional_rescale_values",
+            "regional_rescale_warps",
+            "regional_rescale_waves",
         ):
             value.pop(name)
     return value
@@ -555,6 +650,9 @@ def dynamic_config_from_dict(
         programmatic_dependent_launch=bool(
             value.get("programmatic_dependent_launch", False)
         ),
+        regional_rescale_values=int(value.get("regional_rescale_values", 8)),
+        regional_rescale_warps=int(value.get("regional_rescale_warps", 16)),
+        regional_rescale_waves=int(value.get("regional_rescale_waves", 8)),
     )
 
 
@@ -604,6 +702,15 @@ def update_dynamic_config(
                 "programmatic_dependent_launch",
                 config.programmatic_dependent_launch,
             )
+        ),
+        regional_rescale_values=int(
+            updates.get("regional_rescale_values", config.regional_rescale_values)
+        ),
+        regional_rescale_warps=int(
+            updates.get("regional_rescale_warps", config.regional_rescale_warps)
+        ),
+        regional_rescale_waves=int(
+            updates.get("regional_rescale_waves", config.regional_rescale_waves)
         ),
     )
 

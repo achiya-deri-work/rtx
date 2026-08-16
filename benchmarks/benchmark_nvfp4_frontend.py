@@ -48,7 +48,7 @@ def main() -> None:
     parser.add_argument("--calls", type=int, default=100)
     parser.add_argument(
         "--scaling",
-        choices=("block", "current", "jit_row_region", "delayed"),
+        choices=("block", "current", "jit_row_region"),
         default="block",
     )
     parser.add_argument(

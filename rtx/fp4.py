@@ -177,6 +177,9 @@ class NVFP4ForwardConfig:
     region_order: str = "x_first"
     region_ownership: str = "warp"
     programmatic_dependent_launch: bool = False
+    regional_rescale_values: int = 8
+    regional_rescale_warps: int = 16
+    regional_rescale_waves: int = 8
 
     def rejection(self, problem: NVFP4Problem) -> str | None:
         return self.materialized_rejection(problem)
@@ -196,6 +199,9 @@ class NVFP4ForwardConfig:
             region_order=self.region_order,
             region_ownership=self.region_ownership,
             programmatic_dependent_launch=self.programmatic_dependent_launch,
+            regional_rescale_values=self.regional_rescale_values,
+            regional_rescale_warps=self.regional_rescale_warps,
+            regional_rescale_waves=self.regional_rescale_waves,
         ).rejection(problem)
 
     @classmethod
@@ -214,6 +220,9 @@ class NVFP4ForwardConfig:
             region_order=config.region_order,
             region_ownership=config.region_ownership,
             programmatic_dependent_launch=config.programmatic_dependent_launch,
+            regional_rescale_values=config.regional_rescale_values,
+            regional_rescale_warps=config.regional_rescale_warps,
+            regional_rescale_waves=config.regional_rescale_waves,
         )
 
 
@@ -560,6 +569,18 @@ class _ExpandedFactorRegionGemm:
         self.gemm(qx, qw, sx, sw, out, self.expanded)
 
 
+@dataclass(slots=True)
+class _SeparateRegionGemm:
+    """Native GEMM followed by a coalesced power-of-two BF16 rescale."""
+
+    gemm: object
+    rescale: object
+
+    def __call__(self, qx, qw, sx, sw, out, region_factors) -> None:
+        self.gemm(qx, qw, sx, sw, out)
+        self.rescale(out, region_factors)
+
+
 _JIT_REGION_DYNAMIC_RUNNERS: BoundedCache[
     tuple[object, ...], _JITRegionDynamicRunner
 ] = BoundedCache(runner_cache_limit("jit_region_dynamic", 8, namespace="NVFP4"))
@@ -755,13 +776,27 @@ def _make_jit_region_dynamic_runner(
         + (problem.n + config.weight_scale_region_rows - 1)
         // config.weight_scale_region_rows
     )
-    gemm = compile_nvfp4_jit_region_gemm(
-        storage_problem,
-        config.gemm,
-        config.x_scale_region_rows,
-        config.weight_scale_region_rows,
-        config.programmatic_dependent_launch,
-    )
+    if config.gemm.regional_scale_epilogue == "separate":
+        gemm = _SeparateRegionGemm(
+            compile_nvfp4_block_gemm(storage_problem, config.gemm),
+            compile_nvfp4_region_rescale(
+                problem.m,
+                problem.n,
+                config.x_scale_region_rows,
+                config.weight_scale_region_rows,
+                config.regional_rescale_values,
+                config.regional_rescale_warps,
+                config.regional_rescale_waves,
+            ),
+        )
+    else:
+        gemm = compile_nvfp4_jit_region_gemm(
+            storage_problem,
+            config.gemm,
+            config.x_scale_region_rows,
+            config.weight_scale_region_rows,
+            config.programmatic_dependent_launch,
+        )
     if config.gemm.regional_scale_epilogue == "expanded_factors":
         gemm = _ExpandedFactorRegionGemm(
             compile_nvfp4_region_expand(
@@ -3447,11 +3482,6 @@ class NVFP4Linear(nn.Module):
             region_geometry_explicit=self._region_geometry_explicit,
             jit_row_region=self.scaling == "jit_row_region",
             block_only=self.scaling == "block",
-            fixed_scale_pack=(
-                self._block_scale_pack
-                if self.scaling in ("block", "jit_row_region")
-                else None
-            ),
             backend=self.backend,
             materialized_request_key=self._materialized_request_key,
         )

@@ -155,7 +155,9 @@ def _nv_packed_case(*, fully_prequantized: bool, compiled: bool) -> dict[str, ob
 
 def _nv_delayed_state_case() -> dict[str, object]:
     torch.manual_seed(719)
-    layer = rtx.NVFP4Linear(128, 128, device="cuda", autotune="off")
+    layer = rtx.NVFP4Linear(
+        128, 128, device="cuda", scaling="delayed", autotune="off"
+    )
     x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
     streams = (torch.cuda.Stream(), torch.cuda.Stream())
     stream_ids = []

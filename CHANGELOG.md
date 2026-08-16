@@ -5,6 +5,21 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Advance JIT row-region NVFP4 to kernel revision 5. Add a true
+  producer/MMA/epilogue-warp pipeline: MMA warps publish FP32 accumulator
+  tiles through SMEM, 1/2/4/8 dedicated epilogue warps apply regional scales
+  and store BF16, and persistent tile i+1 MMA overlaps tile i epilogue. Expose
+  epilogue warp/register/persistence coordinates to autotuning and select the
+  measured eight-warp/eight-tile schedule only for saturated K<=1024 outputs.
+  Add a focused epilogue schedule benchmark and bitwise equivalence test.
+- Add an autotunable
+  coalesced separate-rescale implementation, expose its values/warps/waves
+  schedule, and replace the large-output portable seed with the measured
+  fused direct-store, two-tile raster schedule. Old runtime winners are
+  revision-invalidated rather than silently reused.
+- Fix the retained NVFP4 module's stale `fixed_scale_pack` argument after
+  fused-backend removal, and align production/benchmark validation with the
+  stateful delayed-module and functional scaling contracts.
 - Retire the experimental NVFP4 fused, CTA-region, delayed-region, and
   `regional` compatibility paths. The stable NVFP4 backend vocabulary is now
   `auto`/`materialized`; scaling policies are `jit_row_region`, `delayed`,

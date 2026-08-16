@@ -139,7 +139,13 @@ def _gemm_smem_bytes(config: object) -> int:
         if config.epilogue == "tma"
         else 0
     )
-    return q_bytes + scale_bytes + out_bytes
+    accumulator_handoff_bytes = (
+        config.tile_m * config.tile_n * 4
+        if getattr(config, "regional_epilogue_schedule", "mma")
+        == "warp_specialized"
+        else 0
+    )
+    return q_bytes + scale_bytes + out_bytes + accumulator_handoff_bytes
 
 
 def _gemm_launch_smem_bytes(config: object) -> int:
@@ -242,6 +248,12 @@ def _gemm_features(
         producer_warps=1,
         producer_registers=config.producer_registers,
     )
+    epilogue_warps = int(getattr(config, "num_epilogue_warps", 0))
+    epilogue_registers = int(
+        getattr(config, "regional_epilogue_registers", 0)
+    )
+    registers += 32 * epilogue_warps * epilogue_registers
+    warp_specialized_epilogue = bool(epilogue_warps)
     geometry.update(
         launch_resource_features(
             profile=profile,
@@ -276,15 +288,22 @@ def _gemm_features(
         balanced_persistent_grid=float(bool(config.persistent_waves)),
         epilogue_stages=float(config.epilogue_stages),
         epilogue_smem_bytes=float(
-            config.epilogue_stages * config.tile_m * config.tile_n * 2
+            config.tile_m * config.tile_n * 4
+            if warp_specialized_epilogue
+            else config.epilogue_stages * config.tile_m * config.tile_n * 2
             if config.epilogue == "tma"
             else 0
         ),
         epilogue_async_overlap_tiles=float(
-            min(config.epilogue_stages, work_tiles_per_cta)
+            min(1, work_tiles_per_cta - 1)
+            if warp_specialized_epilogue
+            else min(config.epilogue_stages, work_tiles_per_cta)
             if config.epilogue == "tma"
             else 0
         ),
+        epilogue_warp_specialized=float(warp_specialized_epilogue),
+        epilogue_warps=float(epilogue_warps),
+        epilogue_register_budget=float(32 * epilogue_warps * epilogue_registers),
         split_work_ctas=float(total_work_ctas),
         final_cta_active_fraction=(
             total_work_ctas / (grid_ctas * work_tiles_per_cta)

@@ -136,6 +136,16 @@ and weight reuse, dimensions, and distributions differ. Region geometry
 controls outer-scale grouping; GEMM CTA tile shapes and persistent scheduling
 separately control actual operand reuse.
 
+The low-level `NVFP4GemmConfig` also exposes
+`regional_epilogue_schedule`, `regional_epilogue_warps`, and
+`regional_epilogue_registers`. `warp_specialized` assigns independent warps to
+the FP32 regional-scale/BF16-store epilogue and overlaps it with the next
+persistent tile's MMA. It requires a one-stage operand pipeline and at least two
+tiles per CTA because its 128x128 FP32 handoff occupies 64 KiB of SMEM. The
+portable seed enables the measured eight-warp/eight-tile basin only for large
+output grids at K<=1024; other shapes retain `mma`. These are advanced schedule
+coordinates and normally should be left to runtime autotuning.
+
 ### Backend
 
 - `auto` is the production default. It chooses the valid materialized pipeline

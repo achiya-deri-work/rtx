@@ -34,6 +34,7 @@ from rtx.kernels.mxfp8_bwd import (
 )
 from rtx.kernels.mxfp8_bwd import DEFAULT_DECOMPOSED_MXFP8_BWD_CONFIG
 from rtx.configs import MXFP8GemmConfig
+from rtx.configs.nvfp4 import NVFP4GemmConfig, NVFP4Problem
 from rtx.bwd_autotune import BWD_SEARCH_SPACE, update_bwd_config
 
 
@@ -44,6 +45,34 @@ class _CompileConfig:
 
 
 class HardwareAutotuneTests(unittest.TestCase):
+    def test_nvfp4_epilogue_warps_are_visible_to_resource_model(self) -> None:
+        config = NVFP4GemmConfig(
+            stages=1,
+            epilogue="direct",
+            store_vec=1,
+            tiles_per_cta=8,
+            regional_epilogue_schedule="warp_specialized",
+            regional_epilogue_warps=8,
+            regional_epilogue_registers=48,
+        )
+        features = _gemm_features(
+            NVFP4Problem(32768, 2304, 768),
+            config,
+            None,
+            materialized_quant=True,
+        )
+        self.assertEqual(features["epilogue_warp_specialized"], 1.0)
+        self.assertEqual(features["epilogue_warps"], 8.0)
+        self.assertEqual(features["epilogue_smem_bytes"], 128 * 128 * 4)
+        self.assertEqual(features["epilogue_async_overlap_tiles"], 1.0)
+        self.assertEqual(
+            _gemm_launch_smem_bytes(config),
+            (128 + 128) * 128 // 2
+            + 2 * 128 * (128 // 16)
+            + 128 * 128 * 4
+            + 1024,
+        )
+
     def test_persistent_gemm_features_use_actual_grid_and_reuse_edges(self) -> None:
         features = _gemm_features(
             MXFP8Problem(512, 1536, 1536),

@@ -50,6 +50,7 @@ class NVFP4ConfigTests(unittest.TestCase):
             "expanded_factors",
             "factorized",
             "product",
+            "separate",
         ):
             with self.subTest(strategy=strategy):
                 candidate = replace(
@@ -90,6 +91,9 @@ class NVFP4ConfigTests(unittest.TestCase):
                 "dependent_launch",
                 "quant_vector_load",
                 "gemm_geometry",
+                "regional_epilogue_schedule",
+                "regional_epilogue_warps",
+                "regional_epilogue_registers",
             }.issubset(NVFP4_JIT_ROW_REGION_SEARCH_SPACE)
         )
 
@@ -100,6 +104,26 @@ class NVFP4ConfigTests(unittest.TestCase):
         self.assertEqual(
             dynamic_config_from_dict(dynamic_config_to_dict(pdl)), pdl
         )
+
+    def test_epilogue_warp_seed_is_bounded_to_measured_basin(self) -> None:
+        bandwidth_heavy = preferred_jit_row_region_config(
+            NVFP4Problem(32768, 2304, 768)
+        )
+        self.assertEqual(
+            bandwidth_heavy.gemm.regional_epilogue_schedule,
+            "warp_specialized",
+        )
+        self.assertEqual(bandwidth_heavy.gemm.regional_epilogue_warps, 8)
+        self.assertEqual(bandwidth_heavy.gemm.tiles_per_cta, 8)
+        self.assertEqual(bandwidth_heavy.gemm.stages, 1)
+        compute_heavy = preferred_jit_row_region_config(
+            NVFP4Problem(32768, 768, 1536)
+        )
+        self.assertEqual(compute_heavy.gemm.regional_epilogue_schedule, "mma")
+        small_grid = preferred_jit_row_region_config(
+            NVFP4Problem(512, 1536, 768)
+        )
+        self.assertEqual(small_grid.gemm.regional_epilogue_schedule, "mma")
 
     def test_jit_row_region_adapter_has_distinct_runtime_identity(self) -> None:
         problem = NVFP4Problem(256, 1536, 1536)
@@ -170,7 +194,7 @@ class NVFP4ConfigTests(unittest.TestCase):
                 expected_revision = {
                     "nvfp4_dynamic_fwd": 6,
                     "nvfp4_delayed_fwd": 1,
-                    "nvfp4_jit_row_region_fwd": 3,
+                    "nvfp4_jit_row_region_fwd": 5,
                     "nvfp4_weight_prequant_fwd": 3,
                     "nvfp4_fully_prequant_fwd": 3,
                 }[family]
@@ -328,6 +352,62 @@ class NVFP4ConfigTests(unittest.TestCase):
 
 @unittest.skipUnless(_has_sm12x(), "requires an SM120/SM121 CUDA GPU")
 class NVFP4CudaTests(unittest.TestCase):
+    def test_jit_regional_warp_specialized_epilogue(self) -> None:
+        from rtx.fp4 import _make_jit_region_dynamic_runner
+
+        torch.manual_seed(1931)
+        problem = NVFP4Problem(256, 256, 256)
+        base = preferred_jit_row_region_config(problem)
+        config = replace(
+            base,
+            gemm=replace(
+                base.gemm,
+                stages=1,
+                epilogue="direct",
+                epilogue_stages=1,
+                store_vec=1,
+                regional_scale_epilogue="factorized",
+                regional_epilogue_schedule="warp_specialized",
+                regional_epilogue_warps=4,
+                regional_epilogue_registers=48,
+                tiles_per_cta=2,
+                tile_locality="raster",
+            ),
+            programmatic_dependent_launch=False,
+        )
+        self.assertIsNone(config.rejection(problem))
+        x = torch.randn(
+            problem.m, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        weight = torch.randn(
+            problem.n, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        out = torch.empty(
+            problem.m, problem.n, device="cuda", dtype=torch.bfloat16
+        )
+        mma_out = torch.empty_like(out)
+        runner = _make_jit_region_dynamic_runner(problem, config, x.device)
+        mma_config = replace(
+            config,
+            gemm=replace(
+                config.gemm, regional_epilogue_schedule="mma"
+            ),
+        )
+        mma_runner = _make_jit_region_dynamic_runner(
+            problem, mma_config, x.device
+        )
+        runner(x, weight, out)
+        mma_runner(x, weight, mma_out)
+        torch.cuda.synchronize()
+        reference = x.float() @ weight.float().T
+        self.assertTrue(bool(torch.isfinite(out).all()))
+        torch.testing.assert_close(out, mma_out, rtol=0, atol=0)
+        self.assertLess(
+            float(torch.linalg.vector_norm(out.float() - reference))
+            / float(torch.linalg.vector_norm(reference)),
+            0.25,
+        )
+
     def test_repeated_fullgraph_linears_preserve_every_weight_gradient(self) -> None:
         torch.compiler.reset()
         torch.manual_seed(1898)
@@ -777,6 +857,7 @@ class NVFP4CudaTests(unittest.TestCase):
             "expanded_factors",
             "factorized",
             "product",
+            "separate",
         ):
             config = replace(
                 base,
