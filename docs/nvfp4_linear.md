@@ -129,6 +129,14 @@ rtx.NVFP4Linear(
 argument overrides the shared value for that operand. When all three are
 `None`, X uses five rows and W uses four.
 
+Region geometry changes the numerical policy, not only performance. The
+autotuner therefore explores asymmetric and power-of-two candidates—including
+8x4 and 8x8—but never silently changes an explicit user selection. On SM120's
+128x128, atom-N=2 path, the default epilogue hoists repeated X/W FP32 factors
+into registers and reuses each product across its matching accumulator
+fragment. Direct scaling remains in the search space and both paths perform
+the same FP32 multiplication before the final BF16 conversion.
+
 Larger regions amortize observer and scale traffic but share one FP32 scale
 across more rows. Smaller regions track local dynamic range more precisely but
 produce more scales and observer work. X/W asymmetry is intentional: activation
@@ -142,17 +150,23 @@ The low-level `NVFP4GemmConfig` also exposes
 `warp_specialized` remains an experimental coordinate: it assigns independent
 warps to the FP32 regional-scale/BF16-store epilogue and overlaps it with the
 next persistent tile's MMA, but its 128x128 FP32 handoff consumes 64 KiB of
-SMEM. Revision 7 instead seeds the faster TMA/direct-MMA basin. Its CTA
+SMEM. Revision 8 instead seeds the faster TMA/direct-MMA basin. Its CTA
 quantizer retains each thread's small BF16 quantization fragment in registers
 while the CTA resolves the current regional amax, then quantizes those exact
 values without rereading X or W. Regional scales, accumulator scaling, and the
-final BF16 rounding remain FP32, FP32, and BF16 respectively.
+final BF16 rounding remain FP32, FP32, and BF16 respectively. The MMA-thread
+epilogue also loads its two X factors once per fragment, loads one W factor per
+four accumulators, forms two products in registers, and reuses each across two
+adjacent columns.
 
 On the development RTX 5070 Ti, the register-cached producer reached 70.8 us
-for `32768x2304x768`, versus 69.5 us for block-only quantization. End-to-end JIT
-regional forward was 349.4 us versus 329.0 us for tensor-delayed scaling; the
-remaining cost is the fused per-output application of two varying FP32 region
-factors. Shared-memory operand staging, expanded factor/product tables, and a
+for `32768x2304x768`, versus 69.5 us for block-only quantization. Register
+hoisting reduced the measured regional GEMM by about 1.6--6.8 us across the
+decoder shapes, with larger output widths benefiting most. End-to-end JIT
+regional forward remains slower than tensor-delayed scaling because exact
+current regional observation and varying per-output factors retain costs that
+epilogue reuse cannot remove. Shared-memory operand staging, expanded
+factor/product tables, and a
 separate output-rescale pass were measured and rejected because they increased
 end-to-end latency. These schedule details remain autotunable and are not part
 of the public module contract.

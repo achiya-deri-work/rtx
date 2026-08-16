@@ -87,6 +87,8 @@ class MXFP8GemmKernel:
             self.tile_uniform_regional_output_scale = False
         if not hasattr(self, "direct_regional_output_scales"):
             self.direct_regional_output_scales = False
+        if not hasattr(self, "fragment_register_output_scales"):
+            self.fragment_register_output_scales = False
         if not hasattr(self, "warp_specialized_epilogue"):
             self.warp_specialized_epilogue = False
         if not hasattr(self, "num_epilogue_warps"):
@@ -1579,26 +1581,75 @@ class MXFP8GemmKernel:
                 cfg.epilogue == "tma" and self.cache_regional_output_scales
             ):
                 if warp_idx < cfg.num_mma_warps:
-                    for elem in cutlass.range(
-                        cute.size(accumulators), unroll_full=True
+                    if cutlass.const_expr(
+                        self.fragment_register_output_scales
                     ):
-                        coord = t_cc_out[elem]
-                        if (
-                            coord[0] < self.problem.m
-                            and coord[1] < self.problem.n
+                        # SM120's proven 128x128, atom-N=2 fragment repeats
+                        # (row A, col C/C+1), (row B, col C/C+1).  Hoist the
+                        # two X factors across the fragment and the W factor
+                        # across each four-accumulator group.  Products and
+                        # accumulator scaling remain exact FP32 operations.
+                        coord_a = t_cc_out[0]
+                        coord_b = t_cc_out[2]
+                        x_scale_a = self._load_x_output_scale(
+                            output_scale, coord_a[0]
+                        )
+                        x_scale_b = self._load_x_output_scale(
+                            output_scale, coord_b[0]
+                        )
+                        for fragment_group in cutlass.range_constexpr(
+                            cute.size(accumulators) // 4
                         ):
-                            accumulators[elem] = self._scale_tma_accumulator(
-                                accumulators[elem],
-                                tile_s_outer_x,
-                                tile_s_outer_w,
-                                tile_s_outer_product,
-                                tile_output_scale,
-                                output_scale,
-                                coord[0],
-                                coord[1],
-                                coord[0] - block_m * cfg.tile_m,
-                                coord[1] - block_n * cfg.tile_n,
+                            fragment_first = fragment_group * 4
+                            coord = t_cc_out[fragment_first]
+                            weight_scale = self._load_weight_output_scale(
+                                output_scale, coord[1]
                             )
+                            scale_a = Float32(x_scale_a) * Float32(
+                                weight_scale
+                            )
+                            scale_b = Float32(x_scale_b) * Float32(
+                                weight_scale
+                            )
+                            for fragment_offset in cutlass.range_constexpr(4):
+                                fragment_elem = (
+                                    fragment_first + fragment_offset
+                                )
+                                element_coord = t_cc_out[fragment_elem]
+                                if (
+                                    element_coord[0] < self.problem.m
+                                    and element_coord[1] < self.problem.n
+                                ):
+                                    element_scale = (
+                                        scale_a
+                                        if fragment_offset < 2
+                                        else scale_b
+                                    )
+                                    accumulators[fragment_elem] = (
+                                        accumulators[fragment_elem]
+                                        * element_scale
+                                    )
+                    else:
+                        for elem in cutlass.range(
+                            cute.size(accumulators), unroll_full=True
+                        ):
+                            coord = t_cc_out[elem]
+                            if (
+                                coord[0] < self.problem.m
+                                and coord[1] < self.problem.n
+                            ):
+                                accumulators[elem] = self._scale_tma_accumulator(
+                                    accumulators[elem],
+                                    tile_s_outer_x,
+                                    tile_s_outer_w,
+                                    tile_s_outer_product,
+                                    tile_output_scale,
+                                    output_scale,
+                                    coord[0],
+                                    coord[1],
+                                    coord[0] - block_m * cfg.tile_m,
+                                    coord[1] - block_n * cfg.tile_n,
+                                )
 
             if cutlass.const_expr(self.warp_specialized_epilogue):
                 first_epilogue_thread = (cfg.num_mma_warps + 1) * 32

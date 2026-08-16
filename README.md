@@ -377,17 +377,15 @@ symmetric policy, while `x_scale_region_rows` and
 `weight_scale_region_rows` tune the axes independently. The CuTe quantizer gives
 one CTA ownership of each region, performs a cooperative current-amax pass,
 then rereads warm cache lines to emit packed E2M1 values and native E4M3 1x16
-scales. The native GEMM multiplies the corresponding X and weight region
-scales directly in its BF16 epilogue. For saturated output grids with K<=1536,
-the portable seed uses dedicated epilogue warps: tensor-core warps publish one
-FP32 accumulator tile to shared memory and immediately compute the next
-persistent tile while eight CUDA-core warps scale and store the preceding tile.
-The epilogue caches products of the X/weight region factors, applies one lookup
-to four adjacent outputs, and emits the four converted BF16 values as one
-aligned 64-bit store. Output width selects two, four, or eight persistent tiles
-per CTA; very wide outputs use a serpentine weight-stationary traversal.
-The schedule is autotunable and falls back to the ordinary MMA-thread epilogue
-for compute-heavy or small-grid shapes. No eager Torch reduction or additional
+scales. The register-cached producer retains each thread's BF16 fragment across
+the cooperative reduction, so current amax and quantization need only one
+operand read. The native GEMM multiplies the corresponding X and weight region
+factors in FP32 before the sole BF16 conversion. Its portable TMA seed follows
+the SM120 accumulator fragment: each thread loads two X factors once, loads one
+W factor per four accumulators, and reuses the two FP32 products across adjacent
+columns. Direct per-value scaling and dedicated epilogue-warp schedules remain
+autotunable alternatives for shapes or devices where layout and register
+pressure reverse that advantage. No eager Torch reduction or additional
 pointwise output kernel is present.
 Region sizes, warp/CTA ownership, observer vector width/unroll/grid/order, quantizer schedule,
 native scale transport, and GEMM schedule are jointly tuned by the

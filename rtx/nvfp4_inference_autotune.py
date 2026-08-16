@@ -24,7 +24,7 @@ from .prequant_autotune import PREQUANT_SEARCH_SPACE
 NVFP4_INFERENCE_KERNEL_REVISION = 3
 NVFP4_DYNAMIC_KERNEL_REVISION = 6
 NVFP4_DELAYED_KERNEL_REVISION = 1
-NVFP4_JIT_ROW_REGION_KERNEL_REVISION = 7
+NVFP4_JIT_ROW_REGION_KERNEL_REVISION = 8
 
 
 def _gemm_axes() -> dict[str, tuple[dict[str, object], ...]]:
@@ -338,11 +338,13 @@ def preferred_jit_row_region_config(
             raster="n",
             grid_swizzle=2,
             tile_locality="same_b",
-            regional_scale_epilogue="direct",
+            regional_scale_epilogue=(
+                "fragment_registers" if use_regional_tma else "direct"
+            ),
             regional_epilogue_schedule="mma",
             regional_epilogue_warps=8,
             regional_epilogue_registers=48,
-            regional_epilogue_values=1,
+            regional_epilogue_values=(2 if use_regional_tma else 1),
             tiles_per_cta=4,
             persistent_waves=1,
         ),
@@ -370,7 +372,13 @@ def preferred_jit_row_region_config(
     # geometry and fall back only the store schedule.
     direct_candidate = replace(
         candidate,
-        gemm=replace(candidate.gemm, epilogue="direct", store_vec=1),
+        gemm=replace(
+            candidate.gemm,
+            epilogue="direct",
+            store_vec=1,
+            regional_scale_epilogue="direct",
+            regional_epilogue_values=1,
+        ),
     )
     if direct_candidate.rejection(problem) is None:
         return direct_candidate
@@ -447,6 +455,46 @@ _JIT_REGION_IMPLEMENTATION_ANCHORS += tuple(
         (16, 16, 6, 3, 2, False),
         (32, 8, 8, 3, 1, False),
         (16, 8, 4, 1, 1, True),
+    )
+)
+
+# The SM120 128x128, atom-N=2 accumulator fragment repeats two adjacent
+# columns for each of two rows. Hoist its two X factors once per thread and
+# one W factor per four values, then reuse the two exact FP32 products before
+# the final BF16 conversion. Keep the direct anchors above as independent
+# basins; layout, geometry, and register pressure can reverse small wins on a
+# different SKU or shape.
+_JIT_REGION_IMPLEMENTATION_ANCHORS += tuple(
+    asdict(
+        replace(
+            _NATIVE_DYNAMIC_ANCHOR,
+            gemm=replace(
+                _NATIVE_DYNAMIC_ANCHOR.gemm,
+                epilogue="tma",
+                epilogue_stages=1,
+                producer_registers=24,
+                maxrregcount=192,
+                raster="n",
+                grid_swizzle=2,
+                tile_locality="same_b",
+                tiles_per_cta=4,
+                persistent_waves=1,
+                regional_scale_epilogue="fragment_registers",
+                regional_epilogue_values=2,
+            ),
+            quant_launches="dual",
+            x_scale_region_rows=x_rows,
+            weight_scale_region_rows=w_rows,
+            tensor_scale_mode="power2",
+            region_waves=region_waves,
+            region_ownership="cta_cached",
+            programmatic_dependent_launch=False,
+        )
+    )
+    for x_rows, w_rows, region_waves in (
+        (5, 4, 4),
+        (8, 4, 6),
+        (8, 8, 6),
     )
 )
 
@@ -546,6 +594,7 @@ NVFP4_JIT_ROW_REGION_SEARCH_SPACE = {
             "direct",
             "expanded_factors",
             "factorized",
+            "fragment_registers",
             "product",
             "separate",
         )

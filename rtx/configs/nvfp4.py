@@ -133,6 +133,7 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
         "direct",
         "expanded_factors",
         "factorized",
+        "fragment_registers",
         "product",
         "separate",
     ] = "direct"
@@ -190,12 +191,14 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
             "direct",
             "expanded_factors",
             "factorized",
+            "fragment_registers",
             "product",
             "separate",
         ):
             return (
                 "NVFP4 regional_scale_epilogue must be direct, "
-                "expanded_factors, factorized, product, or separate"
+                "expanded_factors, factorized, fragment_registers, product, "
+                "or separate"
             )
         if self.regional_epilogue_schedule not in ("mma", "warp_specialized"):
             return "regional epilogue schedule must be mma or warp_specialized"
@@ -385,6 +388,20 @@ class NVFP4DynamicConfig:
                         "register-cached JIT region exceeds 64 BF16 values "
                         "per thread"
                     )
+            if self.gemm.regional_scale_epilogue == "fragment_registers":
+                if self.gemm.epilogue != "tma":
+                    return "fragment-register epilogue requires TMA output"
+                if (
+                    self.gemm.tile_m != 128
+                    or self.gemm.tile_n != 128
+                    or self.gemm.atom_layout_n != 2
+                ):
+                    return (
+                        "fragment-register epilogue requires the proven "
+                        "128x128 atom-N=2 fragment layout"
+                    )
+                if self.gemm.regional_epilogue_values != 2:
+                    return "fragment-register epilogue requires two-value pairs"
             if self.quant_launches != "dual":
                 return "the first JIT row-region implementation uses one dual launch"
             if (

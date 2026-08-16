@@ -5,6 +5,13 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Advance JIT row-region NVFP4 to kernel revision 8. Add an autotunable
+  register-hoisted SM120 epilogue for the proven 128x128, atom-N=2 fragment:
+  each thread loads its two X factors once and one W factor per four
+  accumulators, forms each FP32 product once, and reuses it before the sole
+  BF16 conversion. It is bitwise identical to direct scaling and improves the
+  measured 5070 Ti GEMM by roughly 1--7 us. Seed 5x4, 8x4, and 8x8 geometry
+  basins while retaining geometry as a user-controlled numerical policy.
 - Advance JIT row-region NVFP4 to kernel revision 7. Make the measured
   TMA/direct-MMA schedule the portable seed and add an autotunable
   `cta_cached` producer that retains each thread's BF16 quantization fragment

@@ -93,6 +93,9 @@ class NVFP4JITRegionGemmKernel(NVFP4GemmKernel):
         )
         strategy = config.regional_scale_epilogue
         self.expanded_factor_output_scales = strategy == "expanded_factors"
+        self.fragment_register_output_scales = (
+            strategy == "fragment_registers"
+        )
         self.cache_output_scale_products = strategy == "product"
         self.output_scale_product_cache_elems = (
             product_count if self.cache_output_scale_products else 0
@@ -103,7 +106,7 @@ class NVFP4JITRegionGemmKernel(NVFP4GemmKernel):
             and weight_region_rows % config.tile_n == 0
         )
         self.direct_regional_output_scales = (
-            strategy in ("direct", "expanded_factors")
+            strategy in ("direct", "expanded_factors", "fragment_registers")
             and not self.tile_uniform_regional_output_scale
         )
         super().__init__(problem, config, use_pdl=use_pdl)

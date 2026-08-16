@@ -1122,13 +1122,26 @@ def _materialized_dynamic_config_key(
                 or 1
             ),
             quant_launches="dual",
-            gemm=replace(
-                selected.gemm,
-                epilogue="direct",
-                epilogue_stages=1,
-                store_vec=1,
-            ),
         )
+        # Fragment-register reuse consumes adjacent two-value packets. An
+        # explicit odd W-region is a valid numerical policy, but its final
+        # packet would cross a region boundary, so preserve that policy with
+        # the generic one-value epilogue. Do not otherwise rewrite installed
+        # or portable TMA winners: doing so silently benchmarked one schedule
+        # and executed another in the public frontend.
+        if (
+            selected.gemm.regional_scale_epilogue == "fragment_registers"
+            and selected.weight_scale_region_rows
+            % selected.gemm.regional_epilogue_values
+        ):
+            selected = replace(
+                selected,
+                gemm=replace(
+                    selected.gemm,
+                    regional_scale_epilogue="direct",
+                    regional_epilogue_values=1,
+                ),
+            )
     config = NVFP4ForwardConfig.from_materialized(
         preferred_dynamic_config(problem) if selected is None else selected
     )

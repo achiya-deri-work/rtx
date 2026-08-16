@@ -94,6 +94,23 @@ class NVFP4ConfigTests(unittest.TestCase):
         )
         self.assertIn("64 BF16", oversized.rejection(problem) or "")
 
+    def test_fragment_register_epilogue_has_strict_layout_contract(self) -> None:
+        problem = NVFP4Problem(32768, 2304, 768)
+        base = preferred_jit_row_region_config(problem)
+        self.assertEqual(
+            base.gemm.regional_scale_epilogue, "fragment_registers"
+        )
+        self.assertEqual(base.gemm.regional_epilogue_values, 2)
+        self.assertIsNone(base.rejection(problem))
+        wrong_atom = replace(
+            base, gemm=replace(base.gemm, atom_layout_n=4)
+        )
+        self.assertIn("atom-N=2", wrong_atom.rejection(problem) or "")
+        wrong_packet = replace(
+            base, gemm=replace(base.gemm, regional_epilogue_values=1)
+        )
+        self.assertIn("two-value", wrong_packet.rejection(problem) or "")
+
     def test_jit_row_region_config_roundtrips_and_exposes_deep_axes(self) -> None:
         problem = NVFP4Problem(257, 769, 768)
         config = preferred_jit_row_region_config(problem)
@@ -144,9 +161,10 @@ class NVFP4ConfigTests(unittest.TestCase):
         self.assertEqual(bandwidth_heavy.gemm.tiles_per_cta, 4)
         self.assertEqual(bandwidth_heavy.region_ownership, "cta_cached")
         self.assertEqual(
-            bandwidth_heavy.gemm.regional_scale_epilogue, "direct"
+            bandwidth_heavy.gemm.regional_scale_epilogue,
+            "fragment_registers",
         )
-        self.assertEqual(bandwidth_heavy.gemm.regional_epilogue_values, 1)
+        self.assertEqual(bandwidth_heavy.gemm.regional_epilogue_values, 2)
         self.assertEqual(bandwidth_heavy.gemm.tile_locality, "same_b")
         narrow = preferred_jit_row_region_config(
             NVFP4Problem(32768, 768, 768)
@@ -243,7 +261,7 @@ class NVFP4ConfigTests(unittest.TestCase):
                 expected_revision = {
                     "nvfp4_dynamic_fwd": 6,
                     "nvfp4_delayed_fwd": 1,
-                    "nvfp4_jit_row_region_fwd": 7,
+                    "nvfp4_jit_row_region_fwd": 8,
                     "nvfp4_weight_prequant_fwd": 3,
                     "nvfp4_fully_prequant_fwd": 3,
                 }[family]
@@ -975,6 +993,60 @@ class NVFP4CudaTests(unittest.TestCase):
         torch.cuda.synchronize()
         for output in outputs[1:]:
             torch.testing.assert_close(output, outputs[0], rtol=0, atol=0)
+
+    def test_fragment_register_epilogue_is_bitwise_equivalent(self) -> None:
+        from rtx.fp4 import _make_jit_region_dynamic_runner
+
+        torch.manual_seed(19152)
+        problem = NVFP4Problem(256, 256, 256)
+        x = torch.randn(
+            problem.m, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        weight = torch.randn(
+            problem.n, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        base = preferred_jit_row_region_config(problem)
+        for x_rows, weight_rows in ((5, 4), (8, 4), (8, 8)):
+            with self.subTest(geometry=(x_rows, weight_rows)):
+                common = replace(
+                    base,
+                    x_scale_region_rows=x_rows,
+                    weight_scale_region_rows=weight_rows,
+                    programmatic_dependent_launch=False,
+                )
+                direct = replace(
+                    common,
+                    gemm=replace(
+                        common.gemm,
+                        regional_scale_epilogue="direct",
+                        regional_epilogue_values=1,
+                    ),
+                )
+                fragment = replace(
+                    common,
+                    gemm=replace(
+                        common.gemm,
+                        regional_scale_epilogue="fragment_registers",
+                        regional_epilogue_values=2,
+                    ),
+                )
+                outputs = []
+                for config in (direct, fragment):
+                    runner = _make_jit_region_dynamic_runner(
+                        problem, config, x.device
+                    )
+                    out = torch.empty(
+                        problem.m,
+                        problem.n,
+                        device=x.device,
+                        dtype=torch.bfloat16,
+                    )
+                    runner(x, weight, out)
+                    outputs.append(out)
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    outputs[1], outputs[0], rtol=0, atol=0
+                )
 
     def test_rowwise_scaling_preserves_heterogeneous_row_ranges(self) -> None:
         torch.manual_seed(1917)

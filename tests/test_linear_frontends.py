@@ -306,7 +306,7 @@ class LinearFrontendContractTests(unittest.TestCase):
             preferred_jit_row_region_config,
         )
 
-        problem = rtx.NVFP4Problem(128, 128, 256)
+        problem = rtx.NVFP4Problem(256, 256, 256)
         winner = replace(
             preferred_jit_row_region_config(problem),
             x_scale_region_rows=16,
@@ -324,6 +324,11 @@ class LinearFrontendContractTests(unittest.TestCase):
         inherited = fp4._resolve_forward_config(inherited_key)
         self.assertEqual(inherited.x_scale_region_rows, 16)
         self.assertEqual(inherited.weight_scale_region_rows, 8)
+        self.assertEqual(inherited.gemm.epilogue, "tma")
+        self.assertEqual(
+            inherited.gemm.regional_scale_epilogue,
+            "fragment_registers",
+        )
 
         explicit_key = fp4._materialized_dynamic_config_key(
             problem,
@@ -336,6 +341,8 @@ class LinearFrontendContractTests(unittest.TestCase):
         explicit = fp4._resolve_forward_config(explicit_key)
         self.assertEqual(explicit.x_scale_region_rows, 7)
         self.assertEqual(explicit.weight_scale_region_rows, 3)
+        self.assertEqual(explicit.gemm.regional_scale_epilogue, "direct")
+        self.assertEqual(explicit.gemm.regional_epilogue_values, 1)
 
     def test_nvfp4_rejects_bias_and_non_bf16_parameters(self) -> None:
         with self.assertRaisesRegex(NotImplementedError, "bias=False"):
