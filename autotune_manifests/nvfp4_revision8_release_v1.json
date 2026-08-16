@@ -1,0 +1,159 @@
+{
+  "schema_version": 2,
+  "name": "nvfp4_revision8_release_v1",
+  "seed": 20260816,
+  "storage_mode": "residual_context",
+  "rotation_mode": "balanced_categories",
+  "jobs": [
+    {
+      "family": "nvfp4_jit_row_region_fwd",
+      "shapes": [
+        {"m": 128, "n": 768, "k": 768, "name": "underfilled_attention_out"},
+        {"m": 1024, "n": 2304, "k": 768, "name": "small_qkv"},
+        {"m": 8192, "n": 3072, "k": 768, "name": "medium_gate_up"},
+        {"m": 32768, "n": 768, "k": 768, "name": "batch64_attention_out"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "batch64_down"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "batch64_qkv"},
+        {"m": 32768, "n": 3072, "k": 768, "name": "batch64_gate_up"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 8,
+      "tags": {
+        "category": "nvfp4_revision8_jit_region",
+        "kernel_revision": 8,
+        "scale_policy": "jit_row_region",
+        "required_geometry_anchors": "5x4,8x4,8x8",
+        "required_epilogues": "direct,fragment_registers"
+      },
+      "tuning": {
+        "portfolio": "hybrid",
+        "orchestration": "bandit",
+        "max_trials": 256,
+        "time_budget_s": 1800.0,
+        "cost_model_trials": 176,
+        "model_warmup": 16,
+        "model_pool_size": 32768,
+        "model_refit_interval": 8,
+        "bandit_exploration": 0.45,
+        "model_estimators": 64,
+        "model_ensembles": 4,
+        "model_max_depth": 5,
+        "model_min_leaf": 3,
+        "model_max_features": 256,
+        "local_beam_width": 12,
+        "confirmation_repeats": 3,
+        "confirmation_ratio": 0.01,
+        "confirm_initial": true
+      },
+      "protocol": {
+        "warmup_calls": 6,
+        "samples": 5,
+        "confirm_samples": 25,
+        "race_rounds": 25,
+        "target_batch_ms": 40.0,
+        "practical_threshold": 0.001,
+        "bootstrap_resamples": 2000,
+        "correctness_rtol": 0.05,
+        "correctness_atol": 0.5,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "nvfp4_delayed_fwd",
+      "shapes": [
+        {"m": 128, "n": 768, "k": 768, "name": "underfilled_attention_out"},
+        {"m": 1024, "n": 2304, "k": 768, "name": "small_qkv"},
+        {"m": 8192, "n": 3072, "k": 768, "name": "medium_gate_up"},
+        {"m": 32768, "n": 768, "k": 768, "name": "batch64_attention_out"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "batch64_down"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "batch64_qkv"},
+        {"m": 32768, "n": 3072, "k": 768, "name": "batch64_gate_up"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 5,
+      "tags": {
+        "category": "nvfp4_revision8_tensor_delayed",
+        "scale_policy": "tensor_delayed",
+        "amax_history_len": 16
+      },
+      "tuning": {
+        "portfolio": "hybrid",
+        "orchestration": "bandit",
+        "max_trials": 128,
+        "time_budget_s": 1200.0,
+        "cost_model_trials": 88,
+        "model_warmup": 12,
+        "model_pool_size": 16384,
+        "model_refit_interval": 8,
+        "bandit_exploration": 0.35,
+        "model_estimators": 48,
+        "model_ensembles": 3,
+        "model_max_depth": 4,
+        "model_min_leaf": 3,
+        "model_max_features": 192,
+        "local_beam_width": 8,
+        "confirmation_repeats": 2,
+        "confirmation_ratio": 0.01,
+        "confirm_initial": true
+      },
+      "protocol": {
+        "warmup_calls": 6,
+        "samples": 5,
+        "confirm_samples": 21,
+        "race_rounds": 21,
+        "target_batch_ms": 40.0,
+        "practical_threshold": 0.001,
+        "bootstrap_resamples": 1500,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "nvfp4_dynamic_fwd",
+      "shapes": [
+        {"m": 128, "n": 768, "k": 768, "name": "underfilled_attention_out"},
+        {"m": 1024, "n": 2304, "k": 768, "name": "small_qkv"},
+        {"m": 8192, "n": 3072, "k": 768, "name": "medium_gate_up"},
+        {"m": 32768, "n": 768, "k": 768, "name": "batch64_attention_out"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "batch64_down"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "batch64_qkv"},
+        {"m": 32768, "n": 3072, "k": 768, "name": "batch64_gate_up"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 5,
+      "tags": {
+        "category": "nvfp4_revision8_block_only",
+        "scale_policy": "block_only"
+      },
+      "tuning": {
+        "portfolio": "hybrid",
+        "orchestration": "bandit",
+        "max_trials": 128,
+        "time_budget_s": 1200.0,
+        "cost_model_trials": 88,
+        "model_warmup": 12,
+        "model_pool_size": 16384,
+        "model_refit_interval": 8,
+        "bandit_exploration": 0.35,
+        "model_estimators": 48,
+        "model_ensembles": 3,
+        "model_max_depth": 4,
+        "model_min_leaf": 3,
+        "model_max_features": 192,
+        "local_beam_width": 8,
+        "confirmation_repeats": 2,
+        "confirmation_ratio": 0.01,
+        "confirm_initial": true
+      },
+      "protocol": {
+        "warmup_calls": 6,
+        "samples": 5,
+        "confirm_samples": 21,
+        "race_rounds": 21,
+        "target_batch_ms": 40.0,
+        "practical_threshold": 0.001,
+        "bootstrap_resamples": 1500,
+        "telemetry": true
+      }
+    }
+  ]
+}
