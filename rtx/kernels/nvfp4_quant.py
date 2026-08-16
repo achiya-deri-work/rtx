@@ -707,7 +707,9 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
             raise ValueError("JIT NVFP4 region waves must be 1, 2, 3, 4, 6, or 8")
         if region_order not in ("x_first", "weight_first"):
             raise ValueError("unknown JIT NVFP4 region order")
-        if region_ownership not in ("warp", "cta"):
+        if region_ownership not in (
+            "warp", "cta", "cta_cached"
+        ):
             raise ValueError("unknown JIT NVFP4 region ownership")
         self.x_region_rows = x_region_rows
         self.weight_region_rows = weight_region_rows
@@ -719,6 +721,8 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
         self.amax_unroll = amax_unroll
         self.region_order = region_order
         self.region_ownership = region_ownership
+        self.cache_region_data = region_ownership == "cta_cached"
+        self.max_region_rows = max(x_region_rows, weight_region_rows)
         self.use_pdl = use_pdl
         sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
         natural_ctas = (
@@ -884,6 +888,240 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
                     local_block % blocks_per_row,
                     lane_in_scale,
                 )
+
+    @cute.jit
+    def _observe_and_quantize_cached_region(
+        self,
+        src: cute.Tensor,
+        packed: cute.Tensor,
+        scales: cute.Tensor,
+        row_begin: Int32,
+        row_end: Int32,
+        warp_amax: cute.Tensor,
+        outer_scale: cute.Tensor,
+    ):
+        """Keep each thread's quantization fragment in registers across amax."""
+
+        cfg = self.config
+        lane_idx = cute.arch.lane_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        block_in_warp = lane_idx // cfg.threads_per_scale
+        lane_in_scale = lane_idx % cfg.threads_per_scale
+        blocks_per_row = self.storage_k // NVFP4_SF_VEC_SIZE
+        max_region_blocks = self.max_region_rows * blocks_per_row
+        max_task_groups = cute.ceil_div(max_region_blocks, cfg.blocks_per_warp)
+        iterations = cute.ceil_div(max_task_groups, cfg.num_warps)
+        cache_size = iterations * cfg.values_per_lane
+        cached = [BFloat16(0.0)] * cache_size
+        valid = [False] * iterations
+        cached_rows = [Int32(0)] * iterations
+        cached_blocks = [Int32(0)] * iterations
+        region_blocks = (row_end - row_begin) * blocks_per_row
+        local_region_amax = Float32(0.0)
+
+        for iteration in cutlass.range_constexpr(iterations):
+            task_group = warp_idx + iteration * cfg.num_warps
+            local_block = task_group * cfg.blocks_per_warp + block_in_warp
+            if local_block < region_blocks:
+                valid[iteration] = True
+                local_row = local_block // blocks_per_row
+                scale_block = local_block % blocks_per_row
+                output_row = row_begin + local_row
+                cached_rows[iteration] = output_row
+                cached_blocks[iteration] = scale_block
+                k_base = (
+                    scale_block * NVFP4_SF_VEC_SIZE
+                    + lane_in_scale * cfg.values_per_lane
+                )
+                src_row = src[output_row, None]
+                values_per_load = cfg.load_bits // BFloat16.width
+                loads_per_lane = cfg.values_per_lane // values_per_load
+                for load_idx in cutlass.range_constexpr(loads_per_lane):
+                    value_base = load_idx * values_per_load
+                    global_k_base = k_base + value_base
+                    if cutlass.const_expr(values_per_load == 1):
+                        if global_k_base < self.k:
+                            value = src_row[global_k_base]
+                            cached[
+                                iteration * cfg.values_per_lane + value_base
+                            ] = value
+                            magnitude = (
+                                Float32(value).bitcast(Int32)
+                                & Int32(0x7FFFFFFF)
+                            ).bitcast(Float32)
+                            local_region_amax = cute.arch.fmax(
+                                local_region_amax, magnitude, nan=True
+                            )
+                    else:
+                        load_bytes = cfg.load_bits // 8
+                        naturally_aligned = (
+                            (output_row * self.k + global_k_base)
+                            * (BFloat16.width // 8)
+                        ) % load_bytes == 0
+                        if (
+                            global_k_base + values_per_load <= self.k
+                            and naturally_aligned
+                        ):
+                            loaded = nvvm.load_ext(
+                                src_row.iterator
+                                + src_row.layout(global_k_base),
+                                dtype=Uint16,
+                                count=values_per_load,
+                            ).bitcast(BFloat16)
+                            for vec in cutlass.range_constexpr(values_per_load):
+                                value = loaded[vec]
+                                cached[
+                                    iteration * cfg.values_per_lane
+                                    + value_base
+                                    + vec
+                                ] = value
+                                magnitude = (
+                                    Float32(value).bitcast(Int32)
+                                    & Int32(0x7FFFFFFF)
+                                ).bitcast(Float32)
+                                local_region_amax = cute.arch.fmax(
+                                    local_region_amax, magnitude, nan=True
+                                )
+                        else:
+                            for vec in cutlass.range_constexpr(values_per_load):
+                                scalar_k = global_k_base + vec
+                                if scalar_k < self.k:
+                                    value = src_row[scalar_k]
+                                    cached[
+                                        iteration * cfg.values_per_lane
+                                        + value_base
+                                        + vec
+                                    ] = value
+                                    magnitude = (
+                                        Float32(value).bitcast(Int32)
+                                        & Int32(0x7FFFFFFF)
+                                    ).bitcast(Float32)
+                                    local_region_amax = cute.arch.fmax(
+                                        local_region_amax, magnitude, nan=True
+                                    )
+
+        warp_max = nvvm.redux_sync(
+            local_region_amax.bitcast(Int32),
+            nvvm.ReductionKind.UMAX,
+            Int32(0xFFFFFFFF),
+        ).bitcast(Float32)
+        if lane_idx == 0:
+            warp_amax[warp_idx] = warp_max
+        cute.arch.sync_threads()
+        if warp_idx == 0:
+            cta_max = Float32(0.0)
+            if lane_idx < cfg.num_warps:
+                cta_max = Float32(warp_amax[lane_idx])
+            cta_max = nvvm.redux_sync(
+                cta_max.bitcast(Int32),
+                nvvm.ReductionKind.UMAX,
+                Int32(0xFFFFFFFF),
+            ).bitcast(Float32)
+            if lane_idx == 0:
+                outer_scale[0] = self._tensor_scale_from_amax(
+                    cta_max, self.tensor_scale_mode
+                )
+        cute.arch.sync_threads()
+        tensor_scale = Float32(outer_scale[0])
+
+        for iteration in cutlass.range_constexpr(iterations):
+            if valid[iteration]:
+                values = [Float32(0.0)] * cfg.values_per_lane
+                local_block_amax = Float32(0.0)
+                for vec in cutlass.range_constexpr(cfg.values_per_lane):
+                    value = Float32(
+                        cached[iteration * cfg.values_per_lane + vec]
+                    )
+                    values[vec] = value
+                    magnitude = (
+                        value.bitcast(Int32) & Int32(0x7FFFFFFF)
+                    ).bitcast(Float32)
+                    local_block_amax = cute.arch.fmax(
+                        local_block_amax, magnitude, nan=True
+                    )
+                block_amax = self._subwarp_amax(
+                    local_block_amax,
+                    cfg.threads_per_scale,
+                    lane_idx,
+                )
+                if cutlass.const_expr(cfg.scale_compute == "leader_broadcast"):
+                    block_scale_bits = Int32(0)
+                    reciprocal = Float32(0.0)
+                    if lane_in_scale == 0:
+                        raw_block_scale = block_amax / (
+                            Float32(F4_MAX) * tensor_scale
+                        )
+                        leader_scale = self._e4m3_scale(raw_block_scale)
+                        block_scale_bits = Int32(leader_scale.bitcast(Uint8))
+                        reciprocal = self._block_reciprocal(
+                            leader_scale, tensor_scale
+                        )
+                    group_base = lane_idx & Int32(
+                        ~(cfg.threads_per_scale - 1)
+                    )
+                    block_scale_bits = cute.arch.shuffle_sync(
+                        block_scale_bits, group_base
+                    )
+                    reciprocal = cute.arch.shuffle_sync(reciprocal, group_base)
+                    block_scale = Uint8(block_scale_bits).bitcast(
+                        Float8E4M3FN
+                    )
+                else:
+                    raw_block_scale = block_amax / (
+                        Float32(F4_MAX) * tensor_scale
+                    )
+                    block_scale = self._e4m3_scale(raw_block_scale)
+                    reciprocal = self._block_reciprocal(
+                        block_scale, tensor_scale
+                    )
+                output_row = cached_rows[iteration]
+                scale_block = cached_blocks[iteration]
+                k_base = (
+                    scale_block * NVFP4_SF_VEC_SIZE
+                    + lane_in_scale * cfg.values_per_lane
+                )
+                packed_row = packed[output_row, None]
+                for pair in cutlass.range_constexpr(
+                    (cfg.values_per_lane + 1) // 2
+                ):
+                    value0_idx = pair * 2
+                    value1_idx = cutlass.min(
+                        value0_idx + 1, cfg.values_per_lane - 1
+                    )
+                    quantized = self._quantize_pair(
+                        values[value0_idx] * reciprocal,
+                        values[value1_idx] * reciprocal,
+                    )
+                    if cutlass.const_expr(cfg.values_per_lane == 1):
+                        nibble = Uint8(quantized & Int16(0xF))
+                        byte_index = (k_base + value0_idx) // 2
+                        old = packed_row[byte_index]
+                        if (k_base + value0_idx) % 2 == 0:
+                            packed_row[byte_index] = (
+                                old & Uint8(0xF0)
+                            ) | nibble
+                        else:
+                            packed_row[byte_index] = (
+                                old & Uint8(0x0F)
+                            ) | (nibble << 4)
+                    else:
+                        packed_row[(k_base + value0_idx) // 2] = Uint8(
+                            quantized
+                        )
+                if lane_in_scale == 0:
+                    if cutlass.const_expr(cfg.scale_layout == "row_major"):
+                        scales[output_row, scale_block] = block_scale
+                    else:
+                        scale_in_tile = scale_block % 8
+                        physical = (
+                            (output_row % 32) * 16
+                            + ((output_row // 32) % 4) * 4
+                            + scale_in_tile % 4
+                            + (scale_in_tile // 4) * 512
+                        )
+                        scales[
+                            output_row // 128, scale_block // 8, physical
+                        ] = block_scale
 
     @cute.jit
     def _warp_region_amax(
@@ -1077,29 +1315,55 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
             if is_x:
                 row_begin = local_region * self.x_region_rows
                 row_end = cutlass.min(row_begin + self.x_region_rows, self.x_rows)
-                self._region_amax(
-                    x, row_begin, row_end, warp_amax, outer_scale
-                )
+                if cutlass.const_expr(self.cache_region_data):
+                    self._observe_and_quantize_cached_region(
+                        x,
+                        qx,
+                        sx,
+                        row_begin,
+                        row_end,
+                        warp_amax,
+                        outer_scale,
+                    )
+                else:
+                    self._region_amax(
+                        x, row_begin, row_end, warp_amax, outer_scale
+                    )
                 scale = Float32(outer_scale[0])
                 if cute.arch.thread_idx()[0] == 0:
                     region_scales[scale_index] = scale
-                self._quantize_region(x, qx, sx, row_begin, row_end, scale)
+                if cutlass.const_expr(not self.cache_region_data):
+                    self._quantize_region(x, qx, sx, row_begin, row_end, scale)
             else:
                 row_begin = local_region * self.weight_region_rows
                 row_end = cutlass.min(
                     row_begin + self.weight_region_rows, self.weight_rows
                 )
-                self._region_amax(
-                    weight,
-                    row_begin,
-                    row_end,
-                    warp_amax,
-                    outer_scale,
-                )
+                if cutlass.const_expr(self.cache_region_data):
+                    self._observe_and_quantize_cached_region(
+                        weight,
+                        qw,
+                        sw,
+                        row_begin,
+                        row_end,
+                        warp_amax,
+                        outer_scale,
+                    )
+                else:
+                    self._region_amax(
+                        weight,
+                        row_begin,
+                        row_end,
+                        warp_amax,
+                        outer_scale,
+                    )
                 scale = Float32(outer_scale[0])
                 if cute.arch.thread_idx()[0] == 0:
                     region_scales[scale_index] = scale
-                self._quantize_region(weight, qw, sw, row_begin, row_end, scale)
+                if cutlass.const_expr(not self.cache_region_data):
+                    self._quantize_region(
+                        weight, qw, sw, row_begin, row_end, scale
+                    )
             cute.arch.sync_threads()
         if cutlass.const_expr(self.use_pdl):
             if nvvm.elect_sync():

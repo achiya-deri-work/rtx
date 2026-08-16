@@ -68,6 +68,32 @@ class NVFP4ConfigTests(unittest.TestCase):
         )
         self.assertIn("4-KiB", too_fine.rejection(problem) or "")
 
+    def test_register_cached_jit_regions_are_legal(self) -> None:
+        problem = NVFP4Problem(32768, 2304, 768)
+        base = preferred_jit_row_region_config(problem)
+        cached = replace(
+            base,
+            gemm=replace(
+                base.gemm,
+                regional_scale_epilogue="direct",
+                regional_epilogue_schedule="mma",
+                regional_epilogue_values=1,
+            ),
+            x_scale_region_rows=4,
+            weight_scale_region_rows=4,
+            region_ownership="cta_cached",
+        )
+        self.assertIsNone(cached.rejection(problem))
+        self.assertEqual(
+            dynamic_config_from_dict(dynamic_config_to_dict(cached)), cached
+        )
+        oversized = replace(
+            cached,
+            x_scale_region_rows=128,
+            weight_scale_region_rows=128,
+        )
+        self.assertIn("64 BF16", oversized.rejection(problem) or "")
+
     def test_jit_row_region_config_roundtrips_and_exposes_deep_axes(self) -> None:
         problem = NVFP4Problem(257, 769, 768)
         config = preferred_jit_row_region_config(problem)
@@ -106,39 +132,40 @@ class NVFP4ConfigTests(unittest.TestCase):
             dynamic_config_from_dict(dynamic_config_to_dict(pdl)), pdl
         )
 
-    def test_epilogue_warp_seed_is_bounded_to_measured_basin(self) -> None:
+    def test_jit_seed_uses_measured_tma_cached_basin(self) -> None:
         bandwidth_heavy = preferred_jit_row_region_config(
             NVFP4Problem(32768, 2304, 768)
         )
         self.assertEqual(
             bandwidth_heavy.gemm.regional_epilogue_schedule,
-            "warp_specialized",
+            "mma",
         )
         self.assertEqual(bandwidth_heavy.gemm.regional_epilogue_warps, 8)
         self.assertEqual(bandwidth_heavy.gemm.tiles_per_cta, 4)
-        self.assertEqual(bandwidth_heavy.gemm.stages, 1)
+        self.assertEqual(bandwidth_heavy.region_ownership, "cta_cached")
         self.assertEqual(
-            bandwidth_heavy.gemm.regional_scale_epilogue, "product"
+            bandwidth_heavy.gemm.regional_scale_epilogue, "direct"
         )
-        self.assertEqual(bandwidth_heavy.gemm.regional_epilogue_values, 4)
+        self.assertEqual(bandwidth_heavy.gemm.regional_epilogue_values, 1)
         self.assertEqual(bandwidth_heavy.gemm.tile_locality, "same_b")
         narrow = preferred_jit_row_region_config(
             NVFP4Problem(32768, 768, 768)
         )
-        self.assertEqual(narrow.gemm.tiles_per_cta, 2)
+        self.assertEqual(narrow.gemm.tiles_per_cta, 4)
         wide = preferred_jit_row_region_config(
             NVFP4Problem(32768, 3072, 768)
         )
-        self.assertEqual(wide.gemm.tiles_per_cta, 8)
-        self.assertEqual(wide.gemm.tile_locality, "serpentine_b")
+        self.assertEqual(wide.gemm.tiles_per_cta, 4)
+        self.assertEqual(wide.gemm.tile_locality, "same_b")
         compute_heavy = preferred_jit_row_region_config(
             NVFP4Problem(32768, 768, 1536)
         )
         self.assertEqual(
             compute_heavy.gemm.regional_epilogue_schedule,
-            "warp_specialized",
+            "mma",
         )
-        self.assertEqual(compute_heavy.gemm.tiles_per_cta, 2)
+        self.assertEqual(compute_heavy.gemm.tiles_per_cta, 4)
+        self.assertEqual(compute_heavy.region_ownership, "cta_cached")
         small_grid = preferred_jit_row_region_config(
             NVFP4Problem(512, 1536, 768)
         )
@@ -155,7 +182,10 @@ class NVFP4ConfigTests(unittest.TestCase):
         features = adapter.features(adapter.initial_config)
         self.assertEqual(features["derived.jit_row_region"], 1.0)
         self.assertGreater(features["derived.x_scale_regions"], 0.0)
-        self.assertGreater(features["derived.region_observer_read_bytes"], 0.0)
+        self.assertEqual(features["derived.region_observer_read_bytes"], 0.0)
+        self.assertGreater(
+            features["derived.region_register_cache_values"], 0.0
+        )
         self.assertEqual(
             features["derived.programmatic_dependent_launch"], 0.0
         )
@@ -213,7 +243,7 @@ class NVFP4ConfigTests(unittest.TestCase):
                 expected_revision = {
                     "nvfp4_dynamic_fwd": 6,
                     "nvfp4_delayed_fwd": 1,
-                    "nvfp4_jit_row_region_fwd": 6,
+                    "nvfp4_jit_row_region_fwd": 7,
                     "nvfp4_weight_prequant_fwd": 3,
                     "nvfp4_fully_prequant_fwd": 3,
                 }[family]
@@ -371,6 +401,49 @@ class NVFP4ConfigTests(unittest.TestCase):
 
 @unittest.skipUnless(_has_sm12x(), "requires an SM120/SM121 CUDA GPU")
 class NVFP4CudaTests(unittest.TestCase):
+    def test_register_cached_jit_quantization_is_bitwise_exact(self) -> None:
+        from rtx.fp4 import _make_jit_region_dynamic_runner
+
+        torch.manual_seed(1932)
+        problem = NVFP4Problem(256, 256, 256)
+        base = preferred_jit_row_region_config(problem)
+        common = replace(
+            base,
+            gemm=replace(
+                base.gemm,
+                epilogue="tma",
+                epilogue_stages=1,
+                regional_scale_epilogue="direct",
+                regional_epilogue_schedule="mma",
+                regional_epilogue_values=1,
+            ),
+            x_scale_region_rows=5,
+            weight_scale_region_rows=4,
+            programmatic_dependent_launch=False,
+        )
+        conventional = replace(common, region_ownership="cta")
+        cached = replace(common, region_ownership="cta_cached")
+        self.assertIsNone(conventional.rejection(problem))
+        self.assertIsNone(cached.rejection(problem))
+        x = torch.randn(
+            problem.m, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        weight = torch.randn(
+            problem.n, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        expected = torch.empty(
+            problem.m, problem.n, device="cuda", dtype=torch.bfloat16
+        )
+        actual = torch.empty_like(expected)
+        _make_jit_region_dynamic_runner(
+            problem, conventional, x.device
+        )(x, weight, expected)
+        _make_jit_region_dynamic_runner(
+            problem, cached, x.device
+        )(x, weight, actual)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_jit_regional_warp_specialized_epilogue(self) -> None:
         from rtx.fp4 import _make_jit_region_dynamic_runner
 

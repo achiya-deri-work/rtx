@@ -24,7 +24,7 @@ from .prequant_autotune import PREQUANT_SEARCH_SPACE
 NVFP4_INFERENCE_KERNEL_REVISION = 3
 NVFP4_DYNAMIC_KERNEL_REVISION = 6
 NVFP4_DELAYED_KERNEL_REVISION = 1
-NVFP4_JIT_ROW_REGION_KERNEL_REVISION = 6
+NVFP4_JIT_ROW_REGION_KERNEL_REVISION = 7
 
 
 def _gemm_axes() -> dict[str, tuple[dict[str, object], ...]]:
@@ -314,10 +314,6 @@ def preferred_jit_row_region_config(
 
     base = preferred_dynamic_config(problem)
     use_regional_tma = problem.k >= 256
-    use_large_output_schedule = problem.m * problem.n >= 10_000_000
-    use_epilogue_warps = (
-        use_large_output_schedule and problem.k <= 1536 and problem.n >= 4
-    )
     # Dense cross-shape sweeps found that the portable optimum is asymmetric:
     # keep a smaller weight region while amortizing each weight chunk across
     # more activation rows.  Divisibility is not required; the observer masks
@@ -332,57 +328,23 @@ def preferred_jit_row_region_config(
         if use_regional_tma
         else 1
     )
-    epilogue_tiles_per_cta = (
-        2 if problem.n <= 1024 else 8 if problem.n >= 3072 else 4
-    )
     candidate = replace(
         base,
         gemm=replace(
             base.gemm,
-            stages=(1 if use_epilogue_warps else base.gemm.stages),
-            epilogue=(
-                "direct"
-                if use_large_output_schedule
-                else "tma"
-                if use_regional_tma
-                else "direct"
-            ),
+            epilogue=("tma" if use_regional_tma else "direct"),
             epilogue_stages=1,
-            store_vec=(
-                1
-                if use_large_output_schedule or not use_regional_tma
-                else base.gemm.store_vec
-            ),
-            regional_scale_epilogue=(
-                "product" if use_epilogue_warps else "factorized"
-                if use_large_output_schedule else "direct"
-            ),
-            regional_epilogue_schedule=(
-                "warp_specialized" if use_epilogue_warps else "mma"
-            ),
-            atom_layout_m=(4 if use_epilogue_warps else base.gemm.atom_layout_m),
+            store_vec=(base.gemm.store_vec if use_regional_tma else 1),
+            raster="n",
+            grid_swizzle=2,
+            tile_locality="same_b",
+            regional_scale_epilogue="direct",
+            regional_epilogue_schedule="mma",
             regional_epilogue_warps=8,
             regional_epilogue_registers=48,
-            regional_epilogue_values=(4 if use_epilogue_warps else 1),
-            tiles_per_cta=(
-                epilogue_tiles_per_cta
-                if use_epilogue_warps
-                else 2
-                if use_large_output_schedule
-                else base.gemm.tiles_per_cta
-            ),
-            tile_locality=(
-                "serpentine_b"
-                if use_epilogue_warps and problem.n >= 3072
-                else "same_b"
-                if use_epilogue_warps
-                else "raster"
-                if use_large_output_schedule
-                else base.gemm.tile_locality
-            ),
-            persistent_waves=(
-                0 if use_epilogue_warps else base.gemm.persistent_waves
-            ),
+            regional_epilogue_values=1,
+            tiles_per_cta=4,
+            persistent_waves=1,
         ),
         quant_launches="dual",
         x_scale_region_rows=x_rows,
@@ -392,12 +354,15 @@ def preferred_jit_row_region_config(
         region_amax_unroll=1,
         region_waves=4,
         region_order="x_first",
-        region_ownership=("cta" if use_regional_tma else "warp"),
+        region_ownership=("cta_cached" if use_regional_tma else "warp"),
         programmatic_dependent_launch=False,
         regional_rescale_values=8,
         regional_rescale_warps=16,
         regional_rescale_waves=8,
     )
+    if candidate.rejection(problem) is None:
+        return candidate
+    candidate = replace(candidate, region_ownership="cta")
     if candidate.rejection(problem) is None:
         return candidate
     # Ragged output tiles cannot use the current TMA epilogue, but that does
@@ -482,6 +447,43 @@ _JIT_REGION_IMPLEMENTATION_ANCHORS += tuple(
         (16, 16, 6, 3, 2, False),
         (32, 8, 8, 3, 1, False),
         (16, 8, 4, 1, 1, True),
+    )
+)
+
+# True current-scale quantization normally reads each BF16 region once for
+# amax and again for quantization. Register-cached CTA anchors retain each
+# thread's quantization fragment across the reduction, preserving identical
+# FP32 scale math while removing the extra global/L2 operand pass.
+_JIT_REGION_IMPLEMENTATION_ANCHORS += tuple(
+    asdict(
+        replace(
+            _NATIVE_DYNAMIC_ANCHOR,
+            gemm=replace(
+                _NATIVE_DYNAMIC_ANCHOR.gemm,
+                epilogue="tma",
+                epilogue_stages=1,
+                producer_registers=24,
+                maxrregcount=192,
+                raster="n",
+                grid_swizzle=2,
+                tile_locality="same_b",
+                tiles_per_cta=4,
+                persistent_waves=1,
+            ),
+            quant_launches="dual",
+            x_scale_region_rows=x_rows,
+            weight_scale_region_rows=w_rows,
+            tensor_scale_mode="power2",
+            region_waves=region_waves,
+            region_ownership=ownership,
+            programmatic_dependent_launch=False,
+        )
+    )
+    for x_rows, w_rows, region_waves, ownership in (
+        (4, 5, 4, "cta_cached"),
+        (5, 4, 4, "cta_cached"),
+        (8, 4, 6, "cta_cached"),
+        (8, 8, 6, "cta_cached"),
     )
 )
 
@@ -603,7 +605,8 @@ NVFP4_JIT_ROW_REGION_SEARCH_SPACE = {
         {"region_order": order} for order in ("x_first", "weight_first")
     ),
     "region_ownership": tuple(
-        {"region_ownership": owner} for owner in ("warp", "cta")
+        {"region_ownership": owner}
+        for owner in ("warp", "cta", "cta_cached")
     ),
     "dependent_launch": tuple(
         {"programmatic_dependent_launch": enabled}

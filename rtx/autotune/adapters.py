@@ -1182,6 +1182,25 @@ def make_nvfp4_dynamic_adapter(
             region_warp_owned=float(
                 getattr(config, "region_ownership", "warp") == "warp"
             ),
+            region_data_register_cached=float(
+                getattr(config, "region_ownership", "warp") == "cta_cached"
+            ),
+            region_register_cache_values=float(
+                math.ceil(
+                    math.ceil(
+                        max(x_region_rows, weight_region_rows)
+                        * (problem.storage_k // 16)
+                        / quant.blocks_per_warp
+                    )
+                    / quant.num_warps
+                )
+                * quant.values_per_lane
+                if (
+                    getattr(config, "region_ownership", "warp")
+                    == "cta_cached"
+                )
+                else 0
+            ),
             region_scale_power2=float(
                 getattr(config, "tensor_scale_mode", "power2") == "power2"
             ),
@@ -1192,7 +1211,11 @@ def make_nvfp4_dynamic_adapter(
                 # Current/JIT scaling must observe BF16 once before it can
                 # quantize with that scale.
                 2 * problem.k * (problem.m + problem.n)
-                if _family == "nvfp4_jit_row_region_fwd"
+                if (
+                    _family == "nvfp4_jit_row_region_fwd"
+                    and getattr(config, "region_ownership", "warp")
+                    != "cta_cached"
+                )
                 else 0
             ),
             region_scale_state_bytes=float(4 * region_scale_values),

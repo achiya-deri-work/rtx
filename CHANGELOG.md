@@ -5,6 +5,14 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Advance JIT row-region NVFP4 to kernel revision 7. Make the measured
+  TMA/direct-MMA schedule the portable seed and add an autotunable
+  `cta_cached` producer that retains each thread's BF16 quantization fragment
+  across the exact current-amax reduction. It is bitwise identical to the
+  conventional two-read producer, brings producer time to block-only parity,
+  and invalidates revision-6 runtime winners. Keep regional factors and
+  accumulator rescaling in FP32; discard slower packet/tile-factor caches and
+  split-rescale experiments.
 - Advance JIT row-region NVFP4 to kernel revision 5. Add a true
   producer/MMA/epilogue-warp pipeline: MMA warps publish FP32 accumulator
   tiles through SMEM, 1/2/4/8 dedicated epilogue warps apply regional scales

@@ -130,7 +130,11 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
     scale_load_vec: int = 4
     scale_layout: str = "row_major"
     regional_scale_epilogue: Literal[
-        "direct", "expanded_factors", "factorized", "product", "separate"
+        "direct",
+        "expanded_factors",
+        "factorized",
+        "product",
+        "separate",
     ] = "direct"
     # ``warp_specialized`` hands the completed FP32 accumulator tile to
     # dedicated CUDA-core warps.  MMA can then start the next persistent tile
@@ -350,8 +354,37 @@ class NVFP4DynamicConfig:
                 return "region_waves must be 1, 2, 3, 4, 6, or 8"
             if self.region_order not in ("x_first", "weight_first"):
                 return "region_order must be x_first or weight_first"
-            if self.region_ownership not in ("warp", "cta"):
-                return "region_ownership must be warp or cta"
+            if self.region_ownership not in (
+                "warp",
+                "cta",
+                "cta_cached",
+            ):
+                return (
+                    "region_ownership must be warp, cta, or cta_cached"
+                )
+            if self.region_ownership == "cta_cached":
+                blocks_per_row = problem.storage_k // NVFP4_SF_VEC_SIZE
+                region_blocks = (
+                    max(
+                        self.x_scale_region_rows,
+                        self.weight_scale_region_rows,
+                    )
+                    * blocks_per_row
+                )
+                task_groups = (
+                    region_blocks + self.quant.blocks_per_warp - 1
+                ) // self.quant.blocks_per_warp
+                iterations = (
+                    task_groups + self.quant.num_warps - 1
+                ) // self.quant.num_warps
+                cached_values_per_thread = (
+                    iterations * self.quant.values_per_lane
+                )
+                if cached_values_per_thread > 64:
+                    return (
+                        "register-cached JIT region exceeds 64 BF16 values "
+                        "per thread"
+                    )
             if self.quant_launches != "dual":
                 return "the first JIT row-region implementation uses one dual launch"
             if (

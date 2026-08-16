@@ -139,16 +139,23 @@ separately control actual operand reuse.
 The low-level `NVFP4GemmConfig` also exposes
 `regional_epilogue_schedule`, `regional_epilogue_warps`,
 `regional_epilogue_registers`, and `regional_epilogue_values`.
-`warp_specialized` assigns independent warps to
-the FP32 regional-scale/BF16-store epilogue and overlaps it with the next
-persistent tile's MMA. It requires a one-stage operand pipeline and at least two
-tiles per CTA because its 128x128 FP32 handoff occupies 64 KiB of SMEM. The
-portable seed enables the measured eight-warp basin for large output grids at
-K<=1536. It caches the product of the two regional factors, shares one lookup
-across four adjacent values, and uses aligned 64-bit BF16 stores. Output width
-selects two, four, or eight persistent tiles per CTA, with a serpentine-B
-traversal for very wide outputs; other shapes retain `mma`. These are advanced
-schedule coordinates and normally should be left to runtime autotuning.
+`warp_specialized` remains an experimental coordinate: it assigns independent
+warps to the FP32 regional-scale/BF16-store epilogue and overlaps it with the
+next persistent tile's MMA, but its 128x128 FP32 handoff consumes 64 KiB of
+SMEM. Revision 7 instead seeds the faster TMA/direct-MMA basin. Its CTA
+quantizer retains each thread's small BF16 quantization fragment in registers
+while the CTA resolves the current regional amax, then quantizes those exact
+values without rereading X or W. Regional scales, accumulator scaling, and the
+final BF16 rounding remain FP32, FP32, and BF16 respectively.
+
+On the development RTX 5070 Ti, the register-cached producer reached 70.8 us
+for `32768x2304x768`, versus 69.5 us for block-only quantization. End-to-end JIT
+regional forward was 349.4 us versus 329.0 us for tensor-delayed scaling; the
+remaining cost is the fused per-output application of two varying FP32 region
+factors. Shared-memory operand staging, expanded factor/product tables, and a
+separate output-rescale pass were measured and rejected because they increased
+end-to-end latency. These schedule details remain autotunable and are not part
+of the public module contract.
 
 ### Backend
 
