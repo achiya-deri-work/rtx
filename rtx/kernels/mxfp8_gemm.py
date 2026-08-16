@@ -610,6 +610,13 @@ class MXFP8GemmKernel:
                 ],
                 16,
             ]
+            outer_product: cute.struct.Align[
+                cute.struct.MemRange[
+                    Float32,
+                    self.output_scale_product_cache_elems,
+                ],
+                16,
+            ]
 
         self.shared_storage = SharedStorage
         m_tiles = cute.ceil_div(self.problem.m, cfg.tile_m)
@@ -788,6 +795,13 @@ class MXFP8GemmKernel:
         # additional shared-memory allocation (even one byte can round the
         # launch above SM120's allocation quantum).
         s_outer_product = s_outer_x
+        if cutlass.const_expr(self.cache_output_scale_products):
+            s_outer_product = storage.outer_product.get_tensor(
+                cute.make_layout(
+                    (self.output_scale_product_cache_elems,),
+                    stride=(1,),
+                )
+            )
         if cutlass.const_expr(self.cluster_output):
             s_cluster_barrier = storage.cluster_barrier.get_tensor(
                 cute.make_layout((2,), stride=(1,))
@@ -1053,6 +1067,24 @@ class MXFP8GemmKernel:
                         output_scale, global_column
                     )
                 cute.arch.sync_threads()
+                if cutlass.const_expr(self.cache_output_scale_products):
+                    for product_index in cutlass.range(
+                        tidx,
+                        self.output_scale_product_cache_elems,
+                        cfg.num_threads,
+                        unroll=1,
+                    ):
+                        x_index = (
+                            product_index // self.output_w_scale_cache_elems
+                        )
+                        weight_index = (
+                            product_index % self.output_w_scale_cache_elems
+                        )
+                        s_outer_product[product_index] = (
+                            Float32(s_outer_x[x_index])
+                            * Float32(s_outer_w[weight_index])
+                        )
+                    cute.arch.sync_threads()
 
             # Reconstruct the exact circular-pipeline phase for this unrolled
             # output tile. Carrying the mutable PipelineState Python object

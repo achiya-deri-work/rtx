@@ -56,16 +56,6 @@ def _config_rejection(
             from ..kernels.mxfp8 import fwd_config_from_dict
 
             return fwd_config_from_dict(config).implementation_rejection(problem)
-        if family == "nvfp4_fused_fwd":
-            from ..configs.nvfp4 import (
-                NVFP4Problem,
-                normalize_nvfp4_fwd_config,
-            )
-
-            nv_problem = NVFP4Problem(problem.m, problem.n, problem.k)
-            return normalize_nvfp4_fwd_config(
-                **dict(config)
-            ).implementation_rejection(nv_problem)
         if family == "mxfp8_prequant_fwd":
             from ..prequant_autotune import prequant_config_from_dict
 
@@ -100,7 +90,6 @@ def _config_rejection(
             "nvfp4_dynamic_fwd",
             "nvfp4_delayed_fwd",
             "nvfp4_jit_row_region_fwd",
-            "nvfp4_region_delayed_fwd",
         ):
             from ..configs.nvfp4 import NVFP4Problem
             from ..nvfp4_inference_autotune import dynamic_config_from_dict
@@ -109,7 +98,6 @@ def _config_rejection(
             if (
                 family in (
                     "nvfp4_jit_row_region_fwd",
-                    "nvfp4_region_delayed_fwd",
                 )
                 and not parsed.jit_row_region
             ):

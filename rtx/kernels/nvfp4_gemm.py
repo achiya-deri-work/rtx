@@ -66,31 +66,33 @@ class NVFP4JITRegionGemmKernel(NVFP4GemmKernel):
         if x_region_rows < 1 or weight_region_rows < 1:
             raise ValueError("JIT NVFP4 region rows must be positive")
         self.cache_regional_output_scales = True
+        # A tile may start in the middle of a region. Account for the leading
+        # partial region as well as the trailing one; ceil(tile/region) alone
+        # under-allocates for non-divisor geometries such as 128/5.
         self.output_x_scale_cache_elems = (
-            config.tile_m + x_region_rows - 1
-        ) // x_region_rows
+            config.tile_m + x_region_rows - 2
+        ) // x_region_rows + 1
         self.output_w_scale_cache_elems = (
-            config.tile_n + weight_region_rows - 1
-        ) // weight_region_rows
+            config.tile_n + weight_region_rows - 2
+        ) // weight_region_rows + 1
         product_count = (
             self.output_x_scale_cache_elems
             * self.output_w_scale_cache_elems
         )
-        # A complete 2-D product cache removes one SMEM load and one multiply
-        # from every output element, but fine row geometries can require a
-        # 16-KiB table and exceed SM120's launch-time SMEM limit.  Keep the
-        # compact fast path and retain factorized caches above this bound.
-        # Revision 3 uses either one tile-uniform register scale or direct
-        # read-only scale loads. A CTA-wide product table reintroduced the
-        # synchronization bottleneck and is deliberately disabled.
-        self.cache_output_scale_products = False
-        self.output_scale_product_cache_elems = 0
+        strategy = config.regional_scale_epilogue
+        self.expanded_factor_output_scales = strategy == "expanded_factors"
+        self.cache_output_scale_products = strategy == "product"
+        self.output_scale_product_cache_elems = (
+            product_count if self.cache_output_scale_products else 0
+        )
         self.tile_uniform_regional_output_scale = (
-            x_region_rows >= config.tile_m
-            and weight_region_rows >= config.tile_n
+            not self.expanded_factor_output_scales
+            and x_region_rows % config.tile_m == 0
+            and weight_region_rows % config.tile_n == 0
         )
         self.direct_regional_output_scales = (
-            not self.tile_uniform_regional_output_scale
+            strategy in ("direct", "expanded_factors")
+            and not self.tile_uniform_regional_output_scale
         )
         super().__init__(problem, config, use_pdl=use_pdl)
         self.apply_output_scale = False
@@ -111,8 +113,17 @@ class NVFP4JITRegionGemmKernel(NVFP4GemmKernel):
         tile_row: Int32,
         tile_column: Int32,
     ):
-        x_index = (row - tile_row) // self.x_region_rows
-        weight_index = (column - tile_column) // self.weight_region_rows
+        if cutlass.const_expr(self.expanded_factor_output_scales):
+            return Float32(output_scale[row]) * Float32(
+                output_scale[self.problem.m + column]
+            )
+        x_index = (
+            row // self.x_region_rows - tile_row // self.x_region_rows
+        )
+        weight_index = (
+            column // self.weight_region_rows
+            - tile_column // self.weight_region_rows
+        )
         if cutlass.const_expr(self.tile_uniform_regional_output_scale):
             return (
                 self._load_x_output_scale(output_scale, row)
@@ -150,6 +161,9 @@ class NVFP4JITRegionGemmKernel(NVFP4GemmKernel):
 
     @cute.jit
     def _x_output_scale_cache_offset(self, cache_index: Int32):
+        # The common loader adds this to the tile origin and then resolves the
+        # global region. Offset zero loads the leading partial region; adding
+        # one full region advances exactly one region even for misaligned CTAs.
         return cache_index * self.x_region_rows
 
     @cute.jit
@@ -170,6 +184,12 @@ class NVFP4JITRegionGemmKernel(NVFP4GemmKernel):
         local_row: Int32,
         local_column: Int32,
     ):
+        if cutlass.const_expr(self.expanded_factor_output_scales):
+            return (
+                value
+                * Float32(output_scale[global_row])
+                * Float32(output_scale[self.problem.m + global_column])
+            )
         if cutlass.const_expr(self.tile_uniform_regional_output_scale):
             return value * tile_output_scale
         if cutlass.const_expr(self.direct_regional_output_scales):
@@ -178,8 +198,14 @@ class NVFP4JITRegionGemmKernel(NVFP4GemmKernel):
                 * self._load_x_output_scale(output_scale, global_row)
                 * self._load_weight_output_scale(output_scale, global_column)
             )
-        x_index = local_row // self.x_region_rows
-        weight_index = local_column // self.weight_region_rows
+        x_index = (
+            global_row // self.x_region_rows
+            - (global_row - local_row) // self.x_region_rows
+        )
+        weight_index = (
+            global_column // self.weight_region_rows
+            - (global_column - local_column) // self.weight_region_rows
+        )
         if cutlass.const_expr(self.cache_output_scale_products):
             product_index = (
                 x_index * self.output_w_scale_cache_elems + weight_index
@@ -265,6 +291,58 @@ class NVFP4RegionRescaleKernel:
                     out[row, column] = BFloat16(
                         Float32(out[row, column]) * x_scale * weight_scale
                     )
+
+
+class NVFP4RegionExpandKernel:
+    """Expand compact regional factors to division-free row/column arrays."""
+
+    def __init__(
+        self,
+        m: int,
+        n: int,
+        x_region_rows: int,
+        weight_region_rows: int,
+    ):
+        self.m = m
+        self.n = n
+        self.x_region_rows = x_region_rows
+        self.weight_region_rows = weight_region_rows
+        x_regions = cute.ceil_div(m, x_region_rows)
+        self.x_regions = x_regions
+        self.count = m + n
+        self.threads = 256
+
+    @cute.jit
+    def __call__(
+        self,
+        factors: cute.Tensor,
+        expanded: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(factors, expanded).launch(
+            grid=(cute.ceil_div(self.count, self.threads), 1, 1),
+            block=(self.threads, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(self, factors: cute.Tensor, expanded: cute.Tensor):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        index = block_idx * self.threads + tidx
+        if index < self.count:
+            if index < self.m:
+                expanded[index] = Float32(
+                    factors[index // self.x_region_rows]
+                )
+            else:
+                column = index - self.m
+                expanded[index] = Float32(
+                    factors[
+                        self.x_regions
+                        + column // self.weight_region_rows
+                    ]
+                )
 
 
 def _fake_nvfp4_scales(
@@ -418,12 +496,18 @@ def compile_nvfp4_jit_region_gemm(
         stride=(problem.n, 1),
         assumed_align=16,
     )
+    x_regions = (problem.m + x_region_rows - 1) // x_region_rows
+    weight_regions = (
+        problem.n + weight_region_rows - 1
+    ) // weight_region_rows
+    scale_values = (
+        problem.m + problem.n
+        if config.regional_scale_epilogue == "expanded_factors"
+        else x_regions + weight_regions
+    )
     region_scales = cute.runtime.make_fake_tensor(
         cutlass.Float32,
-        (
-            (problem.m + x_region_rows - 1) // x_region_rows
-            + (problem.n + weight_region_rows - 1) // weight_region_rows,
-        ),
+        (scale_values,),
         stride=(1,),
         assumed_align=4,
     )
@@ -444,6 +528,38 @@ def compile_nvfp4_jit_region_gemm(
     )
 
 
+@lru_cache(maxsize=None)
+def compile_nvfp4_region_expand(
+    m: int,
+    n: int,
+    x_region_rows: int,
+    weight_region_rows: int,
+):
+    x_regions = cute.ceil_div(m, x_region_rows)
+    weight_regions = cute.ceil_div(n, weight_region_rows)
+    kernel = NVFP4RegionExpandKernel(
+        m, n, x_region_rows, weight_region_rows
+    )
+    factors = cute.runtime.make_fake_tensor(
+        Float32,
+        (x_regions + weight_regions,),
+        stride=(1,),
+        assumed_align=4,
+    )
+    expanded = cute.runtime.make_fake_tensor(
+        Float32,
+        (m + n,),
+        stride=(1,),
+        assumed_align=4,
+    )
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        kernel,
+        factors,
+        expanded,
+        stream,
+        options="--enable-tvm-ffi --opt-level 3",
+    )
 @lru_cache(maxsize=None)
 def compile_nvfp4_region_rescale(
     m: int,
@@ -494,8 +610,10 @@ __all__ = [
     "NVFP4GemmKernel",
     "NVFP4JITRegionGemmKernel",
     "NVFP4RegionRescaleKernel",
+    "NVFP4RegionExpandKernel",
     "compile_nvfp4_block_gemm",
     "compile_nvfp4_gemm",
     "compile_nvfp4_jit_region_gemm",
+    "compile_nvfp4_region_expand",
     "compile_nvfp4_region_rescale",
 ]

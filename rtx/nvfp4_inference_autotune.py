@@ -24,8 +24,7 @@ from .prequant_autotune import PREQUANT_SEARCH_SPACE
 NVFP4_INFERENCE_KERNEL_REVISION = 3
 NVFP4_DYNAMIC_KERNEL_REVISION = 6
 NVFP4_DELAYED_KERNEL_REVISION = 1
-NVFP4_JIT_ROW_REGION_KERNEL_REVISION = 2
-NVFP4_REGION_DELAYED_KERNEL_REVISION = 3
+NVFP4_JIT_ROW_REGION_KERNEL_REVISION = 3
 
 
 def _gemm_axes() -> dict[str, tuple[dict[str, object], ...]]:
@@ -315,6 +314,7 @@ def preferred_jit_row_region_config(
 
     base = preferred_dynamic_config(problem)
     use_regional_tma = problem.k >= 256
+    use_expanded_factors = problem.m * problem.n >= 10_000_000
     # Dense cross-shape sweeps found that the portable optimum is asymmetric:
     # keep a smaller weight region while amortizing each weight chunk across
     # more activation rows.  Divisibility is not required; the observer masks
@@ -336,6 +336,9 @@ def preferred_jit_row_region_config(
             epilogue=("tma" if use_regional_tma else "direct"),
             epilogue_stages=1,
             store_vec=(base.gemm.store_vec if use_regional_tma else 1),
+            regional_scale_epilogue=(
+                "expanded_factors" if use_expanded_factors else "direct"
+            ),
         ),
         quant_launches="dual",
         x_scale_region_rows=x_rows,
@@ -346,6 +349,7 @@ def preferred_jit_row_region_config(
         region_waves=4,
         region_order="x_first",
         region_ownership=("cta" if use_regional_tma else "warp"),
+        programmatic_dependent_launch=False,
     )
     if candidate.rejection(problem) is None:
         return candidate
@@ -445,6 +449,15 @@ NVFP4_JIT_ROW_REGION_SEARCH_SPACE = {
         {"weight_scale_region_rows": rows}
         for rows in (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128)
     ),
+    "regional_scale_epilogue": tuple(
+        {"gemm": {"regional_scale_epilogue": strategy}}
+        for strategy in (
+            "direct",
+            "expanded_factors",
+            "factorized",
+            "product",
+        )
+    ),
     # Stratifying the dense neighborhood by X size prevents a bandit or an
     # interrupted campaign from sampling only the diagonal.  These coordinates
     # expose all 49 asymmetric 2..8 pairs early while the independent axes
@@ -491,269 +504,6 @@ NVFP4_JIT_ROW_REGION_SEARCH_SPACE = {
     **_jit_gemm_axes,
 }
 
-_REGION_DELAYED_IMPLEMENTATION_ANCHORS = tuple(
-    asdict(
-        replace(
-            _NATIVE_DYNAMIC_ANCHOR,
-            gemm=replace(
-                _NATIVE_DYNAMIC_ANCHOR.gemm,
-                epilogue="tma",
-                epilogue_stages=epilogue_stages,
-                persistent_waves=gemm_waves,
-            ),
-            quant_launches="dual",
-            x_scale_region_rows=x_rows,
-            weight_scale_region_rows=w_rows,
-            tensor_scale_mode="power2",
-            region_waves=region_waves,
-            region_ownership="cta",
-        )
-    )
-    for x_rows, w_rows, region_waves, gemm_waves, epilogue_stages in (
-        (4, 8, 4, 1, 1),
-        (8, 8, 4, 1, 2),
-        (8, 16, 6, 3, 1),
-        (16, 8, 4, 3, 2),
-        (16, 16, 6, 1, 2),
-        (32, 8, 8, 3, 1),
-        (32, 32, 4, 1, 2),
-        (64, 16, 6, 3, 2),
-    )
-)
-
-# Region revision 2 was seeded exclusively from the native dynamic anchor and
-# consequently spent most trials compensating for a 96-register producer
-# basin.  Cross the regional implementation with the proven delayed-style
-# persistence/raster schedules explicitly so shallow anytime waves compare
-# implementations rather than hoping a long random walk reconstructs them.
-_REGION_DELAYED_IMPLEMENTATION_ANCHORS += tuple(
-    asdict(
-        replace(
-            _NATIVE_DYNAMIC_ANCHOR,
-            gemm=replace(
-                _NATIVE_DYNAMIC_ANCHOR.gemm,
-                epilogue="tma",
-                epilogue_stages=1,
-                producer_registers=24,
-                maxrregcount=192,
-                raster="n",
-                grid_swizzle=2,
-                tile_locality=locality,
-                tiles_per_cta=tiles,
-                persistent_waves=waves,
-            ),
-            quant_launches="dual",
-            x_scale_region_rows=x_rows,
-            weight_scale_region_rows=w_rows,
-            tensor_scale_mode="power2",
-            region_waves=4,
-            region_ownership="cta",
-        )
-    )
-    for x_rows, w_rows, locality, tiles, waves in (
-        (4, 4, "same_b", 4, 3),
-        (8, 16, "same_b", 4, 3),
-        (128, 128, "same_b", 4, 3),
-        (128, 128, "raster", 8, 0),
-    )
-)
-
-NVFP4_REGION_DELAYED_SEARCH_SPACE = {
-    name: values
-    for name, values in NVFP4_JIT_ROW_REGION_SEARCH_SPACE.items()
-    if name
-    not in {
-        "region_amax_load",
-        "region_amax_unroll",
-        "region_grid",
-        "region_order",
-        "region_ownership",
-        "x_region_rows",
-        "weight_region_rows",
-    }
-}
-NVFP4_REGION_DELAYED_SEARCH_SPACE.update(
-    {
-        "implementation_anchor": _REGION_DELAYED_IMPLEMENTATION_ANCHORS,
-        # X and W region sizes are a coupled coordinate: mutating only one
-        # makes an otherwise valid configuration temporarily illegal, so the
-        # adapter's legality-preserving random walk can never reach it.
-        # Split geometry into X-stratified coordinates.  The portable sampler
-        # selects coordinates uniformly, so one 56-value coordinate would be
-        # visited only about once in a 16-trial coverage wave.  Eight strata
-        # make early anytime results useful while their union remains exactly
-        # the same Cartesian search space for model/local search.
-        **{
-            f"region_geometry_x{x_rows}": tuple(
-                {
-                    "x_scale_region_rows": x_rows,
-                    "weight_scale_region_rows": w_rows,
-                }
-                for w_rows in (2, 4, 8, 16, 32, 64, 128)
-            )
-            for x_rows in (2, 4, 8, 16, 32, 64, 128, 256)
-        },
-        "region_execution": tuple(
-            {"region_waves": waves, "region_order": order}
-            for waves in (1, 2, 3, 4, 6, 8)
-            for order in ("x_first", "weight_first")
-        ),
-    }
-)
-
-# A deliberately narrow second-stage space for the two decoder projections
-# where broad v3 exploration ended within ~2% of tensor-delayed scaling.  This
-# is kept separate from the portable first-stage space: it starts from both
-# measured wide-shape basins and spends trials on coupled scheduling choices
-# that an ordinary one-field coordinate walk reaches poorly.
-_REGION_DELAYED_WIDE_ANCHORS = tuple(
-    asdict(
-        replace(
-            _NATIVE_DYNAMIC_ANCHOR,
-            quant=replace(
-                _NATIVE_DYNAMIC_ANCHOR.quant,
-                values_per_lane=16,
-                load_bits=load_bits,
-                num_warps=16,
-                persistent_waves=2,
-                maxrregcount=quant_registers,
-                scale_compute=scale_compute,
-            ),
-            gemm=replace(
-                _NATIVE_DYNAMIC_ANCHOR.gemm,
-                producer_registers=96,
-                consumer_registers=consumer_registers,
-                raster=raster,
-                grid_swizzle=grid_swizzle,
-                tile_locality=locality,
-                tiles_per_cta=tiles,
-                persistent_waves=waves,
-            ),
-            quant_launches="dual",
-            x_scale_region_rows=128,
-            weight_scale_region_rows=128,
-            tensor_scale_mode="power2",
-            region_waves=4,
-            region_ownership="cta",
-        )
-    )
-    for (
-        load_bits,
-        quant_registers,
-        scale_compute,
-        consumer_registers,
-        raster,
-        grid_swizzle,
-        locality,
-        tiles,
-        waves,
-    ) in (
-        # Verified v3 2304 and 3072 output-width winners.
-        (32, 64, "redundant", 232, "n", 2, "same_b", 4, 3),
-        (64, 128, "leader_broadcast", 128, "m", 1, "raster", 8, 4),
-        # Cross the winners' quantizers and GEMM schedules explicitly.
-        (64, 128, "leader_broadcast", 232, "n", 2, "same_b", 4, 3),
-        (32, 64, "redundant", 128, "m", 1, "raster", 8, 4),
-    )
-)
-
-NVFP4_REGION_DELAYED_WIDE_SEARCH_SPACE = {
-    "implementation_anchor": _REGION_DELAYED_WIDE_ANCHORS,
-    "wide_region_geometry": tuple(
-        {"x_scale_region_rows": x_rows, "weight_scale_region_rows": w_rows}
-        for x_rows, w_rows in (
-            (64, 128),
-            (128, 64),
-            (128, 128),
-            (256, 128),
-        )
-    ),
-    "wide_register_partition": tuple(
-        {
-            "gemm": {
-                "producer_registers": producer,
-                "consumer_registers": consumer,
-                "maxrregcount": maximum,
-            }
-        }
-        for producer, consumer, maximum in (
-            (24, 128, 192),
-            (48, 160, 192),
-            (64, 192, 224),
-            (96, 128, 192),
-            (96, 232, 192),
-        )
-    ),
-    "wide_persistence": tuple(
-        {
-            "gemm": {
-                "tiles_per_cta": tiles,
-                "persistent_waves": waves,
-                "tile_locality": locality,
-            }
-        }
-        for tiles, waves, locality in (
-            (2, 2, "same_b"),
-            (4, 2, "same_b"),
-            (4, 3, "same_b"),
-            (4, 4, "same_b"),
-            (8, 3, "raster"),
-            (8, 4, "raster"),
-            (8, 4, "serpentine_b"),
-        )
-    ),
-    "wide_raster": tuple(
-        {"gemm": {"raster": raster, "grid_swizzle": swizzle}}
-        for raster in ("m", "n")
-        for swizzle in (1, 2, 4, 8)
-    ),
-    "wide_quant_launch": tuple(
-        {
-            "quant": {
-                "values_per_lane": 16,
-                "load_bits": load_bits,
-                "num_warps": warps,
-                "persistent_waves": waves,
-                "maxrregcount": registers,
-                "scale_compute": scale_compute,
-            }
-        }
-        for load_bits, warps, waves, registers, scale_compute in (
-            (32, 16, 2, 64, "redundant"),
-            (64, 16, 2, 128, "leader_broadcast"),
-            (64, 8, 3, 128, "leader_broadcast"),
-            (128, 8, 3, 128, "redundant"),
-        )
-    ),
-}
-
-
-def preferred_region_delayed_wide_config(problem: NVFP4Problem) -> NVFP4DynamicConfig:
-    """Pick the measured wide anchor nearest to the output projection width."""
-
-    anchor = _REGION_DELAYED_WIDE_ANCHORS[0 if problem.n <= 2304 else 1]
-    candidate = dynamic_config_from_dict(anchor)
-    return candidate if candidate.rejection(problem) is None else preferred_region_delayed_config(problem)
-
-
-def preferred_region_delayed_config(
-    problem: NVFP4Problem,
-) -> NVFP4DynamicConfig:
-    base = preferred_jit_row_region_config(problem)
-    def preferred_rows(rows: int, choices: tuple[int, ...]) -> int:
-        return next(value for value in choices if rows % value == 0)
-
-    x_rows = preferred_rows(problem.m, (16, 8, 4, 2, 1))
-    w_rows = preferred_rows(problem.n, (8, 16, 4, 2, 1))
-    candidate = replace(
-        base,
-        gemm=replace(base.gemm, epilogue="tma", epilogue_stages=1),
-        quant_launches="dual",
-        x_scale_region_rows=x_rows,
-        weight_scale_region_rows=w_rows,
-        region_ownership="cta",
-    )
-    return candidate if candidate.rejection(problem) is None else base
 
 
 def _identifier(value: Mapping[str, object]) -> str:
@@ -1080,12 +830,8 @@ __all__ = [
     "NVFP4_INFERENCE_KERNEL_REVISION",
     "NVFP4_JIT_ROW_REGION_KERNEL_REVISION",
     "NVFP4_JIT_ROW_REGION_SEARCH_SPACE",
-    "NVFP4_REGION_DELAYED_KERNEL_REVISION",
-    "NVFP4_REGION_DELAYED_SEARCH_SPACE",
-    "NVFP4_REGION_DELAYED_WIDE_SEARCH_SPACE",
     "NVFP4_WEIGHT_PREQUANT_SEARCH_SPACE",
     "dynamic_config_from_dict",
-    "preferred_region_delayed_wide_config",
     "dynamic_config_id",
     "dynamic_config_to_dict",
     "fully_prequant_config_from_dict",
@@ -1093,7 +839,6 @@ __all__ = [
     "fully_prequant_config_to_dict",
     "preferred_dynamic_config",
     "preferred_jit_row_region_config",
-    "preferred_region_delayed_config",
     "update_fully_prequant_config",
     "update_dynamic_config",
     "update_weight_prequant_config",

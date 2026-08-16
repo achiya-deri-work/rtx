@@ -1,5 +1,8 @@
 # `rtx.NVFP4Linear`
 
+For TorchAO-style whole-model training conversion and packed-weight PTQ, see
+[the model conversion guide](model_conversion.md).
+
 `NVFP4Linear` is a no-bias replacement for `torch.nn.Linear` on supported
 Blackwell RTX GPUs. It stores dynamic training weights in BF16, executes the
 forward GEMM in NVFP4, returns BF16, and computes dX and dW with MXFP8 kernels.
@@ -24,10 +27,8 @@ independent autotuning coordinates, including every asymmetric pair from 2–8
 and wider regions. An installed per-device, per-shape winner can replace the
 portable schedule and geometry.
 
-The default changes deliberately in two situations. A prequantized weight uses
-current activation scaling because its weight scale is already materialized.
-The legacy `backend="fused"` uses current tensorwise scaling because its
-experimental CTA-local regional path is not multi-output-tile correct.
+The default changes for a prequantized weight: it uses current activation
+scaling because its weight scale is already materialized.
 
 ## Constructor
 
@@ -39,7 +40,7 @@ rtx.NVFP4Linear(
     *,
     device=None,
     dtype=torch.bfloat16,
-    forward_config=None,
+    scale_config=None,
     backward_config=None,
     scaling=None,
     scale_region_rows=None,
@@ -83,8 +84,6 @@ operand/backend state. To hold numerical policy fixed, choose explicitly:
 | `delayed` | Previous amax history | Stateful | Avoids a current global reduction but can be stale for one step after a shift |
 | `current` | Current tensorwide X and W amax | Stateless | Tensorwide numerical reference; global reduction/synchronization is expensive |
 | `block` | No FP32 outer scale; native E4M3 block scales only | Stateless | Lowest scale overhead, but least protection for extreme or tiny exponent ranges |
-
-`regional` is accepted only as a compatibility alias for `jit_row_region`.
 
 Delayed mode initializes from current data, keeps device-resident amax history,
 and resets that history after state loading, a relevant shape/stream change, or
@@ -143,9 +142,6 @@ separately control actual operand reuse.
   and its cached/tuned configuration.
 - `materialized` explicitly selects separate quantization/observation and
   native NVFP4 GEMM launches. This is the supported JIT-regional backend.
-- `fused` selects the legacy CTA-local research kernel. Explicit
-  `jit_row_region` is rejected because cross-CTA regional scaling is not yet
-  multi-tile correct there.
 
 “Materialized” means the quantized operands exist between CuTe launches. It
 does not mean eager PyTorch reductions: the registered path remains compatible
@@ -163,8 +159,8 @@ compiler-visible FX where specified.
   remains its compatibility spelling.
 - `tuning_policy` supplies a custom orchestration/search policy.
 - `autotune_cache_dir` selects a non-default winner/cache root.
-- `forward_config` and `backward_config` override low-level fused-forward and
-  MXFP8-backward choices.
+- `scale_config` selects exact/power-of-two outer scaling and delayed-history
+  policy; `backward_config` overrides the low-level MXFP8 backward schedule.
 - `dynamic_config` fixes the dynamic-X/dynamic-W materialized schedule.
 - `weight_prequant_config` fixes dynamic-X/prequantized-W inference.
 - `fully_prequant_config` fixes prequantized-X/prequantized-W inference.

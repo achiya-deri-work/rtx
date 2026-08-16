@@ -199,7 +199,7 @@ def main() -> None:
         default="auto",
     )
     parser.add_argument(
-        "--nv-backend", choices=("auto", "fused", "materialized"), default="auto"
+        "--nv-backend", choices=("auto", "materialized"), default="auto"
     )
     parser.add_argument(
         "--nv-scaling",
@@ -207,7 +207,6 @@ def main() -> None:
             "delayed",
             "current",
             "jit_row_region",
-            "regional",
             "block",
         ),
         default="block",

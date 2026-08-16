@@ -43,6 +43,7 @@ Documentation = "https://github.com/achiya-deri-work/rtx/tree/main/docs"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "build>=1.2", "twine>=5"]
+vision = ["torchvision>=0.27,<=0.28"]
 
 [project.scripts]
 rtx-autotune = "rtx.autotune.dataset:main"

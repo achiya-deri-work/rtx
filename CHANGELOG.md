@@ -5,6 +5,35 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Retire the experimental NVFP4 fused, CTA-region, delayed-region, and
+  `regional` compatibility paths. The stable NVFP4 backend vocabulary is now
+  `auto`/`materialized`; scaling policies are `jit_row_region`, `delayed`,
+  `current`, and `block`.
+- Replace the fused-schedule-shaped `NVFP4FwdConfig` with the focused
+  `NVFP4ScaleConfig`. Kernel schedules remain in `NVFP4DynamicConfig`, while
+  the scale config owns only exact/power-of-two and delayed-history policy.
+- Version retained-family autotuning campaigns as v2 rather than mutating
+  dataset-bearing v1 identities.
+- Validate both supported PyTorch lines in CI. PyTorch 2.12 compatibility now
+  handles the absence of `torch.Tag.out`, Python 3.12 slotted-dataclass super
+  behavior, and CUDA-local TorchAO version identifiers such as
+  `0.18.0+cu132`.
+
+- Add an optional local DINOv3 ViT-S/16 regression matrix spanning BF16,
+  TorchAO rowwise FP8,
+  MXFP8/NVFP4 training and PTQ, layerwise numerics, fullgraph compilation, and
+  compiled backward.
+- Add a reproducible DINOv3 W4A16/W4A8 format study that distinguishes
+  conceptual NVFP4 mixed-activation modes from the hardware-native SM120
+  MXF4/MXFP8 instruction and attributes the remaining error to four-bit
+  weights.
+
+- Add TorchAO-style top-level MXFP8 and NVFP4 dynamic-training conversion plus
+  MXFP8/NVFP4 packed-weight PTQ policies. Preserve original Parameters and
+  optimizer references for training, make PTQ mutation atomic, retain shared
+  module aliases, reject selected biases, and validate selective conversion in
+  a compiled small torchvision Vision Transformer.
+
 - Version installed runtime winners by kernel revision with cache schema v2;
   schema-v1 winners remain inspectable but are deliberately invalidated.
 - Make packed NVFP4 block-only conversion use a unit FP32 tensor scale, and
@@ -28,9 +57,7 @@ project follows semantic versioning while it is in active alpha development.
   power-of-two scale publication stay on device, and the compiled frontend has
   no eager reduction or scale-preparation operators.
 - Add the independently versioned `nvfp4_delayed_fwd` autotuning, dataset,
-  verification, promotion, and runtime-winner family. Preserve the former
-  fused implementation behind explicit `backend="fused"` for controlled
-  comparisons while `backend="auto"` selects the production path.
+  verification, promotion, and runtime-winner family.
 
 ## 0.18.0
 
@@ -205,7 +232,7 @@ project follows semantic versioning while it is in active alpha development.
   NVFP4 physical operand widths, scale-vector sizes, MMA atoms, and output
   scaling while preserving the established MXFP8 launcher contracts and
   metadata-only backward transpose layouts.
-- Add a fully composable `nvfp4_fused_fwd` autotuning family, delayed-telemetry
+- Add NVFP4 forward autotuning, delayed-telemetry
   traffic/resource features, promotion and runtime-winner support, a balanced
   16-context campaign, and a paired release benchmark that requires at least
   1.5x the tuned MXFP8 training-forward speed on its default shapes.

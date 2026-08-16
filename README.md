@@ -12,7 +12,7 @@ contains:
   persistent three-role TMA producer/quantizer/MMA schedules and staged async
   TMA epilogues; E8M0 scales use training-safe round-to-infinity by default,
   while the clipping-prone OCP floor conversion remains an explicit ablation;
-- fused BF16-to-NVFP4 training forward with packed E2M1 operands, E4M3
+- materialized BF16-to-NVFP4 training forward with packed E2M1 operands, E4M3
   block scales, block-only/current/row-region-JIT/delayed FP32 outer-scale
   policies,
   rolling in-kernel amax telemetry, and a native K=64 block-scaled MMA;
@@ -164,7 +164,55 @@ option is described in [the NVFP4Linear API guide](docs/nvfp4_linear.md).
 The corresponding MXFP8 states, backends, conversion methods, and tuning
 controls are described in [the MXFP8Linear API guide](docs/mxfp8_linear.md).
 See the [runtime/checkpoint contract](docs/runtime_contract.md) and
-[troubleshooting guide](docs/troubleshooting.md) for deployment behavior.
+[troubleshooting guide](docs/troubleshooting.md) for deployment behavior. The
+[1.0 release checklist](docs/release_checklist.md) defines the exact source,
+GPU, autotuning, numerical, and packaging gates used for a release tag.
+
+TorchAO-style MXFP8 PTQ is available for existing no-bias BF16 models:
+
+```python
+model.eval().to(device="cuda", dtype=torch.bfloat16)
+model = rtx.quantize_(
+    model,
+    rtx.MXFP8WeightOnlyConfig(autotune="cache"),
+    filter_fn=lambda module, fqn: isinstance(module, torch.nn.Linear)
+    and fqn.startswith("decoder.layers."),
+)
+```
+
+This packs selected weights once while retaining dynamic MXFP8 activation
+quantization. RTX linear layers do not support bias; selected biased linears
+are rejected before any module replacement occurs.
+
+The same top-level conversion surface supports NVFP4 PTQ and dynamic training
+for both formats:
+
+```python
+mxfp8_training = rtx.convert_to_mxfp8_training(
+    model,
+    module_filter_fn=filter_fn,
+    config=rtx.MXFP8TrainingConfig(autotune="cache"),
+)
+nvfp4_training = rtx.convert_to_nvfp4_training(
+    model,
+    module_filter_fn=filter_fn,
+    config=rtx.NVFP4TrainingConfig(autotune="cache"),
+)
+nvfp4_ptq = rtx.quantize_(
+    model,
+    rtx.NVFP4WeightOnlyConfig(scaling="current", autotune="cache"),
+    filter_fn=filter_fn,
+)
+```
+
+See the [model conversion guide](docs/model_conversion.md) for parameter,
+optimizer, TorchAO-rowwise, weight-sharing, bias, and torchvision ViT
+contracts.
+
+For an optional pretrained, model-level numerical and `torch.compile`
+validation across 48 transformer projections, see the
+[DINOv3 regression suite](docs/dinov3_regression.md). DINOv3 source and weights
+are local test assets, separately licensed, and ignored by Git.
 
 ### Decoder-only convergence model
 
@@ -331,7 +379,7 @@ one CTA ownership of each region, performs a cooperative current-amax pass,
 then rereads warm cache lines to emit packed E2M1 values and native E4M3 1x16
 scales. The native GEMM multiplies the corresponding X and weight region
 scales directly in its BF16 epilogue. No eager Torch reduction or additional
-pointwise output kernel is present. `regional` remains a compatibility alias.
+pointwise output kernel is present.
 Region sizes, warp/CTA ownership, observer vector width/unroll/grid/order, quantizer schedule,
 native scale transport, and GEMM schedule are jointly tuned by the
 `nvfp4_jit_row_region_fwd` family. Set
@@ -350,11 +398,8 @@ anchors plus a row-major fallback are measured early, then remain fully
 mutable; they prevent a learned search from spending its entire budget in the
 older consumer-staged or non-persistent basins.
 `backend="auto"` selects this materialized delayed path and its dedicated
-`nvfp4_delayed_fwd` winner family. `backend="fused"` remains available as the
-legacy CTA-local implementation for controlled kernel studies; it is not the
-production delayed backend because it redundantly quantizes shared operands
-for multiple output CTAs.
-An explicit `NVFP4FwdConfig(tensor_scale_mode="exact")` retains the exact
+`nvfp4_delayed_fwd` winner family.
+An explicit `NVFP4ScaleConfig(tensor_scale_mode="exact")` retains the exact
 TorchAO tensorwise FP32 scale for controlled studies; power-of-two is the
 default because its reciprocal is exact and cheaper. A dynamic module honors
 its selected policy during inference; AOT-weight dynamic-X inference supports
@@ -387,8 +432,8 @@ constructs logical transpose layouts from the original contiguous G/W/X
 pointers inside its JIT entry, never through eager `.T`, `contiguous`, or
 transpose-copy kernels.
 
-Both frontends use the public backend terms `auto`, `fused`, and
-`materialized`. Materialized dynamic execution quantizes BF16 operands into
+MXFP8 uses the public backend terms `auto`, `fused`, and `materialized`;
+NVFP4 supports `auto` and `materialized`. Materialized dynamic execution quantizes BF16 operands into
 global memory on every call before launching the GEMM; it is not an AOT weight
 state. MXFP8 still accepts the historical `prequant` spelling as a compatibility
 alias, but modules normalize it to `materialized`.
@@ -455,8 +500,8 @@ rtx-autotune run autotune_manifests/cross_device_dataset_v2.json \
   --calibration hardware_calibration.json
 ```
 
-The same campaign engine accepts `nvfp4_fused_fwd`, `nvfp4_dynamic_fwd`,
-`nvfp4_delayed_fwd`, `nvfp4_jit_row_region_fwd`, `nvfp4_weight_prequant_fwd`, and
+The same campaign engine accepts `nvfp4_dynamic_fwd`, `nvfp4_delayed_fwd`,
+`nvfp4_jit_row_region_fwd`, `nvfp4_weight_prequant_fwd`, and
 `nvfp4_fully_prequant_fwd` jobs. The delayed family measures the full stateful
 observer/quantizer plus GEMM path and always uses one dual quantization launch;
 block dynamic and inference families exclude inactive policy coordinates and
@@ -784,7 +829,7 @@ count:
 
 Supported families are `mxfp8_fused_fwd`, `mxfp8_prequant_fwd`,
 `mxfp8_weight_prequant_fwd`, `mxfp8_fully_prequant_fwd`, `mxfp8_bwd`,
-`nvfp4_fused_fwd`, `nvfp4_dynamic_fwd`, `nvfp4_delayed_fwd`,
+`nvfp4_dynamic_fwd`, `nvfp4_delayed_fwd`, `nvfp4_jit_row_region_fwd`,
 `nvfp4_weight_prequant_fwd`, and `nvfp4_fully_prequant_fwd`. Persistent
 inference families never time their AOT
 packing work and do not expose inactive quantizer coordinates. Additional

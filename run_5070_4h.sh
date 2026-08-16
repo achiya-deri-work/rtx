@@ -112,9 +112,9 @@ else
   autotune_cmd=("${RTX_AUTOTUNE_BIN:-rtx-autotune}")
 fi
 
-manifest=autotune_manifests/blackwell_release_candidate_5070_v1.json
+manifest=autotune_manifests/blackwell_release_candidate_5070_v2.json
 output_dir="${RTX_AUTOTUNE_OUTPUT_DIR:-autotune_datasets}"
-campaign_root="$output_dir/blackwell_release_candidate_5070_v1"
+campaign_root="$output_dir/blackwell_release_candidate_5070_v2"
 report_dir="${RTX_AUTOTUNE_REPORT_DIR:-autotune_reports}"
 mkdir -p "$output_dir" "$report_dir"
 

@@ -71,7 +71,7 @@ run_campaign() {
 }
 
 run_campaign autotune_manifests/decoder_batch64_mxfp8_v1.json "$mx_seconds"
-run_campaign autotune_manifests/decoder_batch64_nvfp4_v1.json "$nv_seconds"
+run_campaign autotune_manifests/decoder_batch64_nvfp4_v2.json "$nv_seconds"
 
 "$autotune_bin" audit "$output_root" \
   --output autotune_reports/decoder_batch64_tuning_audit.json

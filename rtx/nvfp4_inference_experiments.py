@@ -10,7 +10,7 @@ import torch
 
 from .autotune.hardware import compiled_resource_metadata
 from .configs.nvfp4 import (
-    DEFAULT_NVFP4_FWD_CONFIG,
+    DEFAULT_NVFP4_SCALE_CONFIG,
     NVFP4DynamicConfig,
     NVFP4FullyPrequantConfig,
     NVFP4Problem,
@@ -23,7 +23,6 @@ from .fp4 import (
     _delayed_amax_state,
     _make_delayed_dynamic_runner,
     _make_jit_region_dynamic_runner,
-    _make_region_delayed_dynamic_runner,
     _make_block_dynamic_runner,
     _current_tensor_scale,
     _packed_fp4_view,
@@ -260,7 +259,7 @@ class NVFP4DelayedBenchmarkHarness(NVFP4DynamicBenchmarkHarness):
     """Measure compact delayed observation + native materialized GEMM."""
 
     def _build_runner(self, config: NVFP4DynamicConfig) -> object:
-        policy = DEFAULT_NVFP4_FWD_CONFIG
+        policy = DEFAULT_NVFP4_SCALE_CONFIG
         history_len = policy.amax_history_len
         return _DelayedBenchmarkRunner(
             _make_delayed_dynamic_runner(
@@ -381,28 +380,6 @@ class NVFP4JITRowRegionBenchmarkHarness(NVFP4DynamicBenchmarkHarness):
         }
 
 
-class NVFP4RegionDelayedBenchmarkHarness(NVFP4JITRowRegionBenchmarkHarness):
-    """Measure one-pass steady-state regional delayed scaling."""
-
-    def _build_runner(self, config: NVFP4DynamicConfig) -> object:
-        from .nvfp4_inference_autotune import preferred_jit_row_region_config
-
-        selected = (
-            config
-            if config.jit_row_region
-            else preferred_jit_row_region_config(self.problem)
-        )
-        return _make_region_delayed_dynamic_runner(
-            self.problem,
-            NVFP4ForwardConfig.from_materialized(selected),
-            self.device,
-        )
-
-    def _measure_components(self, prepared, calls: int, samples: int):
-        # State buffers alternate every call; isolated measurements would need
-        # to preserve that sequencing and are intentionally deferred to the
-        # dedicated component profiler.
-        return {}
 
 
 def _pair_key(x: torch.Tensor, weight: torch.Tensor) -> tuple[int, int]:
@@ -634,7 +611,6 @@ class NVFP4FullyPrequantBenchmarkHarness(NVFP4InferenceBenchmarkHarness):
 __all__ = [
     "NVFP4DelayedBenchmarkHarness",
     "NVFP4JITRowRegionBenchmarkHarness",
-    "NVFP4RegionDelayedBenchmarkHarness",
     "NVFP4DynamicBenchmarkHarness",
     "NVFP4FullyPrequantBenchmarkHarness",
     "NVFP4InferenceBenchmarkHarness",

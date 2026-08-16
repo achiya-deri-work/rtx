@@ -10,34 +10,28 @@ from rtx.autotune.adapters import (
     make_nvfp4_delayed_adapter,
     make_nvfp4_dynamic_adapter,
     make_nvfp4_fully_prequant_adapter,
-    make_nvfp4_fwd_adapter,
     make_nvfp4_jit_row_region_adapter,
-    make_nvfp4_region_delayed_adapter,
     make_nvfp4_weight_prequant_adapter,
 )
 from rtx.autotune.outcomes import TrialOutcome
 from rtx.autotune.promotion import _config_rejection, _current_revision
 from rtx.configs.nvfp4 import (
-    DEFAULT_NVFP4_FWD_CONFIG,
+    DEFAULT_NVFP4_SCALE_CONFIG,
     NVFP4DynamicConfig,
     NVFP4FullyPrequantConfig,
-    NVFP4FwdConfig,
+    NVFP4ScaleConfig,
     NVFP4GemmConfig,
     NVFP4Problem,
     NVFP4QuantConfig,
     NVFP4WeightPrequantConfig,
-    normalize_nvfp4_fwd_config,
 )
 from rtx.nvfp4_inference_autotune import (
     NVFP4_DELAYED_SEARCH_SPACE,
     NVFP4_DYNAMIC_SEARCH_SPACE,
     NVFP4_JIT_ROW_REGION_SEARCH_SPACE,
-    NVFP4_REGION_DELAYED_KERNEL_REVISION,
-    NVFP4_REGION_DELAYED_SEARCH_SPACE,
     dynamic_config_from_dict,
     dynamic_config_to_dict,
     preferred_jit_row_region_config,
-    preferred_region_delayed_config,
     preferred_dynamic_config,
     update_dynamic_config,
 )
@@ -48,33 +42,30 @@ def _has_sm12x() -> bool:
 
 
 class NVFP4ConfigTests(unittest.TestCase):
-    def test_region_delayed_v2_uses_coupled_stratified_geometry(self) -> None:
-        problem = NVFP4Problem(32768, 768, 1536)
-        config = preferred_region_delayed_config(problem)
-        self.assertEqual(NVFP4_REGION_DELAYED_KERNEL_REVISION, 3)
-        self.assertEqual(config.region_ownership, "cta")
-        self.assertGreater(config.x_scale_region_rows, 1)
-        self.assertGreater(config.weight_scale_region_rows, 1)
-        self.assertNotIn("x_region_rows", NVFP4_REGION_DELAYED_SEARCH_SPACE)
-        self.assertNotIn("weight_region_rows", NVFP4_REGION_DELAYED_SEARCH_SPACE)
-        strata = {
-            name
-            for name in NVFP4_REGION_DELAYED_SEARCH_SPACE
-            if name.startswith("region_geometry_x")
-        }
-        self.assertEqual(len(strata), 8)
-
-        adapter = make_nvfp4_region_delayed_adapter(
-            problem,
-            lambda _config: TrialOutcome("ok", median_ms=1.0),
+    def test_regional_epilogue_strategies_are_tunable_and_bounded(self) -> None:
+        problem = NVFP4Problem(257, 769, 768)
+        base = preferred_jit_row_region_config(problem)
+        for strategy in (
+            "direct",
+            "expanded_factors",
+            "factorized",
+            "product",
+        ):
+            with self.subTest(strategy=strategy):
+                candidate = replace(
+                    base,
+                    gemm=replace(
+                        base.gemm, regional_scale_epilogue=strategy
+                    ),
+                )
+                self.assertIsNone(candidate.rejection(problem))
+        too_fine = replace(
+            base,
+            gemm=replace(base.gemm, regional_scale_epilogue="product"),
+            x_scale_region_rows=1,
+            weight_scale_region_rows=1,
         )
-        features = adapter.features(config)
-        self.assertEqual(features["derived.region_observer_read_bytes"], 0.0)
-        self.assertGreater(features["derived.region_scale_epilogue_reads"], 0.0)
-        self.assertLess(
-            features["derived.region_scale_epilogue_reads"],
-            problem.m * problem.n * 8,
-        )
+        self.assertIn("4-KiB", too_fine.rejection(problem) or "")
 
     def test_jit_row_region_config_roundtrips_and_exposes_deep_axes(self) -> None:
         problem = NVFP4Problem(257, 769, 768)
@@ -142,67 +133,20 @@ class NVFP4ConfigTests(unittest.TestCase):
         problem.validate()
         self.assertEqual(problem.k, 17)
         self.assertEqual(problem.storage_k, 32)
-        self.assertIsNone(
-            DEFAULT_NVFP4_FWD_CONFIG.implementation_rejection(problem)
-        )
 
-    def test_training_fallback_exposes_full_block_lane_ownership(self) -> None:
-        config = DEFAULT_NVFP4_FWD_CONFIG
-        self.assertEqual(config.quant_vec, 16)
-        self.assertEqual(config.quant_load_bits, 128)
-        self.assertEqual(config.tile_k, 256)
-        self.assertEqual(config.native_operand_bits, 4)
-        self.assertEqual(config.scale_vector_size, 16)
-        self.assertIsNone(config.implementation_rejection(NVFP4Problem(256, 1536, 1536)))
-
-    def test_nvfp4_normalizer_preserves_format_specific_coordinates(self) -> None:
-        config = normalize_nvfp4_fwd_config(
-            replace(DEFAULT_NVFP4_FWD_CONFIG, collect_amax=True),
-            k_unroll=2,
-            scale_reciprocal="supplied_pow2_ptx_rcp",
+    def test_scale_config_contains_only_numeric_policy(self) -> None:
+        config = NVFP4ScaleConfig(
+            tensor_scale_mode="exact",
+            amax_history_len=4,
+            amax_history_algo="most_recent",
         )
-        self.assertIsInstance(config, NVFP4FwdConfig)
-        self.assertTrue(config.collect_amax)
-        self.assertEqual(config.k_unroll, 2)
-        self.assertEqual(config.scale_reciprocal, "supplied_pow2_ptx_rcp")
-        self.assertEqual(config.telemetry_layout, "scalar_atomic")
-        self.assertEqual(config.telemetry_ownership, "operand_owner")
-        self.assertEqual(config.amax_history_len, 16)
-        self.assertEqual(config.amax_history_algo, "window_max")
-
-    def test_row_region_scale_legality_tracks_cta_tiles(self) -> None:
-        problem = NVFP4Problem(512, 512, 128)
-        regional = replace(
-            DEFAULT_NVFP4_FWD_CONFIG,
-            tile_k=128,
-            bf16_tile_k=128,
-            x_scale_region_rows=256,
-            weight_scale_region_rows=256,
-        )
-        self.assertIsNone(regional.implementation_rejection(problem))
-        self.assertIsNone(
-            replace(regional, epilogue="tma").implementation_rejection(problem)
-        )
-        self.assertIn(
-            "distinct policies",
-            replace(regional, collect_amax=True).implementation_rejection(problem),
-        )
-        normalized = normalize_nvfp4_fwd_config(
-            regional, x_scale_region_rows=512, weight_scale_region_rows=256
-        )
-        self.assertEqual(normalized.x_scale_region_rows, 512)
-        self.assertEqual(normalized.weight_scale_region_rows, 256)
-
-    def test_row_region_scale_pack_is_region_major(self) -> None:
-        from rtx.fp4 import _regional_tensor_scale_pack
-
-        value = torch.ones(4, 8, dtype=torch.bfloat16)
-        value[2:].mul_(32.0)
-        pack = _regional_tensor_scale_pack(value, 2, "power2").reshape(2, 3)
-        self.assertEqual(tuple(pack.shape), (2, 3))
-        self.assertGreater(float(pack[1, 0]), float(pack[0, 0]))
-        torch.testing.assert_close(pack[:, 0] * pack[:, 1], torch.ones(2))
-        torch.testing.assert_close(pack[:, 2], pack[:, 1] / 6.0)
+        self.assertEqual(config.tensor_scale_mode, "exact")
+        self.assertEqual(config.amax_history_len, 4)
+        self.assertEqual(config.amax_history_algo, "most_recent")
+        self.assertFalse(hasattr(config, "tile_m"))
+        self.assertEqual(DEFAULT_NVFP4_SCALE_CONFIG.amax_history_len, 16)
+        with self.assertRaisesRegex(ValueError, "amax_history_len"):
+            NVFP4ScaleConfig(amax_history_len=2)  # type: ignore[arg-type]
 
     def test_standalone_quantizer_exposes_one_lane_per_block(self) -> None:
         config = NVFP4QuantConfig(values_per_lane=16, load_bits=128)
@@ -210,38 +154,8 @@ class NVFP4ConfigTests(unittest.TestCase):
         self.assertEqual(config.blocks_per_warp, 32)
         self.assertIsNone(config.rejection(128, 128))
 
-    def test_shared_autotuner_builds_nvfp4_family_context(self) -> None:
-        problem = NVFP4Problem(256, 1536, 1536)
-
-        def evaluator(config):
-            return TrialOutcome("ok", median_ms=1.0)
-
-        adapter = make_nvfp4_fwd_adapter(
-            problem,
-            evaluator,
-            axes={"quant_vec": (8, 16), "collect_amax": (True,)},
-        )
-        self.assertEqual(adapter.context.family, "nvfp4_fused_fwd")
-        self.assertTrue(adapter.initial_config.collect_amax)
-        features = adapter.features(adapter.initial_config)
-        self.assertEqual(features["derived.delayed_telemetry_slots"], 1.0)
-        self.assertEqual(
-            features["derived.delayed_telemetry_state_bytes"], 128.0
-        )
-        self.assertEqual(features["derived.delayed_telemetry_memsets"], 2.0)
-        self.assertEqual(features["derived.total_kernel_launches"], 1.0)
-
     def test_runtime_promotion_understands_nvfp4_revision_and_schema(self) -> None:
         problem = NVFP4Problem(256, 1536, 1536)
-        config = replace(DEFAULT_NVFP4_FWD_CONFIG, collect_amax=True)
-        self.assertEqual(_current_revision("nvfp4_fused_fwd"), 6)
-        self.assertIsNone(
-            _config_rejection(
-                "nvfp4_fused_fwd",
-                asdict(config),
-                problem,  # type: ignore[arg-type]
-            )
-        )
         for family, inference_config in (
             ("nvfp4_dynamic_fwd", NVFP4DynamicConfig()),
             ("nvfp4_delayed_fwd", NVFP4DynamicConfig()),
@@ -256,7 +170,7 @@ class NVFP4ConfigTests(unittest.TestCase):
                 expected_revision = {
                     "nvfp4_dynamic_fwd": 6,
                     "nvfp4_delayed_fwd": 1,
-                    "nvfp4_jit_row_region_fwd": 2,
+                    "nvfp4_jit_row_region_fwd": 3,
                     "nvfp4_weight_prequant_fwd": 3,
                     "nvfp4_fully_prequant_fwd": 3,
                 }[family]
@@ -546,7 +460,7 @@ class NVFP4CudaTests(unittest.TestCase):
                 self.assertEqual(result["status"], "ok")
                 self.assertGreater(result["summary_ms"]["median"], 0)
 
-    def test_public_current_scale_fused_forward_is_finite(self) -> None:
+    def test_public_current_scale_forward_is_finite(self) -> None:
         torch.manual_seed(1901)
         x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         weight = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
@@ -556,7 +470,7 @@ class NVFP4CudaTests(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(out).all()))
         self.assertLess(float(error.mean()), 2.0)
 
-    def test_fused_current_matches_torchao_quantization_reference(self) -> None:
+    def test_current_matches_torchao_quantization_reference(self) -> None:
         from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
 
         torch.manual_seed(1905)
@@ -764,7 +678,7 @@ class NVFP4CudaTests(unittest.TestCase):
         )
         torch.testing.assert_close(actual.float(), reference, rtol=0.03, atol=0.15)
 
-    def test_ragged_and_minimum_k_fused_shapes(self) -> None:
+    def test_ragged_and_minimum_k_materialized_shapes(self) -> None:
         torch.manual_seed(1909)
         for m, n, k in (
             (65, 130, 128),
@@ -776,7 +690,7 @@ class NVFP4CudaTests(unittest.TestCase):
             with self.subTest(shape=(m, n, k)):
                 x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
                 weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-                actual = rtx.nvfp4_linear(x, weight, backend="fused")
+                actual = rtx.nvfp4_linear(x, weight, backend="materialized")
                 self.assertEqual(tuple(actual.shape), (m, n))
                 self.assertTrue(bool(torch.isfinite(actual).all()))
 
@@ -786,7 +700,7 @@ class NVFP4CudaTests(unittest.TestCase):
             33,
             29,
             device="cuda",
-            backend="fused",
+            backend="materialized",
             autotune="off",
         ).train()
         compiled = torch.compile(layer, fullgraph=True, dynamic=False)
@@ -804,13 +718,8 @@ class NVFP4CudaTests(unittest.TestCase):
         torch.manual_seed(1910)
         x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         weight = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
-        exact_config = replace(
-            DEFAULT_NVFP4_FWD_CONFIG,
-            tile_k=128,
-            bf16_tile_k=128,
-            tensor_scale_mode="exact",
-        )
-        exact = rtx.nvfp4_linear(x, weight, forward_config=exact_config)
+        exact_config = NVFP4ScaleConfig(tensor_scale_mode="exact")
+        exact = rtx.nvfp4_linear(x, weight, scale_config=exact_config)
         power2 = rtx.nvfp4_linear(x, weight)
         self.assertTrue(bool(torch.isfinite(exact).all()))
         self.assertTrue(bool(torch.isfinite(power2).all()))
@@ -838,7 +747,7 @@ class NVFP4CudaTests(unittest.TestCase):
         x[256:].mul_(32.0)
         weight[256:].mul_(16.0)
         regional = rtx.nvfp4_linear(
-            x, weight, scaling="regional", scale_region_rows=256
+            x, weight, scaling="jit_row_region", scale_region_rows=256
         )
         current = rtx.nvfp4_linear(x, weight, scaling="current")
         reference = x.float() @ weight.float().T
@@ -847,6 +756,49 @@ class NVFP4CudaTests(unittest.TestCase):
             float((regional.float() - reference).abs().mean()),
             float((current.float() - reference).abs().mean()) * 2.0,
         )
+
+    def test_ragged_regional_epilogue_strategies_are_bitwise_equivalent(
+        self,
+    ) -> None:
+        from rtx.fp4 import _make_jit_region_dynamic_runner
+
+        torch.manual_seed(19151)
+        problem = NVFP4Problem(257, 259, 256)
+        x = torch.randn(
+            problem.m, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        weight = torch.randn(
+            problem.n, problem.k, device="cuda", dtype=torch.bfloat16
+        )
+        base = preferred_jit_row_region_config(problem)
+        outputs = []
+        for strategy in (
+            "direct",
+            "expanded_factors",
+            "factorized",
+            "product",
+        ):
+            config = replace(
+                base,
+                gemm=replace(
+                    base.gemm, regional_scale_epilogue=strategy
+                ),
+                programmatic_dependent_launch=False,
+            )
+            runner = _make_jit_region_dynamic_runner(
+                problem, config, x.device
+            )
+            out = torch.empty(
+                problem.m,
+                problem.n,
+                device=x.device,
+                dtype=torch.bfloat16,
+            )
+            runner(x, weight, out)
+            outputs.append(out)
+        torch.cuda.synchronize()
+        for output in outputs[1:]:
+            torch.testing.assert_close(output, outputs[0], rtol=0, atol=0)
 
     def test_rowwise_scaling_preserves_heterogeneous_row_ranges(self) -> None:
         torch.manual_seed(1917)
@@ -859,7 +811,7 @@ class NVFP4CudaTests(unittest.TestCase):
         x = x * dynamic_range[:, None]
         weight = weight * dynamic_range[:, None]
         current = rtx.nvfp4_linear(x, weight, scaling="current")
-        rowwise = rtx.nvfp4_linear(x, weight, scaling="regional")
+        rowwise = rtx.nvfp4_linear(x, weight, scaling="jit_row_region")
         reference = x.float() @ weight.float().T
         denominator = reference.abs().clamp_min(1.0e-30)
         current_relative = ((current.float() - reference).abs() / denominator).median()
@@ -872,7 +824,7 @@ class NVFP4CudaTests(unittest.TestCase):
             128,
             512,
             device="cuda",
-            scaling="regional",
+            scaling="jit_row_region",
         ).eval()
         compiled = torch.compile(
             layer,
@@ -887,7 +839,7 @@ class NVFP4CudaTests(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(out).all()))
 
         def functional(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            return rtx.nvfp4_linear(a, b, scaling="regional")
+            return rtx.nvfp4_linear(a, b, scaling="jit_row_region")
 
         compiled_functional = torch.compile(
             functional,
@@ -999,17 +951,12 @@ class NVFP4CudaTests(unittest.TestCase):
         x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         for mode in ("power2", "exact"):
             with self.subTest(tensor_scale_mode=mode):
-                config = replace(
-                    DEFAULT_NVFP4_FWD_CONFIG,
-                    tile_k=128,
-                    bf16_tile_k=128,
-                    tensor_scale_mode=mode,
-                )
+                config = NVFP4ScaleConfig(tensor_scale_mode=mode)
                 layer = rtx.NVFP4Linear(
                     128,
                     128,
                     device="cuda",
-                    forward_config=config,
+                    scale_config=config,
                     scaling="delayed",
                 )
                 layer(x)
@@ -1019,7 +966,7 @@ class NVFP4CudaTests(unittest.TestCase):
                 current = rtx.nvfp4_linear(
                     jumped,
                     layer.weight,
-                    forward_config=config,
+                    scale_config=config,
                     scaling="current",
                     backend="materialized",
                 )
@@ -1027,54 +974,6 @@ class NVFP4CudaTests(unittest.TestCase):
                 self.assertTrue(bool(torch.isfinite(stale).all()))
                 torch.testing.assert_close(recovered, current, rtol=0, atol=0)
 
-    def test_jit_region_avoids_delayed_saturation_after_distribution_jump(self) -> None:
-        from rtx.fp4 import (
-            _make_jit_region_dynamic_runner,
-            _make_region_delayed_dynamic_runner,
-        )
-
-        problem = NVFP4Problem(256, 256, 256)
-        torch.manual_seed(1923)
-        x = torch.randn(
-            problem.m, problem.k, device="cuda", dtype=torch.bfloat16
-        )
-        weight = torch.randn(
-            problem.n, problem.k, device="cuda", dtype=torch.bfloat16
-        )
-        delayed_config = preferred_region_delayed_config(problem)
-        jit_config = replace(
-            preferred_jit_row_region_config(problem),
-            gemm=delayed_config.gemm,
-            x_scale_region_rows=delayed_config.x_scale_region_rows,
-            weight_scale_region_rows=delayed_config.weight_scale_region_rows,
-            region_ownership=delayed_config.region_ownership,
-            programmatic_dependent_launch=True,
-        )
-        jit = _make_jit_region_dynamic_runner(problem, jit_config, x.device)
-        delayed = _make_region_delayed_dynamic_runner(
-            problem, delayed_config, x.device
-        )
-        delayed.initialize(x, weight)
-        jumped = x * 64.0
-        jit_out = torch.empty(
-            (problem.m, problem.n), device="cuda", dtype=torch.bfloat16
-        )
-        stale_out = torch.empty_like(jit_out)
-        recovered_out = torch.empty_like(jit_out)
-        jit(jumped, weight, jit_out)
-        delayed(jumped, weight, stale_out)
-        delayed(jumped, weight, recovered_out)
-        torch.cuda.synchronize()
-        reference = jumped.float() @ weight.float().T
-
-        def nrmse(value: torch.Tensor) -> float:
-            return float(
-                (value.float() - reference).square().mean().sqrt()
-                / reference.square().mean().sqrt()
-            )
-
-        self.assertLess(nrmse(jit_out), nrmse(stale_out) * 0.25)
-        torch.testing.assert_close(recovered_out, jit_out, rtol=0, atol=0)
 
     def test_jit_region_training_is_fullgraph_compileable(self) -> None:
         torch.manual_seed(1924)

@@ -79,7 +79,7 @@ if TYPE_CHECKING:
     from .autotune import CoordinateDescentPolicy
 
 AutotuneMode = Literal["off", "cache", "coordinate"]
-BWD_FRONTEND_REVISION = 2
+BWD_FRONTEND_REVISION = 3
 
 
 def _zero_tensor_async(tensor: torch.Tensor) -> None:
@@ -632,6 +632,12 @@ _DEFAULT_BWD_KEY = _intern_bwd_config(DEFAULT_MXFP8_BWD_CONFIG)
 def _default_bwd_config(problem: MXFP8Problem) -> MXFP8BwdConfig:
     """Prefer the measured decomposed baseline, using fused tails as needed."""
 
+    # Native-layout materialization has a physical 128x128 scale contract.
+    # Ragged logical dimensions belong to the fused kernel, which predicates
+    # BF16 loads and zero-fills only the register/SMEM tail. Select it directly
+    # so a ragged backward never depends on a failed decomposed compilation.
+    if problem.m % 128 or problem.n % 128 or problem.k % 128:
+        return DEFAULT_FUSED_MXFP8_BWD_CONFIG
     if DEFAULT_MXFP8_BWD_CONFIG.implementation_rejection(problem) is None:
         return DEFAULT_MXFP8_BWD_CONFIG
     return DEFAULT_FUSED_MXFP8_BWD_CONFIG
@@ -1099,23 +1105,26 @@ def _mxfp8_linear_dw_fake(
 # functional custom ops remain the eager API, while compiled graphs allocate
 # their result buffers in the memory planner and call these launch-only ops.
 _BWD_OUT_LIBRARY = torch.library.Library("rtx", "FRAGMENT")
+_BWD_OUT_TAGS = (
+    (torch.Tag.out,) if hasattr(torch.Tag, "out") else ()
+)
 _BWD_OUT_LIBRARY.define(
     "mxfp8_linear_bwd.out("
     "Tensor grad_output, Tensor x, Tensor weight, str config_key, *, "
     "Tensor(a!) grad_x, Tensor(b!) grad_weight) -> (Tensor(a!), Tensor(b!))",
-    tags=(torch.Tag.out,),
+    tags=_BWD_OUT_TAGS,
 )
 _BWD_OUT_LIBRARY.define(
     "mxfp8_linear_dx.out("
     "Tensor grad_output, Tensor x, Tensor weight, str config_key, *, "
     "Tensor(a!) grad_x) -> Tensor(a!)",
-    tags=(torch.Tag.out,),
+    tags=_BWD_OUT_TAGS,
 )
 _BWD_OUT_LIBRARY.define(
     "mxfp8_linear_dw.out("
     "Tensor grad_output, Tensor x, Tensor weight, str config_key, *, "
     "Tensor(a!) grad_weight) -> Tensor(a!)",
-    tags=(torch.Tag.out,),
+    tags=_BWD_OUT_TAGS,
 )
 
 

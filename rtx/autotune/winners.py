@@ -71,10 +71,6 @@ def current_kernel_revision(family: str) -> int:
         from ..kernels.mxfp8 import MXFP8_FWD_KERNEL_REVISION
 
         return MXFP8_FWD_KERNEL_REVISION
-    if family == "nvfp4_fused_fwd":
-        from ..configs.nvfp4 import NVFP4_KERNEL_REVISION
-
-        return NVFP4_KERNEL_REVISION
     if family == "mxfp8_prequant_fwd":
         from ..prequant_autotune import KERNEL_REVISION
 
@@ -95,13 +91,11 @@ def current_kernel_revision(family: str) -> int:
         "nvfp4_dynamic_fwd",
         "nvfp4_delayed_fwd",
         "nvfp4_jit_row_region_fwd",
-        "nvfp4_region_delayed_fwd",
     ):
         from ..nvfp4_inference_autotune import (
             NVFP4_DELAYED_KERNEL_REVISION,
             NVFP4_DYNAMIC_KERNEL_REVISION,
             NVFP4_JIT_ROW_REGION_KERNEL_REVISION,
-            NVFP4_REGION_DELAYED_KERNEL_REVISION,
         )
 
         return (
@@ -109,8 +103,6 @@ def current_kernel_revision(family: str) -> int:
             if family == "nvfp4_delayed_fwd"
             else NVFP4_JIT_ROW_REGION_KERNEL_REVISION
             if family == "nvfp4_jit_row_region_fwd"
-            else NVFP4_REGION_DELAYED_KERNEL_REVISION
-            if family == "nvfp4_region_delayed_fwd"
             else NVFP4_DYNAMIC_KERNEL_REVISION
         )
     raise ValueError(f"unsupported runtime winner family {family!r}")

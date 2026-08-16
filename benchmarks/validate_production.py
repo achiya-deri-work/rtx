@@ -233,7 +233,7 @@ def _nvfp4_cases() -> dict[str, object]:
     for compiled in (False, True):
         prefix = "compiled" if compiled else "eager"
         cases[f"{prefix}_delayed_training"] = lambda compiled=compiled: _nv_dynamic_case(
-            compiled=compiled, training=True, scaling="delayed", backend="fused"
+            compiled=compiled, training=True, scaling="delayed", backend="materialized"
         )
         cases[f"{prefix}_materialized_training"] = lambda compiled=compiled: _nv_dynamic_case(
             compiled=compiled, training=True, scaling="block", backend="materialized"

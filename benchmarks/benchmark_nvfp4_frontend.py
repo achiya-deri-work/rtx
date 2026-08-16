@@ -47,11 +47,13 @@ def main() -> None:
     parser.add_argument("--samples", type=int, default=21)
     parser.add_argument("--calls", type=int, default=100)
     parser.add_argument(
-        "--scaling", choices=("block", "current", "regional"), default="block"
+        "--scaling",
+        choices=("block", "current", "jit_row_region", "delayed"),
+        default="block",
     )
     parser.add_argument(
         "--nv-backend",
-        choices=("auto", "fused", "materialized"),
+        choices=("auto", "materialized"),
         default="auto",
     )
     args = parser.parse_args()

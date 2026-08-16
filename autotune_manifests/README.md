@@ -8,13 +8,13 @@ context identity. Add a newly versioned file instead.
 
 | Manifest | Purpose | Contexts |
 | --- | --- | ---: |
-| `blackwell_all_kernels_scaling_v1.json` | Paired release study across every MXFP8/NVFP4 forward, shared backward, scaling, cache, and packed-inference family | 144 |
+| `blackwell_all_kernels_scaling_v2.json` | Retained-family release study across MXFP8/NVFP4 forward, shared backward, scaling, cache, and packed inference | 120 |
 | `decoder_batch64_mxfp8_v1.json` | Batch-64 decoder MXFP8 fused-forward/shared-backward tuning | 8 |
-| `decoder_batch64_nvfp4_v1.json` | Batch-64 decoder delayed-fused and block-materialized NVFP4 tuning | 8 |
+| `decoder_batch64_nvfp4_v2.json` | Batch-64 decoder block-materialized NVFP4 tuning after fused-family retirement | 4 |
 | `nvfp4_jit_row_region_v1.json` | Current local FP32 row-region scale geometry plus NVFP4 quantizer/GEMM tuning | 16 |
 | `decoder_training_hot_v1.json` | Exact decoder-shape NVFP4 dynamic-forward and MXFP8 backward training study | 8 |
 | `decoder_mxfp8_forward_hot_v1.json` | Exact decoder-shape materialized MXFP8 forward study | 4 |
-| `blackwell_release_candidate_5070_v1.json` | Current-revision MXFP8/NVFP4 production calibration across every operand state on both 5070 variants | 108 |
+| `blackwell_release_candidate_5070_v2.json` | Retained-family MXFP8/NVFP4 production calibration across every operand state on both 5070 variants | 96 |
 | `nvfp4_dynamic_persistent_shapes_v1.json` | Bounded revision-3 anchor/generalization study at M=128/512/8192 | 3 |
 | `nvfp4_dynamic_balanced_iteration_v5.json` | Corrected cap-four balanced-grid confirmation at M=N=K=1536 | 1 |
 | `nvfp4_dynamic_balanced_iteration_v4.json` | Immutable cap-two anchor control which preserves the 72-CTA tail | 1 |
@@ -22,7 +22,6 @@ context identity. Add a newly versioned file instead.
 | `nvfp4_dynamic_block_iteration_v2_128.json` | Bounded 128-trial joint dynamic block-quantizer/native-GEMM study | 2 |
 | `nvfp4_dynamic_components_iteration_v1.json` | Bounded packed-GEMM and dynamic-X component study | 4 |
 | `nvfp4_inference_states_v1.json` | NVFP4 dynamic-X/AOT-W and fully packed inference tuning | 16 |
-| `nvfp4_training_v1.json` | NVFP4 single-launch training-forward tuning, including per-CTA delayed-scale telemetry | 16 |
 | `mxfp8_bwd_revision19_calibration_v1.json` | Frozen-revision MXFP8 backward calibration and runtime-winner campaign | 12 |
 | `autotuner_prospective_5070_v1.json` | Interruption-safe random vs. random+local vs. online-bandit study on the two 5070s | 144 residual units |
 | `cross_device_dataset_bandit_v1.json` | Hierarchical strategy/context-bandit campaign for new cross-device measurements | 54 |

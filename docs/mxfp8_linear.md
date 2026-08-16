@@ -94,6 +94,41 @@ with torch.inference_mode():
 to the inference-only packed-weight state. Packed modules reject training and
 dtype conversion; move them with `.to(device=...)`.
 
+## TorchAO-style PTQ conversion
+
+For inference, convert selected existing BF16 `nn.Linear` modules in place:
+
+```python
+import torch
+import rtx
+
+model.eval().to(device="cuda", dtype=torch.bfloat16)
+model = rtx.quantize_(
+    model,
+    rtx.MXFP8WeightOnlyConfig(autotune="cache"),
+    filter_fn=lambda module, fqn: (
+        isinstance(module, torch.nn.Linear)
+        and fqn in {"decoder.layers.0.mlp.up_proj", "decoder.layers.0.mlp.down_proj"}
+    ),
+)
+compiled = torch.compile(model, fullgraph=True, dynamic=False)
+```
+
+Each selected weight is quantized exactly once to E4M3 with E8M0 block scales;
+its BF16 master copy is removed. BF16 activations are still quantized just in
+time on every invocation, so "weight-only" describes persistent checkpoint
+storage rather than the GEMM operand precision.
+
+The default filter converts `nn.Linear` instances and subclasses. A custom filter takes
+`(module, fully_qualified_name)`. RTX linear layers never support bias, so a
+selected biased linear is rejected during preflight. Selected weights must
+already be BF16 CUDA tensors, or pass `device="cuda"` after converting the
+model to BF16. The function returns the model because selecting a root linear
+requires replacing the root object.
+
+For dynamic training conversion, NVFP4 PTQ parity, TorchAO-rowwise models, and
+optimizer/weight-sharing guarantees, see [the model conversion guide](model_conversion.md).
+
 ## Autotuning
 
 - `autotune=None` follows `RTX_MXFP8_AUTOTUNE`, defaulting to `cache`.

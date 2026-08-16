@@ -10,8 +10,6 @@ from .adapters import (
     make_nvfp4_fully_prequant_adapter,
     make_nvfp4_dynamic_adapter,
     make_nvfp4_jit_row_region_adapter,
-    make_nvfp4_region_delayed_adapter,
-    make_nvfp4_fwd_adapter,
     make_nvfp4_weight_prequant_adapter,
 )
 from .bandit import (
@@ -266,10 +264,8 @@ __all__ = [
     "make_mxfp8_bwd_adapter",
     "make_mxfp8_fully_prequant_adapter",
     "make_mxfp8_fwd_adapter",
-    "make_nvfp4_fwd_adapter",
     "make_nvfp4_dynamic_adapter",
     "make_nvfp4_jit_row_region_adapter",
-    "make_nvfp4_region_delayed_adapter",
     "make_nvfp4_fully_prequant_adapter",
     "make_nvfp4_weight_prequant_adapter",
     "make_mxfp8_prequant_adapter",

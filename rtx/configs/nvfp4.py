@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Literal
 
 from .mxfp8 import MXFP8GemmConfig
-from ..kernels.mxfp8 import (
-    FWD_SEARCH_SPACE,
-    MXFP8FwdConfig,
-    normalize_fwd_config,
-)
 
 
 NVFP4_SF_VEC_SIZE = 16
@@ -94,149 +89,28 @@ class NVFP4Problem:
 
 
 @dataclass(frozen=True, slots=True)
-class NVFP4FwdConfig(MXFP8FwdConfig):
-    """Fused BF16-to-NVFP4 forward schedule.
+class NVFP4ScaleConfig:
+    """Numerical policy for NVFP4 outer FP32 scaling.
 
-    The first implementation deliberately shares the mature SM120 scheduling
-    coordinates with MXFP8. NVFP4 changes the scale vector, packed operand
-    width, converter, and MMA atom; inherited coordinates still select real
-    generated schedules rather than aliases.
+    Kernel schedules live in :class:`NVFP4DynamicConfig`.  Keeping the scale
+    policy separate makes every public field effective for every retained
+    NVFP4 implementation and avoids exposing controls from the retired fused
+    forward experiment.
     """
 
-    tile_k: int = 256
-    atom_layout_m: int = 8
-    atom_layout_n: int = 2
-    num_mma_warps: int = 16
-    bf16_tile_k: int = 256
-    mxfp8_stages: int = 1
-    quant_vec: int = 16
-    quant_load_bits: int = 128
-    quant_math: str = "fp32"
-    quant_amax: str = "fp32"
-    quantizer_warps: int = 16
-    k_unroll: int = 1
-    num_threads: int = 512
-    a_ldmatrix_matrices: int = 4
-    b_ldmatrix_matrices: int = 4
-    a_swizzle: str = "128b"
-    b_swizzle: str = "128b"
-    scale_reciprocal: str = "supplied_pow2_ptx_lut"
-    tensor_scale_mode: str = "power2"
-    # Zero selects one tensor-wide outer FP32 scale.  Positive values select
-    # independently scaled contiguous row regions.  They are numerical-policy
-    # coordinates, not hidden schedule aliases: the frontend emits one
-    # three-value scale pack per region and the CTA selects its pack after
-    # raster/persistent work assignment.
-    x_scale_region_rows: int = 0
-    weight_scale_region_rows: int = 0
-    collect_amax: bool = False
-    telemetry_layout: str = "scalar_atomic"
-    telemetry_ownership: str = "operand_owner"
-    amax_history_len: int = 16
-    amax_history_algo: str = "window_max"
-    # Compute current outer scales cooperatively from the exact BF16 operand
-    # tiles owned by this output CTA.  This removes the launch-wide
-    # observe/quantize -> GEMM dependency of the materialized JIT path and
-    # lets the existing BF16/native pipelines overlap quantization and MMA.
-    # It is intentionally a separate implementation coordinate because X/W
-    # observation is duplicated across output CTAs.
-    jit_cta_scale: bool = False
+    tensor_scale_mode: Literal["power2", "exact"] = "power2"
+    amax_history_len: Literal[1, 4, 16, 64] = 16
+    amax_history_algo: Literal["most_recent", "window_max"] = "window_max"
 
-    @property
-    def native_operand_bits(self) -> int:
-        return 4
-
-    @property
-    def smem_operand_bits(self) -> int:
-        # E2M1 values are logically four bits, but the fused kernel's staged
-        # CuTe SMEM allocation uses byte-addressable packed storage.  Capacity
-        # accounting must model the physical byte or it admits kernels that
-        # compile but fail launch with 130+ KiB dynamic SMEM.
-        return 8
-
-    @property
-    def scale_vector_size(self) -> int:
-        return NVFP4_SF_VEC_SIZE
-
-    def implementation_rejection(self, problem: NVFP4Problem) -> str | None:
-        reason = super().implementation_rejection(problem)  # type: ignore[arg-type]
-        if reason is not None:
-            return reason
-        if self.quant_vec not in (2, 4, 8, 16):
-            return "NVFP4 quant_vec must own whole packed pairs"
-        if self.quant_math not in ("fp32", "bf16x2"):
-            return "the fused NVFP4 converter requires fp32 or bf16x2 math"
-        if self.quant_amax not in ("fp32", "bf16_bits"):
-            return "the fused NVFP4 scale path requires fp32 or bf16_bits amax"
-        if self.scale_reciprocal not in (
-            "direct",
-            "supplied_exact",
-            "supplied_pow2",
-            "supplied_pow2_ptx_lut",
-            "supplied_pow2_ptx_rcp",
-        ):
-            return (
-                "NVFP4 scale_reciprocal must be direct, supplied_exact, or "
-                "one of the supplied_pow2 variants"
-            )
+    def __post_init__(self) -> None:
         if self.tensor_scale_mode not in ("power2", "exact"):
-            return "NVFP4 tensor_scale_mode must be power2 or exact"
-        for name, rows, problem_rows in (
-            ("X", self.x_scale_region_rows, problem.m),
-            ("weight", self.weight_scale_region_rows, problem.n),
-        ):
-            if rows < 0:
-                return f"NVFP4 {name} scale-region rows cannot be negative"
-            if rows:
-                if self.collect_amax:
-                    return (
-                        "row-region JIT scaling and delayed amax are distinct "
-                        "policies"
-                    )
-                if problem_rows % rows:
-                    return (
-                        f"NVFP4 {name} rows must be divisible by its scale region; "
-                        f"got {problem_rows} and {rows}"
-                    )
-        if self.telemetry_layout not in ("per_cta", "scalar_atomic"):
-            return "NVFP4 telemetry_layout must be per_cta or scalar_atomic"
-        if self.telemetry_ownership not in ("all", "operand_owner"):
-            return "NVFP4 telemetry_ownership must be all or operand_owner"
+            raise ValueError("tensor_scale_mode must be power2 or exact")
         if self.amax_history_len not in (1, 4, 16, 64):
-            return "NVFP4 amax_history_len must be 1, 4, 16, or 64"
+            raise ValueError("amax_history_len must be 1, 4, 16, or 64")
         if self.amax_history_algo not in ("most_recent", "window_max"):
-            return "NVFP4 amax_history_algo must be most_recent or window_max"
-        if self.jit_cta_scale:
-            if self.collect_amax:
-                return "current CTA scaling and delayed scaling are distinct policies"
-            if self.x_scale_region_rows != self.tile_m:
-                return "current CTA X region must equal tile_m"
-            if self.weight_scale_region_rows != self.tile_n:
-                return "current CTA weight region must equal tile_n"
-            output_tiles = (
-                (problem.m + self.tile_m - 1) // self.tile_m
-            ) * ((problem.n + self.tile_n - 1) // self.tile_n)
-            if output_tiles != 1:
-                return (
-                    "experimental fused current-region scaling is not yet "
-                    "multi-tile correct"
-                )
-        if self.bf16_tile_k < 64:
-            return "NVFP4 staged transport tiles must cover a complete K=64 MMA"
-        return None
-
-    def oriented_implementation_rejection(
-        self,
-        problem: NVFP4Problem,
-        a_orientation: str,
-        b_orientation: str,
-    ) -> str | None:
-        reason = self.implementation_rejection(problem)
-        if reason is not None:
-            return reason
-        if a_orientation != "row" or b_orientation != "row":
-            return "the initial fused NVFP4 forward accepts row-major operands"
-        return None
+            raise ValueError(
+                "amax_history_algo must be most_recent or window_max"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +125,9 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
     stages: int = 2
     scale_load_vec: int = 4
     scale_layout: str = "row_major"
+    regional_scale_epilogue: Literal[
+        "direct", "expanded_factors", "factorized", "product"
+    ] = "direct"
 
     @property
     def native_operand_bits(self) -> int:
@@ -280,11 +157,23 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
             )
         if self.scale_layout not in ("row_major", "mma128"):
             return "NVFP4 GEMM scales must use row_major or mma128 layout"
+        if self.regional_scale_epilogue not in (
+            "direct",
+            "expanded_factors",
+            "factorized",
+            "product",
+        ):
+            return (
+                "NVFP4 regional_scale_epilogue must be direct, "
+                "expanded_factors, factorized, or product"
+            )
         if (self.tile_k // NVFP4_SF_VEC_SIZE) % self.scale_load_vec:
             return "scale_load_vec must divide the NVFP4 K-tile scale count"
         # The common checker uses native_operand_bits and scale_vector_size,
         # so its capacity model covers packed E2M1 and twice-dense E4M3 scales.
-        return super().rejection(problem)  # type: ignore[arg-type]
+        # Explicit super is required for the class object returned by
+        # dataclass(slots=True) on Python 3.12/PyTorch 2.12 environments.
+        return super(NVFP4GemmConfig, self).rejection(problem)  # type: ignore[arg-type]
 
 
 def _inference_l2_rejection(value: int | None) -> str | None:
@@ -397,6 +286,23 @@ class NVFP4DynamicConfig:
                 return "region_ownership must be warp or cta"
             if self.quant_launches != "dual":
                 return "the first JIT row-region implementation uses one dual launch"
+            if (
+                self.gemm.regional_scale_epilogue == "expanded_factors"
+                and self.programmatic_dependent_launch
+            ):
+                return "expanded regional factors require ordinary launch ordering"
+            if self.gemm.regional_scale_epilogue == "product":
+                x_cache = (
+                    self.gemm.tile_m + self.x_scale_region_rows - 2
+                ) // self.x_scale_region_rows + 1
+                w_cache = (
+                    self.gemm.tile_n + self.weight_scale_region_rows - 2
+                ) // self.weight_scale_region_rows + 1
+                # Keep the product table bounded to 4 KiB. Larger tables erase
+                # occupancy on SM120 and are better represented by the
+                # independently tunable factorized cache.
+                if x_cache * w_cache > 1024:
+                    return "regional product cache exceeds its 4-KiB budget"
             if self.gemm.epilogue == "tma" and problem.k < 256:
                 return (
                     "regional TMA epilogue requires K >= 256; small K uses "
@@ -424,152 +330,23 @@ class NVFP4DynamicConfig:
 
 DEFAULT_NVFP4_GEMM_CONFIG = NVFP4GemmConfig()
 DEFAULT_NVFP4_QUANT_CONFIG = NVFP4QuantConfig()
-DEFAULT_NVFP4_FWD_CONFIG = NVFP4FwdConfig()
+DEFAULT_NVFP4_SCALE_CONFIG = NVFP4ScaleConfig()
 DEFAULT_NVFP4_DYNAMIC_CONFIG = NVFP4DynamicConfig()
-NVFP4_KERNEL_REVISION = 6
-
-
-_NVFP4_EXCLUDED_COMPOUND_AXES = {
-    "cta_reuse_tile",
-    "cluster_reuse_tile",
-    "cpasync_cluster_reuse_tile",
-    "cpasync_ldmatrix_pipeline",
-    "persistent_tma_pipeline",
-}
-NVFP4_FWD_SEARCH_SPACE: dict[str, tuple[object, ...]] = {
-    name: tuple(values)
-    for name, values in FWD_SEARCH_SPACE.items()
-    if name not in _NVFP4_EXCLUDED_COMPOUND_AXES
-}
-NVFP4_FWD_SEARCH_SPACE.update(
-    tile_k=(128, 256),
-    bf16_tile_k=(64, 128, 256),
-    quant_vec=(2, 4, 8, 16),
-    quant_math=("fp32", "bf16x2"),
-    quant_amax=("fp32", "bf16_bits"),
-    scale_reciprocal=(
-        "supplied_pow2",
-        "supplied_pow2_ptx_lut",
-        "supplied_pow2_ptx_rcp",
-    ),
-    # Numerical scale policy is held fixed within one tuning context so exact
-    # output comparison does not conflate schedules with quantization policy.
-    tensor_scale_mode=("power2",),
-    collect_amax=(True,),
-    telemetry_layout=("per_cta", "scalar_atomic"),
-    telemetry_ownership=("all", "operand_owner"),
-    # History policy changes numerical behavior. Keep the production recipe
-    # fixed in latency campaigns; numerical studies can explicitly override
-    # these axes without conflating quality and schedule performance.
-    amax_history_len=(16,),
-    amax_history_algo=("window_max",),
-    # One fused current-scale implementation coordinate.  Tile geometry and
-    # both real pipeline depths move together so every proposed candidate is
-    # immediately legal rather than requiring a lucky sequence of mutations.
-    jit_cta_pipeline=tuple(
-        (tile_m, tile_n, bf16_stages, native_stages, schedule)
-        for tile_m, tile_n in ((64, 128), (128, 128), (256, 256))
-        for bf16_stages in (1, 2, 3)
-        for native_stages in (1, 2, 3)
-        for schedule in ("cooperative", "three_role")
-    ),
-)
-
-
-def normalize_nvfp4_fwd_config(
-    base: NVFP4FwdConfig | None = None,
-    /,
-    **updates: object,
-) -> NVFP4FwdConfig:
-    """Apply common compound coordinates while preserving NVFP4 fields."""
-
-    selected = base or DEFAULT_NVFP4_FWD_CONFIG
-    jit_cta_pipeline = updates.pop("jit_cta_pipeline", None)
-    if jit_cta_pipeline is not None:
-        tile_m, tile_n, bf16_stages, native_stages, schedule = (
-            jit_cta_pipeline
-        )
-        updates.update(
-            tile_m=int(tile_m),
-            tile_n=int(tile_n),
-            tile_k=128,
-            bf16_stages=int(bf16_stages),
-            mxfp8_stages=int(native_stages),
-            schedule=str(schedule),
-            load_engine=("tma" if schedule == "three_role" else "scalar"),
-            bf16_tile_k=(64 if schedule == "three_role" else 128),
-            bf16_swizzle=("none" if schedule == "three_role" else "128b"),
-            quantizer_warps=(4 if schedule == "three_role" else 16),
-            x_scale_region_rows=int(tile_m),
-            weight_scale_region_rows=int(tile_n),
-            collect_amax=False,
-            jit_cta_scale=True,
-            # CTA-derived reciprocals are runtime shared values.  The
-            # supplied PTX paths were designed for compiler-visible scale
-            # packs and produced non-dominating per-CTA values beyond block
-            # zero; direct division is the correct initial implementation.
-            scale_reciprocal="direct",
-        )
-    values = asdict(selected)
-    scale_reciprocal = updates.pop(
-        "scale_reciprocal", values.pop("scale_reciprocal")
-    )
-    tensor_scale_mode = updates.pop(
-        "tensor_scale_mode", values.pop("tensor_scale_mode")
-    )
-    x_scale_region_rows = updates.pop(
-        "x_scale_region_rows", values.pop("x_scale_region_rows")
-    )
-    weight_scale_region_rows = updates.pop(
-        "weight_scale_region_rows", values.pop("weight_scale_region_rows")
-    )
-    collect_amax = updates.pop("collect_amax", values.pop("collect_amax"))
-    telemetry_layout = updates.pop(
-        "telemetry_layout", values.pop("telemetry_layout")
-    )
-    telemetry_ownership = updates.pop(
-        "telemetry_ownership", values.pop("telemetry_ownership")
-    )
-    amax_history_len = updates.pop(
-        "amax_history_len", values.pop("amax_history_len")
-    )
-    amax_history_algo = updates.pop(
-        "amax_history_algo", values.pop("amax_history_algo")
-    )
-    jit_cta_scale = updates.pop(
-        "jit_cta_scale", values.pop("jit_cta_scale")
-    )
-    common = MXFP8FwdConfig(**values)
-    normalized = normalize_fwd_config(common, **updates)
-    return NVFP4FwdConfig(
-        **asdict(normalized),
-        scale_reciprocal=str(scale_reciprocal),
-        tensor_scale_mode=str(tensor_scale_mode),
-        x_scale_region_rows=int(x_scale_region_rows),
-        weight_scale_region_rows=int(weight_scale_region_rows),
-        collect_amax=bool(collect_amax),
-        telemetry_layout=str(telemetry_layout),
-        telemetry_ownership=str(telemetry_ownership),
-        amax_history_len=int(amax_history_len),
-        amax_history_algo=str(amax_history_algo),
-        jit_cta_scale=bool(jit_cta_scale),
-    )
+NVFP4_KERNEL_REVISION = 7
 
 
 __all__ = [
     "DEFAULT_NVFP4_DYNAMIC_CONFIG",
     "DEFAULT_NVFP4_GEMM_CONFIG",
-    "DEFAULT_NVFP4_FWD_CONFIG",
+    "DEFAULT_NVFP4_SCALE_CONFIG",
     "DEFAULT_NVFP4_QUANT_CONFIG",
     "NVFP4GemmConfig",
     "NVFP4DynamicConfig",
     "NVFP4FullyPrequantConfig",
-    "NVFP4FwdConfig",
+    "NVFP4ScaleConfig",
     "NVFP4Problem",
     "NVFP4QuantConfig",
     "NVFP4WeightPrequantConfig",
     "NVFP4_KERNEL_REVISION",
-    "NVFP4_FWD_SEARCH_SPACE",
-    "normalize_nvfp4_fwd_config",
     "NVFP4_SF_VEC_SIZE",
 ]

@@ -8,7 +8,7 @@ def __getattr__(name: str):
         "MXFP8GemmConfig",
         "MXFP8QuantConfig",
         "NVFP4GemmConfig",
-        "NVFP4FwdConfig",
+        "NVFP4ScaleConfig",
         "NVFP4Problem",
         "NVFP4QuantConfig",
     ):
@@ -25,7 +25,7 @@ __all__ = [
     "MXFP8Problem",
     "MXFP8QuantConfig",
     "NVFP4GemmConfig",
-    "NVFP4FwdConfig",
+    "NVFP4ScaleConfig",
     "NVFP4Problem",
     "NVFP4QuantConfig",
 ]

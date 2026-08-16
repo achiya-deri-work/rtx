@@ -142,18 +142,16 @@ class LinearFrontendContractTests(unittest.TestCase):
         )
         self.assertEqual(layer.scaling, "jit_row_region")
         self.assertEqual(layer.scale_region_rows, 8)
-        legacy = rtx.NVFP4Linear(
-            128, 64, device="cpu", scaling="regional"
-        )
-        self.assertEqual(legacy.scaling, "jit_row_region")
-        with self.assertRaisesRegex(ValueError, "experimental"):
+        with self.assertRaisesRegex(ValueError, "scaling"):
+            rtx.NVFP4Linear(128, 64, device="cpu", scaling="regional")
+        with self.assertRaisesRegex(ValueError, "backend"):
             rtx.NVFP4Linear(
                 128,
                 64,
                 device="cpu",
                 scaling="jit_row_region",
                 scale_region_rows=128,
-                backend="fused",
+                backend="fused",  # type: ignore[arg-type]
             )
         fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
         if fp4_dtype is not None:
@@ -178,6 +176,24 @@ class LinearFrontendContractTests(unittest.TestCase):
             rtx.MXFP8Linear(128, 64, device="cpu", backend="materialized").backend,
             "materialized",
         )
+        with self.assertRaisesRegex(ValueError, "auto or materialized"):
+            rtx.NVFP4Linear(128, 64, device="cpu", backend="fused")
+
+    def test_nvfp4_scale_policy_has_only_effective_public_fields(self) -> None:
+        policy = rtx.NVFP4ScaleConfig(
+            tensor_scale_mode="exact",
+            amax_history_len=4,
+            amax_history_algo="most_recent",
+        )
+        layer = rtx.NVFP4Linear(
+            128,
+            64,
+            device="cpu",
+            scaling="delayed",
+            scale_config=policy,
+        )
+        self.assertIs(layer.scale_config, policy)
+        self.assertFalse(hasattr(policy, "tile_m"))
 
     def test_mxfp8_canonical_config_names_and_legacy_aliases(self) -> None:
         forward = rtx.MXFP8FwdConfig()
@@ -221,7 +237,7 @@ class LinearFrontendContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "auto, fused, or materialized"):
             rtx.MXFP8Linear(128, 64, device="cpu", backend="unknown")
-        with self.assertRaisesRegex(ValueError, "auto, fused, or materialized"):
+        with self.assertRaisesRegex(ValueError, "auto or materialized"):
             rtx.NVFP4Linear(128, 64, device="cpu", backend="unknown")
 
     def test_nvfp4_exposes_all_materialized_autotune_states(self) -> None:
@@ -342,9 +358,7 @@ class LinearFrontendContractTests(unittest.TestCase):
             weight = torch.empty(
                 64, 128, device="cuda", dtype=torch.bfloat16
             )
-            nvfp4_scale_pack = torch.ones(
-                3, device="cuda", dtype=torch.float32
-            )
+            nvfp4_scale = torch.ones(1, device="cuda", dtype=torch.float32)
             calls = (
                 (torch.ops.rtx.mxfp8_linear_fwd, (x, weight, "fake")),
                 (
@@ -352,16 +366,17 @@ class LinearFrontendContractTests(unittest.TestCase):
                     (x, weight, "fake", "fake"),
                 ),
                 (
-                    torch.ops.rtx.nvfp4_linear_fwd,
-                    (x, weight, nvfp4_scale_pack, nvfp4_scale_pack, "fake"),
+                    torch.ops.rtx.nvfp4_linear_materialized_fwd,
+                    (x, weight, nvfp4_scale, nvfp4_scale, nvfp4_scale, "fake"),
                 ),
                 (
-                    torch.ops.rtx.nvfp4_linear_train,
+                    torch.ops.rtx.nvfp4_linear_materialized_train,
                     (
                         x,
                         weight,
-                        nvfp4_scale_pack,
-                        nvfp4_scale_pack,
+                        nvfp4_scale,
+                        nvfp4_scale,
+                        nvfp4_scale,
                         "fake",
                         "fake",
                     ),

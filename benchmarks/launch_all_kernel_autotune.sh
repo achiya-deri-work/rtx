@@ -2,8 +2,8 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-manifest="autotune_manifests/blackwell_all_kernels_scaling_v1.json"
-campaign="blackwell_all_kernels_scaling_v1"
+manifest="autotune_manifests/blackwell_all_kernels_scaling_v2.json"
+campaign="blackwell_all_kernels_scaling_v2"
 
 duration_to_seconds() {
   local value="$1"

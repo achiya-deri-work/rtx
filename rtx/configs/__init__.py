@@ -4,19 +4,17 @@ from .mxfp8 import MXFP8GemmConfig, MXFP8QuantConfig
 from .inference import MXFP8FullyPrequantConfig, MXFP8WeightPrequantConfig
 from .nvfp4 import (
     DEFAULT_NVFP4_DYNAMIC_CONFIG,
-    DEFAULT_NVFP4_FWD_CONFIG,
+    DEFAULT_NVFP4_SCALE_CONFIG,
     DEFAULT_NVFP4_GEMM_CONFIG,
     DEFAULT_NVFP4_QUANT_CONFIG,
     NVFP4DynamicConfig,
     NVFP4FullyPrequantConfig,
-    NVFP4FwdConfig,
+    NVFP4ScaleConfig,
     NVFP4GemmConfig,
     NVFP4Problem,
     NVFP4QuantConfig,
     NVFP4WeightPrequantConfig,
     NVFP4_KERNEL_REVISION,
-    NVFP4_FWD_SEARCH_SPACE,
-    normalize_nvfp4_fwd_config,
 )
 
 __all__ = [
@@ -25,17 +23,15 @@ __all__ = [
     "MXFP8QuantConfig",
     "MXFP8WeightPrequantConfig",
     "DEFAULT_NVFP4_DYNAMIC_CONFIG",
-    "DEFAULT_NVFP4_FWD_CONFIG",
+    "DEFAULT_NVFP4_SCALE_CONFIG",
     "DEFAULT_NVFP4_GEMM_CONFIG",
     "DEFAULT_NVFP4_QUANT_CONFIG",
     "NVFP4DynamicConfig",
     "NVFP4FullyPrequantConfig",
-    "NVFP4FwdConfig",
+    "NVFP4ScaleConfig",
     "NVFP4GemmConfig",
     "NVFP4Problem",
     "NVFP4QuantConfig",
     "NVFP4WeightPrequantConfig",
     "NVFP4_KERNEL_REVISION",
-    "NVFP4_FWD_SEARCH_SPACE",
-    "normalize_nvfp4_fwd_config",
 ]

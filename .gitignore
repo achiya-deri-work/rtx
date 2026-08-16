@@ -1,4 +1,4 @@
-.venv/
+.venv*/
 __pycache__/
 *.py[cod]
 autotune_logs/
@@ -21,3 +21,7 @@ training_results/
 copied_datasets/
 hardware_calibration*.json
 *.log
+
+# Local DINOv3 regression checkout and checkpoints.  The upstream source and
+# its separately licensed assets are deliberately not distributed by RTX.
+fp8dinov3/

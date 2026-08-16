@@ -40,12 +40,7 @@ def main() -> None:
         features, features, device="cuda", dtype=torch.bfloat16
     ) / features**0.5
     initial_weight = torch.randn_like(target_weight) / features**0.5
-    exact_config = replace(
-        rtx.NVFP4FwdConfig(),
-        tile_k=128 if features % 256 else 256,
-        bf16_tile_k=128 if features % 256 else 256,
-        tensor_scale_mode="exact",
-    )
+    exact_config = rtx.NVFP4ScaleConfig(tensor_scale_mode="exact")
     models: dict[str, nn.Module] = {
         "bf16": nn.Linear(
             features,
@@ -62,13 +57,13 @@ def main() -> None:
             features,
             device="cuda",
             scaling="delayed",
-            forward_config=exact_config,
+            scale_config=exact_config,
         ),
         "current_power2": rtx.NVFP4Linear(
             features, features, device="cuda", scaling="current"
         ),
-        "regional_rowwise": rtx.NVFP4Linear(
-            features, features, device="cuda", scaling="regional"
+        "jit_row_region": rtx.NVFP4Linear(
+            features, features, device="cuda", scaling="jit_row_region"
         ),
         "block_only": rtx.NVFP4Linear(
             features, features, device="cuda", scaling="block"
@@ -119,7 +114,7 @@ def main() -> None:
         "delayed_power2",
         "delayed_exact",
         "current_power2",
-        "regional_rowwise",
+        "jit_row_region",
         "block_only",
     ):
         result = summaries[name]

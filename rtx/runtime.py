@@ -53,6 +53,12 @@ def _numeric_version(value: str) -> tuple[int, ...]:
     return tuple(fields)
 
 
+def _public_version(value: str) -> str:
+    """Drop a PEP 440 local build tag without hiding the installed identity."""
+
+    return value.split("+", 1)[0]
+
+
 @lru_cache(maxsize=1)
 def validate_runtime_environment() -> dict[str, str]:
     """Validate the deliberately narrow native-kernel software contract.
@@ -88,7 +94,7 @@ def validate_runtime_environment() -> dict[str, str]:
             errors.append(f"required distribution {distribution} is not installed")
             continue
         resolved[distribution] = installed
-        if installed != expected:
+        if _public_version(installed) != expected:
             errors.append(
                 f"{distribution} {installed} is unsupported; expected {expected}"
             )

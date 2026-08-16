@@ -41,7 +41,6 @@ class LinearSpec:
             "delayed",
             "current",
             "jit_row_region",
-            "regional",
             "block",
         ):
             raise ValueError(

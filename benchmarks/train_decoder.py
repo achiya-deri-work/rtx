@@ -779,7 +779,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--nvfp4-backend",
-        choices=("auto", "fused", "materialized"),
+        choices=("auto", "materialized"),
         default="auto",
     )
     parser.add_argument(

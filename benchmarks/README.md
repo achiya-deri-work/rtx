@@ -9,10 +9,8 @@ repository root so imports and output paths are predictable.
 | `run_decoder_four_mode.sh` | Exact 460.8M-token four-mode release convergence/runtime launcher |
 | `run_decoder_batch64_autotune.sh` | Two bounded 12-minute searches plus verification, winner installation, and batch-24/64 model races |
 | `benchmark_mxfp8_frontend.py` | End-to-end `torch.compile` MXFP8 frontend benchmark |
-| `benchmark_nvfp4_training.py` | Legacy CTA-local fused NVFP4 study retained for implementation comparisons |
 | `benchmark_nvfp4_end_to_end.py` | Production backend paired forward-plus-MXFP8-backward layer benchmark |
 | `benchmark_nvfp4_frontend.py` | Paired fullgraph dynamic-forward latency and normalized numerical-error comparison against MXFP8 |
-| `validate_nvfp4_regional_scaling.py` | Matched current-JIT versus regional-delayed scaling study with distribution shifts, scale staleness, gradient impact, and stable latency statistics |
 | `validate_nvfp4_convergence.py` | Controlled BF16/current/rowwise-JIT/delayed/exact scale-policy convergence study |
 | `benchmark_mxfp8_prequant.py` | Dynamic BF16 quantization plus native-scale MXFP8 GEMM, with mainloop/epilogue stage and persistent-locality controls |
 | `benchmark_torchao_fp8_rowwise.py` | TorchAO rowwise FP8 comparison baseline |
@@ -151,7 +149,7 @@ contexts. Override `RTX_AUTOTUNE_OUTPUT_DIR`, `RTX_AUTOTUNE_REPORT_DIR`, or
 `RTX_AUTOTUNE_LOG_DIR` when collecting multiple independent replicates.
 
 The worker rotates breadth-first across MXFP8 forward/inference, shared MXFP8
-backward, NVFP4 current/block/delayed/JIT-region/region-delayed forward, and
+backward, NVFP4 current/block/delayed/JIT-region forward, and
 NVFP4 packed inference. On exit it audits the journals and emits both CSV and
 Parquet without automatically installing exploratory winners.
 
@@ -163,11 +161,6 @@ python benchmarks/benchmark_nvfp4_end_to_end.py \
   --compile --nv-scaling delayed --nv-backend auto \
   --output autotune_reports/nvfp4_delayed_end_to_end.json
 ```
-
-`benchmark_nvfp4_training.py` directly launches the older fused CTA-local
-kernel and is intentionally retained as an implementation-control experiment;
-it does not represent the `NVFP4Linear(..., scaling="delayed",
-backend="auto")` production path.
 
 The end-to-end benchmark supports eager and `--compile` runs. It verifies that
 both frontends produce bit-identical MXFP8 dX/dW and uses device-wide fences so

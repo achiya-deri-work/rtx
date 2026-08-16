@@ -1109,6 +1109,15 @@ def _validate_packed_linear_operands(
     n, weight_k = mxfp8_matrix_shape(weight)
     if k != weight_k:
         raise ValueError(f"packed linear K mismatch: X={k}, W={weight_k}")
+    expected_storage_k = MXFP8Problem(m, n, k).storage_k
+    x_storage_k = int(x.qdata.shape[-1])
+    weight_storage_k = int(weight.qdata.shape[-1])
+    if x_storage_k != expected_storage_k or weight_storage_k != expected_storage_k:
+        raise ValueError(
+            "packed linear operands must use the minimal common block-aligned "
+            f"storage K={expected_storage_k}; got X={x_storage_k}, "
+            f"W={weight_storage_k}"
+        )
     if x.device != weight.device:
         raise ValueError("packed X and W must be on one CUDA device")
     if x.device.type != "cuda":
@@ -1158,6 +1167,11 @@ def _launch_weight_prequant_out(
         raise ValueError("dynamic X and packed W have incompatible shape/device")
     x_c = x if x.is_contiguous() else x.contiguous()
     problem = MXFP8Problem(int(x_c.shape[0]), n, k)
+    if int(weight.qdata.shape[-1]) != problem.storage_k:
+        raise ValueError(
+            "packed MXFP8 weight storage does not match logical K padding: "
+            f"expected {problem.storage_k}, got {weight.qdata.shape[-1]}"
+        )
     storage_problem = MXFP8Problem(problem.m, problem.n, int(weight.qdata.shape[-1]))
     config_key = _resolve_packed_inference_request(
         problem, weight, x=None, config_key=config_key

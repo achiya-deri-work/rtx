@@ -715,47 +715,6 @@ def make_mxfp8_fwd_adapter(
     )
 
 
-def make_nvfp4_fwd_adapter(
-    problem,
-    evaluator: Callable[[object], TrialOutcome],
-    *,
-    initial=None,
-    axes=None,
-    device: DeviceFingerprint | Mapping[str, object] | None = None,
-    regime: str = "hot",
-    tags: Mapping[str, object] | None = None,
-    _family: str = "nvfp4_fused_fwd",
-    _revision: int | None = None,
-):
-    from ..configs.nvfp4 import (
-        DEFAULT_NVFP4_FWD_CONFIG,
-        NVFP4_FWD_SEARCH_SPACE,
-        NVFP4_KERNEL_REVISION,
-        normalize_nvfp4_fwd_config,
-    )
-
-    selected_axes = NVFP4_FWD_SEARCH_SPACE if axes is None else axes
-    selected_initial = initial or replace(
-        DEFAULT_NVFP4_FWD_CONFIG, collect_amax=True
-    )
-
-    def deserialize(values: dict[str, object]):
-        return normalize_nvfp4_fwd_config(**values)
-
-    return make_mxfp8_fwd_adapter(
-        problem,
-        evaluator,
-        initial=selected_initial,
-        axes=selected_axes,
-        device=device,
-        regime=regime,
-        tags=tags,
-        _family=_family,
-        _revision=NVFP4_KERNEL_REVISION if _revision is None else _revision,
-        _allowed_axes=NVFP4_FWD_SEARCH_SPACE,
-        _normalizer=normalize_nvfp4_fwd_config,
-        _deserialize=deserialize,
-    )
 
 
 def make_mxfp8_prequant_adapter(
@@ -1212,8 +1171,7 @@ def make_nvfp4_dynamic_adapter(
             ),
             region_observer_read_bytes=float(
                 # Current/JIT scaling must observe BF16 once before it can
-                # quantize with that scale. Regional delayed scaling observes
-                # values during its ordinary quantization read instead.
+                # quantize with that scale.
                 2 * problem.k * (problem.m + problem.n)
                 if _family == "nvfp4_jit_row_region_fwd"
                 else 0
@@ -1232,8 +1190,6 @@ def make_nvfp4_dynamic_adapter(
         "operand_state": (
             "delayed_materialized"
             if _family == "nvfp4_delayed_fwd"
-            else "region_delayed"
-            if _family == "nvfp4_region_delayed_fwd"
             else "jit_row_region"
             if _family == "nvfp4_jit_row_region_fwd"
             else "dynamic"
@@ -1336,44 +1292,6 @@ def make_nvfp4_jit_row_region_adapter(
     )
 
 
-def make_nvfp4_region_delayed_adapter(
-    problem,
-    evaluator: Callable[[object], TrialOutcome],
-    *,
-    initial: object | None = None,
-    axes: Mapping[str, Iterable[Mapping[str, object]]] | None = None,
-    device: DeviceFingerprint | Mapping[str, object] | None = None,
-    regime: str = "hot",
-    tags: Mapping[str, object] | None = None,
-) -> DiscreteKernelAdapter[object]:
-    """Tune one-pass regional delayed scaling plus cached TMA epilogue."""
-
-    from ..nvfp4_inference_autotune import (
-        NVFP4_REGION_DELAYED_KERNEL_REVISION,
-        NVFP4_REGION_DELAYED_SEARCH_SPACE,
-        preferred_region_delayed_config,
-    )
-
-    selected = preferred_region_delayed_config(problem) if initial is None else initial
-    return make_nvfp4_dynamic_adapter(
-        problem,
-        evaluator,
-        initial=selected,
-        axes=NVFP4_REGION_DELAYED_SEARCH_SPACE if axes is None else axes,
-        device=device,
-        regime=regime,
-        tags={
-            **dict(tags or {}),
-            "scale_policy": "region_delayed",
-            "outer_scale_scope": "row_region",
-        },
-        _family="nvfp4_region_delayed_fwd",
-        _revision=NVFP4_REGION_DELAYED_KERNEL_REVISION,
-        _allowed_axes={
-            **NVFP4_REGION_DELAYED_SEARCH_SPACE,
-            **({} if axes is None else dict(axes)),
-        },
-    )
 
 def make_nvfp4_fully_prequant_adapter(
     problem,
@@ -1936,13 +1854,11 @@ __all__ = [
     "make_mxfp8_bwd_adapter",
     "make_mxfp8_fully_prequant_adapter",
     "make_mxfp8_fwd_adapter",
-    "make_nvfp4_fwd_adapter",
     "make_mxfp8_prequant_adapter",
     "make_mxfp8_weight_prequant_adapter",
     "make_nvfp4_fully_prequant_adapter",
     "make_nvfp4_dynamic_adapter",
     "make_nvfp4_jit_row_region_adapter",
-    "make_nvfp4_region_delayed_adapter",
     "make_nvfp4_delayed_adapter",
     "make_nvfp4_weight_prequant_adapter",
 ]
