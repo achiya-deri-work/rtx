@@ -1,0 +1,167 @@
+{
+  "schema_version": 2,
+  "name": "nvfp4_full_power_topology_v1",
+  "seed": 20260817,
+  "storage_mode": "residual_context",
+  "rotation_mode": "balanced_categories",
+  "jobs": [
+    {
+      "family": "nvfp4_jit_row_region_fwd",
+      "shapes": [
+        {"m": 64, "n": 512, "k": 512, "name": "tiny_square"},
+        {"m": 256, "n": 1536, "k": 1536, "name": "inference_hidden"},
+        {"m": 1024, "n": 4608, "k": 1536, "name": "small_qkv_3x"},
+        {"m": 4096, "n": 1536, "k": 1536, "name": "mid_square"},
+        {"m": 4096, "n": 6144, "k": 1536, "name": "mid_gate_4x"},
+        {"m": 8192, "n": 1536, "k": 3072, "name": "mid_down_2x"},
+        {"m": 16384, "n": 4096, "k": 4096, "name": "large_square"},
+        {"m": 65536, "n": 1024, "k": 1024, "name": "long_sequence"},
+        {"m": 8192, "n": 11008, "k": 4096, "name": "wide_gate"},
+        {"m": 1000, "n": 1537, "k": 769, "name": "ragged_all_axes"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 8,
+      "tags": {
+        "category": "full_power_topology_jit",
+        "kernel_revision": 8,
+        "scale_policy": "jit_row_region",
+        "coverage": "m_n_k_ratio_ragged_cache"
+      },
+      "tuning": {
+        "portfolio": "hybrid",
+        "orchestration": "bandit",
+        "max_trials": 384,
+        "time_budget_s": 2400.0,
+        "cost_model_trials": 256,
+        "model_warmup": 16,
+        "model_pool_size": 65536,
+        "model_refit_interval": 8,
+        "bandit_exploration": 0.48,
+        "model_estimators": 80,
+        "model_ensembles": 4,
+        "model_max_depth": 6,
+        "model_min_leaf": 3,
+        "model_max_features": 320,
+        "local_beam_width": 14,
+        "confirmation_repeats": 3,
+        "confirmation_ratio": 0.01,
+        "confirm_initial": true
+      },
+      "protocol": {
+        "warmup_calls": 6,
+        "samples": 5,
+        "confirm_samples": 25,
+        "race_rounds": 25,
+        "target_batch_ms": 40.0,
+        "practical_threshold": 0.001,
+        "bootstrap_resamples": 2000,
+        "correctness_rtol": 0.05,
+        "correctness_atol": 0.5,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "nvfp4_delayed_fwd",
+      "shapes": [
+        {"m": 64, "n": 512, "k": 512, "name": "tiny_square"},
+        {"m": 256, "n": 1536, "k": 1536, "name": "inference_hidden"},
+        {"m": 1024, "n": 4608, "k": 1536, "name": "small_qkv_3x"},
+        {"m": 4096, "n": 1536, "k": 1536, "name": "mid_square"},
+        {"m": 4096, "n": 6144, "k": 1536, "name": "mid_gate_4x"},
+        {"m": 8192, "n": 1536, "k": 3072, "name": "mid_down_2x"},
+        {"m": 16384, "n": 4096, "k": 4096, "name": "large_square"},
+        {"m": 65536, "n": 1024, "k": 1024, "name": "long_sequence"},
+        {"m": 8192, "n": 11008, "k": 4096, "name": "wide_gate"},
+        {"m": 1000, "n": 1537, "k": 769, "name": "ragged_all_axes"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 5,
+      "tags": {
+        "category": "full_power_topology_delayed",
+        "scale_policy": "tensor_delayed",
+        "amax_history_len": 16
+      },
+      "tuning": {
+        "portfolio": "hybrid",
+        "orchestration": "bandit",
+        "max_trials": 192,
+        "time_budget_s": 1800.0,
+        "cost_model_trials": 128,
+        "model_warmup": 12,
+        "model_pool_size": 32768,
+        "model_refit_interval": 8,
+        "bandit_exploration": 0.38,
+        "model_estimators": 56,
+        "model_ensembles": 3,
+        "model_max_depth": 5,
+        "model_min_leaf": 3,
+        "model_max_features": 224,
+        "local_beam_width": 10,
+        "confirmation_repeats": 2,
+        "confirmation_ratio": 0.01,
+        "confirm_initial": true
+      },
+      "protocol": {
+        "warmup_calls": 6,
+        "samples": 5,
+        "confirm_samples": 21,
+        "race_rounds": 21,
+        "target_batch_ms": 40.0,
+        "practical_threshold": 0.001,
+        "bootstrap_resamples": 1500,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "nvfp4_dynamic_fwd",
+      "shapes": [
+        {"m": 64, "n": 512, "k": 512, "name": "tiny_square"},
+        {"m": 256, "n": 1536, "k": 1536, "name": "inference_hidden"},
+        {"m": 1024, "n": 4608, "k": 1536, "name": "small_qkv_3x"},
+        {"m": 4096, "n": 1536, "k": 1536, "name": "mid_square"},
+        {"m": 4096, "n": 6144, "k": 1536, "name": "mid_gate_4x"},
+        {"m": 8192, "n": 1536, "k": 3072, "name": "mid_down_2x"},
+        {"m": 16384, "n": 4096, "k": 4096, "name": "large_square"},
+        {"m": 65536, "n": 1024, "k": 1024, "name": "long_sequence"},
+        {"m": 8192, "n": 11008, "k": 4096, "name": "wide_gate"},
+        {"m": 1000, "n": 1537, "k": 769, "name": "ragged_all_axes"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 5,
+      "tags": {
+        "category": "full_power_topology_block",
+        "scale_policy": "block_only"
+      },
+      "tuning": {
+        "portfolio": "hybrid",
+        "orchestration": "bandit",
+        "max_trials": 192,
+        "time_budget_s": 1800.0,
+        "cost_model_trials": 128,
+        "model_warmup": 12,
+        "model_pool_size": 32768,
+        "model_refit_interval": 8,
+        "bandit_exploration": 0.38,
+        "model_estimators": 56,
+        "model_ensembles": 3,
+        "model_max_depth": 5,
+        "model_min_leaf": 3,
+        "model_max_features": 224,
+        "local_beam_width": 10,
+        "confirmation_repeats": 2,
+        "confirmation_ratio": 0.01,
+        "confirm_initial": true
+      },
+      "protocol": {
+        "warmup_calls": 6,
+        "samples": 5,
+        "confirm_samples": 21,
+        "race_rounds": 21,
+        "target_batch_ms": 40.0,
+        "practical_threshold": 0.001,
+        "bootstrap_resamples": 1500,
+        "telemetry": true
+      }
+    }
+  ]
+}

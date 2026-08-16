@@ -23,6 +23,7 @@ repository root so imports and output paths are predictable.
 | `tune_mxfp8_native_quant.py` | Standalone native quantizer coordinate sweep |
 | `tune_mxfp8_native_gemm.py` | Standalone prequantized GEMM coordinate sweep |
 | `run_5070_autotuner_study.sh` | Resumable 3-hour laptop / 6-hour desktop prospective optimizer study |
+| `launch_nvfp4_full_power_6h.sh` | Clock-driven six-hour NVFP4 release/topology/deep-JIT/overflow campaign for SM120 SKUs |
 
 Portable multi-shape and cross-device campaigns belong in
 `autotune_manifests/` and should be launched with `rtx-autotune`; these scripts
@@ -50,6 +51,30 @@ journals, exports CSV/Parquet, and installs verified device-local winners.
 All generated JSON, JSONL, logs, datasets, and compiled artifacts must go to an
 ignored output directory such as `autotune_results/`, `autotune_logs/`, or
 `autotune_datasets/`.
+
+For the matched NVFP4 revision-8 campaign on the RTX 5070 Ti, RTX 5070 Laptop,
+and RTX 5090, pull the same commit and run this command on each machine:
+
+```bash
+./benchmarks/launch_nvfp4_full_power_6h.sh 6h
+```
+
+The launcher identifies the machine by hostname; set a stable explicit label
+when hostnames are ambiguous:
+
+```bash
+RTX_AUTOTUNE_NODE=rtx5070ti ./benchmarks/launch_nvfp4_full_power_6h.sh 6h
+RTX_AUTOTUNE_NODE=rtx5070_laptop ./benchmarks/launch_nvfp4_full_power_6h.sh 6h
+RTX_AUTOTUNE_NODE=rtx5090 ./benchmarks/launch_nvfp4_full_power_6h.sh 6h
+```
+
+The worker reserves the final five minutes for journal audit. Before that it
+uses 25% of the clock for matched release contexts, 35% for broad M/N/K and
+ragged topology coverage, 30% for deep JIT-region exploration, and all
+remaining time for two-replicate overflow contexts. A phase that exhausts its
+search space early advances immediately; watchdog/CUDA-context exits resume
+from append-only residual journals. Each phase emits independent CSV and
+Parquet reports and never installs exploratory winners automatically.
 
 Run the fixed-token decoder convergence comparison with:
 
