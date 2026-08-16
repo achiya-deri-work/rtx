@@ -1,0 +1,132 @@
+{
+  "schema_version": 2,
+  "name": "nvfp4_jit_sibling_showdown_v1",
+  "seed": 20260816,
+  "storage_mode": "residual_context",
+  "rotation_mode": "balanced_categories",
+  "jobs": [
+    {
+      "family": "mxfp8_fused_fwd",
+      "shapes": [
+        {"m": 32768, "n": 768, "k": 768, "name": "attention_out"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "down"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "qkv"},
+        {"m": 32768, "n": 3072, "k": 768, "name": "gate_up"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 5,
+      "tags": {"category": "showdown_mxfp8", "scaling": "e8m0_block"},
+      "tuning": {
+        "portfolio": "hybrid", "orchestration": "bandit",
+        "max_trials": 256, "time_budget_s": 2400,
+        "cost_model_trials": 160, "model_warmup": 16,
+        "model_pool_size": 32768, "model_refit_interval": 8,
+        "bandit_exploration": 0.4, "model_estimators": 64,
+        "model_ensembles": 4, "model_max_depth": 5,
+        "model_min_leaf": 3, "model_max_features": 256,
+        "local_beam_width": 12, "confirmation_repeats": 3,
+        "confirmation_ratio": 0.01, "confirm_initial": true
+      },
+      "protocol": {
+        "warmup_calls": 6, "samples": 5, "confirm_samples": 25,
+        "race_rounds": 25, "target_batch_ms": 40.0,
+        "practical_threshold": 0.001, "bootstrap_resamples": 2000,
+        "correctness_rtol": 0.05, "correctness_atol": 0.5,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "nvfp4_dynamic_fwd",
+      "shapes": [
+        {"m": 32768, "n": 768, "k": 768, "name": "attention_out"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "down"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "qkv"},
+        {"m": 32768, "n": 3072, "k": 768, "name": "gate_up"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 5,
+      "tags": {"category": "showdown_nvfp4_block", "scaling": "block_only"},
+      "tuning": {
+        "portfolio": "hybrid", "orchestration": "bandit",
+        "max_trials": 256, "time_budget_s": 2400,
+        "cost_model_trials": 160, "model_warmup": 16,
+        "model_pool_size": 32768, "model_refit_interval": 8,
+        "bandit_exploration": 0.4, "model_estimators": 64,
+        "model_ensembles": 4, "model_max_depth": 5,
+        "model_min_leaf": 3, "model_max_features": 256,
+        "local_beam_width": 12, "confirmation_repeats": 3,
+        "confirmation_ratio": 0.01, "confirm_initial": true
+      },
+      "protocol": {
+        "warmup_calls": 6, "samples": 5, "confirm_samples": 25,
+        "race_rounds": 25, "target_batch_ms": 40.0,
+        "practical_threshold": 0.001, "bootstrap_resamples": 2000,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "nvfp4_delayed_fwd",
+      "shapes": [
+        {"m": 32768, "n": 768, "k": 768, "name": "attention_out"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "down"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "qkv"},
+        {"m": 32768, "n": 3072, "k": 768, "name": "gate_up"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 5,
+      "tags": {"category": "showdown_nvfp4_delayed", "scaling": "tensor_delayed"},
+      "tuning": {
+        "portfolio": "hybrid", "orchestration": "bandit",
+        "max_trials": 256, "time_budget_s": 2400,
+        "cost_model_trials": 160, "model_warmup": 16,
+        "model_pool_size": 32768, "model_refit_interval": 8,
+        "bandit_exploration": 0.4, "model_estimators": 64,
+        "model_ensembles": 4, "model_max_depth": 5,
+        "model_min_leaf": 3, "model_max_features": 256,
+        "local_beam_width": 12, "confirmation_repeats": 3,
+        "confirmation_ratio": 0.01, "confirm_initial": true
+      },
+      "protocol": {
+        "warmup_calls": 6, "samples": 5, "confirm_samples": 25,
+        "race_rounds": 25, "target_batch_ms": 40.0,
+        "practical_threshold": 0.001, "bootstrap_resamples": 2000,
+        "telemetry": true
+      }
+    },
+    {
+      "family": "nvfp4_jit_row_region_fwd",
+      "shapes": [
+        {"m": 32768, "n": 768, "k": 768, "name": "attention_out"},
+        {"m": 32768, "n": 768, "k": 1536, "name": "down"},
+        {"m": 32768, "n": 2304, "k": 768, "name": "qkv"},
+        {"m": 32768, "n": 3072, "k": 768, "name": "gate_up"}
+      ],
+      "regimes": ["hot", "rotate"],
+      "promote": 8,
+      "tags": {
+        "category": "showdown_nvfp4_jit_region",
+        "scaling": "jit_row_region_current",
+        "kernel_revision": "6",
+        "search": "region_geometry_packet_cache_mma_epilogue_persistence"
+      },
+      "tuning": {
+        "portfolio": "hybrid", "orchestration": "bandit",
+        "max_trials": 512, "time_budget_s": 4800,
+        "cost_model_trials": 384, "model_warmup": 24,
+        "model_pool_size": 65536, "model_refit_interval": 8,
+        "bandit_exploration": 0.5, "model_estimators": 96,
+        "model_ensembles": 5, "model_max_depth": 6,
+        "model_min_leaf": 3, "model_max_features": 384,
+        "local_beam_width": 16, "confirmation_repeats": 3,
+        "confirmation_ratio": 0.01, "confirm_initial": true
+      },
+      "protocol": {
+        "warmup_calls": 6, "samples": 5, "confirm_samples": 31,
+        "race_rounds": 31, "target_batch_ms": 40.0,
+        "practical_threshold": 0.001, "bootstrap_resamples": 2000,
+        "correctness_rtol": 0.05, "correctness_atol": 0.5,
+        "telemetry": true
+      }
+    }
+  ]
+}
