@@ -211,6 +211,21 @@ feasibility, exact-SKU heads when present, and matched random catalogue replay
 without modifying deployment gates. Exact source-file overlap or an identical
 dataset digest is rejected unless an explicitly in-sample diagnostic opts in.
 
+For an interpretable cross-SKU study after training, run:
+
+```bash
+rtx-autotune study-sku DATASET... \
+  --artifact autotune_models/portable_v1 \
+  --output autotune_reports/sku_study_v1
+```
+
+This emits `study.json` and `study.md` with device profiles, context-normalized
+coordinate associations and bootstrap intervals, SKU-sensitive regions,
+cross-SKU winner-transfer regret, model split/path interactions, feasibility
+structure, and deployment-gate results. Single-coordinate associations remain
+observational because adaptive search couples coordinates; parent-linked rules
+and held-out transfer replay are the stronger evidence sources.
+
 ## Architecture and SKU features
 
 Dataset campaigns pass a complete SM120/SM121 hardware profile into every

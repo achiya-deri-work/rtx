@@ -82,6 +82,7 @@ from .recipes import (
     make_hybrid_autotuner,
 )
 from .runtime import balanced_coordinate_policy, balanced_hybrid_policy
+from .sku_study import study_sku_relationships
 from .pretrained import (
     ConditionalEffectRule,
     ConditionalRuleSet,
@@ -209,6 +210,7 @@ __all__ = [
     "HybridTuningPolicy",
     "balanced_coordinate_policy",
     "balanced_hybrid_policy",
+    "study_sku_relationships",
     "InMemoryTuningStore",
     "JsonTuningDatabase",
     "JsonlTuningStore",

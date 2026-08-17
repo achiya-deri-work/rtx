@@ -2760,6 +2760,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print the complete validation manifest instead of a concise summary",
     )
 
+    sku_study = subparsers.add_parser(
+        "study-sku",
+        help="analyze conditional SKU/spec and kernel search-space relationships",
+    )
+    sku_study.add_argument("paths", type=Path, nargs="+")
+    sku_study.add_argument("--output", type=Path, required=True)
+    sku_study.add_argument(
+        "--artifact",
+        type=Path,
+        help="optional pretrained artifact supplying model/rule diagnostics",
+    )
+    sku_study.add_argument("--seed", type=int, default=20260817)
+    sku_study.add_argument("--minimum-contexts", type=int, default=5)
+
     evaluate_pretrained = subparsers.add_parser(
         "evaluate-pretrained",
         help="evaluate a frozen pretrained artifact on disjoint held-out data",
@@ -2905,6 +2919,33 @@ def main(argv: Sequence[str] | None = None) -> None:
                 },
             }
         print(json.dumps(printable, indent=2, sort_keys=True))
+        return
+    if args.command == "study-sku":
+        from .sku_study import study_sku_relationships
+
+        report = study_sku_relationships(
+            args.paths,
+            args.output,
+            artifact=args.artifact,
+            seed=args.seed,
+            minimum_contexts=args.minimum_contexts,
+        )
+        print(
+            json.dumps(
+                {
+                    "output": str(args.output.resolve()),
+                    "observations": report["input"]["observations"],
+                    "devices": [
+                        value["sku"] for value in report["device_profiles"]
+                    ],
+                    "coordinate_effects": len(report["coordinate_effects"]),
+                    "portable_effects": len(report["portable_effects"]),
+                    "artifact_id": report.get("artifact_id"),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return
     if args.command == "validate":
         manifest = DatasetManifest.load(args.manifest)
