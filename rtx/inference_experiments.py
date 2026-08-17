@@ -42,7 +42,10 @@ def _materialize(
     config,
 ) -> MXFP8Tensor:
     rows, k = map(int, source.shape)
-    data = torch.empty_like(source, dtype=torch.float8_e4m3fn)
+    storage_k = (k + 31) // 32 * 32
+    data = torch.empty(
+        (rows, storage_k), dtype=torch.float8_e4m3fn, device=source.device
+    )
     scales = _allocate_scales(rows, k, config.scale_layout, source.device)
     compile_mxfp8_quant(rows, k, config)(source, data, scales)
     return make_mxfp8_tensor(
@@ -173,7 +176,10 @@ class MXFP8InferenceBenchmarkHarness(PrequantBenchmarkHarness):
         started = time.monotonic()
         try:
             try:
-                gemm = compile_mxfp8_gemm(self.problem, config.gemm)
+                storage_problem = type(self.problem)(
+                    self.problem.m, self.problem.n, self.problem.storage_k
+                )
+                gemm = compile_mxfp8_gemm(storage_problem, config.gemm)
                 packed_pairs: dict[
                     tuple[int, int], tuple[MXFP8Tensor | None, MXFP8Tensor]
                 ] = {}
@@ -181,7 +187,11 @@ class MXFP8InferenceBenchmarkHarness(PrequantBenchmarkHarness):
                     quant_x = compile_mxfp8_quant(
                         self.problem.m, self.problem.k, config.quant_x
                     )
-                    qx = torch.empty_like(self.x, dtype=torch.float8_e4m3fn)
+                    qx = torch.empty(
+                        (self.problem.m, self.problem.storage_k),
+                        dtype=torch.float8_e4m3fn,
+                        device=self.device,
+                    )
                     sx = _allocate_scales(
                         self.problem.m,
                         self.problem.k,

@@ -216,12 +216,84 @@ class DatasetTests(unittest.TestCase):
             "inference_states_pilot_v1.json",
             "autotuner_prospective_5070_v1.json",
             "mxfp8_bwd_revision19_calibration_v1.json",
+            "blackwell_diversity_atlas_v1.json",
         ):
             manifest = DatasetManifest.load(root / "autotune_manifests" / name)
             restored = DatasetManifest.from_dict(manifest.as_dict())
             self.assertEqual(restored, manifest)
             self.assertEqual(restored.digest, manifest.digest)
             self.assertGreater(sum(len(job.shapes) for job in manifest.jobs), 0)
+
+    def test_manifest_expands_shared_shape_sets_and_job_defaults(self) -> None:
+        manifest = DatasetManifest.from_dict(
+            {
+                "schema_version": 2,
+                "name": "composed",
+                "shape_sets": {
+                    "atlas": [
+                        {"m": 32, "n": 256, "k": 129, "name": "ragged"},
+                        {"m": 512, "n": 768, "k": 1024, "name": "dense"},
+                    ]
+                },
+                "job_defaults": {
+                    "shape_set": "atlas",
+                    "regimes": ["hot"],
+                    "promote": 2,
+                    "tuning": {"max_trials": 12, "model_warmup": 4},
+                    "protocol": {"samples": 3},
+                    "tags": {"study": "coverage"},
+                },
+                "jobs": [
+                    {"family": "mxfp8_fused_fwd"},
+                    {
+                        "family": "nvfp4_dynamic_fwd",
+                        "tuning": {"max_trials": 8},
+                        "tags": {"precision": "nvfp4"},
+                    },
+                ],
+            }
+        )
+        self.assertEqual(len(manifest.jobs), 2)
+        self.assertEqual(len(manifest.jobs[0].shapes), 2)
+        self.assertEqual(manifest.jobs[0].tuning.max_trials, 12)
+        self.assertEqual(manifest.jobs[1].tuning.max_trials, 8)
+        self.assertEqual(manifest.jobs[1].tuning.model_warmup, 4)
+        self.assertEqual(manifest.jobs[1].protocol.samples, 3)
+        self.assertEqual(
+            manifest.jobs[1].tags,
+            {"study": "coverage", "precision": "nvfp4"},
+        )
+        self.assertEqual(DatasetManifest.from_dict(manifest.as_dict()), manifest)
+
+        inline = DatasetManifest.from_dict(
+            {
+                "name": "inline-override",
+                "shape_sets": {"atlas": [{"m": 32, "n": 32, "k": 32}]},
+                "job_defaults": {"shape_set": "atlas", "regimes": ["hot"]},
+                "jobs": [
+                    {
+                        "family": "mxfp8_fused_fwd",
+                        "shapes": [{"m": 48, "n": 80, "k": 112}],
+                    }
+                ],
+            }
+        )
+        shape = inline.jobs[0].shapes[0]
+        self.assertEqual((shape.m, shape.n, shape.k), (48, 80, 112))
+
+        bad = {
+            "name": "bad-shape-set",
+            "shape_sets": {"atlas": [{"m": 32, "n": 32, "k": 32}]},
+            "jobs": [
+                {
+                    "family": "mxfp8_fused_fwd",
+                    "shape_set": "atlas",
+                    "shapes": [{"m": 64, "n": 64, "k": 64}],
+                }
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "both shapes and shape_set"):
+            DatasetManifest.from_dict(bad)
 
     def test_posthoc_verification_rechecks_current_residual_finalists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

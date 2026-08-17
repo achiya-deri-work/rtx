@@ -656,6 +656,33 @@ class NVFP4CudaTests(unittest.TestCase):
                 self.assertEqual(result["status"], "ok")
                 self.assertGreater(result["summary_ms"]["median"], 0)
 
+    def test_ragged_inference_harnesses_use_physical_storage_k(self) -> None:
+        from rtx.nvfp4_inference_experiments import (
+            NVFP4FullyPrequantBenchmarkHarness,
+            NVFP4WeightPrequantBenchmarkHarness,
+        )
+        from rtx.prequant_experiments import BenchmarkProtocol, ShapeSpec
+
+        protocol = BenchmarkProtocol(
+            warmup_calls=1,
+            samples=1,
+            confirm_samples=1,
+            race_rounds=1,
+            target_batch_ms=1.0,
+            max_calls_per_sample=1,
+            bootstrap_resamples=10,
+            telemetry=False,
+        )
+        shape = ShapeSpec(17, 29, 33)
+        for harness_type, config in (
+            (NVFP4WeightPrequantBenchmarkHarness, NVFP4WeightPrequantConfig()),
+            (NVFP4FullyPrequantBenchmarkHarness, NVFP4FullyPrequantConfig()),
+        ):
+            with self.subTest(harness=harness_type.__name__):
+                harness = harness_type(shape, "hot", protocol, seed=1913)
+                result = harness.measure(config, samples=1, seed=1913)
+                self.assertEqual(result["status"], "ok", result.get("error"))
+
     def test_public_current_scale_forward_is_finite(self) -> None:
         torch.manual_seed(1901)
         x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)

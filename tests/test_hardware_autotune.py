@@ -45,6 +45,15 @@ class _CompileConfig:
 
 
 class HardwareAutotuneTests(unittest.TestCase):
+    def test_backward_adapter_uses_fused_initial_config_for_ragged_shapes(self) -> None:
+        problem = MXFP8Problem(48, 512, 129)
+        adapter = make_mxfp8_bwd_adapter(
+            problem,
+            lambda _config: TrialOutcome("ok", median_ms=1.0),
+        )
+        self.assertEqual(adapter.initial_config, DEFAULT_FUSED_MXFP8_BWD_CONFIG)
+        self.assertIsNone(adapter.initial_config.implementation_rejection(problem))
+
     def test_nvfp4_epilogue_warps_are_visible_to_resource_model(self) -> None:
         config = NVFP4GemmConfig(
             stages=1,

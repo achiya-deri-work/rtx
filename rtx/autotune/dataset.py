@@ -338,12 +338,57 @@ class DatasetManifest:
         version = int(value.get("schema_version", DATASET_SCHEMA_VERSION))
         if version not in (1, DATASET_SCHEMA_VERSION):
             raise ValueError(f"unsupported dataset manifest schema {version}")
+        raw_shape_sets = value.get("shape_sets", {})
+        if not isinstance(raw_shape_sets, Mapping):
+            raise TypeError("manifest shape_sets must be a mapping")
+        shape_sets: dict[str, object] = {
+            str(name): shapes for name, shapes in raw_shape_sets.items()
+        }
+        raw_defaults = value.get("job_defaults", {})
+        if not isinstance(raw_defaults, Mapping):
+            raise TypeError("manifest job_defaults must be a mapping")
+
+        def expand_job(raw_job: object) -> DatasetJob:
+            if not isinstance(raw_job, Mapping):
+                raise TypeError("manifest jobs must be mappings")
+            merged = dict(raw_defaults)
+            for nested in ("tuning", "protocol", "tags"):
+                defaults = raw_defaults.get(nested, {})
+                override = raw_job.get(nested, {})
+                if not isinstance(defaults, Mapping) or not isinstance(
+                    override, Mapping
+                ):
+                    raise TypeError(f"job {nested} must be a mapping")
+                if defaults or override:
+                    merged[nested] = {**dict(defaults), **dict(override)}
+            merged.update(
+                {
+                    key: child
+                    for key, child in raw_job.items()
+                    if key not in ("tuning", "protocol", "tags", "shape_set")
+                }
+            )
+            default_shape_set = merged.pop("shape_set", None)
+            shape_set = raw_job.get("shape_set", default_shape_set)
+            # An inline shape list is an explicit override of a default shape
+            # set.  Defining both on the same job is still almost certainly a
+            # manifest authoring error and remains rejected below.
+            if "shapes" in raw_job and "shape_set" not in raw_job:
+                shape_set = None
+            if shape_set is not None:
+                if "shapes" in raw_job:
+                    raise ValueError("a job cannot define both shapes and shape_set")
+                try:
+                    merged["shapes"] = shape_sets[str(shape_set)]
+                except KeyError as exc:
+                    raise ValueError(f"unknown manifest shape_set {shape_set!r}") from exc
+            if "shapes" not in merged:
+                raise ValueError("a job requires shapes or a shape_set")
+            return DatasetJob.from_dict(merged)
+
         return cls(
             name=str(value["name"]),
-            jobs=tuple(
-                DatasetJob.from_dict(item)
-                for item in value["jobs"]  # type: ignore[union-attr]
-            ),
+            jobs=tuple(expand_job(item) for item in value["jobs"]),  # type: ignore[union-attr]
             seed=int(value.get("seed", 0)),
             shard_index=int(value.get("shard_index", 0)),
             shard_count=int(value.get("shard_count", 1)),

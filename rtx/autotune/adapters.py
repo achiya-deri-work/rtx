@@ -1429,9 +1429,19 @@ def make_mxfp8_bwd_adapter(
         bwd_config_to_dict,
         update_bwd_config,
     )
-    from ..kernels.mxfp8_bwd import DEFAULT_MXFP8_BWD_CONFIG
+    from ..kernels.mxfp8_bwd import (
+        DEFAULT_FUSED_MXFP8_BWD_CONFIG,
+        DEFAULT_MXFP8_BWD_CONFIG,
+    )
 
-    initial_config = DEFAULT_MXFP8_BWD_CONFIG if initial is None else initial
+    if initial is None:
+        initial_config = (
+            DEFAULT_MXFP8_BWD_CONFIG
+            if DEFAULT_MXFP8_BWD_CONFIG.implementation_rejection(problem) is None
+            else DEFAULT_FUSED_MXFP8_BWD_CONFIG
+        )
+    else:
+        initial_config = initial
     selected_axes = BWD_SEARCH_SPACE if axes is None else axes
     axis_values = {name: tuple(values) for name, values in selected_axes.items()}
     unknown = set(axis_values).difference(BWD_SEARCH_SPACE)

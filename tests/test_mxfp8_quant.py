@@ -589,6 +589,27 @@ class MXFP8QuantCudaTests(unittest.TestCase):
                 self.assertNotIn("w_quant", components)
                 self.assertNotIn("dual_quant", components)
 
+    def test_ragged_inference_harnesses_use_physical_storage_k(self) -> None:
+        shape = ShapeSpec(17, 29, 33)
+        protocol = BenchmarkProtocol(
+            warmup_calls=1,
+            samples=1,
+            confirm_samples=1,
+            race_rounds=1,
+            target_batch_ms=1.0,
+            max_calls_per_sample=1,
+            bootstrap_resamples=10,
+            telemetry=False,
+        )
+        for harness_type, config in (
+            (WeightPrequantBenchmarkHarness, MXFP8WeightPrequantConfig()),
+            (FullyPrequantBenchmarkHarness, MXFP8FullyPrequantConfig()),
+        ):
+            with self.subTest(harness=harness_type.__name__):
+                harness = harness_type(shape, "hot", protocol, seed=1708)
+                result = harness.measure(config, samples=1, seed=1708)
+                self.assertEqual(result["status"], "ok", result.get("error"))
+
 
 if __name__ == "__main__":
     unittest.main()

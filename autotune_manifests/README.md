@@ -8,6 +8,7 @@ context identity. Add a newly versioned file instead.
 
 | Manifest | Purpose | Contexts |
 | --- | --- | ---: |
+| `blackwell_diversity_atlas_v1.json` | Coverage-first matched atlas across 10 retained families, 30 stratified/ragged shapes, and both cache regimes | 600 |
 | `blackwell_all_kernels_scaling_v2.json` | Retained-family release study across MXFP8/NVFP4 forward, shared backward, scaling, cache, and packed inference | 120 |
 | `decoder_batch64_mxfp8_v1.json` | Batch-64 decoder MXFP8 fused-forward/shared-backward tuning | 8 |
 | `decoder_batch64_nvfp4_v2.json` | Batch-64 decoder block-materialized NVFP4 tuning after fused-family retirement | 4 |
@@ -48,6 +49,28 @@ regimes across all 12 production families. Its balanced-category rotation and
 4/8/16/32/64/128 milestones make every interruption a useful paired dataset.
 NVFP4 backward is represented by `mxfp8_bwd`, because that is the actual
 backward implementation shared by every NVFP4 scaling policy.
+
+The diversity atlas is the broad portable-model campaign. It covers micro and
+under-wave expert shapes, vision and decoder projections, balanced and strongly
+rectangular GEMMs, long sequences, tile boundaries, prime/ragged dimensions,
+and packed-NVFP4 stride boundaries. Shared `shape_sets` and `job_defaults` keep
+the source manifest reviewable; validation expands them into the same immutable
+normalized manifest stored with every bundle. The launcher uses
+1/2/4/8/16/32/64/128 breadth-first milestones so an interrupted run contains a
+balanced screening dataset instead of a few deeply tuned early jobs:
+
+```bash
+./benchmarks/launch_diversity_atlas.sh 6h
+tail -f autotune_logs/blackwell_diversity_atlas_v1_$(hostname -s).log
+```
+
+Run the full, unsharded atlas on different GPU SKUs. Matched contexts are what
+allow a portable model to separate GPU effects from shape and kernel effects.
+Only use `RTX_AUTOTUNE_SHARD_INDEX` and `RTX_AUTOTUNE_SHARD_COUNT` to divide
+work among equivalent GPUs of the same SKU. Results are written as per-context
+residual journals and finalized as CSV and Parquet. Environment overrides can
+change visit duration and milestones, but a different experiment policy should
+normally receive a new manifest version.
 
 The prospective 5070 manifest expands every base workload across three search
 treatments and two independent replicates. Its order balances every prefix

@@ -511,15 +511,18 @@ class NVFP4InferenceBenchmarkHarness(PrequantBenchmarkHarness):
         self,
         config: NVFP4WeightPrequantConfig | NVFP4FullyPrequantConfig,
     ) -> _NVFP4InferenceRunner:
-        gemm = compile_nvfp4_gemm(self.problem, config.gemm)
+        storage_problem = NVFP4Problem(
+            self.problem.m, self.problem.n, self.problem.storage_k
+        )
+        gemm = compile_nvfp4_gemm(storage_problem, config.gemm)
         if isinstance(config, NVFP4WeightPrequantConfig):
             qx = torch.empty(
-                (self.problem.m, self.problem.k // 2),
+                (self.problem.m, self.problem.storage_k // 2),
                 dtype=torch.uint8,
                 device=self.device,
             )
             sx = torch.empty(
-                (self.problem.m, self.problem.k // 16),
+                (self.problem.m, self.problem.storage_k // 16),
                 dtype=torch.float8_e4m3fn,
                 device=self.device,
             )
