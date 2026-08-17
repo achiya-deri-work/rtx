@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,11 @@ from typing import Callable, Iterable, Mapping, TypeVar
 
 from .legacy import DeviceFingerprint, default_cache_dir
 from ..kernels.mxfp8 import MXFP8Problem
+
+try:  # Linux is the production target; keep cache reads usable elsewhere.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts.
+    fcntl = None  # type: ignore[assignment]
 
 
 ConfigT = TypeVar("ConfigT")
@@ -163,6 +169,38 @@ def save_runtime_winner(
     return path
 
 
+@contextmanager
+def runtime_tuning_lock(
+    key: RuntimeWinnerKey,
+    *,
+    root: Path | str | None = None,
+):
+    """Serialize first-hit tuning for one exact runtime context.
+
+    The winner itself is still written by atomic replacement.  This advisory
+    lock prevents local workers/ranks sharing a cache from compiling the same
+    missing context concurrently.  Callers must recheck the winner after the
+    lock is acquired because another process may have populated it while they
+    waited.
+    """
+
+    base = default_cache_dir() if root is None else Path(root).expanduser()
+    path = base / "runtime_locks" / key.relative_path.relative_to(
+        "runtime_winners"
+    )
+    path = path.with_suffix(path.suffix + ".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        if fcntl is None:
+            yield
+            return
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def load_runtime_winner(
     key: RuntimeWinnerKey,
     deserialize: Callable[[Mapping[str, object]], ConfigT],
@@ -266,5 +304,6 @@ __all__ = [
     "load_runtime_winner",
     "list_runtime_winners",
     "runtime_winner_key",
+    "runtime_tuning_lock",
     "save_runtime_winner",
 ]

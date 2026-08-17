@@ -65,6 +65,14 @@ class HybridTuningPolicy:
     use_pretrained: bool = True
     pretrained_warmup_trials: int = 4
     pretrained_rule_weight: float = 0.15
+    # Runtime harness controls. Dataset campaigns may leave these at their
+    # high-confidence defaults; balanced first-hit policies reduce them while
+    # retaining a confirmed final winner.
+    warmup: int = 5
+    samples: int = 7
+    calls_per_sample: int = 4096
+    correctness_rtol: float = 5e-2
+    correctness_atol: float = 5e-1
 
 
 def make_hybrid_autotuner(

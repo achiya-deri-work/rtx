@@ -130,7 +130,10 @@ class LinearFrontendContractTests(unittest.TestCase):
         online = rtx.MXFP8Linear(
             128, 64, device="cpu", autotune="online"
         ).explain(x)
-        self.assertEqual(online.autotune, "coordinate")
+        self.assertEqual(online.autotune, "balanced")
+
+        default = rtx.NVFP4Linear(128, 64, device="cpu").explain(x)
+        self.assertEqual(default.autotune, "balanced")
 
     def test_nvfp4_jit_row_region_is_canonical_and_materialized(self) -> None:
         layer = rtx.NVFP4Linear(

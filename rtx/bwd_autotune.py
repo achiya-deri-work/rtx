@@ -1282,14 +1282,28 @@ class BwdCoordinateDescentTuner:
                     if self.policy.randomize_coordinates:
                         rng.shuffle(coordinates)
                     for coordinate in coordinates:
-                        if time.monotonic() - self.started >= self.policy.time_budget_s:
+                        if (
+                            time.monotonic() - self.started
+                            >= self.policy.time_budget_s
+                            or (
+                                self.policy.max_trials is not None
+                                and self.evaluated >= self.policy.max_trials
+                            )
+                        ):
                             budget_stop = True
                             break
                         axis_config, axis_score = current, current_score
                         variants = self.axes[coordinate]
                         self._log(f"AXIS  {coordinate} variants={len(variants)}")
                         for variant in variants:
-                            if time.monotonic() - self.started >= self.policy.time_budget_s:
+                            if (
+                                time.monotonic() - self.started
+                                >= self.policy.time_budget_s
+                                or (
+                                    self.policy.max_trials is not None
+                                    and self.evaluated >= self.policy.max_trials
+                                )
+                            ):
                                 budget_stop = True
                                 break
                             candidate = self._candidate(current, coordinate, variant)

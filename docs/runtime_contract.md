@@ -63,9 +63,12 @@ integration work requiring an explicit production matrix rather than assuming
 that tensor-subclass metadata survives arbitrary redistribution.
 
 Autotuning winners are device/SKU/software/shape specific. Every rank may read
-the same cache root, but online tuning should be coordinated so multiple ranks
-do not benchmark the same missing context concurrently. Production distributed
-runs should normally use `autotune="cache"` with preinstalled winners.
+the same cache root. Balanced first-hit tuning takes an advisory per-context
+filesystem lock, rechecks the cache after acquiring it, and atomically publishes
+the winner, so local ranks sharing that filesystem do not compile the same miss.
+Independent hosts without a shared cache still tune independently. Production
+distributed runs may use `autotune="cache"` with preinstalled winners when any
+runtime benchmarking is undesirable.
 
 Runtime-winner schema v2 also keys every entry by the current kernel revision.
 Revision changes select a different cache path, so a legal-looking schedule

@@ -3,8 +3,8 @@
 from typing import Literal
 
 
-AutotuneMode = Literal["off", "cache", "online", "coordinate"]
-CanonicalAutotuneMode = Literal["off", "cache", "coordinate"]
+AutotuneMode = Literal["off", "cache", "balanced", "online", "coordinate"]
+CanonicalAutotuneMode = Literal["off", "cache", "balanced", "coordinate"]
 LinearBackend = Literal["auto", "fused", "materialized"]
 MXFP8Backend = Literal["auto", "fused", "materialized", "prequant"]
 NVFP4Backend = Literal["auto", "materialized"]

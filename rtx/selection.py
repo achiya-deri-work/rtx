@@ -27,7 +27,7 @@ class LinearExecutionDecision:
     backend: Literal["fused", "materialized"]
     family: str
     selection_source: SelectionSource
-    autotune: Literal["off", "cache", "coordinate"]
+    autotune: Literal["off", "cache", "balanced", "coordinate"]
     scaling: str | None = None
     x_scale_region_rows: int | None = None
     weight_scale_region_rows: int | None = None

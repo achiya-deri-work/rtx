@@ -6,6 +6,7 @@ from pathlib import Path
 import random
 import tempfile
 import unittest
+from unittest import mock
 
 from rtx.autotune import (
     AdaptiveBanditScheduler,
@@ -29,6 +30,8 @@ from rtx.autotune import (
     TrialOutcome,
     TuningBudget,
     UCB1Scheduler,
+    balanced_coordinate_policy,
+    balanced_hybrid_policy,
     import_legacy_json_database,
     make_mxfp8_bwd_adapter,
     make_mxfp8_fully_prequant_adapter,
@@ -87,6 +90,27 @@ def _toy_adapter() -> DiscreteKernelAdapter[_ToyConfig]:
 
 
 class ComposableAutotuneTests(unittest.TestCase):
+    def test_balanced_runtime_policies_are_bounded_and_confirmed(self) -> None:
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "RTX_BALANCED_AUTOTUNE_TRIALS": "24",
+                "RTX_BALANCED_AUTOTUNE_SECONDS": "30",
+            },
+        ):
+            hybrid = balanced_hybrid_policy()
+            coordinate = balanced_coordinate_policy()
+        self.assertEqual(hybrid.max_trials, 24)
+        self.assertEqual(hybrid.time_budget_s, 30.0)
+        self.assertEqual(hybrid.orchestration, "bandit")
+        self.assertGreaterEqual(hybrid.confirmation_repeats, 1)
+        self.assertLess(hybrid.samples, HybridTuningPolicy().samples)
+
+        self.assertEqual(coordinate.time_budget_s, 30.0)
+        self.assertEqual(coordinate.max_trials, 24)
+        self.assertEqual(coordinate.max_passes, 1)
+        self.assertEqual(coordinate.restarts, 1)
+
     def test_durable_ask_tell_runner_uses_store_and_resumes(self) -> None:
         adapter = _toy_adapter()
         store = InMemoryTuningStore()

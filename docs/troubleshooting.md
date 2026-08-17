@@ -16,8 +16,9 @@ must point to a toolkit whose NVVM backend supports `sm_120a`.
 ## First call is slow
 
 Native CuTe kernels compile lazily. `autotune="cache"` may load a winner but
-does not eliminate initial compilation. `autotune="online"` may additionally
-benchmark candidates when no winner exists. Use `module.explain(x)` to inspect
+does not eliminate initial compilation. The default `autotune="balanced"`
+additionally benchmarks up to 24 candidates or 30 seconds when no winner
+exists; `"online"` is its compatibility alias. Use `module.explain(x)` to inspect
 whether selection is deferred and `rtx-autotune list-winners --summary` to
 inspect installed winners.
 

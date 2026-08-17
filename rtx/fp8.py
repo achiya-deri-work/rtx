@@ -35,6 +35,7 @@ from .kernels.mxfp8 import (
     MXFP8FwdConfig,
     MXFP8Problem,
     fwd_config_from_dict,
+    fwd_config_to_dict,
 )
 from .runtime import BoundedCache, load_kernel_symbol, runner_cache_limit
 from .types import AutotuneMode, CanonicalAutotuneMode, MXFP8Backend
@@ -811,33 +812,69 @@ def _build_prequant_runner(
         )
         selected_key = _PREQUANT_AUTOTUNE_SELECTIONS.get(selection_key)
         if selected_key is None:
-            from .autotune.winners import load_runtime_winner, runtime_winner_key
+            from .autotune.winners import (
+                load_runtime_winner,
+                runtime_winner_key,
+                runtime_tuning_lock,
+                save_runtime_winner,
+            )
             from .prequant_autotune import (
                 load_cached_mxfp8_prequant_config,
                 prequant_config_from_dict,
+                prequant_config_to_dict,
                 tune_mxfp8_prequant,
             )
 
+            winner_key = runtime_winner_key(
+                "mxfp8_prequant_fwd", problem, device=x.device
+            )
             selected = load_runtime_winner(
-                runtime_winner_key(
-                    "mxfp8_prequant_fwd", problem, device=x.device
-                ),
+                winner_key,
                 prequant_config_from_dict,
                 root=request.cache_dir,
                 rejection=lambda candidate: candidate.rejection(problem),
             )
             if selected is not None:
                 pass
-            elif request.mode == "coordinate":
-                result = tune_mxfp8_prequant(
-                    x,
-                    weight,
-                    policy=request.policy,
-                    initial=request.initial,
-                    cache_dir=request.cache_dir,
-                    progress=print,
-                )
-                selected = result.config
+            elif request.mode in ("balanced", "coordinate"):
+                with runtime_tuning_lock(winner_key, root=request.cache_dir):
+                    selected = load_runtime_winner(
+                        winner_key,
+                        prequant_config_from_dict,
+                        root=request.cache_dir,
+                        rejection=lambda candidate: candidate.rejection(problem),
+                    )
+                    if selected is None:
+                        policy = request.policy
+                        if request.mode == "balanced" and policy is None:
+                            from .autotune.runtime import (
+                                balanced_coordinate_policy,
+                            )
+
+                            policy = balanced_coordinate_policy(
+                                correctness_rtol=5e-2,
+                                correctness_atol=5e-1,
+                            )
+                        result = tune_mxfp8_prequant(
+                            x,
+                            weight,
+                            policy=policy,
+                            initial=request.initial,
+                            cache_dir=request.cache_dir,
+                            progress=print,
+                        )
+                        selected = result.config
+                        serialized = prequant_config_to_dict(selected)
+                        save_runtime_winner(
+                            winner_key,
+                            serialized,
+                            config_id=hashlib.sha256(
+                                json.dumps(serialized, sort_keys=True).encode()
+                            ).hexdigest()[:20],
+                            root=request.cache_dir,
+                            median_ms=result.median_ms,
+                            metadata={"source": "runtime_tuner"},
+                        )
             else:
                 selected = load_cached_mxfp8_prequant_config(
                     problem,
@@ -1769,7 +1806,12 @@ def _resolve_packed_inference_config(
     cached_selection = _PACKED_INFERENCE_SELECTIONS.get(selection_key)
     if cached_selection is not None:
         return cached_selection
-    from .autotune.winners import load_runtime_winner, runtime_winner_key
+    from .autotune.winners import (
+        load_runtime_winner,
+        runtime_winner_key,
+        runtime_tuning_lock,
+    )
+    from .autotune.runtime import balanced_hybrid_policy
     from .inference_autotune import (
         fully_prequant_config_from_dict,
         tune_mxfp8_inference_state,
@@ -1798,17 +1840,36 @@ def _resolve_packed_inference_config(
             ),
         )
         if selected is None:
-            if mode != "coordinate":
+            if mode not in ("balanced", "coordinate"):
                 _PACKED_INFERENCE_SELECTIONS[selection_key] = fallback
                 return fallback
-            selected = tune_mxfp8_inference_state(
-                problem,
-                state="weight_prequantized",
-                weight_layout=weight_layout,
-                device=weight.device,
-                cache_dir=cache_dir,
-                policy=tuning_policy,
-            )
+            with runtime_tuning_lock(key, root=cache_dir):
+                selected = load_runtime_winner(
+                    key,
+                    weight_prequant_config_from_dict,
+                    root=cache_dir,
+                    rejection=lambda config: (
+                        config.rejection(problem)
+                        or (
+                            "cached weight scale layout does not match packed W"
+                            if config.operand_scale_layouts[1] != weight_layout
+                            else None
+                        )
+                    ),
+                )
+                if selected is None:
+                    selected = tune_mxfp8_inference_state(
+                        problem,
+                        state="weight_prequantized",
+                        weight_layout=weight_layout,
+                        device=weight.device,
+                        cache_dir=cache_dir,
+                        policy=(
+                            tuning_policy
+                            if tuning_policy is not None or mode == "coordinate"
+                            else balanced_hybrid_policy()
+                        ),
+                    )
         assert isinstance(selected, MXFP8WeightPrequantConfig)
         resolved = MXFP8PrequantConfig(
             quant=selected.quant_x,
@@ -1843,18 +1904,38 @@ def _resolve_packed_inference_config(
         ),
     )
     if selected is None:
-        if mode != "coordinate":
+        if mode not in ("balanced", "coordinate"):
             _PACKED_INFERENCE_SELECTIONS[selection_key] = fallback
             return fallback
-        selected = tune_mxfp8_inference_state(
-            problem,
-            state="fully_prequantized",
-            activation_layout=x_layout,
-            weight_layout=weight_layout,
-            device=weight.device,
-            cache_dir=cache_dir,
-            policy=tuning_policy,
-        )
+        with runtime_tuning_lock(key, root=cache_dir):
+            selected = load_runtime_winner(
+                key,
+                fully_prequant_config_from_dict,
+                root=cache_dir,
+                rejection=lambda config: (
+                    config.rejection(problem)
+                    or (
+                        "cached operand layouts do not match packed X/W"
+                        if config.operand_scale_layouts
+                        != (x_layout, weight_layout)
+                        else None
+                    )
+                ),
+            )
+            if selected is None:
+                selected = tune_mxfp8_inference_state(
+                    problem,
+                    state="fully_prequantized",
+                    activation_layout=x_layout,
+                    weight_layout=weight_layout,
+                    device=weight.device,
+                    cache_dir=cache_dir,
+                    policy=(
+                        tuning_policy
+                        if tuning_policy is not None or mode == "coordinate"
+                        else balanced_hybrid_policy()
+                    ),
+                )
     assert isinstance(selected, MXFP8FullyPrequantConfig)
     resolved = MXFP8PrequantConfig(
         quant=selected.activation_packing_quant(),
@@ -2117,12 +2198,16 @@ def _autotune_mode(
 ) -> CanonicalAutotuneMode:
     if isinstance(value, bool):
         return "coordinate" if value else "off"
-    selected = os.getenv("RTX_MXFP8_AUTOTUNE", "cache") if value is None else value
+    selected = (
+        os.getenv("RTX_MXFP8_AUTOTUNE", os.getenv("RTX_AUTOTUNE", "balanced"))
+        if value is None
+        else value
+    )
     if selected == "online":
-        selected = "coordinate"
-    if selected not in ("off", "cache", "coordinate"):
+        selected = "balanced"
+    if selected not in ("off", "cache", "balanced", "coordinate"):
         raise ValueError(
-            "autotune must be off, cache, online, or coordinate; "
+            "autotune must be off, cache, balanced, online, or coordinate; "
             f"got {selected!r}"
         )
     return selected
@@ -2239,11 +2324,19 @@ def _resolve_fwd_config(
         load_cached_mxfp8_fwd_config,
         tune_mxfp8_fwd,
     )
-    from .autotune.winners import load_runtime_winner, runtime_winner_key
+    from .autotune.winners import (
+        load_runtime_winner,
+        runtime_winner_key,
+        runtime_tuning_lock,
+        save_runtime_winner,
+    )
 
     problem = MXFP8Problem(x.shape[0], weight.shape[0], x.shape[1])
+    winner_key = runtime_winner_key(
+        "mxfp8_fused_fwd", problem, device=x.device
+    )
     cached = load_runtime_winner(
-        runtime_winner_key("mxfp8_fused_fwd", problem, device=x.device),
+        winner_key,
         lambda value: fwd_config_from_dict(dict(value)),
         root=cache_dir,
         rejection=lambda candidate: candidate.implementation_rejection(problem),
@@ -2255,15 +2348,42 @@ def _resolve_fwd_config(
     if cached is not None or mode == "cache":
         return cached or DEFAULT_MXFP8_FWD_CONFIG
 
-    policy = tuning_policy
-    if policy is None:
-        policy = CoordinateDescentPolicy(
-            time_budget_s=float(os.getenv("RTX_MXFP8_AUTOTUNE_SECONDS", "1800")),
-            max_passes=int(os.getenv("RTX_MXFP8_AUTOTUNE_PASSES", "4")),
+    with runtime_tuning_lock(winner_key, root=cache_dir):
+        cached = load_runtime_winner(
+            winner_key,
+            lambda value: fwd_config_from_dict(dict(value)),
+            root=cache_dir,
+            rejection=lambda candidate: candidate.implementation_rejection(
+                problem
+            ),
         )
-    return tune_mxfp8_fwd(
-        x, weight, policy=policy, cache_dir=cache_dir
-    ).config
+        if cached is not None:
+            return cached
+        policy = tuning_policy
+        if policy is None and mode == "balanced":
+            from .autotune.runtime import balanced_coordinate_policy
+
+            policy = balanced_coordinate_policy()
+        elif policy is None:
+            policy = CoordinateDescentPolicy(
+                time_budget_s=float(
+                    os.getenv("RTX_MXFP8_AUTOTUNE_SECONDS", "1800")
+                ),
+                max_passes=int(os.getenv("RTX_MXFP8_AUTOTUNE_PASSES", "4")),
+            )
+        result = tune_mxfp8_fwd(x, weight, policy=policy, cache_dir=cache_dir)
+        serialized = fwd_config_to_dict(result.config)
+        save_runtime_winner(
+            winner_key,
+            serialized,
+            config_id=hashlib.sha256(
+                json.dumps(serialized, sort_keys=True).encode()
+            ).hexdigest()[:20],
+            root=cache_dir,
+            median_ms=result.median_ms,
+            metadata={"source": "runtime_tuner"},
+        )
+        return result.config
 
 
 class MXFP8Linear(nn.Module):

@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 from threading import RLock
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -20,6 +20,7 @@ from .kernels.mxfp8_bwd import (
     MXFP8BwdMatmulConfig,
 )
 from .runtime import BoundedCache, load_kernel_symbol, runner_cache_limit
+from .types import AutotuneMode
 
 
 def compile_mxfp8_gemm(*args, **kwargs):
@@ -78,7 +79,6 @@ def compile_mxfp8_backward_quad_quant(*args, **kwargs):
 if TYPE_CHECKING:
     from .autotune import CoordinateDescentPolicy
 
-AutotuneMode = Literal["off", "cache", "coordinate"]
 BWD_FRONTEND_REVISION = 3
 
 
@@ -732,15 +732,24 @@ def _resolve_bwd_context(
         )
         selected_key = _AUTOTUNE_SELECTIONS.get(selection_key)
         if selected_key is None:
-            from .autotune.winners import load_runtime_winner, runtime_winner_key
+            from .autotune.winners import (
+                load_runtime_winner,
+                runtime_winner_key,
+                runtime_tuning_lock,
+                save_runtime_winner,
+            )
             from .bwd_autotune import (
+                bwd_config_to_dict,
                 bwd_config_from_dict,
                 load_cached_mxfp8_bwd_config,
                 tune_mxfp8_backward,
             )
 
+            winner_key = runtime_winner_key(
+                "mxfp8_bwd", problem, device=x.device
+            )
             selected = load_runtime_winner(
-                runtime_winner_key("mxfp8_bwd", problem, device=x.device),
+                winner_key,
                 bwd_config_from_dict,
                 root=request.cache_dir,
                 rejection=lambda candidate: candidate.implementation_rejection(
@@ -751,15 +760,47 @@ def _resolve_bwd_context(
                 selected = load_cached_mxfp8_bwd_config(
                     problem, device=x.device, cache_dir=request.cache_dir
                 )
-            if selected is None and request.mode == "coordinate":
-                selected = tune_mxfp8_backward(
-                    grad_output,
-                    x,
-                    weight,
-                    policy=request.policy,
-                    cache_dir=request.cache_dir,
-                    initial=_default_bwd_config(problem),
-                ).config
+            if selected is None and request.mode in ("balanced", "coordinate"):
+                with runtime_tuning_lock(winner_key, root=request.cache_dir):
+                    selected = load_runtime_winner(
+                        winner_key,
+                        bwd_config_from_dict,
+                        root=request.cache_dir,
+                        rejection=lambda candidate: (
+                            candidate.implementation_rejection(problem)
+                        ),
+                    )
+                    if selected is None:
+                        policy = request.policy
+                        if policy is None and request.mode == "balanced":
+                            from .autotune.runtime import (
+                                balanced_coordinate_policy,
+                            )
+
+                            policy = balanced_coordinate_policy(
+                                correctness_rtol=7e-2,
+                                correctness_atol=1.0,
+                            )
+                        result = tune_mxfp8_backward(
+                            grad_output,
+                            x,
+                            weight,
+                            policy=policy,
+                            cache_dir=request.cache_dir,
+                            initial=_default_bwd_config(problem),
+                        )
+                        selected = result.config
+                        serialized = bwd_config_to_dict(selected)
+                        save_runtime_winner(
+                            winner_key,
+                            serialized,
+                            config_id=hashlib.sha256(
+                                json.dumps(serialized, sort_keys=True).encode()
+                            ).hexdigest()[:20],
+                            root=request.cache_dir,
+                            median_ms=result.median_ms,
+                            metadata={"source": "runtime_tuner"},
+                        )
             selected_key = _intern_bwd_config(
                 selected or _default_bwd_config(problem)
             )
@@ -1592,13 +1633,19 @@ def mxfp8_linear_backward(
             mode = "coordinate" if autotune else "off"
         else:
             mode = (
-                os.getenv("RTX_MXFP8_BWD_AUTOTUNE", "cache")
+                os.getenv(
+                    "RTX_MXFP8_BWD_AUTOTUNE",
+                    os.getenv("RTX_AUTOTUNE", "balanced"),
+                )
                 if autotune is None
                 else autotune
             )
-        if mode not in ("off", "cache", "coordinate"):
+        if mode == "online":
+            mode = "balanced"
+        if mode not in ("off", "cache", "balanced", "coordinate"):
             raise ValueError(
-                "backward autotune must be off, cache, or coordinate; "
+                "backward autotune must be off, cache, balanced, online, "
+                "or coordinate; "
                 f"got {mode!r}"
             )
         problem = MXFP8Problem(
@@ -1608,14 +1655,23 @@ def mxfp8_linear_backward(
             selected = _default_bwd_config(problem)
         else:
             from .bwd_autotune import (
+                bwd_config_to_dict,
                 bwd_config_from_dict,
                 load_cached_mxfp8_bwd_config,
                 tune_mxfp8_backward,
             )
-            from .autotune.winners import load_runtime_winner, runtime_winner_key
+            from .autotune.winners import (
+                load_runtime_winner,
+                runtime_winner_key,
+                runtime_tuning_lock,
+                save_runtime_winner,
+            )
 
+            winner_key = runtime_winner_key(
+                "mxfp8_bwd", problem, device=x.device
+            )
             cached = load_runtime_winner(
-                runtime_winner_key("mxfp8_bwd", problem, device=x.device),
+                winner_key,
                 bwd_config_from_dict,
                 root=autotune_cache_dir,
                 rejection=lambda candidate: candidate.implementation_rejection(
@@ -1630,15 +1686,47 @@ def mxfp8_linear_backward(
                 )
             if cached is not None:
                 selected = cached
-            elif mode == "coordinate":
-                selected = tune_mxfp8_backward(
-                    grad_2d,
-                    x_2d,
-                    weight,
-                    policy=tuning_policy,
-                    cache_dir=autotune_cache_dir,
-                    initial=_default_bwd_config(problem),
-                ).config
+            elif mode in ("balanced", "coordinate"):
+                with runtime_tuning_lock(winner_key, root=autotune_cache_dir):
+                    selected = load_runtime_winner(
+                        winner_key,
+                        bwd_config_from_dict,
+                        root=autotune_cache_dir,
+                        rejection=lambda candidate: (
+                            candidate.implementation_rejection(problem)
+                        ),
+                    )
+                    if selected is None:
+                        policy = tuning_policy
+                        if policy is None and mode == "balanced":
+                            from .autotune.runtime import (
+                                balanced_coordinate_policy,
+                            )
+
+                            policy = balanced_coordinate_policy(
+                                correctness_rtol=7e-2,
+                                correctness_atol=1.0,
+                            )
+                        result = tune_mxfp8_backward(
+                            grad_2d,
+                            x_2d,
+                            weight,
+                            policy=policy,
+                            cache_dir=autotune_cache_dir,
+                            initial=_default_bwd_config(problem),
+                        )
+                        selected = result.config
+                        serialized = bwd_config_to_dict(selected)
+                        save_runtime_winner(
+                            winner_key,
+                            serialized,
+                            config_id=hashlib.sha256(
+                                json.dumps(serialized, sort_keys=True).encode()
+                            ).hexdigest()[:20],
+                            root=autotune_cache_dir,
+                            median_ms=result.median_ms,
+                            metadata={"source": "runtime_tuner"},
+                        )
             else:
                 selected = _default_bwd_config(problem)
     key = (

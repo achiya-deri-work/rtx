@@ -81,6 +81,7 @@ from .recipes import (
     make_hybrid_ask_tell_runner,
     make_hybrid_autotuner,
 )
+from .runtime import balanced_coordinate_policy, balanced_hybrid_policy
 from .pretrained import (
     ConditionalEffectRule,
     ConditionalRuleSet,
@@ -122,6 +123,7 @@ from .winners import (
     list_runtime_winners,
     load_runtime_winner,
     runtime_winner_key,
+    runtime_tuning_lock,
     save_runtime_winner,
 )
 from .strategies import (
@@ -205,6 +207,8 @@ __all__ = [
     "GradientBoostedCostModel",
     "GradientBoostedFeasibilityModel",
     "HybridTuningPolicy",
+    "balanced_coordinate_policy",
+    "balanced_hybrid_policy",
     "InMemoryTuningStore",
     "JsonTuningDatabase",
     "JsonlTuningStore",
@@ -276,6 +280,7 @@ __all__ = [
     "optimizer_study_rows",
     "register_dataset_backend",
     "runtime_winner_key",
+    "runtime_tuning_lock",
     "save_runtime_winner",
     "static_device_profile",
     "summarize_optimizer_study",

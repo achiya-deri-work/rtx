@@ -133,6 +133,7 @@ class DeviceFingerprint:
 @dataclass(frozen=True, slots=True)
 class CoordinateDescentPolicy:
     time_budget_s: float = 1800.0
+    max_trials: int | None = None
     max_passes: int = 4
     restarts: int = 1
     warmup: int = 5
@@ -151,6 +152,8 @@ class CoordinateDescentPolicy:
     def __post_init__(self) -> None:
         if self.time_budget_s <= 0:
             raise ValueError("time_budget_s must be positive")
+        if self.max_trials is not None and self.max_trials <= 0:
+            raise ValueError("max_trials must be positive when set")
         if self.max_passes <= 0:
             raise ValueError("max_passes must be positive")
         if self.restarts <= 0:
@@ -476,7 +479,13 @@ class CoordinateDescentTuner:
             self.progress(f"[{elapsed:8.2f}s] {message}")
 
     def _budget_exhausted(self) -> bool:
-        return time.monotonic() - self._start_time >= self.policy.time_budget_s
+        return (
+            time.monotonic() - self._start_time >= self.policy.time_budget_s
+            or (
+                self.policy.max_trials is not None
+                and self.evaluated_trials >= self.policy.max_trials
+            )
+        )
 
     def _make_restart_seed(
         self,

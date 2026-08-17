@@ -11,6 +11,7 @@ from rtx.autotune.winners import (
     RuntimeWinnerKey,
     list_runtime_winners,
     save_runtime_winner,
+    runtime_tuning_lock,
 )
 from rtx.kernels.mxfp8 import (
     MXFP8_FWD_KERNEL_REVISION,
@@ -26,6 +27,19 @@ def _write(path: Path, value: object) -> None:
 
 
 class AutotuneOperationsTests(unittest.TestCase):
+    def test_runtime_tuning_lock_uses_a_context_specific_cache_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            key = RuntimeWinnerKey(
+                "mxfp8_fused_fwd",
+                MXFP8Problem(128, 256, 512),
+                "hot",
+                "device",
+                7,
+            )
+            with runtime_tuning_lock(key, root=directory):
+                locks = list(Path(directory).glob("runtime_locks/**/*.lock"))
+                self.assertEqual(len(locks), 1)
+
     def test_runtime_winners_are_inspectable_without_deserialization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

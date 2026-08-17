@@ -251,10 +251,13 @@ nvfp4.load_state_dict(initial_state, strict=True)
 compiled = torch.compile(mxfp8, fullgraph=True, dynamic=False)
 ```
 
-The low-precision default is `autotune="cache"`; convergence runs therefore
-consume verified device-local winners when available and do not launch a fresh
-coordinate search in the training process. The model is a validation scaffold,
-not a pretrained architecture or checkpoint format.
+The low-precision frontend default is `autotune="balanced"`: exact
+device/shape/policy winners are loaded first, while a missing context receives
+a bounded 24-trial/30-second first-hit search and an atomically persisted
+winner. Repeated calls reuse the process-local selection. Reproducible
+convergence runs can still select `autotune="cache"` to forbid benchmarking.
+The model is a validation scaffold, not a pretrained architecture or checkpoint
+format.
 
 Production convergence and throughput runs use BF16 model parameters,
 gradients, and activations for all four training modes. FP32 is retained
@@ -447,7 +450,8 @@ alias, but modules normalize it to `materialized`.
 
 The frontends also share runtime-tuning controls: `autotune="off"` uses an
 explicit or built-in configuration, `"cache"` consumes only an installed
-winner, and `"coordinate"` launches the composable tuner when no winner exists.
+winner, `"balanced"` performs bounded cache-miss tuning, and `"coordinate"`
+launches the deep tuner. `"online"` remains an alias for `"balanced"`.
 Both accept `tuning_policy` and `autotune_cache_dir`. NVFP4 exposes independent
 schedule overrides for its three materialized states:
 

@@ -917,7 +917,15 @@ class PrequantCoordinateDescentTuner:
                     if self.policy.randomize_coordinates:
                         rng.shuffle(coordinates)
                     for coordinate in coordinates:
-                        if time.monotonic() - self._start >= self.policy.time_budget_s:
+                        if (
+                            time.monotonic() - self._start
+                            >= self.policy.time_budget_s
+                            or (
+                                self.policy.max_trials is not None
+                                and self.evaluated_trials
+                                >= self.policy.max_trials
+                            )
+                        ):
                             budget_stop = True
                             break
                         axis_config, axis_score = current, current_score
@@ -925,7 +933,15 @@ class PrequantCoordinateDescentTuner:
                             f"AXIS  {coordinate} variants={len(self.axes[coordinate])}"
                         )
                         for variant in self.axes[coordinate]:
-                            if time.monotonic() - self._start >= self.policy.time_budget_s:
+                            if (
+                                time.monotonic() - self._start
+                                >= self.policy.time_budget_s
+                                or (
+                                    self.policy.max_trials is not None
+                                    and self.evaluated_trials
+                                    >= self.policy.max_trials
+                                )
+                            ):
                                 budget_stop = True
                                 break
                             candidate = self._candidate(current, coordinate, variant)

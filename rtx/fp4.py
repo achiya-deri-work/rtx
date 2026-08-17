@@ -290,15 +290,15 @@ def _nvfp4_autotune_mode(
     if isinstance(value, bool):
         return "coordinate" if value else "off"
     selected = (
-        os.getenv("RTX_NVFP4_AUTOTUNE", os.getenv("RTX_AUTOTUNE", "cache"))
+        os.getenv("RTX_NVFP4_AUTOTUNE", os.getenv("RTX_AUTOTUNE", "balanced"))
         if value is None
         else value
     )
     if selected == "online":
-        selected = "coordinate"
-    if selected not in ("off", "cache", "coordinate"):
+        selected = "balanced"
+    if selected not in ("off", "cache", "balanced", "coordinate"):
         raise ValueError(
-            "autotune must be off, cache, online, or coordinate; "
+            "autotune must be off, cache, balanced, online, or coordinate; "
             f"got {selected!r}"
         )
     return selected
@@ -934,7 +934,11 @@ def _packed_inference_config_key(
     selected_key = _INFERENCE_CONFIG_SELECTIONS.get(selection_key)
     if selected_key is not None:
         return selected_key
-    from .autotune.winners import load_runtime_winner, runtime_winner_key
+    from .autotune.winners import (
+        load_runtime_winner,
+        runtime_winner_key,
+        runtime_tuning_lock,
+    )
     from .nvfp4_inference_autotune import (
         fully_prequant_config_from_dict,
         weight_prequant_config_from_dict,
@@ -956,16 +960,33 @@ def _packed_inference_config_key(
                 root=request.cache_dir,
                 rejection=lambda value: value.rejection(problem),
             )
-        if selected is None and request.mode == "coordinate":
+        if selected is None and request.mode in ("balanced", "coordinate"):
             from .nvfp4_inference_autotune import tune_nvfp4_inference_state
+            from .autotune.runtime import balanced_hybrid_policy
 
-            selected = tune_nvfp4_inference_state(
-                problem,
-                state=state,
-                device=device,
-                cache_dir=request.cache_dir,
-                policy=request.policy,
+            winner_key = runtime_winner_key(
+                family, problem, device=device, variant=variant
             )
+            with runtime_tuning_lock(winner_key, root=request.cache_dir):
+                selected = load_runtime_winner(
+                    winner_key,
+                    fully_prequant_config_from_dict,
+                    root=request.cache_dir,
+                    rejection=lambda value: value.rejection(problem),
+                )
+                if selected is None:
+                    selected = tune_nvfp4_inference_state(
+                        problem,
+                        state=state,
+                        device=device,
+                        cache_dir=request.cache_dir,
+                        policy=(
+                            request.policy
+                            if request.policy is not None
+                            or request.mode == "coordinate"
+                            else balanced_hybrid_policy()
+                        ),
+                    )
         selected = selected or NVFP4FullyPrequantConfig()
         config = NVFP4ForwardConfig(
             gemm=selected.gemm,
@@ -982,16 +1003,33 @@ def _packed_inference_config_key(
                 root=request.cache_dir,
                 rejection=lambda value: value.rejection(problem),
             )
-        if selected is None and request.mode == "coordinate":
+        if selected is None and request.mode in ("balanced", "coordinate"):
             from .nvfp4_inference_autotune import tune_nvfp4_inference_state
+            from .autotune.runtime import balanced_hybrid_policy
 
-            selected = tune_nvfp4_inference_state(
-                problem,
-                state=state,
-                device=device,
-                cache_dir=request.cache_dir,
-                policy=request.policy,
+            winner_key = runtime_winner_key(
+                family, problem, device=device, variant=variant
             )
+            with runtime_tuning_lock(winner_key, root=request.cache_dir):
+                selected = load_runtime_winner(
+                    winner_key,
+                    weight_prequant_config_from_dict,
+                    root=request.cache_dir,
+                    rejection=lambda value: value.rejection(problem),
+                )
+                if selected is None:
+                    selected = tune_nvfp4_inference_state(
+                        problem,
+                        state=state,
+                        device=device,
+                        cache_dir=request.cache_dir,
+                        policy=(
+                            request.policy
+                            if request.policy is not None
+                            or request.mode == "coordinate"
+                            else balanced_hybrid_policy()
+                        ),
+                    )
         selected = selected or NVFP4WeightPrequantConfig()
         config = NVFP4ForwardConfig(
             quant=selected.quant_x,
@@ -1047,24 +1085,27 @@ def _materialized_dynamic_config_key(
     selected_key = _DYNAMIC_CONFIG_SELECTIONS.get(selection_key)
     if selected_key is not None:
         return selected_key
-    from .autotune.winners import load_runtime_winner, runtime_winner_key
+    from .autotune.winners import (
+        load_runtime_winner,
+        runtime_winner_key,
+        runtime_tuning_lock,
+    )
     from .nvfp4_inference_autotune import (
         dynamic_config_from_dict,
         preferred_dynamic_config,
     )
 
+    def reject_runtime_dynamic(value: NVFP4DynamicConfig) -> str | None:
+        if family == "nvfp4_jit_row_region_fwd" and not value.jit_row_region:
+            return "JIT row-region winner has no region geometry"
+        return value.rejection(problem)
+
+    winner_key = None
     selected = request.dynamic
     if selected is None and request.mode != "off":
-        def reject_runtime_dynamic(value: NVFP4DynamicConfig) -> str | None:
-            if (
-                family == "nvfp4_jit_row_region_fwd"
-                and not value.jit_row_region
-            ):
-                return "JIT row-region winner has no region geometry"
-            return value.rejection(problem)
-
+        winner_key = runtime_winner_key(family, problem, device=device)
         selected = load_runtime_winner(
-            runtime_winner_key(family, problem, device=device),
+            winner_key,
             dynamic_config_from_dict,
             root=request.cache_dir,
             rejection=reject_runtime_dynamic,
@@ -1080,22 +1121,37 @@ def _materialized_dynamic_config_key(
             )
     if (
         selected is None
-        and request.mode == "coordinate"
+        and request.mode in ("balanced", "coordinate")
         and family in ("nvfp4_dynamic_fwd", "nvfp4_jit_row_region_fwd")
     ):
         from .nvfp4_inference_autotune import tune_nvfp4_inference_state
+        from .autotune.runtime import balanced_hybrid_policy
 
-        selected = tune_nvfp4_inference_state(
-            problem,
-            state=(
-                "jit_row_region"
-                if family == "nvfp4_jit_row_region_fwd"
-                else "dynamic"
-            ),
-            device=device,
-            cache_dir=request.cache_dir,
-            policy=request.policy,
-        )
+        assert winner_key is not None
+        with runtime_tuning_lock(winner_key, root=request.cache_dir):
+            selected = load_runtime_winner(
+                winner_key,
+                dynamic_config_from_dict,
+                root=request.cache_dir,
+                rejection=reject_runtime_dynamic,
+            )
+            if selected is None:
+                selected = tune_nvfp4_inference_state(
+                    problem,
+                    state=(
+                        "jit_row_region"
+                        if family == "nvfp4_jit_row_region_fwd"
+                        else "dynamic"
+                    ),
+                    device=device,
+                    cache_dir=request.cache_dir,
+                    policy=(
+                        request.policy
+                        if request.policy is not None
+                        or request.mode == "coordinate"
+                        else balanced_hybrid_policy()
+                    ),
+                )
     if selected is None and family == "nvfp4_jit_row_region_fwd":
         from .nvfp4_inference_autotune import preferred_jit_row_region_config
 

@@ -186,12 +186,15 @@ compiler-visible FX where specified.
 ### Autotuning and low-level overrides
 
 - `autotune=None` follows `RTX_NVFP4_AUTOTUNE`/`RTX_AUTOTUNE`, defaulting to
-  cache lookup.
+  `balanced`.
 - `autotune="off"` uses supplied or portable configurations.
 - `autotune="cache"` loads an installed verified winner and otherwise uses a
   portable seed.
-- `autotune="online"` permits tuning for a missing context. `"coordinate"`
-  remains its compatibility spelling.
+- `autotune="balanced"` checks the exact cache first, explores at most 24
+  candidates or 30 seconds on a miss, confirms the winner, saves it atomically,
+  and reuses it for every subsequent call with the same context.
+- `autotune="online"` is a compatibility alias for `"balanced"`.
+- `autotune="coordinate"` requests the full deep-search policy.
 - `tuning_policy` supplies a custom orchestration/search policy.
 - `autotune_cache_dir` selects a non-default winner/cache root.
 - `scale_config` selects exact/power-of-two outer scaling and delayed-history
@@ -203,6 +206,14 @@ compiler-visible FX where specified.
 Low-level configs are primarily for reproducible benchmarking and installed
 winners. Most users should leave them unset so runtime selection can account
 for GPU SKU, shape, cache regime, and kernel revision.
+
+Set `RTX_BALANCED_AUTOTUNE_TRIALS` or `RTX_BALANCED_AUTOTUNE_SECONDS` to change
+the bounded first-hit budget. The default 24-trial cutoff was selected from
+prospective 5070 Ti, laptop 5070, and 5090 campaigns: it reached a configuration
+within 2% of each context's eventual campaign best in 97.6%, 92.5%, and 95.7%
+of contexts respectively.
+`RTX_AUTOTUNE_PRETRAINED_ARTIFACT` may point at a separately validated portable
+cost-model bundle; the runtime never silently trains on copied campaign data.
 
 ## Training
 

@@ -131,13 +131,26 @@ optimizer/weight-sharing guarantees, see [the model conversion guide](model_conv
 
 ## Autotuning
 
-- `autotune=None` follows `RTX_MXFP8_AUTOTUNE`, defaulting to `cache`.
+- `autotune=None` follows `RTX_MXFP8_AUTOTUNE`/`RTX_AUTOTUNE`, defaulting to
+  `balanced`.
 - `off` uses an explicit or portable configuration.
 - `cache` loads compatible verified winners and never benchmarks unexpectedly.
-- `online` permits first-use tuning/resume for a missing context.
-  `coordinate` remains its compatibility spelling.
+- `balanced` checks the exact runtime cache first, explores at most 24 candidates
+  or 30 seconds on a miss, confirms the winner, and persists it atomically.
+  Repeated calls use the process-local selection without another lookup.
+- `online` is a compatibility alias for `balanced`.
+- `coordinate` is the explicit deep-search mode and retains the legacy
+  30-minute default when no custom policy is supplied.
 - `tuning_policy` and `autotune_cache_dir` customize online orchestration and
   winner storage.
+
+The balanced limits can be changed with `RTX_BALANCED_AUTOTUNE_TRIALS` and
+`RTX_BALANCED_AUTOTUNE_SECONDS`. Screening defaults to five adaptive samples;
+`RTX_BALANCED_AUTOTUNE_WARMUP`, `RTX_BALANCED_AUTOTUNE_SAMPLES`, and
+`RTX_BALANCED_AUTOTUNE_CALLS_PER_SAMPLE` expose the remaining first-hit cost.
+Set `RTX_AUTOTUNE_PRETRAINED_ARTIFACT` to a validated portable model bundle to
+seed the learned arms; without it, the same policy learns only from the current
+context and any resumable local journal.
 
 Exact winner selection is keyed by device/software identity, kernel revision,
 shape, operand state, and physical scale layouts. It remains opaque through
