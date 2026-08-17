@@ -241,7 +241,7 @@ class PretrainedAutotuneTests(unittest.TestCase):
             )
             self.assertIn("toy@7", manifest["families"])
             self.assertEqual(len(manifest["artifact_id"]), 24)
-            self.assertEqual(manifest["trainer_revision"], 2)
+            self.assertEqual(manifest["trainer_revision"], 3)
             self.assertTrue(manifest["input"]["dataset_sha256"])
             self.assertEqual(
                 len(manifest["families"]["toy@7"]["files_sha256"]), 4
@@ -254,6 +254,17 @@ class PretrainedAutotuneTests(unittest.TestCase):
             self.assertTrue(family.cost_model.fitted)
             self.assertEqual(family.artifact_id, manifest["artifact_id"])
             self.assertTrue((output / "manifest.json").exists())
+
+            stale = dict(manifest)
+            stale["trainer_revision"] = 2
+            (output / "manifest.json").write_text(
+                json.dumps(stale), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "stale trainer revision"):
+                load_pretrained_family(output, "toy", 7)
+            (output / "manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
 
             heldout_path = root / "heldout" / "observations.jsonl"
             heldout_path.parent.mkdir()

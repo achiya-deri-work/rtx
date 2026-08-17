@@ -17,7 +17,11 @@ import cutlass.utils as utils
 from cutlass import BFloat16, Float8E4M3FN, Float32, Int16, Int32, Uint16, Uint8
 from cutlass.experimental.primitives import nvvm_wrapper as nvvm
 
-from ..configs.nvfp4 import NVFP4QuantConfig, NVFP4_SF_VEC_SIZE
+from ..configs.nvfp4 import (
+    NVFP4QuantConfig,
+    NVFP4_SF_VEC_SIZE,
+    nvfp4_storage_k,
+)
 
 
 F4_MAX = 6.0
@@ -34,11 +38,7 @@ class NVFP4QuantKernel:
             raise ValueError(f"illegal NVFP4 quantizer configuration: {rejection}")
         self.rows = rows
         self.k = k
-        self.storage_k = (
-            (k + NVFP4_SF_VEC_SIZE - 1)
-            // NVFP4_SF_VEC_SIZE
-            * NVFP4_SF_VEC_SIZE
-        )
+        self.storage_k = nvfp4_storage_k(k)
         self.config = config
         blocks = rows * (self.storage_k // NVFP4_SF_VEC_SIZE)
         self.task_groups = cute.ceil_div(blocks, config.blocks_per_warp)
@@ -366,11 +366,7 @@ class NVFP4DualQuantKernel(NVFP4QuantKernel):
         self.x_rows = x_rows
         self.weight_rows = weight_rows
         self.k = k
-        self.storage_k = (
-            (k + NVFP4_SF_VEC_SIZE - 1)
-            // NVFP4_SF_VEC_SIZE
-            * NVFP4_SF_VEC_SIZE
-        )
+        self.storage_k = nvfp4_storage_k(k)
         self.config = config
         blocks_per_row = self.storage_k // NVFP4_SF_VEC_SIZE
         self.x_task_groups = cute.ceil_div(
@@ -1495,11 +1491,7 @@ def _fake_bf16(rows: int, k: int):
 
 
 def _fake_packed(rows: int, k: int):
-    storage_k = (
-        (k + NVFP4_SF_VEC_SIZE - 1)
-        // NVFP4_SF_VEC_SIZE
-        * NVFP4_SF_VEC_SIZE
-    )
+    storage_k = nvfp4_storage_k(k)
     return cute.runtime.make_fake_tensor(
         Uint8,
         (rows, storage_k // 2),
@@ -1510,11 +1502,7 @@ def _fake_packed(rows: int, k: int):
 
 def _fake_scales(rows: int, k: int, scale_layout: str = "row_major"):
     if scale_layout == "row_major":
-        storage_k = (
-            (k + NVFP4_SF_VEC_SIZE - 1)
-            // NVFP4_SF_VEC_SIZE
-            * NVFP4_SF_VEC_SIZE
-        )
+        storage_k = nvfp4_storage_k(k)
         return cute.runtime.make_fake_tensor(
             Float8E4M3FN,
             (rows, storage_k // NVFP4_SF_VEC_SIZE),

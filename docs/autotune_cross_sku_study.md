@@ -196,3 +196,61 @@ the same context, plus more SKUs. That design will separate causal schedule
 effects from correlations introduced by adaptive search and will let hardware
 ratios become statistically meaningful instead of being inferred from only
 three points.
+
+## Follow-up paired and shape-held-out evidence
+
+The paired study resolved 15,952 measured parent→child moves. Of these, 9,293
+were coupled or composite changes and are deliberately excluded from claims
+about one coordinate. The remaining exact transitions provide substantially
+stronger proposal-order evidence than the marginal tables above. Examples seen
+consistently across devices include severe regressions from narrowing quantizer
+vector ownership from 8 or 16 values to 2, and large JIT-region regressions when
+moving otherwise competitive X-region geometries to one row.
+
+A symmetric parent-pair classifier reached approximately 0.75–0.91 held-out
+pair AUC. That did not translate into safe search: every portable and exact-SKU
+family failed the eight-trial regret gate with complete M/N/K groups held out
+after practically tied measurements (within 0.2%) were removed from the labels.
+The artifact writer therefore emitted no pairwise model. This demonstrates why
+pair classification accuracy cannot substitute for fixed-budget search replay.
+
+The failure study found a deterministic revision-8 JIT-region boundary: all
+539 correctness failures occurred on the two deliberately ragged N/K shapes,
+and no candidate on those shapes succeeded. The failures reproduced on all
+three GPUs with near-zero cosine, making this an implementation contract bug
+rather than ordinary NVFP4 numerical loss. Focused CUDA isolation showed that
+N tails were correct and every failure had an odd physical count of 1x16 blocks.
+That makes the packed row stride an odd multiple of eight bytes, violating the
+16-byte alignment assumed by the SM120 native load path on following rows.
+Native RTX storage therefore uses the smallest 32-value K boundary, the
+quantizer zero-fills the extra block, a CUDA regression covers the boundary,
+and affected NVFP4 runtime-winner revisions were advanced. Arbitrary logical
+shapes remain supported; the worst additional packed storage versus a
+standalone NVFP4 encoding is only eight bytes per row.
+
+Raw timing prefixes also expose strong SKU differences. On fixed candidate
+cohorts where every candidate received at least fifteen measurements (twenty
+when that larger cohort retained at least five contexts), the first sample
+count meeting ≤1% p90 median error, ≤2% p90 winner regret, and ≥95% winners
+within 2% was:
+
+| Family | 5070 Laptop | 5070 Ti | 5090 |
+|---|---:|---:|---:|
+| Delayed | 15 | 5 | 15 |
+| Dynamic | 15 | 5 | 9 |
+| JIT-region | 20 | 3 | 5 |
+
+These values describe this campaign's fixed confirmation cohort, not universal
+defaults. They justify SKU-aware measurement budgets and stronger final races
+on the laptop. The 5070 Ti is markedly stable.
+
+Finally, proposal time is material. Across JIT-region contexts, gradient-boosted
+pool construction accumulated roughly 2,600 seconds on the laptop, 3,400 on
+the 5070 Ti, and 4,000 on the 5090; model-local ranking accumulated another
+1,700–2,200 seconds. Random and coordinate proposal time remained tiny. Bandit
+reward already charges this cost to its arm, and balanced first-hit tuning now
+uses explicit 512-candidate/250-ms global and 256-candidate local caps. Offline
+campaigns retain the ability to enlarge these limits deliberately.
+
+The statistical contracts behind these conclusions are specified in
+[Autotuning evidence methodology](autotune_evidence_methodology.md).

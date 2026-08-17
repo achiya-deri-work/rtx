@@ -2774,6 +2774,17 @@ def _build_parser() -> argparse.ArgumentParser:
     sku_study.add_argument("--seed", type=int, default=20260817)
     sku_study.add_argument("--minimum-contexts", type=int, default=5)
 
+    evidence_study = subparsers.add_parser(
+        "study-evidence",
+        help="analyze paired mutations, held-out ranking, failures, and timing budgets",
+    )
+    evidence_study.add_argument("paths", type=Path, nargs="+")
+    evidence_study.add_argument("--output", type=Path, required=True)
+    evidence_study.add_argument("--seed", type=int, default=20260817)
+    evidence_study.add_argument("--minimum-pairs", type=int, default=8)
+    evidence_study.add_argument("--minimum-contexts", type=int, default=5)
+    evidence_study.add_argument("--pairwise-estimators", type=int, default=16)
+
     evaluate_pretrained = subparsers.add_parser(
         "evaluate-pretrained",
         help="evaluate a frozen pretrained artifact on disjoint held-out data",
@@ -2941,6 +2952,34 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "coordinate_effects": len(report["coordinate_effects"]),
                     "portable_effects": len(report["portable_effects"]),
                     "artifact_id": report.get("artifact_id"),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+    if args.command == "study-evidence":
+        from .evidence import build_evidence_study
+
+        report = build_evidence_study(
+            args.paths,
+            args.output,
+            seed=args.seed,
+            minimum_pairs=args.minimum_pairs,
+            minimum_contexts=args.minimum_contexts,
+            pairwise_estimators=args.pairwise_estimators,
+        )
+        print(
+            json.dumps(
+                {
+                    "output": str(args.output.resolve()),
+                    "observations": report["input"]["observations"],
+                    "paired_moves": report["parent_moves"]["paired_moves"],
+                    "pairwise_families": len(report["pairwise_shape_heldout"]),
+                    "deployable_pairwise_models": len(
+                        report["pairwise_artifact"]["models"]
+                    ),
+                    "archetype_effects": len(report["archetypes"]),
                 },
                 indent=2,
                 sort_keys=True,

@@ -31,7 +31,7 @@ PRETRAINED_SCHEMA_VERSION = 1
 # Bump this whenever training, validation, or deployment semantics change in a
 # way that can alter how an otherwise identical set of model files is used.
 # Schema version describes readability; trainer revision describes behavior.
-PRETRAINED_TRAINER_REVISION = 2
+PRETRAINED_TRAINER_REVISION = 3
 _ALL_FAILURES = (
     "compile_error",
     "runtime_error",
@@ -545,6 +545,18 @@ def _device_key(item: Observation[object]) -> str:
     return f"sms-{sms:g}-bus-{bus:g}"
 
 
+def _shape_group_key(item: Observation[object]) -> tuple[object, ...]:
+    """Validation group which cannot leak through regimes or replicates."""
+
+    return (
+        item.family,
+        item.kernel_revision,
+        int(item.features.get("context.workload.m", 0)),
+        int(item.features.get("context.workload.n", 0)),
+        int(item.features.get("context.workload.k", 0)),
+    )
+
+
 def _bootstrap_median_ci(
     values: Sequence[float], *, seed: int, resamples: int = 300
 ) -> tuple[float, float, float]:
@@ -907,6 +919,11 @@ def load_pretrained_family(
         or manifest.get("type") != "rtx_pretrained_autotune_bundle"
     ):
         raise ValueError("unsupported pretrained autotune artifact")
+    if manifest.get("trainer_revision") != PRETRAINED_TRAINER_REVISION:
+        raise ValueError(
+            "pretrained autotune artifact uses a stale trainer revision; "
+            "retrain it before runtime deployment"
+        )
     key = f"{family}@{kernel_revision}"
     try:
         entry = manifest["families"][key]
@@ -963,6 +980,11 @@ def evaluate_pretrained_bundle(
         or manifest.get("type") != "rtx_pretrained_autotune_bundle"
     ):
         raise ValueError("unsupported pretrained autotune artifact")
+    if manifest.get("trainer_revision") != PRETRAINED_TRAINER_REVISION:
+        raise ValueError(
+            "pretrained autotune artifact uses a stale trainer revision; "
+            "retrain it before held-out evaluation"
+        )
     observations, evaluation_input = load_offline_observations(
         paths, campaign=campaign
     )
@@ -1227,30 +1249,31 @@ def train_pretrained_bundle(
             for device_index, device in enumerate(devices):
                 device_rows = [item for item in rows if _device_key(item) == device]
                 context_ids = sorted({item.context_id for item in device_rows})
-                if len(context_ids) < 4:
+                shape_groups = sorted({_shape_group_key(item) for item in device_rows})
+                if len(shape_groups) < 4:
                     continue
-                fold_count = min(4, len(context_ids))
-                ordered_contexts = sorted(
-                    context_ids,
-                    key=lambda context_id: hashlib.sha256(
-                        f"{family_seed}:{device}:{context_id}".encode()
+                fold_count = min(4, len(shape_groups))
+                ordered_shapes = sorted(
+                    shape_groups,
+                    key=lambda shape: hashlib.sha256(
+                        f"{family_seed}:{device}:{shape}".encode()
                     ).hexdigest(),
                 )
-                context_fold = {
-                    context_id: index % fold_count
-                    for index, context_id in enumerate(ordered_contexts)
+                shape_fold = {
+                    shape: index % fold_count
+                    for index, shape in enumerate(ordered_shapes)
                 }
                 fold_metrics = []
                 for fold_index in range(fold_count):
                     fold_train = [
                         item
                         for item in device_rows
-                        if context_fold[item.context_id] != fold_index
+                        if shape_fold[_shape_group_key(item)] != fold_index
                     ]
                     fold_test = [
                         item
                         for item in device_rows
-                        if context_fold[item.context_id] == fold_index
+                        if shape_fold[_shape_group_key(item)] == fold_index
                     ]
                     fold_train = _balanced_training_rows(
                         fold_train,
@@ -1286,6 +1309,12 @@ def train_pretrained_bundle(
                             ),
                             "test_contexts": len(
                                 {item.context_id for item in fold_test}
+                            ),
+                            "train_shapes": len(
+                                {_shape_group_key(item) for item in fold_train}
+                            ),
+                            "test_shapes": len(
+                                {_shape_group_key(item) for item in fold_test}
                             ),
                             "latency": evaluate_latency_model(fold_cost, fold_test),
                             "ranking": evaluate_latency_model(
@@ -1336,16 +1365,17 @@ def train_pretrained_bundle(
                 device_models[device] = {
                     "rows": len(device_rows),
                     "contexts": len(context_ids),
+                    "shapes": len(shape_groups),
                     "cost_model": str(device_cost_path),
                     "ranking_model": str(device_ranking_path),
-                    "cross_context_folds": fold_metrics,
+                    "shape_group_folds": fold_metrics,
                     "validation_summary": {
                         "latency": latency_summary,
                         "ranking": ranking_summary,
                     },
                     "deployment": {
                         "validation_gated": True,
-                        "validation_scope": "same_device_unseen_context",
+                        "validation_scope": "same_device_unseen_shape",
                         "catalog_replay_budget": 4,
                         "selected_cost_head": selected_device_head,
                         "pretrained_random_warmup_trials": (

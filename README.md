@@ -313,9 +313,11 @@ Both modules return BF16 and expose the usual no-bias
 All positive M/N/K shapes are supported. Dynamic fused kernels keep the BF16
 GMEM tensors at their exact logical shape and predicate or TMA-zero-fill the
 final tensor-core tile on chip. Materialized and AOT operands allocate only the
-smallest format block tail: `ceil(K / 32) * 32` E4M3 values for MXFP8 and
-`ceil(K / 16) * 16` logical E2M1 values for NVFP4. Their original logical shape
-is retained as RTX metadata while GEMM sees the zero-filled physical extent;
+smallest native-MMA storage tail: `ceil(K / 32) * 32` E4M3 values for MXFP8
+and `ceil(K / 32) * 32` logical E2M1 values for NVFP4. NVFP4 still uses one
+E4M3 scale per 16 values; the 32-value physical boundary keeps every packed
+FP4 row 16-byte aligned, appending a zero block when necessary. Original logical
+shape is retained as RTX metadata while GEMM sees the physical extent;
 there is no `torch.pad`, padded BF16 temporary, or explicit transpose in a
 registered forward/backward path. Native blocked scale layouts remain an
 aligned fast path, while ragged packed operands use row-major block scales.

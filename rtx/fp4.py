@@ -26,6 +26,7 @@ from .configs import (
     NVFP4Problem,
     NVFP4QuantConfig,
     NVFP4WeightPrequantConfig,
+    nvfp4_storage_k,
 )
 from .formats import NVFP4Tensor, make_nvfp4_tensor
 from .formats.common import (
@@ -52,7 +53,7 @@ if TYPE_CHECKING:
     from .kernels.mxfp8_bwd import MXFP8BwdConfig
 
 WeightMode = Literal["dynamic", "prequantized"]
-NVFP4_FRONTEND_REVISION = 6
+NVFP4_FRONTEND_REVISION = 7
 DEFAULT_NVFP4_X_SCALE_REGION_ROWS = 5
 DEFAULT_NVFP4_WEIGHT_SCALE_REGION_ROWS = 4
 
@@ -394,7 +395,7 @@ def _empty_nvfp4_scales(
     device: torch.device,
 ) -> torch.Tensor:
     if config.scale_layout == "row_major":
-        shape = (rows, ((k + 15) // 16))
+        shape = (rows, nvfp4_storage_k(k) // 16)
     else:
         shape = (rows // 128, k // 128, 1024)
     return torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
@@ -1522,7 +1523,7 @@ def quantize_nvfp4(
         raise TypeError("NVFP4 tensor_scale must be one FP32 value")
     if scale.device != source.device:
         raise ValueError("NVFP4 tensor_scale and source must share one device")
-    storage_k = (k + 15) // 16 * 16
+    storage_k = nvfp4_storage_k(k)
     qdata = torch.empty((rows, storage_k // 2), dtype=torch.uint8, device=source.device)
     scales = torch.empty(
         (rows, storage_k // 16), dtype=torch.float8_e4m3fn, device=source.device
@@ -1642,7 +1643,7 @@ def _nvfp4_linear_dynamic_x_prequant_w_op(
 ) -> torch.Tensor:
     if weight_scale_layout != "row_major":
         raise RuntimeError("native NVFP4 GEMM currently requires row-major scales")
-    storage_k = (k + 15) // 16 * 16
+    storage_k = nvfp4_storage_k(k)
     if x.ndim != 2 or tuple(weight_data.shape) != (n, storage_k // 2):
         raise ValueError("dynamic-X/prequant-W NVFP4 operand shape mismatch")
     _check_sm12x(x.device)

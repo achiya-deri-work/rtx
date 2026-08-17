@@ -7,6 +7,7 @@ from math import ceil
 import torch
 from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
 
+from ..configs.nvfp4 import nvfp4_storage_k
 from .common import Orientation, ScaleLayout, flattened_matrix_shape
 
 
@@ -27,11 +28,11 @@ def make_nvfp4_tensor(
     if (qdata.numel() * 2) % rows:
         raise ValueError("NVFP4 qdata rows do not divide its packed storage")
     storage_k = qdata.numel() * 2 // rows
-    expected_storage_k = (k + 15) // 16 * 16
+    expected_storage_k = nvfp4_storage_k(k)
     if storage_k != expected_storage_k:
         raise ValueError(
             f"NVFP4 qdata storage K={storage_k} cannot represent logical K={k}; "
-            f"expected the minimal block-aligned K={expected_storage_k}"
+            f"expected native 16-byte-row-aligned K={expected_storage_k}"
         )
     if scales.dtype is not torch.float8_e4m3fn:
         raise TypeError("NVFP4 block scales must use float8_e4m3fn")
@@ -78,8 +79,12 @@ def validate_nvfp4_tensor(value: NVFP4Tensor) -> None:
         )
     rows, k = nvfp4_matrix_shape(value)
     storage_k = int(value.qdata.shape[-1]) * 2
-    if storage_k < k or storage_k % 16:
-        raise ValueError("RTX NVFP4 storage K must cover logical K in blocks of 16")
+    expected_storage_k = nvfp4_storage_k(k)
+    if storage_k != expected_storage_k:
+        raise ValueError(
+            "RTX NVFP4 storage K must keep packed rows 16-byte aligned; "
+            f"expected {expected_storage_k}, got {storage_k}"
+        )
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     if value.qdata.dtype not in (torch.uint8, fp4_dtype):
         raise TypeError("RTX NVFP4 requires uint8 or float4_e2m1fn_x2 qdata")

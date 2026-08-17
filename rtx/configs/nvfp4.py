@@ -13,6 +13,19 @@ from ..kernels.mxfp8 import (
 
 
 NVFP4_SF_VEC_SIZE = 16
+# SM120 native loads require each packed FP4 row to retain 16-byte alignment.
+# Since two E2M1 values share one byte, physical K must be a multiple of 32.
+# A 16-value-aligned standalone encoding can otherwise give alternate rows an
+# eight-byte offset. Keep public logical K while aligning native GEMM storage.
+NVFP4_STORAGE_K_ALIGNMENT = 2 * NVFP4_SF_VEC_SIZE
+
+
+def nvfp4_storage_k(k: int) -> int:
+    return (
+        (k + NVFP4_STORAGE_K_ALIGNMENT - 1)
+        // NVFP4_STORAGE_K_ALIGNMENT
+        * NVFP4_STORAGE_K_ALIGNMENT
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,11 +98,9 @@ class NVFP4Problem:
 
     @property
     def storage_k(self) -> int:
-        """Smallest NVFP4 block-aligned packed reduction extent."""
+        """Smallest native 16-byte-row-aligned packed reduction extent."""
 
-        return ((self.k + NVFP4_SF_VEC_SIZE - 1) // NVFP4_SF_VEC_SIZE) * (
-            NVFP4_SF_VEC_SIZE
-        )
+        return nvfp4_storage_k(self.k)
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,7 +484,7 @@ DEFAULT_NVFP4_GEMM_CONFIG = NVFP4GemmConfig()
 DEFAULT_NVFP4_QUANT_CONFIG = NVFP4QuantConfig()
 DEFAULT_NVFP4_SCALE_CONFIG = NVFP4ScaleConfig()
 DEFAULT_NVFP4_DYNAMIC_CONFIG = NVFP4DynamicConfig()
-NVFP4_KERNEL_REVISION = 7
+NVFP4_KERNEL_REVISION = 8
 
 
 __all__ = [
@@ -490,4 +501,6 @@ __all__ = [
     "NVFP4WeightPrequantConfig",
     "NVFP4_KERNEL_REVISION",
     "NVFP4_SF_VEC_SIZE",
+    "NVFP4_STORAGE_K_ALIGNMENT",
+    "nvfp4_storage_k",
 ]

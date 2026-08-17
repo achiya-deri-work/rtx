@@ -219,11 +219,14 @@ class NVFP4ConfigTests(unittest.TestCase):
             dynamic_config_from_dict(serialized), NVFP4DynamicConfig()
         )
 
-    def test_problem_keeps_logical_k_and_exposes_minimal_storage_k(self) -> None:
+    def test_problem_keeps_logical_k_and_aligns_packed_row_stride(self) -> None:
         problem = NVFP4Problem(3, 5, 17)
         problem.validate()
         self.assertEqual(problem.k, 17)
         self.assertEqual(problem.storage_k, 32)
+        self.assertEqual(NVFP4Problem(3, 5, 129).storage_k, 160)
+        self.assertEqual(NVFP4Problem(3, 5, 144).storage_k, 160)
+        self.assertEqual(NVFP4Problem(3, 5, 145).storage_k, 160)
 
     def test_scale_config_contains_only_numeric_policy(self) -> None:
         config = NVFP4ScaleConfig(
@@ -259,11 +262,11 @@ class NVFP4ConfigTests(unittest.TestCase):
         ):
             with self.subTest(family=family):
                 expected_revision = {
-                    "nvfp4_dynamic_fwd": 6,
-                    "nvfp4_delayed_fwd": 1,
-                    "nvfp4_jit_row_region_fwd": 8,
-                    "nvfp4_weight_prequant_fwd": 3,
-                    "nvfp4_fully_prequant_fwd": 3,
+                    "nvfp4_dynamic_fwd": 7,
+                    "nvfp4_delayed_fwd": 2,
+                    "nvfp4_jit_row_region_fwd": 9,
+                    "nvfp4_weight_prequant_fwd": 4,
+                    "nvfp4_fully_prequant_fwd": 4,
                 }[family]
                 self.assertEqual(
                     _current_revision(family),
@@ -796,7 +799,7 @@ class NVFP4CudaTests(unittest.TestCase):
             atol=0,
         )
 
-    def test_ragged_k_packed_inference_uses_minimal_fp4_storage(self) -> None:
+    def test_ragged_k_packed_inference_uses_native_mma_storage(self) -> None:
         torch.manual_seed(1919)
         m, n, k = 17, 29, 33
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
@@ -825,8 +828,8 @@ class NVFP4CudaTests(unittest.TestCase):
             compiled_dynamic_x = compiled(x)
             compiled_fully_packed = compiled(packed_x)
         torch.cuda.synchronize()
-        self.assertEqual(tuple(packed_x.qdata.shape), (m, 24))
-        self.assertEqual(tuple(packed_weight.qdata.shape), (n, 24))
+        self.assertEqual(tuple(packed_x.qdata.shape), (m, 32))
+        self.assertEqual(tuple(packed_weight.qdata.shape), (n, 32))
         self.assertEqual(tuple(fully_packed.shape), (m, n))
         self.assertEqual(tuple(dynamic_x.shape), (m, n))
         self.assertEqual(tuple(compiled_dynamic_x.shape), (m, n))
@@ -835,6 +838,17 @@ class NVFP4CudaTests(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(dynamic_x).all()))
         self.assertTrue(bool(torch.isfinite(compiled_dynamic_x).all()))
         self.assertTrue(bool(torch.isfinite(compiled_fully_packed).all()))
+        reference = x.float() @ weight.float().T
+        for actual in (
+            fully_packed,
+            dynamic_x,
+            compiled_dynamic_x,
+            compiled_fully_packed,
+        ):
+            cosine = torch.nn.functional.cosine_similarity(
+                actual.float().flatten(), reference.flatten(), dim=0
+            )
+            self.assertGreater(float(cosine), 0.8)
 
     def test_native_64_row_packed_gemm_matches_dequantized_reference(self) -> None:
         torch.manual_seed(1908)
@@ -886,6 +900,32 @@ class NVFP4CudaTests(unittest.TestCase):
                 actual = rtx.nvfp4_linear(x, weight, backend="materialized")
                 self.assertEqual(tuple(actual.shape), (m, n))
                 self.assertTrue(bool(torch.isfinite(actual).all()))
+
+    def test_jit_region_unaligned_packed_row_tail_matches_reference(self) -> None:
+        """Native storage must keep every packed FP4 row 16-byte aligned."""
+
+        torch.manual_seed(1927)
+        m, n, k = 67, 131, 129
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        actual = rtx.nvfp4_linear(
+            x,
+            weight,
+            scaling="jit_row_region",
+            x_scale_region_rows=5,
+            weight_scale_region_rows=4,
+            autotune="off",
+        ).float()
+        reference = x.float() @ weight.float().T
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.flatten(), reference.flatten(), dim=0
+        )
+        nrmse = torch.sqrt(torch.mean((actual - reference) ** 2)) / torch.sqrt(
+            torch.mean(reference**2)
+        )
+        torch.cuda.synchronize()
+        self.assertGreater(float(cosine), 0.8)
+        self.assertLess(float(nrmse), 0.5)
 
     def test_ragged_nvfp4_training_is_fullgraph_compileable(self) -> None:
         torch.manual_seed(1918)

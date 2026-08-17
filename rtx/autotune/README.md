@@ -210,6 +210,8 @@ the final prospective check. It scores latency and context-ranking heads,
 feasibility, exact-SKU heads when present, and matched random catalogue replay
 without modifying deployment gates. Exact source-file overlap or an identical
 dataset digest is rejected unless an explicitly in-sample diagnostic opts in.
+Exact-SKU deployment folds hold out complete M/N/K groups, so hot/rotate cache
+regimes or campaign replicates of the same shape cannot leak into training.
 
 For an interpretable cross-SKU study after training, run:
 
@@ -225,6 +227,21 @@ cross-SKU winner-transfer regret, model split/path interactions, feasibility
 structure, and deployment-gate results. Single-coordinate associations remain
 observational because adaptive search couples coordinates; parent-linked rules
 and held-out transfer replay are the stronger evidence sources.
+
+For stricter evidence based on exact local mutations and unseen shapes, run:
+
+```bash
+rtx-autotune study-evidence DATASET... \
+  --output autotune_reports/evidence_v1
+```
+
+This emits `evidence.json` and `evidence.md` containing exact parent→child
+transition effects, portable and exact-SKU pairwise models evaluated with
+complete M/N/K groups held out, fixed-trial and wall-clock catalogue replay,
+schedule-archetype/bottleneck associations, typed failure enrichment, and raw
+timing-sample convergence. Pairwise heads have an independent deployment gate:
+classification AUC alone is never sufficient when p90 search regret fails to
+beat matched random search.
 
 ## Architecture and SKU features
 
@@ -356,6 +373,14 @@ Every observation includes:
 Strategy-selection events and context-allocation rows store the state and score
 of every scheduler arm. This makes offline replay and counterfactual
 orchestration analysis possible.
+
+Model proposal generation is itself budgeted. `model_initial_pool_cap` and
+`model_proposal_budget_s` bound the global sampler's first pass and adapt later
+pools to observed CPU cost; `local_model_candidate_cap` bounds complete
+neighborhood ranking. Balanced first-hit tuning uses 512 candidates, a 250 ms
+proposal target, and 256 local candidates. Offline campaigns can enlarge all
+three explicitly, while bandit rewards charge proposal time to the responsible
+arm.
 
 When `transfer_history=True`, the cost model receives observations from other
 contexts with the same family and kernel revision. Deduplication and incumbent

@@ -105,6 +105,9 @@ class ComposableAutotuneTests(unittest.TestCase):
         self.assertEqual(hybrid.orchestration, "bandit")
         self.assertGreaterEqual(hybrid.confirmation_repeats, 1)
         self.assertLess(hybrid.samples, HybridTuningPolicy().samples)
+        self.assertEqual(hybrid.model_initial_pool_cap, 512)
+        self.assertEqual(hybrid.local_model_candidate_cap, 256)
+        self.assertEqual(hybrid.model_proposal_budget_s, 0.25)
 
         self.assertEqual(coordinate.time_budget_s, 30.0)
         self.assertEqual(coordinate.max_trials, 24)

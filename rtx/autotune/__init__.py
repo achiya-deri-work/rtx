@@ -83,6 +83,19 @@ from .recipes import (
 )
 from .runtime import balanced_coordinate_policy, balanced_hybrid_policy
 from .sku_study import study_sku_relationships
+from .evidence import (
+    PairwisePreferenceModel,
+    archetype_analysis,
+    bottleneck_class,
+    build_evidence_study,
+    failure_analysis,
+    pair_features,
+    pairwise_shape_heldout_study,
+    parent_move_analysis,
+    strategy_efficiency_analysis,
+    save_deployable_pairwise_models,
+    timing_convergence_analysis,
+)
 from .pretrained import (
     ConditionalEffectRule,
     ConditionalRuleSet,
@@ -211,6 +224,17 @@ __all__ = [
     "balanced_coordinate_policy",
     "balanced_hybrid_policy",
     "study_sku_relationships",
+    "archetype_analysis",
+    "PairwisePreferenceModel",
+    "bottleneck_class",
+    "build_evidence_study",
+    "failure_analysis",
+    "pair_features",
+    "pairwise_shape_heldout_study",
+    "parent_move_analysis",
+    "strategy_efficiency_analysis",
+    "save_deployable_pairwise_models",
+    "timing_convergence_analysis",
     "InMemoryTuningStore",
     "JsonTuningDatabase",
     "JsonlTuningStore",

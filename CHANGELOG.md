@@ -5,6 +5,16 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Add evidence-oriented cross-SKU autotuning analysis: paired mutation effects,
+  complete-shape-held-out pair ranking and fixed-budget replay, schedule
+  archetypes, typed failure enrichment, raw-timing convergence, and
+  proposal-time efficiency. Exact-SKU pretrained heads now use the same
+  complete-shape holdout and stale trainer-revision artifacts fail closed.
+- Fix NVFP4 packed storage at ragged K tails. A valid standalone encoding with
+  an odd 1x16 block count has an eight-byte-unaligned packed row stride, while
+  the native SM120 load path assumes 16-byte row alignment. RTX storage now
+  pads to 32 logical values while preserving logical K. Add a CUDA regression
+  and invalidate affected NVFP4 runtime winners.
 - Advance JIT row-region NVFP4 to kernel revision 8. Add an autotunable
   register-hoisted SM120 epilogue for the proven 128x128, atom-N=2 fragment:
   each thread loads its two X factors once and one W factor per four

@@ -45,6 +45,13 @@ The packed operand schema is versioned independently from kernel revisions.
 Requantize from the BF16 master checkpoint when changing numeric format or
 when a future release announces an incompatible packed schema.
 
+RTX schema v3 keeps NVFP4's numerical block size at 16 but requires physical K
+storage to be a multiple of 32 so every packed FP4 row has the 16-byte stride
+alignment assumed by the SM120 native load path. If standalone TorchAO packing
+ends on an odd block, repack from the BF16 source with `rtx.quantize_nvfp4`
+before using the native GEMM. The extra zero block costs at most eight bytes per
+row.
+
 Direct serialization of a standalone TorchAO tensor subclass is governed by
 TorchAO. For durable RTX inference checkpoints, prefer the packed module's raw
 buffers and metadata rather than relying on private `_rtx_*` tensor attributes.

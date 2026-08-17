@@ -15,6 +15,8 @@ from .nvfp4 import (
     NVFP4QuantConfig,
     NVFP4WeightPrequantConfig,
     NVFP4_KERNEL_REVISION,
+    NVFP4_STORAGE_K_ALIGNMENT,
+    nvfp4_storage_k,
 )
 
 __all__ = [
@@ -34,4 +36,6 @@ __all__ = [
     "NVFP4QuantConfig",
     "NVFP4WeightPrequantConfig",
     "NVFP4_KERNEL_REVISION",
+    "NVFP4_STORAGE_K_ALIGNMENT",
+    "nvfp4_storage_k",
 ]

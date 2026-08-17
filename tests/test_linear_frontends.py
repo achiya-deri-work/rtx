@@ -595,10 +595,16 @@ class LinearFrontendContractTests(unittest.TestCase):
 
         with FakeTensorMode():
             scale = torch.ones((), device="cuda", dtype=torch.float32)
-            qx = torch.empty(17, 24, device="cuda", dtype=fp4_dtype)
-            qw = torch.empty(29, 24, device="cuda", dtype=fp4_dtype)
-            sx = torch.empty(17, 3, device="cuda", dtype=torch.float8_e4m3fn)
-            sw = torch.empty(29, 3, device="cuda", dtype=torch.float8_e4m3fn)
+            odd_qx = torch.empty(17, 24, device="cuda", dtype=fp4_dtype)
+            odd_sx = torch.empty(
+                17, 3, device="cuda", dtype=torch.float8_e4m3fn
+            )
+            with self.assertRaisesRegex(ValueError, "16-byte-row-aligned"):
+                make_nvfp4_tensor(odd_qx, odd_sx, scale, (17, 33))
+            qx = torch.empty(17, 32, device="cuda", dtype=fp4_dtype)
+            qw = torch.empty(29, 32, device="cuda", dtype=fp4_dtype)
+            sx = torch.empty(17, 4, device="cuda", dtype=torch.float8_e4m3fn)
+            sw = torch.empty(29, 4, device="cuda", dtype=torch.float8_e4m3fn)
             packed_x = make_nvfp4_tensor(qx, sx, scale, (17, 33))
             packed_w = make_nvfp4_tensor(qw, sw, scale, (29, 33))
             self.assertEqual(nvfp4_matrix_shape(packed_x), (17, 33))
