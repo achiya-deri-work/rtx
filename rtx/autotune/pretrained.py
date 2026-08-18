@@ -31,7 +31,7 @@ PRETRAINED_SCHEMA_VERSION = 1
 # Bump this whenever training, validation, or deployment semantics change in a
 # way that can alter how an otherwise identical set of model files is used.
 # Schema version describes readability; trainer revision describes behavior.
-PRETRAINED_TRAINER_REVISION = 3
+PRETRAINED_TRAINER_REVISION = 4
 _ALL_FAILURES = (
     "compile_error",
     "runtime_error",
@@ -892,6 +892,98 @@ def _balanced_training_rows(
     return result
 
 
+def _aggregate_config_replicates(
+    observations: Sequence[Observation[object]],
+) -> list[Observation[object]]:
+    """Give each context/config one robust training target.
+
+    Separate portfolio sessions can legitimately benchmark the same candidate.
+    Those repeats estimate timing noise, but feeding every repeat to a cost
+    model would weight frequently rediscovered configurations more heavily.
+    Keep a deterministic representative and replace its latency with the
+    median across successful repeats.  Raw observations remain untouched for
+    strategy-efficiency and timing-convergence studies.
+    """
+
+    groups: dict[tuple[str, str], list[Observation[object]]] = defaultdict(list)
+    for item in observations:
+        groups[(item.context_id, item.config_id)].append(item)
+    result: list[Observation[object]] = []
+    for (context_id, config_id), rows in sorted(groups.items()):
+        if len(rows) == 1:
+            result.append(rows[0])
+            continue
+        successful = [
+            item
+            for item in rows
+            if item.successful and item.outcome.median_ms is not None
+        ]
+        candidates = successful or rows
+        if successful:
+            target = float(
+                np.median([float(item.outcome.median_ms) for item in successful])
+            )
+            representative = min(
+                successful,
+                key=lambda item: (
+                    abs(float(item.outcome.median_ms) - target),
+                    item.observation_id,
+                ),
+            )
+            timings = [
+                value for item in successful for value in item.outcome.timings_ms
+            ]
+            compile_values = [
+                float(item.outcome.compile_ms)
+                for item in successful
+                if item.outcome.compile_ms is not None
+            ]
+            outcome = replace(
+                representative.outcome,
+                median_ms=target,
+                timings_ms=timings,
+                compile_ms=(
+                    None
+                    if not compile_values
+                    else float(np.median(compile_values))
+                ),
+            )
+        else:
+            statuses = Counter(item.outcome.status for item in rows)
+            selected_status = min(statuses, key=lambda status: (-statuses[status], status))
+            representative = min(
+                (item for item in candidates if item.outcome.status == selected_status),
+                key=lambda item: item.observation_id,
+            )
+            outcome = representative.outcome
+        constituent_ids = sorted(item.observation_id for item in rows)
+        aggregate_id = "aggregate-" + hashlib.sha256(
+            canonical_json(
+                {
+                    "context_id": context_id,
+                    "config_id": config_id,
+                    "observation_ids": constituent_ids,
+                }
+            ).encode()
+        ).hexdigest()[:24]
+        result.append(
+            replace(
+                representative,
+                observation_id=aggregate_id,
+                session_id="offline-aggregate",
+                outcome=outcome,
+                elapsed_s=float(np.median([item.elapsed_s for item in rows])),
+                metadata={
+                    **representative.metadata,
+                    "offline_config_replicates": len(rows),
+                    "offline_successful_replicates": len(successful),
+                    "offline_observation_ids": constituent_ids,
+                },
+            )
+        )
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class PretrainedFamilyModels:
     family: str
@@ -1140,7 +1232,8 @@ def train_pretrained_bundle(
     for item in observations:
         grouped[(item.family, item.kernel_revision)].append(item)
     families: dict[str, object] = {}
-    for family_index, ((family, revision), rows) in enumerate(sorted(grouped.items())):
+    for family_index, ((family, revision), raw_rows) in enumerate(sorted(grouped.items())):
+        rows = _aggregate_config_replicates(raw_rows)
         family_seed = seed ^ (family_index + 1) * 104729
         balanced = _balanced_training_rows(rows, seed=family_seed)
         cost = NormalizedCostModel(
@@ -1428,6 +1521,8 @@ def train_pretrained_bundle(
             "family": family,
             "kernel_revision": revision,
             "rows": len(rows),
+            "raw_rows": len(raw_rows),
+            "aggregated_replicates": len(raw_rows) - len(rows),
             "successful_rows": sum(item.successful for item in rows),
             "statuses": dict(Counter(item.outcome.status for item in rows)),
             "contexts": len({item.context_id for item in rows}),

@@ -237,11 +237,15 @@ class PretrainedAutotuneTests(unittest.TestCase):
                 min_leaf=2,
                 min_rule_support=3,
                 validate_devices=False,
-                campaign="bundle-a",
+                campaign=["bundle-a", "bundle-b"],
             )
             self.assertIn("toy@7", manifest["families"])
             self.assertEqual(len(manifest["artifact_id"]), 24)
-            self.assertEqual(manifest["trainer_revision"], 3)
+            self.assertEqual(manifest["trainer_revision"], 4)
+            family = manifest["families"]["toy@7"]
+            self.assertEqual(family["raw_rows"], len(observations) * 2)
+            self.assertEqual(family["rows"], len(observations))
+            self.assertEqual(family["aggregated_replicates"], len(observations))
             self.assertTrue(manifest["input"]["dataset_sha256"])
             self.assertEqual(
                 len(manifest["families"]["toy@7"]["files_sha256"]), 4
@@ -268,7 +272,17 @@ class PretrainedAutotuneTests(unittest.TestCase):
 
             heldout_path = root / "heldout" / "observations.jsonl"
             heldout_path.parent.mkdir()
-            heldout_path.write_text(payload_b, encoding="utf-8")
+            payload_c = "".join(
+                json.dumps(
+                    {
+                        **item.as_dict(),
+                        "observation_id": f"heldout-{item.observation_id}",
+                    }
+                )
+                + "\n"
+                for item in observations
+            )
+            heldout_path.write_text(payload_c, encoding="utf-8")
             evaluation = evaluate_pretrained_bundle(output, [heldout_path])
             self.assertTrue(evaluation["separation"]["held_out"])
             self.assertEqual(evaluation["families"]["toy@7"]["rows"], 12)

@@ -120,6 +120,14 @@ class AutotuneEvidenceTests(unittest.TestCase):
         timing = timing_convergence_analysis(rows)
         self.assertEqual(timing["rows_with_raw_timings"], 48)
         self.assertTrue(timing["convergence"])
+        self.assertEqual(
+            {
+                item["cohort"]
+                for item in timing["convergence"]
+                if item["cohort"].startswith("common_")
+            },
+            {"common_5"},
+        )
 
     def test_pairwise_model_round_trip(self) -> None:
         rows = self._rows()
@@ -145,6 +153,43 @@ class AutotuneEvidenceTests(unittest.TestCase):
                 "".join(json.dumps(item.as_dict()) + "\n" for item in rows),
                 encoding="utf-8",
             )
+            verification = []
+            for item in rows:
+                if item.config_id != "tile-128":
+                    continue
+                timings = [item.outcome.median_ms * factor for factor in (
+                    1.01,
+                    0.99,
+                    1.005,
+                    0.995,
+                    1.002,
+                    0.998,
+                    1.001,
+                    0.999,
+                    1.0,
+                )]
+                verification.append(
+                    {
+                        "record_type": "verification_measurement",
+                        "stage": "confirm",
+                        "observation_key": f"verify-{item.context_id}",
+                        "context_id": item.context_id,
+                        "family": item.family,
+                        "kernel_revision": item.kernel_revision,
+                        "config_id": item.config_id,
+                        "config": item.serialized_config,
+                        "features": item.features,
+                        "outcome": {
+                            "status": "ok",
+                            "timings_ms": timings,
+                            "summary_ms": {"median": item.outcome.median_ms},
+                        },
+                    }
+                )
+            (root / "verification.jsonl").write_text(
+                "".join(json.dumps(item) + "\n" for item in verification),
+                encoding="utf-8",
+            )
             report = build_evidence_study(
                 [root],
                 root / "report",
@@ -154,6 +199,21 @@ class AutotuneEvidenceTests(unittest.TestCase):
             )
             self.assertIn("toy_kernel@1", report["pairwise_shape_heldout"])
             self.assertIn("timing_convergence", report)
+            self.assertEqual(
+                report["confirmation_timing_convergence"][
+                    "rows_with_raw_timings"
+                ],
+                8,
+            )
+            self.assertEqual(
+                {
+                    item["cohort"]
+                    for item in report["confirmation_timing_convergence"][
+                        "screening_recommendations"
+                    ]
+                },
+                {"common_9"},
+            )
             self.assertTrue(report["strategy_efficiency"])
             self.assertEqual(
                 report["pairwise_artifact"]["type"],

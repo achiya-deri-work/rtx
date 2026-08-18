@@ -196,6 +196,46 @@ class AutotuneOperationsTests(unittest.TestCase):
             self.assertFalse(report["ok"])
             self.assertEqual(report["summary"]["errors"], 1)
 
+    def test_audit_accepts_repeated_measurement_of_same_context_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            path = bundle / "residuals/unit/observations.jsonl"
+            original = json.loads(path.read_text(encoding="utf-8"))
+            repeated = dict(original)
+            repeated["observation_id"] = "independent-repeat"
+            repeated["outcome"] = {"status": "ok", "median_ms": 1.1}
+            path.write_text(
+                json.dumps(original) + "\n" + json.dumps(repeated) + "\n",
+                encoding="utf-8",
+            )
+            report = audit_bundles((root,))
+            self.assertTrue(report["ok"])
+            bundle_report = report["bundles"][0]
+            self.assertEqual(bundle_report["duplicate_context_configs"], 1)
+            self.assertEqual(bundle_report["conflicting_context_configs"], 0)
+            self.assertIn("repeated context/config", bundle_report["warnings"][0])
+
+    def test_audit_rejects_config_id_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            path = bundle / "residuals/unit/observations.jsonl"
+            original = json.loads(path.read_text(encoding="utf-8"))
+            original["config"] = {"tile": 64}
+            collision = dict(original)
+            collision["observation_id"] = "config-collision"
+            collision["config"] = {"tile": 128}
+            path.write_text(
+                json.dumps(original) + "\n" + json.dumps(collision) + "\n",
+                encoding="utf-8",
+            )
+            report = audit_bundles((root,))
+            self.assertFalse(report["ok"])
+            self.assertEqual(
+                report["bundles"][0]["conflicting_context_configs"], 1
+            )
+
     def test_audit_reports_interrupted_candidate_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

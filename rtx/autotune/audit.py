@@ -170,8 +170,9 @@ def _audit_bundle(reader: _BundleReader) -> dict[str, object]:
     verification_keys: dict[str, str] = {}
     duplicate_verification_keys = 0
     conflicting_verification_keys = 0
-    context_config: set[tuple[str, str]] = set()
+    context_config: dict[tuple[str, str], str] = {}
     duplicate_context_configs = 0
+    conflicting_context_configs = 0
     observed_contexts: set[str] = set()
     candidate_starts: dict[str, str] = {}
     candidate_completions: set[str] = set()
@@ -220,7 +221,12 @@ def _audit_bundle(reader: _BundleReader) -> dict[str, object]:
                 if all(pair):
                     if pair in context_config:
                         duplicate_context_configs += 1
-                    context_config.add(pair)
+                        if context_config[pair] != _canonical_json(
+                            record.get("config")
+                        ):
+                            conflicting_context_configs += 1
+                    else:
+                        context_config[pair] = _canonical_json(record.get("config"))
                 unit = units.get(context_id)
                 if unit is not None and record.get("family") not in (None, unit.get("family")):
                     errors.append(f"{name}:{index + 1}: family differs from unit")
@@ -263,8 +269,14 @@ def _audit_bundle(reader: _BundleReader) -> dict[str, object]:
         errors.append(f"{conflicting_observation_ids} conflicting duplicate observation_id values")
     elif duplicate_observation_ids:
         warnings.append(f"{duplicate_observation_ids} repeated observation_id values")
-    if duplicate_context_configs:
-        errors.append(f"{duplicate_context_configs} duplicate context/config observations")
+    if conflicting_context_configs:
+        errors.append(
+            f"{conflicting_context_configs} context/config IDs map to conflicting configs"
+        )
+    elif duplicate_context_configs:
+        warnings.append(
+            f"{duplicate_context_configs} repeated context/config measurements"
+        )
     if conflicting_verification_keys:
         errors.append(f"{conflicting_verification_keys} conflicting duplicate verification keys")
     elif duplicate_verification_keys:
@@ -307,6 +319,7 @@ def _audit_bundle(reader: _BundleReader) -> dict[str, object]:
         "duplicate_observation_ids": duplicate_observation_ids,
         "conflicting_observation_ids": conflicting_observation_ids,
         "duplicate_context_configs": duplicate_context_configs,
+        "conflicting_context_configs": conflicting_context_configs,
         "candidate_attempts": {
             "started": len(candidate_starts),
             "completed": len(candidate_completions | observed_attempts),

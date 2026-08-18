@@ -19,6 +19,7 @@ import numpy as np
 
 from .core import FeatureMap, Observation, canonical_json
 from .cost_model import GradientBoostedFeasibilityModel
+from .dataset_export import _iter_jsonl
 from .outcomes import TrialOutcome
 from .pretrained import load_offline_observations, portable_features
 
@@ -916,30 +917,43 @@ def strategy_efficiency_analysis(
 
 def timing_convergence_analysis(
     rows: Sequence[Observation[object]],
+    *,
+    require_winner_metrics: bool = True,
+    minimum_contexts: int = 5,
 ) -> dict[str, object]:
     usable = [
         item
         for item in rows
         if item.successful and len(item.outcome.timings_ms) >= 3
     ]
-    sample_counts = (1, 2, 3, 5, 9, 12, 15, 20)
+    observed_counts = sorted(
+        {len(item.outcome.timings_ms) for item in usable if item.outcome.timings_ms}
+    )
+    sample_counts = tuple(
+        sorted({1, 2, 3, 5, 9, 12, 15, 20, *observed_counts})
+    )
     result = []
     for family in sorted({item.family for item in usable}):
         for sku in sorted({_sku(item) for item in usable if item.family == family}):
             selected = [
                 item for item in usable if item.family == family and _sku(item) == sku
             ]
-            common = [
-                item for item in selected if len(item.outcome.timings_ms) >= 15
-            ]
-            common_20 = [
-                item for item in selected if len(item.outcome.timings_ms) >= 20
-            ]
-            for cohort, cohort_rows in (
-                ("available", selected),
-                ("common_15", common),
-                ("common_20", common_20),
-            ):
+            cohort_thresholds = sorted(
+                {len(item.outcome.timings_ms) for item in selected}
+            )
+            cohorts = [("available", selected)]
+            cohorts.extend(
+                (
+                    f"common_{threshold}",
+                    [
+                        item
+                        for item in selected
+                        if len(item.outcome.timings_ms) >= threshold
+                    ],
+                )
+                for threshold in cohort_thresholds
+            )
+            for cohort, cohort_rows in cohorts:
                 for count in sample_counts:
                     eligible = [
                         item
@@ -982,7 +996,8 @@ def timing_convergence_analysis(
                             "cohort": cohort,
                             "samples": count,
                             "rows": len(eligible),
-                            "contexts": len(regrets),
+                            "contexts": len(by_context),
+                            "winner_contexts": len(regrets),
                             "median_absolute_relative_error": float(np.median(errors)),
                             "p90_absolute_relative_error": float(
                                 np.quantile(errors, 0.9)
@@ -1003,33 +1018,44 @@ def timing_convergence_analysis(
         for sku in sorted(
             {item["sku"] for item in result if item["family"] == family}
         ):
-            preferred_cohort = (
-                "common_20"
-                if any(
-                    item["family"] == family
-                    and item["sku"] == sku
-                    and item["cohort"] == "common_20"
-                    and int(item["contexts"]) >= 5
+            fixed_cohorts = sorted(
+                {
+                    str(item["cohort"])
                     for item in result
-                )
-                else "common_15"
+                    if item["family"] == family
+                    and item["sku"] == sku
+                    and str(item["cohort"]).startswith("common_")
+                    and int(item["contexts"]) >= minimum_contexts
+                },
+                key=lambda value: int(value.removeprefix("common_")),
             )
+            if not fixed_cohorts:
+                continue
+            preferred_cohort = fixed_cohorts[-1]
+            reference_samples = int(preferred_cohort.removeprefix("common_"))
             candidates = [
                 item
                 for item in result
                 if item["family"] == family
                 and item["sku"] == sku
                 and item["cohort"] == preferred_cohort
-                and item["samples"] in (3, 5, 9, 15, 20)
+                # The full cohort median is the reference, not a candidate
+                # policy: admitting it would qualify tautologically.
+                and 3 <= int(item["samples"]) < reference_samples
             ]
             qualified = [
                 item
                 for item in candidates
                 if float(item["p90_absolute_relative_error"]) <= 0.01
-                and item["winner_p90_regret"] is not None
-                and float(item["winner_p90_regret"]) <= 0.02
-                and item["winner_within_2pct"] is not None
-                and float(item["winner_within_2pct"]) >= 0.95
+                and (
+                    not require_winner_metrics
+                    or (
+                        item["winner_p90_regret"] is not None
+                        and float(item["winner_p90_regret"]) <= 0.02
+                        and item["winner_within_2pct"] is not None
+                        and float(item["winner_within_2pct"]) >= 0.95
+                    )
+                )
             ]
             selected = (
                 min(qualified, key=lambda item: int(item["samples"]))
@@ -1046,23 +1072,75 @@ def timing_convergence_analysis(
                         "family": family,
                         "sku": sku,
                         "samples": selected["samples"],
+                        "reference_samples": reference_samples,
                         "cohort": preferred_cohort,
                         "qualified": selected in qualified,
                         "criteria": {
                             "p90_median_error_max": 0.01,
-                            "p90_winner_regret_max": 0.02,
-                            "winner_within_2pct_min": 0.95,
+                            "p90_winner_regret_max": (
+                                0.02 if require_winner_metrics else None
+                            ),
+                            "winner_within_2pct_min": (
+                                0.95 if require_winner_metrics else None
+                            ),
                         },
                     }
                 )
     return {
         "rows_with_raw_timings": len(usable),
+        "selection_metrics_required": require_winner_metrics,
         "sample_count_distribution": dict(
             Counter(len(item.outcome.timings_ms) for item in usable)
         ),
         "convergence": result,
         "screening_recommendations": recommendations,
     }
+
+
+def _verification_timing_observations(
+    paths: Sequence[Path | str],
+) -> list[Observation[dict[str, object]]]:
+    """Load high-resolution confirmation rows without feeding them to models."""
+
+    rows: list[Observation[dict[str, object]]] = []
+    for source, record in _iter_jsonl(paths, "verification.jsonl"):
+        if (
+            record.get("record_type") != "verification_measurement"
+            or record.get("stage") != "confirm"
+        ):
+            continue
+        try:
+            raw_outcome = dict(record["outcome"])
+            summary = raw_outcome.get("summary_ms", {})
+            if raw_outcome.get("median_ms") is None and isinstance(
+                summary, Mapping
+            ):
+                raw_outcome["median_ms"] = summary.get("median")
+            outcome = TrialOutcome.from_dict(raw_outcome)
+            config = dict(record["config"])
+            observation_key = str(record["observation_key"])
+            rows.append(
+                Observation(
+                    observation_id=f"verification:{source}:{observation_key}",
+                    session_id="verification",
+                    sequence=0,
+                    context_id=str(record["context_id"]),
+                    family=str(record["family"]),
+                    kernel_revision=int(record["kernel_revision"]),
+                    config_id=str(record["config_id"]),
+                    config=config,
+                    serialized_config=config,
+                    features=portable_features(dict(record["features"])),
+                    strategy="verification",
+                    outcome=outcome,
+                    started_at=str(record.get("recorded_at", "")),
+                    finished_at=str(record.get("recorded_at", "")),
+                    elapsed_s=float(raw_outcome.get("elapsed_s", 0.0)),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return rows
 
 
 def _markdown(report: Mapping[str, object]) -> str:
@@ -1151,14 +1229,20 @@ def _markdown(report: Mapping[str, object]) -> str:
             "",
             "## Timing convergence",
             "",
-            "The `common_15` and `common_20` cohorts hold the candidate population fixed, avoiding the selection bias caused by comparing configurations which happened to receive different sample counts.",
+            "Each `common_N` cohort holds fixed the configurations with at least N raw timing samples. This avoids comparing prefixes over a candidate population that changes with sample count.",
             "",
             "| Family | SKU | Samples | P90 median error | P90 winner regret | Within 2% |",
             "|---|---|---:|---:|---:|---:|",
         ]
     )
+    recommended_cohorts = {
+        (item["family"], item["sku"]): item["cohort"]
+        for item in timing["screening_recommendations"]
+    }
     for item in timing["convergence"]:
-        if item["cohort"] != "common_15" or item["samples"] not in (1, 3, 5, 9, 15):
+        if item["cohort"] != recommended_cohorts.get(
+            (item["family"], item["sku"])
+        ):
             continue
         regret = item["winner_p90_regret"]
         within = item["winner_within_2pct"]
@@ -1174,7 +1258,21 @@ def _markdown(report: Mapping[str, object]) -> str:
     )
     for item in timing["screening_recommendations"]:
         lines.append(
-            f"- `{item['family']}` / `{item['sku']}`: {item['samples']} samples on `{item['cohort']}` ({'qualified' if item['qualified'] else 'no tested count met every threshold'})."
+            f"- `{item['family']}` / `{item['sku']}`: {item['samples']} samples against a {item['reference_samples']}-sample reference on `{item['cohort']}` ({'qualified' if item['qualified'] else 'no tested count met every threshold'})."
+        )
+    confirmation = report["confirmation_timing_convergence"]
+    lines.extend(
+        [
+            "",
+            "### Promoted-candidate confirmation",
+            "",
+            "Confirmation rows contain one promoted candidate per context, so they estimate median stability against the higher-resolution timing reference; they cannot estimate winner-selection regret by themselves.",
+            "",
+        ]
+    )
+    for item in confirmation["screening_recommendations"]:
+        lines.append(
+            f"- `{item['family']}` / `{item['sku']}`: {item['samples']} samples against a {item['reference_samples']}-sample reference ({'qualified' if item['qualified'] else 'p90 median error remains above 1%'})."
         )
     lines.extend(
         [
@@ -1212,6 +1310,7 @@ def build_evidence_study(
         seed=seed,
         n_estimators=pairwise_estimators,
     )
+    verification_rows = _verification_timing_observations(paths)
     report: dict[str, object] = {
         "schema_version": 1,
         "type": "rtx_autotuning_evidence_study",
@@ -1226,7 +1325,15 @@ def build_evidence_study(
         ),
         "failures": failure_analysis(rows, minimum_support=minimum_pairs),
         "strategy_efficiency": strategy_efficiency_analysis(rows),
-        "timing_convergence": timing_convergence_analysis(rows),
+        "timing_convergence": timing_convergence_analysis(
+            rows,
+            minimum_contexts=minimum_contexts,
+        ),
+        "confirmation_timing_convergence": timing_convergence_analysis(
+            verification_rows,
+            require_winner_metrics=False,
+            minimum_contexts=minimum_contexts,
+        ),
     }
     (destination / "evidence.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"

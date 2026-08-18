@@ -239,7 +239,11 @@ This emits `evidence.json` and `evidence.md` containing exact parent→child
 transition effects, portable and exact-SKU pairwise models evaluated with
 complete M/N/K groups held out, fixed-trial and wall-clock catalogue replay,
 schedule-archetype/bottleneck associations, typed failure enrichment, and raw
-timing-sample convergence. Pairwise heads have an independent deployment gate:
+timing-sample convergence. Timing convergence uses dynamic `common_N` cohorts
+matched to the sample counts actually present in a campaign, and reports
+promoted-candidate verification separately from screening observations so a
+high-resolution confirmation median is never mistaken for winner-selection
+evidence. Pairwise heads have an independent deployment gate:
 classification AUC alone is never sufficient when p90 search regret fails to
 beat matched random search.
 
