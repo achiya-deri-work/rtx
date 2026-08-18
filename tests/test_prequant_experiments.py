@@ -19,12 +19,14 @@ from rtx.prequant_experiments import (
     ShapeSpec,
     _reference_prequant_config,
     config_in_shard,
+    collect_stable_timing_samples,
     collect_timing_samples,
     derived_features,
     export_journal_csv,
     generate_legal_catalog,
     merge_journals,
     robust_summary,
+    stabilize_timing_batches,
 )
 from rtx.prequant_autotune import prequant_config_id
 
@@ -89,6 +91,34 @@ class PrequantExperimentTests(unittest.TestCase):
         noisy = [1.0, 1.05, 0.95, 1.04, 0.96, 1.03, 0.97]
         self.assertFalse(protocol.race_complete(noisy, noisy))
         self.assertTrue(protocol.race_complete(noisy + [1.02] * 4, noisy + [0.98] * 4))
+
+    def test_nonstationary_timing_attempt_is_retried(self) -> None:
+        protocol = BenchmarkProtocol(
+            samples=5,
+            adaptive_sampling=False,
+            measurement_retries=1,
+            stabilization_target_ms=0.0,
+        )
+        values = [1.0, 1.0, 1.8, 1.8, 1.8, 1.0, 1.001, 0.999, 1.0, 1.0]
+        timings, metadata = collect_stable_timing_samples(
+            lambda index: values[index],
+            protocol,
+            requested_samples=5,
+        )
+        self.assertEqual(metadata["attempt_count"], 2)
+        self.assertEqual(metadata["selected_attempt"], 1)
+        self.assertTrue(metadata["stationary"])
+        self.assertEqual(timings, values[5:])
+
+    def test_calibrated_stabilization_targets_elapsed_gpu_time(self) -> None:
+        protocol = BenchmarkProtocol(
+            stabilization_target_ms=25.0,
+            stabilization_max_batches=4,
+        )
+        metadata = stabilize_timing_batches(lambda _index: 10.0, protocol)
+        self.assertEqual(metadata["batches"], 3)
+        self.assertEqual(metadata["elapsed_ms"], 30.0)
+        self.assertTrue(metadata["target_reached"])
 
     def test_reference_config_supports_64_row_campaign_shapes(self) -> None:
         problem = MXFP8Problem(64, 1536, 1536)

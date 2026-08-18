@@ -122,6 +122,9 @@ class BenchmarkProtocol:
     confirm_samples: int = 11
     race_rounds: int = 11
     target_batch_ms: float = 30.0
+    stabilization_target_ms: float = 50.0
+    stabilization_max_batches: int = 8
+    measurement_retries: int = 1
     adaptive_sampling: bool = True
     screen_min_samples: int = 3
     confirm_min_samples: int = 5
@@ -129,6 +132,10 @@ class BenchmarkProtocol:
     screen_stable_cv: float = 0.005
     confirm_stable_cv: float = 0.0025
     race_stable_cv: float = 0.005
+    screen_max_relative_drift: float = 0.03
+    confirm_max_relative_drift: float = 0.015
+    screen_max_relative_range: float = 0.10
+    confirm_max_relative_range: float = 0.05
     min_calls_per_sample: int = 1
     max_calls_per_sample: int = 4096
     correctness_rtol: float = 5e-2
@@ -159,6 +166,19 @@ class BenchmarkProtocol:
             raise ValueError("adaptive stability thresholds must be nonnegative")
         if self.target_batch_ms <= 0:
             raise ValueError("target_batch_ms must be positive")
+        if self.stabilization_target_ms < 0:
+            raise ValueError("stabilization target must be nonnegative")
+        if self.stabilization_max_batches <= 0:
+            raise ValueError("stabilization batch limit must be positive")
+        if self.measurement_retries < 0:
+            raise ValueError("measurement retries must be nonnegative")
+        if min(
+            self.screen_max_relative_drift,
+            self.confirm_max_relative_drift,
+            self.screen_max_relative_range,
+            self.confirm_max_relative_range,
+        ) < 0:
+            raise ValueError("timing stationarity thresholds must be nonnegative")
         if not 0 <= self.practical_threshold < 1:
             raise ValueError("practical_threshold must be in [0, 1)")
         if self.min_calls_per_sample <= 0:
@@ -197,6 +217,67 @@ class BenchmarkProtocol:
             and len(values) % 2 == 1
             and self.relative_stdev(values) <= threshold
         )
+
+    def timing_quality(
+        self,
+        values: Sequence[float],
+        *,
+        requested_samples: int,
+    ) -> dict[str, object]:
+        """Describe dispersion and within-attempt timing-plateau movement."""
+
+        numeric = [float(value) for value in values]
+        if not numeric:
+            return {
+                "stationary": False,
+                "relative_stdev": math.inf,
+                "relative_mad": math.inf,
+                "relative_range": math.inf,
+                "relative_split_drift": math.inf,
+                "quality_score": math.inf,
+            }
+        center = float(statistics.median(numeric))
+        denominator = max(abs(center), 1.0e-12)
+        relative_stdev = self.relative_stdev(numeric)
+        relative_mad = float(
+            statistics.median(abs(value - center) for value in numeric)
+            / denominator
+        )
+        relative_range = float((max(numeric) - min(numeric)) / denominator)
+        relative_split_drift = 0.0
+        if len(numeric) >= 5:
+            half = len(numeric) // 2
+            early = float(statistics.median(numeric[:half]))
+            late = float(statistics.median(numeric[-half:]))
+            relative_split_drift = abs(early - late) / denominator
+        confirmation = requested_samples > self.samples
+        drift_limit = (
+            self.confirm_max_relative_drift
+            if confirmation
+            else self.screen_max_relative_drift
+        )
+        range_limit = (
+            self.confirm_max_relative_range
+            if confirmation
+            else self.screen_max_relative_range
+        )
+        stationary = (
+            relative_split_drift <= drift_limit
+            and relative_range <= range_limit
+        )
+        return {
+            "stationary": stationary,
+            "relative_stdev": relative_stdev,
+            "relative_mad": relative_mad,
+            "relative_range": relative_range,
+            "relative_split_drift": relative_split_drift,
+            "drift_limit": drift_limit,
+            "range_limit": range_limit,
+            "quality_score": max(
+                relative_split_drift / max(drift_limit, 1.0e-12),
+                relative_range / max(range_limit, 1.0e-12),
+            ),
+        }
 
     def race_complete(
         self,
@@ -277,6 +358,86 @@ def collect_timing_samples(
         if protocol.timing_complete(timings, requested_samples=requested_samples):
             break
     return timings
+
+
+def stabilize_timing_batches(
+    measure_batch: Callable[[int], float],
+    protocol: BenchmarkProtocol,
+) -> dict[str, object]:
+    """Burn calibrated GPU work until the requested stabilization duration."""
+
+    batches: list[float] = []
+    elapsed_ms = 0.0
+    while (
+        len(batches) < protocol.stabilization_max_batches
+        and elapsed_ms < protocol.stabilization_target_ms
+    ):
+        duration_ms = max(0.0, float(measure_batch(len(batches))))
+        batches.append(duration_ms)
+        elapsed_ms += duration_ms
+    return {
+        "target_ms": protocol.stabilization_target_ms,
+        "elapsed_ms": elapsed_ms,
+        "batches": len(batches),
+        "batch_timings_ms": batches,
+        "target_reached": elapsed_ms >= protocol.stabilization_target_ms,
+    }
+
+
+def collect_stable_timing_samples(
+    measure: Callable[[int], float],
+    protocol: BenchmarkProtocol,
+    *,
+    requested_samples: int,
+    stabilize: Callable[[int], Mapping[str, object]] | None = None,
+    telemetry: Callable[[], Mapping[str, object]] | None = None,
+) -> tuple[list[float], dict[str, object]]:
+    """Retry a measurement when samples move between timing plateaus."""
+
+    attempts: list[dict[str, object]] = []
+    for attempt in range(protocol.measurement_retries + 1):
+        stabilization = None if stabilize is None else dict(stabilize(attempt))
+        telemetry_before = None if telemetry is None else dict(telemetry())
+        offset = attempt * requested_samples
+        timings = collect_timing_samples(
+            lambda sample: measure(offset + sample),
+            protocol,
+            requested_samples=requested_samples,
+        )
+        quality = protocol.timing_quality(
+            timings,
+            requested_samples=requested_samples,
+        )
+        telemetry_after = None if telemetry is None else dict(telemetry())
+        attempts.append(
+            {
+                "attempt": attempt,
+                "timings_ms": timings,
+                "quality": quality,
+                "stabilization": stabilization,
+                "telemetry_before": telemetry_before,
+                "telemetry_after": telemetry_after,
+            }
+        )
+        if bool(quality["stationary"]):
+            break
+    selected_index = min(
+        range(len(attempts)),
+        key=lambda index: (
+            not bool(attempts[index]["quality"]["stationary"]),  # type: ignore[index]
+            float(attempts[index]["quality"]["quality_score"]),  # type: ignore[index]
+            index,
+        ),
+    )
+    selected = attempts[selected_index]
+    return list(selected["timings_ms"]), {  # type: ignore[arg-type]
+        "attempts": attempts,
+        "attempt_count": len(attempts),
+        "retry_count": len(attempts) - 1,
+        "selected_attempt": selected_index,
+        "stationary": bool(selected["quality"]["stationary"]),  # type: ignore[index]
+        "quality": selected["quality"],
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1024,10 +1185,27 @@ class PrequantBenchmarkHarness:
             prepared.runner(x, weight, prepared.out)
         torch.cuda.synchronize(self.device)
         calls, pilot_ms = self.calibrate_calls(prepared)
-        timings = collect_timing_samples(
+        timings, collection = collect_stable_timing_samples(
             lambda sample: self._time_batch(prepared, calls, sample * calls),
             self.protocol,
             requested_samples=samples,
+            stabilize=lambda attempt: stabilize_timing_batches(
+                lambda batch: self._time_batch(
+                    prepared,
+                    calls,
+                    -((attempt + 1) * self.protocol.stabilization_max_batches + batch)
+                    * calls,
+                )
+                * calls,
+                self.protocol,
+            ),
+            telemetry=(
+                lambda: _nvidia_smi_snapshot(
+                    self.device.index or torch.cuda.current_device()
+                )
+            )
+            if self.protocol.telemetry
+            else None,
         )
         telemetry_after = (
             _nvidia_smi_snapshot(self.device.index or torch.cuda.current_device())
@@ -1051,9 +1229,12 @@ class PrequantBenchmarkHarness:
             "pilot_ms_per_call": pilot_ms,
             "rotation_buffers": len(self._inputs),
             "timings_ms": timings,
-            "sampling": self.protocol.sampling_metadata(
-                timings, requested_samples=samples
-            ),
+            "sampling": {
+                **self.protocol.sampling_metadata(
+                    timings, requested_samples=samples
+                ),
+                "collection": collection,
+            },
             "summary_ms": summary.as_dict(),
             "components": component_results,
             "elapsed_s": time.monotonic() - started,
@@ -1075,6 +1256,13 @@ class PrequantBenchmarkHarness:
             return {"status": "prepare_error", "error": f"{type(exc).__name__}: {exc}"[:4000]}
         calls_a, _pilot_a = self.calibrate_calls(a)
         calls_b, _pilot_b = self.calibrate_calls(b)
+        stabilization = stabilize_timing_batches(
+            lambda batch: (
+                self._time_batch(a, calls_a, -(batch + 1) * calls_a) * calls_a
+                + self._time_batch(b, calls_b, -(batch + 1) * calls_b) * calls_b
+            ),
+            self.protocol,
+        )
         a_times: list[float] = []
         b_times: list[float] = []
         for round_index in range(self.protocol.race_rounds):
@@ -1112,6 +1300,7 @@ class PrequantBenchmarkHarness:
             "challenger_calls_per_sample": calls_b,
             "rotation_buffers": len(self._inputs),
             "sampling": self.protocol.race_sampling_metadata(a_times, b_times),
+            "stabilization": stabilization,
         }
 
 
@@ -1860,6 +2049,8 @@ __all__ = [
     "RobustSummary",
     "ShapeSpec",
     "config_in_shard",
+    "collect_stable_timing_samples",
+    "collect_timing_samples",
     "analyze_observations",
     "derived_features",
     "export_journal_csv",
@@ -1868,6 +2059,7 @@ __all__ = [
     "merge_journals",
     "probe_device",
     "robust_summary",
+    "stabilize_timing_batches",
 ]
 
 

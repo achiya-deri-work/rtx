@@ -8,7 +8,7 @@ kept paired, and model evaluation holds out complete shape groups.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -675,6 +675,81 @@ def save_deployable_pairwise_models(
         encoding="utf-8",
     )
     return artifact
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedPairwiseFamily:
+    artifact_id: str
+    family: str
+    kernel_revision: int
+    scope: str
+    model: PairwisePreferenceModel
+    deployment_gate: Mapping[str, object]
+
+
+def load_pairwise_family(
+    artifact: Path | str,
+    family: str,
+    kernel_revision: int,
+    *,
+    device_family: str | None = None,
+) -> LoadedPairwiseFamily:
+    """Load an integrity-checked exact-SKU or portable deployed pairwise head."""
+
+    root = Path(artifact).expanduser()
+    manifest_path = root / "pairwise_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("type") != "rtx_pairwise_preference_bundle"
+    ):
+        raise ValueError("unsupported pairwise preference artifact")
+    models = manifest.get("models")
+    if not isinstance(models, Mapping):
+        raise ValueError("pairwise preference artifact has no model catalog")
+    base = f"{family}@{kernel_revision}"
+    scopes = (
+        (f"device-{device_family}", "portable")
+        if device_family is not None
+        else ("portable",)
+    )
+    entry = None
+    selected_scope = None
+    disabled_scopes: list[str] = []
+    for scope in scopes:
+        candidate = models.get(f"{base}:{scope}")
+        if isinstance(candidate, Mapping):
+            gate = candidate.get("deployment_gate", {})
+            if isinstance(gate, Mapping) and bool(gate.get("enabled", False)):
+                entry = candidate
+                selected_scope = scope
+                break
+            disabled_scopes.append(scope)
+    if entry is None or selected_scope is None:
+        if disabled_scopes:
+            raise KeyError(
+                f"pairwise artifact has no deployment-enabled model for {base}; "
+                f"disabled scopes: {', '.join(disabled_scopes)}"
+            )
+        raise KeyError(f"pairwise artifact has no deployed model for {base}")
+    gate = entry.get("deployment_gate", {})
+    assert isinstance(gate, Mapping)
+    relative = Path(str(entry["model"]))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("pairwise artifact model path escapes its root")
+    model_path = root / relative
+    expected = str(entry["sha256"])
+    actual = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    if actual != expected:
+        raise RuntimeError("pairwise artifact model failed integrity check")
+    return LoadedPairwiseFamily(
+        artifact_id=str(manifest["artifact_id"]),
+        family=family,
+        kernel_revision=kernel_revision,
+        scope=selected_scope,
+        model=PairwisePreferenceModel.load(model_path),
+        deployment_gate=dict(gate),
+    )
 
 
 def _feature_value(item: Observation[object], suffix: str, default: float = 0.0) -> float:
@@ -1348,6 +1423,8 @@ __all__ = [
     "build_evidence_study",
     "failure_analysis",
     "PairwisePreferenceModel",
+    "LoadedPairwiseFamily",
+    "load_pairwise_family",
     "pair_features",
     "pairwise_shape_heldout_study",
     "parent_move_analysis",

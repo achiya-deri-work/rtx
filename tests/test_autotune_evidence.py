@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ from rtx.autotune.evidence import (
     failure_analysis,
     parent_move_analysis,
     timing_convergence_analysis,
+    load_pairwise_family,
 )
 from rtx.autotune.outcomes import TrialOutcome
 
@@ -143,7 +145,78 @@ class AutotuneEvidenceTests(unittest.TestCase):
             actual, _ = PairwisePreferenceModel.load(path).predict(
                 [left], [right]
             )
-        self.assertAlmostEqual(float(expected[0]), float(actual[0]))
+            self.assertAlmostEqual(float(expected[0]), float(actual[0]))
+
+    def test_pairwise_bundle_prefers_exact_sku_and_checks_integrity(self) -> None:
+        rows = self._rows()
+        model = PairwisePreferenceModel()
+        model.fit(rows)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model_root = root / "models"
+            model_root.mkdir()
+            portable = model_root / "toy-r1-portable.json"
+            exact = model_root / "toy-r1-device-small.json"
+            model.save(portable)
+            model.save(exact)
+            entries = {}
+            for scope, path in (("portable", portable), ("device-small", exact)):
+                entries[f"toy_kernel@1:{scope}"] = {
+                    "model": str(path.relative_to(root)),
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "deployment_gate": {"enabled": True},
+                }
+            (root / "pairwise_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "type": "rtx_pairwise_preference_bundle",
+                        "artifact_id": "test-artifact",
+                        "models": entries,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = load_pairwise_family(
+                root,
+                "toy_kernel",
+                1,
+                device_family="small",
+            )
+            self.assertEqual(loaded.scope, "device-small")
+            exact.write_text("{}", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                load_pairwise_family(
+                    root,
+                    "toy_kernel",
+                    1,
+                    device_family="small",
+                )
+            model.save(exact)
+            entries["toy_kernel@1:device-small"]["sha256"] = hashlib.sha256(
+                exact.read_bytes()
+            ).hexdigest()
+            entries["toy_kernel@1:device-small"]["deployment_gate"] = {
+                "enabled": False
+            }
+            (root / "pairwise_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "type": "rtx_pairwise_preference_bundle",
+                        "artifact_id": "test-artifact",
+                        "models": entries,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fallback = load_pairwise_family(
+                root,
+                "toy_kernel",
+                1,
+                device_family="small",
+            )
+            self.assertEqual(fallback.scope, "portable")
 
     def test_end_to_end_evidence_report(self) -> None:
         rows = self._rows()

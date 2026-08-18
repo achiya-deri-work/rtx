@@ -9,6 +9,7 @@ from .bandit import AdaptiveBanditScheduler
 from .ask_tell import DurableLocalAskTellRunner
 from .core import ConfigT, KernelAdapter, TuningBudget
 from .cost_model import GradientBoostedCostModel, GradientBoostedFeasibilityModel
+from .evidence import load_pairwise_family
 from .orchestrator import (
     AutotuneOrchestrator,
     ConfirmationPolicy,
@@ -20,6 +21,7 @@ from .strategies import (
     CoordinateLocalSearch,
     CostModelGuidedSearch,
     CostModelLocalSearch,
+    PairwiseModelGuidedSearch,
     RandomSearch,
     SharedModelFitState,
 )
@@ -68,6 +70,12 @@ class HybridTuningPolicy:
     use_pretrained: bool = True
     pretrained_warmup_trials: int = 4
     pretrained_rule_weight: float = 0.15
+    pairwise_artifact: str | None = None
+    use_pairwise: bool = True
+    pairwise_trials: int = 8
+    pairwise_pool_size: int = 1024
+    pairwise_exploration: float = 0.1
+    bandit_pairwise_bootstrap: int = 2
     # Runtime harness controls. Dataset campaigns may leave these at their
     # high-confidence defaults; balanced first-hit policies reduce them while
     # retaining a confirmed final winner.
@@ -173,6 +181,23 @@ def make_hybrid_autotuner(
         "latency",
         "ranking",
     }
+    pairwise = None
+    if policy.use_pairwise and policy.pairwise_artifact is not None:
+        sku = adapter.context.device.get("sku", {})
+        device_family = (
+            str(sku.get("sku_family"))
+            if isinstance(sku, Mapping) and sku.get("sku_family") is not None
+            else None
+        )
+        try:
+            pairwise = load_pairwise_family(
+                policy.pairwise_artifact,
+                adapter.context.family,
+                adapter.context.kernel_revision,
+                device_family=device_family,
+            )
+        except KeyError:
+            pairwise = None
     if pretrained_model_active:
         cost_model = (
             pretrained.ranking_model
@@ -257,29 +282,58 @@ def make_hybrid_autotuner(
         feasibility_exploration=policy.feasibility_exploration,
         minimum_optimistic_feasibility=policy.minimum_optimistic_feasibility,
     )
+    pairwise_search = (
+        None
+        if pairwise is None
+        else PairwiseModelGuidedSearch[ConfigT](
+            pairwise.model,
+            pool_size=policy.pairwise_pool_size,
+            exploration=policy.pairwise_exploration,
+            model_provenance={
+                "artifact_id": pairwise.artifact_id,
+                "family": pairwise.family,
+                "kernel_revision": pairwise.kernel_revision,
+                "scope": pairwise.scope,
+                "deployment_gate": dict(pairwise.deployment_gate),
+            },
+        )
+    )
     if policy.orchestration == "sequential":
-        strategies = [learned, local]
+        strategies = (
+            [learned, local]
+            if pairwise_search is None
+            else [pairwise_search, learned, local]
+        )
+        stages = []
+        if pairwise_search is not None:
+            stages.append((pairwise_search.name, policy.pairwise_trials))
+        stages.extend(((learned.name, policy.cost_model_trials), (local.name, None)))
         scheduler = SequentialScheduler(
-            ((learned.name, policy.cost_model_trials), (local.name, None))
+            tuple(stages)
         )
     else:
         coordinate = CoordinateLocalSearch[ConfigT](
             beam_width=policy.local_beam_width
         )
         strategies = [random_search, coordinate, learned, local]
+        if pairwise_search is not None:
+            strategies.append(pairwise_search)
+        minimum_pulls = {
+            coordinate.name: policy.bandit_coordinate_bootstrap,
+            learned.name: policy.bandit_learned_bootstrap,
+            local.name: policy.bandit_model_local_bootstrap,
+        }
+        if pairwise_search is not None:
+            minimum_pulls[pairwise_search.name] = policy.bandit_pairwise_bootstrap
         scheduler = AdaptiveBanditScheduler(
             exploration=policy.bandit_exploration,
             warmup_trials=(
                 policy.model_warmup
-                if not pretrained_model_active
+                if not (pretrained_model_active or pairwise_search is not None)
                 else policy.pretrained_warmup_trials
             ),
             warmup_arm=random_search.name,
-            minimum_pulls={
-                coordinate.name: policy.bandit_coordinate_bootstrap,
-                learned.name: policy.bandit_learned_bootstrap,
-                local.name: policy.bandit_model_local_bootstrap,
-            },
+            minimum_pulls=minimum_pulls,
         )
     return AutotuneOrchestrator(
         adapter,

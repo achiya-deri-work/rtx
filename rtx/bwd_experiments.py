@@ -17,8 +17,9 @@ from .prequant_experiments import (
     CacheRegime,
     ShapeSpec,
     _nvidia_smi_snapshot,
-    collect_timing_samples,
+    collect_stable_timing_samples,
     robust_summary,
+    stabilize_timing_batches,
 )
 
 
@@ -327,10 +328,27 @@ class BwdBenchmarkHarness:
             )
         torch.cuda.synchronize(self.device)
         calls, pilot_ms = self.calibrate_calls(prepared)
-        timings = collect_timing_samples(
+        timings, collection = collect_stable_timing_samples(
             lambda sample: self._time_batch(prepared, calls, sample * calls),
             self.protocol,
             requested_samples=samples,
+            stabilize=lambda attempt: stabilize_timing_batches(
+                lambda batch: self._time_batch(
+                    prepared,
+                    calls,
+                    -((attempt + 1) * self.protocol.stabilization_max_batches + batch)
+                    * calls,
+                )
+                * calls,
+                self.protocol,
+            ),
+            telemetry=(
+                lambda: _nvidia_smi_snapshot(
+                    self.device.index or torch.cuda.current_device()
+                )
+            )
+            if self.protocol.telemetry
+            else None,
         )
         telemetry_after = (
             _nvidia_smi_snapshot(self.device.index or torch.cuda.current_device())
@@ -347,9 +365,12 @@ class BwdBenchmarkHarness:
             "pilot_ms_per_call": pilot_ms,
             "rotation_buffers": len(self._inputs),
             "timings_ms": timings,
-            "sampling": self.protocol.sampling_metadata(
-                timings, requested_samples=samples
-            ),
+            "sampling": {
+                **self.protocol.sampling_metadata(
+                    timings, requested_samples=samples
+                ),
+                "collection": collection,
+            },
             "summary_ms": robust_summary(
                 timings,
                 seed=seed,
@@ -397,6 +418,13 @@ class BwdBenchmarkHarness:
             )
         calls_a, _ = self.calibrate_calls(a)
         calls_b, _ = self.calibrate_calls(b)
+        stabilization = stabilize_timing_batches(
+            lambda batch: (
+                self._time_batch(a, calls_a, -(batch + 1) * calls_a) * calls_a
+                + self._time_batch(b, calls_b, -(batch + 1) * calls_b) * calls_b
+            ),
+            self.protocol,
+        )
         a_times: list[float] = []
         b_times: list[float] = []
         for round_index in range(self.protocol.race_rounds):
@@ -437,6 +465,7 @@ class BwdBenchmarkHarness:
             "challenger_calls_per_sample": calls_b,
             "rotation_buffers": len(self._inputs),
             "sampling": self.protocol.race_sampling_metadata(a_times, b_times),
+            "stabilization": stabilization,
         }
 
 

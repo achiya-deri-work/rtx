@@ -5,8 +5,11 @@ import json
 from pathlib import Path
 import random
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
+
+import numpy as np
 
 from rtx.autotune import (
     AdaptiveBanditScheduler,
@@ -23,6 +26,7 @@ from rtx.autotune import (
     KernelContext,
     HybridTuningPolicy,
     RandomSearch,
+    PairwiseModelGuidedSearch,
     RuntimeWinnerKey,
     SearchHistory,
     SharedModelFitState,
@@ -262,6 +266,74 @@ class ComposableAutotuneTests(unittest.TestCase):
         )
         self.assertEqual(adapter.calls, 2)
         self.assertEqual(proposals[0].config, _ToyConfig(1, 1))
+
+    def test_pairwise_strategy_ranks_candidates_against_incumbent(self) -> None:
+        class PreferLargeX:
+            def predict(self, left, right):
+                del right
+                probability = np.asarray(
+                    [0.1 + 0.15 * row["config.x"] for row in left]
+                )
+                return probability, np.zeros_like(probability)
+
+        adapter = _toy_adapter()
+        seen = evaluate_proposal(
+            adapter,
+            Proposal(adapter.initial_config, "initial"),
+            session_id="seed",
+            sequence=0,
+        )
+        proposals = PairwiseModelGuidedSearch(
+            PreferLargeX(),
+            pool_size=128,
+        ).propose(
+            adapter,
+            SearchHistory([seen], adapter.context.identifier),
+            random.Random(7),
+            1,
+        )
+        self.assertEqual(proposals[0].config.x, 4)
+        self.assertEqual(proposals[0].strategy, "pairwise_pretrained")
+        self.assertIn(
+            "predicted_probability_beats_incumbent",
+            proposals[0].metadata,
+        )
+
+    def test_hybrid_recipe_adds_only_a_deployed_pairwise_arm(self) -> None:
+        class NeutralPairwise:
+            def predict(self, left, right):
+                del right
+                values = np.full(len(left), 0.5)
+                return values, np.zeros_like(values)
+
+        loaded = SimpleNamespace(
+            artifact_id="pairwise-test",
+            family="toy",
+            kernel_revision=1,
+            scope="portable",
+            model=NeutralPairwise(),
+            deployment_gate={"enabled": True},
+        )
+        with mock.patch(
+            "rtx.autotune.recipes.load_pairwise_family",
+            return_value=loaded,
+        ):
+            tuner = make_hybrid_autotuner(
+                _toy_adapter(),
+                InMemoryTuningStore(),
+                HybridTuningPolicy(
+                    orchestration="bandit",
+                    max_trials=8,
+                    pairwise_artifact="unused-in-test",
+                    use_pretrained=False,
+                ),
+            )
+        self.assertIn("pairwise_pretrained", tuner.strategies)
+        pairwise = tuner.strategies["pairwise_pretrained"]
+        self.assertEqual(
+            pairwise.model_provenance["artifact_id"],
+            "pairwise-test",
+        )
 
     def test_adaptive_bandit_replays_state_across_resume(self) -> None:
         adapter = _toy_adapter()

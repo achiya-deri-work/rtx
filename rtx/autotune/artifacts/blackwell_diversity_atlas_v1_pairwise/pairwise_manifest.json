@@ -1,0 +1,82 @@
+{
+  "artifact_id": "50ec39fa9ad2f99c765c4a4c",
+  "models": {
+    "mxfp8_fused_fwd@22:device-geforce_rtx_5070_laptop": {
+      "deployment_gate": {
+        "budget": 8,
+        "enabled": true,
+        "passed_folds": 3,
+        "required_folds": 3
+      },
+      "family": "mxfp8_fused_fwd",
+      "kernel_revision": 22,
+      "model": "models/mxfp8_fused_fwd-r22-device-geforce_rtx_5070_laptop.json",
+      "pairs": 1238,
+      "rows": 1643,
+      "scope": "device-geforce_rtx_5070_laptop",
+      "sha256": "dfab4ca88ee50f7ce25425b9d475454191e557bd556d58de360e6cc15619fa60"
+    },
+    "mxfp8_fused_fwd@22:device-geforce_rtx_5070_ti": {
+      "deployment_gate": {
+        "budget": 8,
+        "enabled": true,
+        "passed_folds": 4,
+        "required_folds": 3
+      },
+      "family": "mxfp8_fused_fwd",
+      "kernel_revision": 22,
+      "model": "models/mxfp8_fused_fwd-r22-device-geforce_rtx_5070_ti.json",
+      "pairs": 2044,
+      "rows": 2879,
+      "scope": "device-geforce_rtx_5070_ti",
+      "sha256": "d8cd73354126a9dee7f01882aceacd96440591e1dc3e748e31648582b327faf4"
+    },
+    "mxfp8_fused_fwd@22:portable": {
+      "deployment_gate": {
+        "budget": 8,
+        "enabled": true,
+        "passed_folds": 4,
+        "required_folds": 3
+      },
+      "family": "mxfp8_fused_fwd",
+      "kernel_revision": 22,
+      "model": "models/mxfp8_fused_fwd-r22-portable.json",
+      "pairs": 3282,
+      "rows": 4522,
+      "scope": "portable",
+      "sha256": "fd9e99b03cb1421a155e69904e5101c636a15dc15aa0f4212198c1c5f73e3bf9"
+    },
+    "nvfp4_delayed_fwd@2:device-geforce_rtx_5070_ti": {
+      "deployment_gate": {
+        "budget": 8,
+        "enabled": true,
+        "passed_folds": 3,
+        "required_folds": 3
+      },
+      "family": "nvfp4_delayed_fwd",
+      "kernel_revision": 2,
+      "model": "models/nvfp4_delayed_fwd-r2-device-geforce_rtx_5070_ti.json",
+      "pairs": 2090,
+      "rows": 2828,
+      "scope": "device-geforce_rtx_5070_ti",
+      "sha256": "786d5cfbaf2df266385a6c82662315fc3c05a48179fd2b5866634d94a299622f"
+    },
+    "nvfp4_delayed_fwd@2:portable": {
+      "deployment_gate": {
+        "budget": 8,
+        "enabled": true,
+        "passed_folds": 3,
+        "required_folds": 3
+      },
+      "family": "nvfp4_delayed_fwd",
+      "kernel_revision": 2,
+      "model": "models/nvfp4_delayed_fwd-r2-portable.json",
+      "pairs": 3568,
+      "rows": 4476,
+      "scope": "portable",
+      "sha256": "da451153138e0b9e16dfceba11de0c896cc07e03041904c16e1a52992127b79b"
+    }
+  },
+  "schema_version": 1,
+  "type": "rtx_pairwise_preference_bundle"
+}

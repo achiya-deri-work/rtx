@@ -9,6 +9,7 @@ an offline campaign.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from dataclasses import replace
 
 from .legacy import CoordinateDescentPolicy
@@ -21,6 +22,21 @@ def _seconds() -> float:
 
 def _trials() -> int:
     return int(os.getenv("RTX_BALANCED_AUTOTUNE_TRIALS", "24"))
+
+
+def _pairwise_artifact() -> str | None:
+    configured = os.getenv("RTX_AUTOTUNE_PAIRWISE_ARTIFACT")
+    if configured is not None:
+        return (
+            None
+            if configured.lower() in {"", "0", "false", "none", "off"}
+            else configured
+        )
+    bundled = (
+        Path(__file__).with_name("artifacts")
+        / "blackwell_diversity_atlas_v1_pairwise"
+    )
+    return str(bundled) if (bundled / "pairwise_manifest.json").is_file() else None
 
 
 def balanced_coordinate_policy(
@@ -81,6 +97,7 @@ def balanced_hybrid_policy() -> HybridTuningPolicy:
         confirm_initial=True,
         seed=int(os.getenv("RTX_BALANCED_AUTOTUNE_SEED", "20260817")),
         pretrained_artifact=os.getenv("RTX_AUTOTUNE_PRETRAINED_ARTIFACT") or None,
+        pairwise_artifact=_pairwise_artifact(),
         warmup=int(os.getenv("RTX_BALANCED_AUTOTUNE_WARMUP", "3")),
         samples=int(os.getenv("RTX_BALANCED_AUTOTUNE_SAMPLES", "5")),
         calls_per_sample=int(

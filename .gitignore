@@ -10,10 +10,7 @@ build/
 dist/
 *.egg-info/
 autotune_datasets/
-autotune_datasets*.zip
-*autotuner*dataset*.zip
-*autotuner*prospective*.zip
-blackwell_release_candidate*.zip
+*.zip
 autotune_models/
 autotune_reports/
 training_data/

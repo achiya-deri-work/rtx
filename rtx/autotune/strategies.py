@@ -29,6 +29,14 @@ class SearchStrategy(Protocol, Generic[ConfigT]):
     def observe(self, observation: Observation[ConfigT]) -> None: ...
 
 
+class PairwisePredictor(Protocol):
+    def predict(
+        self,
+        left: Sequence[Mapping[str, float]],
+        right: Sequence[Mapping[str, float]],
+    ) -> tuple[np.ndarray, np.ndarray]: ...
+
+
 @dataclass(slots=True)
 class SharedModelFitState:
     """One fit clock shared by every strategy consuming the same models."""
@@ -174,6 +182,96 @@ class CoordinateLocalSearch(Generic[ConfigT]):
 
     def observe(self, observation: Observation[ConfigT]) -> None:
         return None
+
+
+@dataclass(slots=True)
+class PairwiseModelGuidedSearch(Generic[ConfigT]):
+    """Rank a fresh legal pool by probability of beating the incumbent."""
+
+    model: PairwisePredictor
+    pool_size: int = 1024
+    exploration: float = 0.1
+    model_provenance: Mapping[str, object] | None = None
+    name: str = "pairwise_pretrained"
+    _queue: list[Proposal[ConfigT]] = field(default_factory=list, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.pool_size <= 0 or self.exploration < 0:
+            raise ValueError("invalid pairwise search policy")
+
+    def propose(
+        self,
+        adapter: KernelAdapter[ConfigT],
+        history: SearchHistory[ConfigT],
+        rng: random.Random,
+        limit: int,
+    ) -> list[Proposal[ConfigT]]:
+        selected: list[Proposal[ConfigT]] = []
+        while self._queue and len(selected) < limit:
+            proposal = self._queue.pop(0)
+            if adapter.config_id(proposal.config) not in history.seen_ids:
+                selected.append(proposal)
+        if len(selected) >= limit:
+            return selected
+        incumbent = history.best
+        reference = (
+            adapter.initial_config if incumbent is None else incumbent.config
+        )
+        seeds = [
+            item.config
+            for item in sorted(history.successful, key=lambda item: item.score)[:8]
+        ]
+        candidates: dict[str, ConfigT] = {}
+        for candidate in adapter.sample(rng, self.pool_size, seeds):
+            config_id = adapter.config_id(candidate)
+            if (
+                config_id in history.seen_ids
+                or config_id in candidates
+                or adapter.rejection(candidate) is not None
+            ):
+                continue
+            candidates[config_id] = candidate
+        if not candidates:
+            return selected
+        configs = list(candidates.values())
+        feature_rows = [adapter.features(config) for config in configs]
+        reference_features = adapter.features(reference)
+        probability, uncertainty = self.model.predict(
+            feature_rows,
+            [reference_features] * len(feature_rows),
+        )
+        acquisition = probability + self.exploration * uncertainty
+        order = sorted(
+            range(len(configs)),
+            key=lambda index: float(acquisition[index]),
+            reverse=True,
+        )
+        for rank, index in enumerate(order[: max(64, limit * 8)]):
+            metadata: dict[str, object] = {
+                "predicted_probability_beats_incumbent": float(probability[index]),
+                "predicted_pairwise_uncertainty": float(uncertainty[index]),
+                "pairwise_acquisition": float(acquisition[index]),
+                "candidate_pool_size": len(configs),
+                "candidate_rank": rank,
+                "reference_config_id": adapter.config_id(reference),
+                "proposal_probability": None,
+                "proposal_probability_kind": "frozen_pairwise_rank",
+            }
+            if self.model_provenance is not None:
+                metadata["pairwise_pretrained"] = dict(self.model_provenance)
+            self._queue.append(
+                Proposal(configs[index], self.name, metadata=metadata)
+            )
+        while self._queue and len(selected) < limit:
+            proposal = self._queue.pop(0)
+            if adapter.config_id(proposal.config) not in history.seen_ids:
+                selected.append(proposal)
+        return selected
+
+    def observe(self, observation: Observation[ConfigT]) -> None:
+        # Refresh the reference after every measurement; queued ranks are
+        # relative to the previous incumbent.
+        self._queue.clear()
 
 
 @dataclass(slots=True)
@@ -669,6 +767,7 @@ __all__ = [
     "CoordinateLocalSearch",
     "CostModelLocalSearch",
     "CostModelGuidedSearch",
+    "PairwiseModelGuidedSearch",
     "RandomSearch",
     "SearchStrategy",
     "SharedModelFitState",

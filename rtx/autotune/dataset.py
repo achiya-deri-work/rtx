@@ -81,9 +81,10 @@ from ..prequant_experiments import (
     _device_properties,
     _nvidia_smi_snapshot,
     _reference_prequant_config,
-    collect_timing_samples,
+    collect_stable_timing_samples,
     probe_device,
     robust_summary,
+    stabilize_timing_batches,
 )
 from ..inference_experiments import (
     FullyPrequantBenchmarkHarness,
@@ -618,10 +619,27 @@ class FusedFwdBenchmarkHarness:
             self._launch_prepared(prepared, x, weight)
         torch.cuda.synchronize(self.device)
         calls, pilot = self.calibrate_calls(prepared)
-        timings = collect_timing_samples(
+        timings, collection = collect_stable_timing_samples(
             lambda sample: self._time_batch(prepared, calls, sample * calls),
             self.protocol,
             requested_samples=samples,
+            stabilize=lambda attempt: stabilize_timing_batches(
+                lambda batch: self._time_batch(
+                    prepared,
+                    calls,
+                    -((attempt + 1) * self.protocol.stabilization_max_batches + batch)
+                    * calls,
+                )
+                * calls,
+                self.protocol,
+            ),
+            telemetry=(
+                lambda: _nvidia_smi_snapshot(
+                    self.device.index or torch.cuda.current_device()
+                )
+            )
+            if self.protocol.telemetry
+            else None,
         )
         telemetry_after = (
             _nvidia_smi_snapshot(self.device.index or torch.cuda.current_device())
@@ -637,9 +655,12 @@ class FusedFwdBenchmarkHarness:
             "pilot_ms_per_call": pilot,
             "rotation_buffers": len(self._inputs),
             "timings_ms": timings,
-            "sampling": self.protocol.sampling_metadata(
-                timings, requested_samples=samples
-            ),
+            "sampling": {
+                **self.protocol.sampling_metadata(
+                    timings, requested_samples=samples
+                ),
+                "collection": collection,
+            },
             "summary_ms": robust_summary(
                 timings,
                 seed=seed,
@@ -659,6 +680,13 @@ class FusedFwdBenchmarkHarness:
             return {"status": "prepare_error", "error": f"{type(exc).__name__}: {exc}"[:4000]}
         calls_a, _ = self.calibrate_calls(a)
         calls_b, _ = self.calibrate_calls(b)
+        stabilization = stabilize_timing_batches(
+            lambda batch: (
+                self._time_batch(a, calls_a, -(batch + 1) * calls_a) * calls_a
+                + self._time_batch(b, calls_b, -(batch + 1) * calls_b) * calls_b
+            ),
+            self.protocol,
+        )
         a_times: list[float] = []
         b_times: list[float] = []
         for index in range(self.protocol.race_rounds):
@@ -697,6 +725,7 @@ class FusedFwdBenchmarkHarness:
             "challenger_calls_per_sample": calls_b,
             "rotation_buffers": len(self._inputs),
             "sampling": self.protocol.race_sampling_metadata(a_times, b_times),
+            "stabilization": stabilization,
         }
 
 
@@ -1261,6 +1290,7 @@ class DatasetCampaign:
         adopt_existing_context_identity: bool = False,
         adopt_existing_context_identity_if_present: bool = False,
         pretrained_artifact: Path | str | None = None,
+        pairwise_artifact: Path | str | None = None,
         execution_engine: Literal["synchronous", "ask_tell"] = "synchronous",
         reuse_deterministic_failures: bool = False,
         progress=print,
@@ -1279,6 +1309,11 @@ class DatasetCampaign:
             None
             if pretrained_artifact is None
             else str(Path(pretrained_artifact).expanduser().resolve())
+        )
+        self.pairwise_artifact = (
+            None
+            if pairwise_artifact is None
+            else str(Path(pairwise_artifact).expanduser().resolve())
         )
         self.fingerprint = DeviceFingerprint.current(self.device)
         if self.fingerprint.capability[0] != 12:
@@ -1891,6 +1926,17 @@ class DatasetCampaign:
                     pretrained_artifact=self.pretrained_artifact,
                 ),
             )
+        if (
+            self.pairwise_artifact is not None
+            and effective_job.tuning.use_pairwise
+        ):
+            effective_job = replace(
+                effective_job,
+                tuning=replace(
+                    effective_job.tuning,
+                    pairwise_artifact=self.pairwise_artifact,
+                ),
+            )
         if promote is not None:
             effective_job = replace(effective_job, promote=min(promote, job.promote))
         make_tuner = (
@@ -1901,8 +1947,10 @@ class DatasetCampaign:
         model_policy = {
             key: value
             for key, value in asdict(effective_job.tuning).items()
-            if key.startswith(("model_", "feasibility_", "pretrained_"))
-            or key in ("use_pretrained",)
+            if key.startswith(
+                ("model_", "feasibility_", "pretrained_", "pairwise_")
+            )
+            or key in ("use_pretrained", "use_pairwise")
         }
         model_state_key = stable_id(
             {
@@ -1911,6 +1959,7 @@ class DatasetCampaign:
                 "treatment": job.tags.get("treatment", "default"),
                 "replicate": int(job.tags.get("replicate", 0)),
                 "pretrained_artifact": self.pretrained_artifact,
+                "pairwise_artifact": self.pairwise_artifact,
                 "policy": model_policy,
             },
             32,
@@ -2678,6 +2727,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="offline model bundle produced by 'rtx-autotune pretrain'",
     )
     run.add_argument(
+        "--pairwise-artifact",
+        type=Path,
+        help="deployment-gated bundle produced by 'rtx-autotune study-evidence'",
+    )
+    run.add_argument(
         "--execution-engine",
         choices=("synchronous", "ask_tell"),
         default="synchronous",
@@ -3196,6 +3250,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.adopt_existing_context_identity_if_present
         ),
         pretrained_artifact=args.pretrained_artifact,
+        pairwise_artifact=args.pairwise_artifact,
         execution_engine=args.execution_engine,
         reuse_deterministic_failures=args.reuse_deterministic_failures,
         progress=None if args.quiet else print,

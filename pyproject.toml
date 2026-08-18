@@ -57,7 +57,7 @@ version = {attr = "rtx._version.__version__"}
 include = ["rtx", "rtx.*"]
 
 [tool.setuptools.package-data]
-rtx = ["py.typed"]
+rtx = ["py.typed", "autotune/artifacts/**/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

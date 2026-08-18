@@ -247,6 +247,29 @@ evidence. Pairwise heads have an independent deployment gate:
 classification AUC alone is never sufficient when p90 search regret fails to
 beat matched random search.
 
+The package ships the small, integrity-checked pairwise heads that cleared
+those gates. Balanced first-hit tuning prefers an exact-SKU head and falls
+back to a portable head. Families without a qualified entry do not receive a
+pairwise arm. Set `RTX_AUTOTUNE_PAIRWISE_ARTIFACT=off` to disable the bundled
+prior, or point it at another `study-evidence` output directory.
+
+Benchmarking is plateau-aware. Every timed attempt first burns calibrated GPU
+work for a target duration, records telemetry around the samples, rejects
+excessive early/late drift or range, and performs a bounded retry. Raw
+attempts, stabilization batches, the selected attempt, and its stationarity
+decision remain in observation metadata. Three-sample screening stays cheap;
+promoted candidates use the manifest's independent high-resolution protocol.
+
+Launch the prospective held-out study detached and resumably with:
+
+```bash
+./run_blackwell_prospective_v2.sh 6h
+```
+
+It rotates random, online-only, and validation-gated treatments across every
+kernel family and cache regime. Residual journals remain valid after deadline
+interruptions.
+
 ## Architecture and SKU features
 
 Dataset campaigns pass a complete SM120/SM121 hardware profile into every
