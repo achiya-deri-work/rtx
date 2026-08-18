@@ -41,11 +41,24 @@ if [[ "${1:-}" != "--worker" ]]; then
       exit 1
     fi
   fi
-  nohup setsid "$repo_root/run_blackwell_prospective_v2.sh" \
-    --worker "$seconds" "$tag" </dev/null >>"$log" 2>&1 &
-  worker_pid=$!
-  disown "$worker_pid" 2>/dev/null || true
-  echo "$worker_pid" >"$pid_file"
+  # `setsid --fork` survives non-interactive launchers that reap a direct
+  # background child as soon as their terminal command returns.  The worker
+  # publishes its own durable PID, avoiding the intermediate setsid PID.
+  nohup setsid --fork "$repo_root/run_blackwell_prospective_v2.sh" \
+    --worker "$seconds" "$tag" </dev/null >>"$log" 2>&1
+  worker_pid=""
+  for _ in $(seq 1 50); do
+    candidate="$(sed -n '1p' "$pid_file" 2>/dev/null || true)"
+    if [[ "$candidate" =~ ^[1-9][0-9]*$ ]] && kill -0 "$candidate" 2>/dev/null; then
+      worker_pid="$candidate"
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ -z "$worker_pid" ]]; then
+    echo "Prospective v2 worker failed to publish a live PID; inspect $log" >&2
+    exit 1
+  fi
   echo "Started prospective v2: pid=$worker_pid duration=$duration"
   echo "Log: $log"
   echo "Watch: tail -f '$log'"
@@ -55,6 +68,7 @@ fi
 wall_seconds="${2:?missing worker duration}"
 tag="${3:?missing machine tag}"
 pid_file="autotune_logs/prospective_v2_${tag}.pid"
+echo "$$" >"$pid_file"
 trap 'rm -f "$pid_file"' EXIT
 
 if [[ -z "${CUDA_HOME:-}" && -d /usr/local/cuda-13.2 ]]; then
