@@ -349,6 +349,23 @@ class PretrainedAutotuneTests(unittest.TestCase):
         self.assertIsNone(metrics["within_context_median_spearman"])
         self.assertNotIn("NaN", json.dumps(metrics))
 
+    def test_current_revision_view_rejects_retired_family_only_input(self) -> None:
+        _adapter_value, observations = _observations()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "observations.jsonl"
+            source.write_text(
+                "".join(json.dumps(item.as_dict()) + "\n" for item in observations),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "no current-revision"):
+                train_pretrained_bundle(
+                    [source],
+                    root / "artifact",
+                    current_revisions_only=True,
+                    validate_devices=False,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

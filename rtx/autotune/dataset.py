@@ -3361,6 +3361,11 @@ def _build_parser() -> argparse.ArgumentParser:
     pretrain.add_argument("--min-rule-support", type=int, default=12)
     pretrain.add_argument("--max-rules", type=int, default=256)
     pretrain.add_argument(
+        "--current-revisions-only",
+        action="store_true",
+        help="emit deployable heads only for each runtime family's current revision",
+    )
+    pretrain.add_argument(
         "--skip-device-validation",
         action="store_true",
         help="skip leave-one-device-out transfer evaluation",
@@ -3516,6 +3521,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_rules=args.max_rules,
             validate_devices=not args.skip_device_validation,
             campaign=args.campaign,
+            current_revisions_only=args.current_revisions_only,
         )
         if args.full_report:
             printable = report

@@ -1256,10 +1256,34 @@ def train_pretrained_bundle(
     max_rules: int = 256,
     validate_devices: bool = True,
     campaign: str | Sequence[str] | None = None,
+    current_revisions_only: bool = False,
 ) -> dict[str, object]:
     observations, load_report = load_offline_observations(paths, campaign=campaign)
     if not observations:
         raise ValueError("no autotuning observations were found")
+    stale_revision_rows = 0
+    if current_revisions_only:
+        from .winners import current_kernel_revision
+
+        retained: list[Observation[dict[str, object]]] = []
+        for item in observations:
+            try:
+                current_revision = current_kernel_revision(item.family)
+            except ValueError:
+                stale_revision_rows += 1
+                continue
+            if item.kernel_revision != current_revision:
+                stale_revision_rows += 1
+                continue
+            retained.append(item)
+        observations = retained
+        if not observations:
+            raise ValueError("no current-revision autotuning observations were found")
+    load_report["revision_view"] = {
+        "policy": "current_only" if current_revisions_only else "all",
+        "excluded_rows": stale_revision_rows,
+        "rows": len(observations),
+    }
     destination = Path(output).expanduser()
     destination.mkdir(parents=True, exist_ok=True)
     grouped: dict[tuple[str, int], list[Observation[object]]] = defaultdict(list)
@@ -1605,6 +1629,7 @@ def train_pretrained_bundle(
                 "exclude_explicitly_nonstationary_successes"
             ),
             "feasibility_stationarity_policy": "retain_all",
+            "revision_policy": "current_only" if current_revisions_only else "all",
         },
         "input": load_report,
         "families": families,
