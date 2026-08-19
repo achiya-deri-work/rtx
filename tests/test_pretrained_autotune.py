@@ -241,7 +241,7 @@ class PretrainedAutotuneTests(unittest.TestCase):
             )
             self.assertIn("toy@7", manifest["families"])
             self.assertEqual(len(manifest["artifact_id"]), 24)
-            self.assertEqual(manifest["trainer_revision"], 5)
+            self.assertEqual(manifest["trainer_revision"], 6)
             family = manifest["families"]["toy@7"]
             self.assertEqual(family["raw_rows"], len(observations) * 2)
             self.assertEqual(family["rows"], len(observations))
@@ -332,6 +332,22 @@ class PretrainedAutotuneTests(unittest.TestCase):
             family = manifest["families"]["toy@7"]
             self.assertEqual(family["latency_excluded_nonstationary"], 1)
             self.assertEqual(family["feasibility_rows"], len(rows))
+
+    def test_singleton_context_ranking_metric_is_json_null(self) -> None:
+        _adapter_value, observations = _observations()
+        singletons = [
+            replace(item, context_id=f"singleton-{index}")
+            for index, item in enumerate(observations)
+        ]
+        model = NormalizedCostModel(
+            GradientBoostedCostModel(
+                n_estimators=4, ensembles=1, max_depth=2, min_leaf=2, seed=8
+            )
+        )
+        model.fit(singletons)
+        metrics = evaluate_latency_model(model, singletons)
+        self.assertIsNone(metrics["within_context_median_spearman"])
+        self.assertNotIn("NaN", json.dumps(metrics))
 
 
 if __name__ == "__main__":

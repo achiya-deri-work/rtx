@@ -31,7 +31,7 @@ PRETRAINED_SCHEMA_VERSION = 1
 # Bump this whenever training, validation, or deployment semantics change in a
 # way that can alter how an otherwise identical set of model files is used.
 # Schema version describes readability; trainer revision describes behavior.
-PRETRAINED_TRAINER_REVISION = 5
+PRETRAINED_TRAINER_REVISION = 6
 _ALL_FAILURES = (
     "compile_error",
     "runtime_error",
@@ -799,8 +799,10 @@ def evaluate_latency_model(
         "contexts": len(by_context),
         "log_mae": log_mae,
         "spearman": spearman,
-        "within_context_median_spearman": float(
-            np.median(within_context_correlations)
+        "within_context_median_spearman": (
+            float(np.median(within_context_correlations))
+            if within_context_correlations
+            else None
         ),
         "predicted_best_median_regret": float(np.median(regrets)),
         "predicted_best_p90_regret": float(np.quantile(regrets, 0.9)),
