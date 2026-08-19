@@ -359,6 +359,12 @@ verification keys. Once a bundle is audited and its confirmations are trusted,
 winners that would be promoted into the runtime cache. Promotion never
 overwrites an existing entry without `--force`.
 
+For multi-treatment anytime studies, `rtx-autotune tournament-winners MANIFEST`
+reads residual journals directly, promotes each treatment's best stationary
+screened candidate, confirms their union with one high-resolution protocol,
+and resolves the winner with paired races. Its journal is resumable;
+family-filtered invocations merge rather than overwrite completed families.
+
 The learned bandit portfolio contains random, coordinate-local, global
 gradient-boosted, and model-local arms. After random warmup it gives configured
 minimum pulls to each local/learned arm before discounted contextual UCB takes
@@ -371,8 +377,11 @@ Sticky accelerator failures and generated-kernel deadlocks use a real process
 boundary. Before evaluation, the worker fsyncs an event containing the exact
 serialized configuration and provenance. `--stall-timeout` runs the campaign
 under a parent process which streams progress and kills the whole child process
-group after prolonged silence; it exits 75 so a deadline-aware launcher can
-resume. Incomplete attempts are excluded at exact context/config scope, and
+group only after both output and process-tree CPU activity stop. Active,
+output-silent compilation gets a hard ceiling controlled by
+`--active-stall-timeout`; the default is the greater of five inactive timeouts
+or 20 minutes. The watchdog exits 75 so a deadline-aware launcher can resume.
+Incomplete attempts are excluded at exact context/config scope, and
 `rtx-autotune audit` reports their IDs. Ordinary Python, manifest, and dependency
 failures remain terminal. Threads or Python signals are intentionally not used
 as a CUDA kernel that never returns requires destroying its CUDA context.

@@ -194,7 +194,14 @@ class DatasetTests(unittest.TestCase):
             bundle = Path(directory)
             source = {"python_source_sha256": "old-source", "git_commit": "old"}
             (bundle / "machine.json").write_text(
-                json.dumps({"machine_id": "same-machine", "source": source}),
+                json.dumps(
+                    {
+                        "machine_id": "old-runner-machine-id",
+                        "source": source,
+                        "device": {"fingerprint_id": "same-device"},
+                        "identities": {"calibration_id": "same-calibration"},
+                    }
+                ),
                 encoding="utf-8",
             )
             (bundle / "manifest.json").write_text(
@@ -202,7 +209,11 @@ class DatasetTests(unittest.TestCase):
             )
             campaign = DatasetCampaign.__new__(DatasetCampaign)
             campaign.bundle = bundle
-            campaign.machine = {"machine_id": "same-machine"}
+            campaign.machine = {
+                "machine_id": "new-runner-machine-id",
+                "device": {"fingerprint_id": "same-device"},
+                "identities": {"calibration_id": "same-calibration"},
+            }
             campaign.manifest = manifest
             self.assertEqual(campaign._existing_context_source(), source)
 
@@ -303,6 +314,7 @@ class DatasetTests(unittest.TestCase):
             campaign.bundle = bundle
             campaign.manifest = SimpleNamespace(digest="manifest-digest")
             campaign.machine = {"machine_id": "machine-one"}
+            campaign.bundle_machine_id = "machine-one"
             campaign.progress = None
             job = DatasetManifest.from_dict(
                 {

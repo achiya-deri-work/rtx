@@ -620,8 +620,10 @@ status 75. On resume, any issued candidate without a durable completion is
 reported by `audit` and excluded at exact context/config scope rather than
 launched again. The launch script automatically starts a fresh CUDA context
 with the remaining global wall-time and resumes the existing residuals. Set
-`RTX_AUTOTUNE_STALL_TIMEOUT` to increase the default 180-second threshold for
-an unusually slow compiler. The launcher also preserves compatible context
+`RTX_AUTOTUNE_STALL_TIMEOUT` to increase the inactive threshold. The watchdog
+also samples CPU time across the compiler process tree, so an output-silent but
+active NVVM compile is retained (subject to a separate 20-minute hard ceiling)
+while a blocked CUDA synchronization is restarted. The launcher also preserves compatible context
 identity across these runner-only upgrades. The launcher pins `CUDA_HOME` to
 the available CUDA 13.2 toolkit when the calling shell omitted it, keeping
 libNVVM discovery and the compiler/machine fingerprint stable across restarts.
@@ -641,6 +643,22 @@ rtx-autotune summarize-tuners \
   --output autotune_reports/5070_prospective_v1 \
   --format both
 ```
+
+After an anytime campaign, compare the best stationary candidate from every
+treatment under one higher-resolution protocol before promotion:
+
+```bash
+rtx-autotune tournament-winners \
+  autotune_manifests/blackwell_prospective_v2.json \
+  --device cuda:0 --output-dir autotune_datasets \
+  --calibration hardware_calibration.json
+
+rtx-autotune install-winners autotune_datasets --dry-run
+```
+
+The tournament is append-only and resumable at each confirmation and paired
+race. Partial family runs merge into the same summary. Promotion rejects an
+explicitly nonstationary confirmation unless `--allow-nonstationary` is used.
 
 The report includes validity and compiler-waste rates, evaluator time to first
 valid candidate, best latency and observed-oracle regret at 1/4/8/16/32/64

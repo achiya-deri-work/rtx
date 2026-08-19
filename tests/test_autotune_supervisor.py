@@ -29,6 +29,21 @@ class AutotuneSupervisorTests(unittest.TestCase):
         self.assertEqual(status, STALL_EXIT_CODE)
         self.assertIn("WATCHDOG", output.getvalue())
 
+    def test_cpu_active_silent_compile_is_not_mistaken_for_a_stall(self) -> None:
+        output = io.StringIO()
+        status = supervise_command(
+            [
+                sys.executable,
+                "-c",
+                "import time\nend=time.monotonic()+0.35\nwhile time.monotonic()<end: pass",
+            ],
+            stall_timeout_s=0.05,
+            active_stall_timeout_s=2.0,
+            output=output,
+        )
+        self.assertEqual(status, 0)
+        self.assertNotIn("terminating", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

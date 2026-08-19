@@ -116,6 +116,7 @@ def install_verified_winners(
     treatments: Iterable[str] | None = None,
     device_ids: Iterable[str] | None = None,
     minimum_support: int = 1,
+    allow_nonstationary: bool = False,
     dry_run: bool = False,
     force: bool = False,
 ) -> dict[str, object]:
@@ -152,17 +153,25 @@ def install_verified_winners(
             except (KeyError, OSError, json.JSONDecodeError):
                 summary = {"results": []}
             result_documents = list(summary.get("results", []))
-            try:
-                posthoc = json.loads(
-                    reader.read_text(prefix + "verification_summary.json")
-                )
-            except (KeyError, OSError, json.JSONDecodeError):
-                posthoc = None
-            if (
-                isinstance(posthoc, Mapping)
-                and posthoc.get("type") == "rtx_autotune_posthoc_verification"
+            for summary_name, summary_type in (
+                (
+                    "verification_summary.json",
+                    "rtx_autotune_posthoc_verification",
+                ),
+                (
+                    "tournament_summary.json",
+                    "rtx_autotune_cross_treatment_tournament",
+                ),
             ):
-                result_documents.extend(posthoc.get("results", []))
+                try:
+                    posthoc = json.loads(reader.read_text(prefix + summary_name))
+                except (KeyError, OSError, json.JSONDecodeError):
+                    continue
+                if (
+                    isinstance(posthoc, Mapping)
+                    and posthoc.get("type") == summary_type
+                ):
+                    result_documents.extend(posthoc.get("results", []))
             device_id = str(machine.get("device", {}).get("fingerprint_id", ""))
             if not device_id or (device_filter is not None and device_id not in device_filter):
                 continue
@@ -183,11 +192,30 @@ def install_verified_winners(
                     summary_ms = outcome.get("summary_ms")
                     if not isinstance(summary_ms, Mapping) or summary_ms.get("median") is None:
                         continue
+                    collection = outcome.get("sampling", {})
+                    if isinstance(collection, Mapping):
+                        collection = collection.get("collection", {})
+                    stationary = (
+                        collection.get("stationary")
+                        if isinstance(collection, Mapping)
+                        else None
+                    )
+                    if stationary is False and not allow_nonstationary:
+                        rejected_candidates.append(
+                            {
+                                "context_id": str(record.get("context_id")),
+                                "family": str(record.get("family", "")),
+                                "config_id": str(record.get("config_id", "")),
+                                "reason": "nonstationary verification measurement",
+                            }
+                        )
+                        continue
                     verified_measurements[
                         (str(record.get("context_id")), str(record.get("config_id")))
                     ] = {
                         "median_ms": float(summary_ms["median"]),
                         "kernel_revision": record.get("kernel_revision"),
+                        "stationary": stationary,
                     }
             latest: dict[str, Mapping[str, object]] = {}
             for result in result_documents:
@@ -319,6 +347,7 @@ def install_verified_winners(
                     "contexts": [row["context_id"] for row in selected],
                     "treatments": sorted({str(row["treatment"]) for row in selected}),
                     "sources": sorted({str(row["bundle"]) for row in selected}),
+                    "stationarity_required": not allow_nonstationary,
                 },
             )
         installed.append(
@@ -341,6 +370,7 @@ def install_verified_winners(
         "audit": audit["summary"],
         "cache_dir": str(root),
         "dry_run": dry_run,
+        "allow_nonstationary": allow_nonstationary,
         "installed": installed,
         "skipped": skipped,
         "rejected_candidates": rejected_candidates,

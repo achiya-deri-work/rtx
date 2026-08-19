@@ -241,7 +241,7 @@ class PretrainedAutotuneTests(unittest.TestCase):
             )
             self.assertIn("toy@7", manifest["families"])
             self.assertEqual(len(manifest["artifact_id"]), 24)
-            self.assertEqual(manifest["trainer_revision"], 4)
+            self.assertEqual(manifest["trainer_revision"], 5)
             family = manifest["families"]["toy@7"]
             self.assertEqual(family["raw_rows"], len(observations) * 2)
             self.assertEqual(family["rows"], len(observations))
@@ -295,6 +295,43 @@ class PretrainedAutotuneTests(unittest.TestCase):
             copied_overlap.write_text(payload, encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "shared observations"):
                 evaluate_pretrained_bundle(output, [copied_overlap])
+
+    def test_nonstationary_success_is_feasibility_only(self) -> None:
+        _adapter_value, observations = _observations()
+        unstable = replace(
+            observations[0],
+            outcome=replace(
+                observations[0].outcome,
+                metadata={
+                    "sampling": {"collection": {"stationary": False}}
+                },
+            ),
+        )
+        rows = [unstable, *observations[1:]]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "observations.jsonl"
+            source.write_text(
+                "".join(json.dumps(item.as_dict()) + "\n" for item in rows),
+                encoding="utf-8",
+            )
+            loaded, report = load_offline_observations([source])
+            self.assertEqual(len(loaded), len(rows))
+            self.assertEqual(
+                report["latency_view"]["excluded_nonstationary_successes"], 1
+            )
+            manifest = train_pretrained_bundle(
+                [source],
+                root / "artifact",
+                n_estimators=4,
+                ensembles=1,
+                max_depth=2,
+                min_leaf=2,
+                validate_devices=False,
+            )
+            family = manifest["families"]["toy@7"]
+            self.assertEqual(family["latency_excluded_nonstationary"], 1)
+            self.assertEqual(family["feasibility_rows"], len(rows))
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ after copying bundles from any number of machines.
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
@@ -1329,14 +1330,21 @@ class DatasetCampaign:
             / str(self.machine["machine_id"])
             / f"shard-{manifest.shard_index:03d}-of-{manifest.shard_count:03d}"
         )
-        if adopt_existing_context_identity_if_present:
-            self.adopt_existing_context_identity = (
-                (self.bundle / "machine.json").is_file()
-                and (self.bundle / "manifest.json").is_file()
-            )
+        if self.adopt_existing_context_identity or adopt_existing_context_identity_if_present:
+            compatible = self._find_compatible_existing_bundle()
+            if compatible is not None:
+                self.bundle = compatible
+                self.adopt_existing_context_identity = True
+            elif adopt_existing_context_identity_if_present:
+                self.adopt_existing_context_identity = False
         self.context_source = self.machine["source"]
+        self.bundle_machine_id = str(self.machine["machine_id"])
         if self.adopt_existing_context_identity:
             self.context_source = self._existing_context_source()
+            prior_machine = json.loads(
+                (self.bundle / "machine.json").read_text(encoding="utf-8")
+            )
+            self.bundle_machine_id = str(prior_machine["machine_id"])
         self.verification = ExperimentJournal(self.bundle / "verification.jsonl")
         self.context_allocations = ExperimentJournal(
             self.bundle / "context_allocations.jsonl"
@@ -1345,6 +1353,53 @@ class DatasetCampaign:
         # Reuse them across anytime slices while strategies retain independent
         # proposal queues for each workload.
         self._shared_model_states: dict[str, SharedModelFitState] = {}
+
+    def _find_compatible_existing_bundle(self) -> Path | None:
+        """Locate this device/manifest bundle across runner source revisions."""
+
+        shard = (
+            f"shard-{self.manifest.shard_index:03d}-of-"
+            f"{self.manifest.shard_count:03d}"
+        )
+        current_fingerprint = str(self.machine["device"]["fingerprint_id"])  # type: ignore[index]
+        current_calibration = str(
+            self.machine.get("identities", {}).get("calibration_id", "")  # type: ignore[union-attr]
+        )
+        matches: list[Path] = []
+        for candidate in sorted(
+            (self.output_dir / self.manifest.name).glob(f"*/{shard}")
+        ):
+            try:
+                machine = json.loads(
+                    (candidate / "machine.json").read_text(encoding="utf-8")
+                )
+                prior_manifest = json.loads(
+                    (candidate / "manifest.json").read_text(encoding="utf-8")
+                )
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                continue
+            fingerprint = str(
+                machine.get("device", {}).get("fingerprint_id", "")
+            )
+            calibration = str(
+                machine.get("identities", {}).get("calibration_id", "")
+            )
+            if (
+                fingerprint == current_fingerprint
+                and _digest(prior_manifest) == self.manifest.digest
+                and (
+                    not current_calibration
+                    or not calibration
+                    or calibration == current_calibration
+                )
+            ):
+                matches.append(candidate)
+        if len(matches) > 1:
+            raise RuntimeError(
+                "multiple compatible campaign bundles found for this device and "
+                f"manifest: {[str(path) for path in matches]}"
+            )
+        return matches[0] if matches else None
 
     def _existing_context_source(self) -> Mapping[str, object]:
         """Adopt v2 context tags after runner-only source changes.
@@ -1366,8 +1421,26 @@ class DatasetCampaign:
             prior_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"cannot read existing v2 bundle identity: {exc}") from exc
-        if prior_machine.get("machine_id") != self.machine.get("machine_id"):
-            raise RuntimeError("existing bundle machine identity does not match this device")
+        prior_fingerprint = str(
+            prior_machine.get("device", {}).get("fingerprint_id", "")
+        )
+        current_fingerprint = str(
+            self.machine.get("device", {}).get("fingerprint_id", "")
+        )
+        if not prior_fingerprint or prior_fingerprint != current_fingerprint:
+            raise RuntimeError("existing bundle device fingerprint does not match this device")
+        prior_calibration = str(
+            prior_machine.get("identities", {}).get("calibration_id", "")
+        )
+        current_calibration = str(
+            self.machine.get("identities", {}).get("calibration_id", "")
+        )
+        if (
+            prior_calibration
+            and current_calibration
+            and prior_calibration != current_calibration
+        ):
+            raise RuntimeError("existing bundle calibration does not match this device")
         if _digest(prior_manifest) != self.manifest.digest:
             raise RuntimeError("existing bundle manifest does not match the requested manifest")
         source = prior_machine.get("source")
@@ -1389,7 +1462,7 @@ class DatasetCampaign:
             **dict(job.tags),
             "campaign": self.manifest.name,
             "manifest_digest": self.manifest.digest,
-            "machine_id": self.machine["machine_id"],
+            "machine_id": self.bundle_machine_id,
             "source_sha256": self.context_source["python_source_sha256"],
             "git_commit": self.context_source.get("git_commit"),
             "git_dirty": self.context_source.get("git_dirty"),
@@ -1419,7 +1492,7 @@ class DatasetCampaign:
             "schema_version": DATASET_SCHEMA_VERSION,
             "recorded_at": _utc_now(),
             "manifest_digest": self.manifest.digest,
-            "machine_id": self.machine["machine_id"],
+            "machine_id": self.bundle_machine_id,
             "device_id": self.fingerprint.identifier,
             "context_id": adapter.context.identifier,
             "context": adapter.context.as_dict(),
@@ -2266,7 +2339,7 @@ class DatasetCampaign:
             recorded_at = _utc_now()
             allocation_id = stable_id(
                 {
-                    "machine_id": self.machine["machine_id"],
+                    "machine_id": self.bundle_machine_id,
                     "context_id": selected,
                     "sequence": allocation_sequence,
                     "before": before,
@@ -2283,7 +2356,7 @@ class DatasetCampaign:
                     "sequence": allocation_sequence,
                     "recorded_at": recorded_at,
                     "manifest_digest": self.manifest.digest,
-                    "machine_id": self.machine["machine_id"],
+                    "machine_id": self.bundle_machine_id,
                     "device_id": self.fingerprint.identifier,
                     "context_id": selected,
                     "family": job.family,
@@ -2516,7 +2589,410 @@ class DatasetCampaign:
                 "type": "rtx_autotune_posthoc_verification",
                 "recorded_at": _utc_now(),
                 "manifest_digest": self.manifest.digest,
-                "machine_id": self.machine["machine_id"],
+                "machine_id": self.bundle_machine_id,
+                "contexts": len(results),
+                "verified": sum(
+                    isinstance(result.get("verification"), Mapping)
+                    and result["verification"].get("status") == "ok"  # type: ignore[union-attr]
+                    for result in results
+                ),
+                "results": results,
+            },
+        )
+        return summary_path
+
+    @staticmethod
+    def _stationary_screen(record: Mapping[str, object]) -> bool:
+        outcome = record.get("outcome")
+        if not isinstance(outcome, Mapping):
+            return False
+        metadata = outcome.get("metadata")
+        if not isinstance(metadata, Mapping):
+            return True
+        sampling = metadata.get("sampling")
+        if not isinstance(sampling, Mapping):
+            return True
+        collection = sampling.get("collection")
+        return not (
+            isinstance(collection, Mapping)
+            and collection.get("stationary") is False
+        )
+
+    @staticmethod
+    def _stationary_confirmation(outcome: Mapping[str, object]) -> bool:
+        sampling = outcome.get("sampling")
+        if not isinstance(sampling, Mapping):
+            return True
+        collection = sampling.get("collection")
+        return not (
+            isinstance(collection, Mapping)
+            and collection.get("stationary") is False
+        )
+
+    def tournament_existing(
+        self,
+        *,
+        promote_per_treatment: int = 1,
+        confirm_samples: int = 31,
+        race_rounds: int = 21,
+        stabilization_ms: float = 250.0,
+        measurement_retries: int = 2,
+        families: Sequence[str] | None = None,
+    ) -> Path:
+        """Confirm and pairwise-race final incumbents across treatments.
+
+        Residual observation journals are the authority.  This deliberately
+        bypasses an anytime run's last, possibly deferred, summary and merges
+        the best stationary screened candidates from every treatment before
+        performing high-resolution confirmation on one common harness.
+        """
+
+        if promote_per_treatment <= 0:
+            raise ValueError("promote_per_treatment must be positive")
+        if confirm_samples <= 0 or confirm_samples % 2 == 0:
+            raise ValueError("confirm_samples must be a positive odd number")
+        if race_rounds <= 0 or race_rounds % 2 == 0:
+            raise ValueError("race_rounds must be a positive odd number")
+        if stabilization_ms < 0 or measurement_retries < 0:
+            raise ValueError("invalid tournament stabilization policy")
+        if self.manifest.storage_mode != "residual_context":
+            raise RuntimeError(
+                "cross-treatment tournaments require residual_context storage"
+            )
+        family_filter = None if families is None else set(families)
+        jobs = {job.family: job for job in self.manifest.jobs}
+        groups: dict[
+            tuple[str, str, str, int],
+            dict[str, dict[str, Mapping[str, object]]],
+        ] = defaultdict(lambda: defaultdict(dict))
+        descriptors: dict[tuple[str, str, str, int], Mapping[str, object]] = {}
+        for unit_path in sorted(self.bundle.glob("residuals/**/unit.json")):
+            descriptor = json.loads(unit_path.read_text(encoding="utf-8"))
+            family = str(descriptor.get("family", ""))
+            if family_filter is not None and family not in family_filter:
+                continue
+            key = (
+                family,
+                str(descriptor["shape_key"]),
+                str(descriptor["regime"]),
+                int(descriptor.get("replicate", 0)),
+            )
+            treatment = str(descriptor.get("treatment", "default"))
+            descriptors[key] = descriptor
+            observations_path = unit_path.with_name("observations.jsonl")
+            if not observations_path.is_file():
+                continue
+            with observations_path.open(encoding="utf-8") as source:
+                for line in source:
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    outcome = record.get("outcome")
+                    if (
+                        not isinstance(outcome, Mapping)
+                        or outcome.get("status") != "ok"
+                        or outcome.get("median_ms") is None
+                        or not isinstance(record.get("config"), Mapping)
+                        or not self._stationary_screen(record)
+                    ):
+                        continue
+                    config_id = str(record["config_id"])
+                    previous = groups[key][treatment].get(config_id)
+                    if previous is None or float(outcome["median_ms"]) < float(
+                        previous["outcome"]["median_ms"]  # type: ignore[index]
+                    ):
+                        groups[key][treatment][config_id] = record
+
+        journal = ExperimentJournal(self.bundle / "tournament_verification.jsonl")
+        protocol_id = stable_id(
+            {
+                "schema": 1,
+                "confirm_samples": confirm_samples,
+                "race_rounds": race_rounds,
+                "stabilization_ms": stabilization_ms,
+                "measurement_retries": measurement_retries,
+                "promote_per_treatment": promote_per_treatment,
+            },
+            24,
+        )
+        results: list[dict[str, object]] = []
+        for key in sorted(groups):
+            family, shape_key, regime, replicate = key
+            job = jobs.get(family)
+            if job is None:
+                continue
+            shape = next((item for item in job.shapes if item.key == shape_key), None)
+            if shape is None:
+                continue
+            candidates: dict[str, dict[str, object]] = {}
+            for treatment, by_config in groups[key].items():
+                ranked = sorted(
+                    by_config.values(),
+                    key=lambda record: float(record["outcome"]["median_ms"]),  # type: ignore[index]
+                )[:promote_per_treatment]
+                for record in ranked:
+                    config_id = str(record["config_id"])
+                    candidate = candidates.setdefault(
+                        config_id,
+                        {
+                            "config": dict(record["config"]),  # type: ignore[arg-type]
+                            "treatments": set(),
+                            "source_context_ids": set(),
+                            "screen_medians_ms": [],
+                        },
+                    )
+                    candidate["treatments"].add(treatment)  # type: ignore[union-attr]
+                    candidate["source_context_ids"].add(  # type: ignore[union-attr]
+                        str(record["context_id"])
+                    )
+                    candidate["screen_medians_ms"].append(  # type: ignore[union-attr]
+                        float(record["outcome"]["median_ms"])  # type: ignore[index]
+                    )
+            tournament_id = stable_id(
+                {
+                    "manifest": self.manifest.digest,
+                    "machine": self.bundle_machine_id,
+                    "family": family,
+                    "shape": shape_key,
+                    "regime": regime,
+                    "replicate": replicate,
+                    "protocol": protocol_id,
+                },
+                24,
+            )
+            self._log(
+                f"TOURNAMENT {family} {shape_key} {regime} "
+                f"candidates={len(candidates)}"
+            )
+            if not candidates:
+                results.append(
+                    {
+                        "context_id": tournament_id,
+                        "family": family,
+                        "shape": shape_key,
+                        "regime": regime,
+                        "replicate": replicate,
+                        "treatment": "cross_treatment",
+                        "verification": {"status": "no_candidate"},
+                    }
+                )
+                continue
+            protocol = replace(
+                job.protocol,
+                confirm_samples=confirm_samples,
+                race_rounds=race_rounds,
+                target_batch_ms=max(job.protocol.target_batch_ms, 50.0),
+                stabilization_target_ms=stabilization_ms,
+                stabilization_max_batches=max(
+                    job.protocol.stabilization_max_batches, 12
+                ),
+                measurement_retries=measurement_retries,
+                confirm_min_samples=min(confirm_samples, max(11, job.protocol.confirm_min_samples)),
+                race_min_rounds=min(race_rounds, max(11, job.protocol.race_min_rounds)),
+            )
+            tournament_job = replace(job, protocol=protocol)
+            harness = self._make_harness(tournament_job, shape, regime)  # type: ignore[arg-type]
+            adapter = self._make_adapter(tournament_job, shape, regime, harness)  # type: ignore[arg-type]
+            existing = journal.records()
+            completed = journal.completed_keys()
+            measurement_by_config = {
+                str(record.get("config_id")): record
+                for record in existing
+                if record.get("record_type") == "verification_measurement"
+                and record.get("context_id") == tournament_id
+                and record.get("protocol_id") == protocol_id
+            }
+            base = {
+                "schema_version": DATASET_SCHEMA_VERSION,
+                "recorded_at": _utc_now(),
+                "manifest_digest": self.manifest.digest,
+                "machine_id": self.bundle_machine_id,
+                "device_id": self.fingerprint.identifier,
+                "context_id": tournament_id,
+                "family": family,
+                "kernel_revision": adapter.context.kernel_revision,
+                "shape": asdict(shape),
+                "shape_key": shape_key,
+                "regime": regime,
+                "replicate": replicate,
+                "treatment": "cross_treatment",
+                "protocol": asdict(protocol),
+                "protocol_id": protocol_id,
+            }
+            for config_id, candidate in sorted(candidates.items()):
+                observation_key = _digest(
+                    (self.manifest.digest, tournament_id, "confirm", config_id)
+                )
+                if observation_key not in completed:
+                    config = adapter.deserialize(candidate["config"])  # type: ignore[arg-type]
+                    outcome = harness.measure(
+                        config,
+                        samples=confirm_samples,
+                        seed=self.manifest.seed ^ int(observation_key[:8], 16),
+                        components=True,
+                    )
+                    record = {
+                        **base,
+                        "record_type": "verification_measurement",
+                        "observation_key": observation_key,
+                        "stage": "cross_treatment_confirm",
+                        "config_id": config_id,
+                        "config": adapter.serialize(config),
+                        "features": adapter.features(config),
+                        "candidate_provenance": {
+                            "treatments": sorted(candidate["treatments"]),  # type: ignore[arg-type]
+                            "source_context_ids": sorted(candidate["source_context_ids"]),  # type: ignore[arg-type]
+                            "screen_medians_ms": candidate["screen_medians_ms"],
+                        },
+                        "outcome": outcome,
+                    }
+                    journal.append(record)
+                    measurement_by_config[config_id] = record
+                    completed.add(observation_key)
+                    if isinstance(outcome, Mapping) and outcome.get("error") is not None:
+                        raise_if_fatal_device_context_error(outcome["error"])
+
+            confirmed = [
+                record
+                for record in measurement_by_config.values()
+                if isinstance(record.get("outcome"), Mapping)
+                and record["outcome"].get("status") == "ok"  # type: ignore[union-attr]
+                and self._stationary_confirmation(record["outcome"])  # type: ignore[arg-type]
+            ]
+            confirmed.sort(
+                key=lambda record: float(record["outcome"]["summary_ms"]["median"])  # type: ignore[index]
+            )
+            if not confirmed:
+                results.append(
+                    {
+                        "context_id": tournament_id,
+                        "family": family,
+                        "shape": shape_key,
+                        "regime": regime,
+                        "replicate": replicate,
+                        "treatment": "cross_treatment",
+                        "verification": {
+                            "status": "no_stationary_candidate",
+                            "measured": len(measurement_by_config),
+                        },
+                    }
+                )
+                del harness, adapter
+                continue
+            incumbent = adapter.deserialize(confirmed[0]["config"])  # type: ignore[arg-type]
+            races = {
+                str(record.get("observation_key")): record
+                for record in existing
+                if record.get("record_type") == "race"
+                and record.get("context_id") == tournament_id
+                and record.get("protocol_id") == protocol_id
+            }
+            for record in confirmed[1:]:
+                challenger = adapter.deserialize(record["config"])  # type: ignore[arg-type]
+                incumbent_id = adapter.config_id(incumbent)
+                challenger_id = adapter.config_id(challenger)
+                race_key = _digest(
+                    (
+                        self.manifest.digest,
+                        tournament_id,
+                        "race",
+                        incumbent_id,
+                        challenger_id,
+                    )
+                )
+                if race_key in completed:
+                    outcome = races.get(race_key, {}).get("outcome", {})
+                else:
+                    outcome = harness.race(
+                        incumbent,
+                        challenger,
+                        seed=self.manifest.seed ^ int(race_key[:8], 16),
+                    )
+                    race_record = {
+                        **base,
+                        "record_type": "race",
+                        "observation_key": race_key,
+                        "stage": "cross_treatment_race",
+                        "incumbent_id": incumbent_id,
+                        "challenger_id": challenger_id,
+                        "incumbent_config": adapter.serialize(incumbent),
+                        "challenger_config": adapter.serialize(challenger),
+                        "outcome": outcome,
+                    }
+                    journal.append(race_record)
+                    races[race_key] = race_record
+                    completed.add(race_key)
+                if isinstance(outcome, Mapping) and outcome.get("decision") == "challenger":
+                    incumbent = challenger
+            winner_id = adapter.config_id(incumbent)
+            winner_measurement = measurement_by_config[winner_id]
+            results.append(
+                {
+                    "context_id": tournament_id,
+                    "family": family,
+                    "kernel_revision": adapter.context.kernel_revision,
+                    "shape": shape_key,
+                    "regime": regime,
+                    "replicate": replicate,
+                    "treatment": "cross_treatment",
+                    "target_trials": sum(
+                        len(values) for values in groups[key].values()
+                    ),
+                    "verification": {
+                        "status": "ok",
+                        "winner_id": winner_id,
+                        "winner_config": adapter.serialize(incumbent),
+                        "median_ms": float(
+                            winner_measurement["outcome"]["summary_ms"]["median"]  # type: ignore[index]
+                        ),
+                        "confirmed": len(confirmed),
+                        "measured": len(measurement_by_config),
+                        "protocol_id": protocol_id,
+                    },
+                }
+            )
+            del harness, adapter
+
+        summary_path = self.bundle / "tournament_summary.json"
+        merged_results: dict[tuple[str, str, str, int], dict[str, object]] = {}
+        if summary_path.is_file():
+            try:
+                prior_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                prior_summary = {}
+            if (
+                prior_summary.get("type")
+                == "rtx_autotune_cross_treatment_tournament"
+                and prior_summary.get("manifest_digest") == self.manifest.digest
+            ):
+                for result in prior_summary.get("results", []):
+                    if not isinstance(result, Mapping):
+                        continue
+                    result_key = (
+                        str(result.get("family", "")),
+                        str(result.get("shape", "")),
+                        str(result.get("regime", "")),
+                        int(result.get("replicate", 0)),
+                    )
+                    merged_results[result_key] = dict(result)
+        for result in results:
+            result_key = (
+                str(result.get("family", "")),
+                str(result.get("shape", "")),
+                str(result.get("regime", "")),
+                int(result.get("replicate", 0)),
+            )
+            merged_results[result_key] = result
+        results = [merged_results[key] for key in sorted(merged_results)]
+        _atomic_json(
+            summary_path,
+            {
+                "schema_version": DATASET_SCHEMA_VERSION,
+                "type": "rtx_autotune_cross_treatment_tournament",
+                "recorded_at": _utc_now(),
+                "manifest_digest": self.manifest.digest,
+                "machine_id": self.bundle_machine_id,
+                "protocol_id": protocol_id,
                 "contexts": len(results),
                 "verified": sum(
                     isinstance(result.get("verification"), Mapping)
@@ -2571,7 +3047,7 @@ class DatasetCampaign:
                     "recorded_at": _utc_now(),
                     "elapsed_s": time.monotonic() - started,
                     "manifest_digest": self.manifest.digest,
-                    "machine_id": self.machine["machine_id"],
+                    "machine_id": self.bundle_machine_id,
                     "run_mode": "sequential" if self.anytime is None else "anytime",
                     "execution_engine": self.execution_engine,
                     "reuse_deterministic_failures": (
@@ -2756,6 +3232,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "exit code 75 after this much output silence (for example 180s)"
         ),
     )
+    run.add_argument(
+        "--active-stall-timeout",
+        type=_parse_duration,
+        help=(
+            "hard ceiling for output-silent but CPU-active compilation; "
+            "defaults to max(5x --stall-timeout, 20 minutes)"
+        ),
+    )
 
     collect = subparsers.add_parser("collect", help="merge copied campaign bundles")
     collect.add_argument("paths", type=Path, nargs="+")
@@ -2794,6 +3278,11 @@ def _build_parser() -> argparse.ArgumentParser:
     install.add_argument("--treatment", action="append")
     install.add_argument("--device-id", action="append")
     install.add_argument("--minimum-support", type=int, default=1)
+    install.add_argument(
+        "--allow-nonstationary",
+        action="store_true",
+        help="allow explicitly nonstationary confirmation measurements",
+    )
     install.add_argument("--dry-run", action="store_true")
     install.add_argument("--force", action="store_true")
 
@@ -2826,6 +3315,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="number of screened finalists to confirm per context",
     )
     verify.add_argument("--quiet", action="store_true")
+
+    tournament = subparsers.add_parser(
+        "tournament-winners",
+        help=(
+            "high-resolution confirm and pairwise-race final candidates "
+            "across prospective treatments"
+        ),
+    )
+    tournament.add_argument("manifest", type=Path)
+    tournament.add_argument(
+        "--output-dir", type=Path, default=Path("autotune_datasets")
+    )
+    tournament.add_argument("--device", default="cuda")
+    tournament.add_argument("--calibration", type=Path)
+    tournament.add_argument("--shard-index", type=int)
+    tournament.add_argument("--shard-count", type=int)
+    tournament.add_argument("--family", action="append")
+    tournament.add_argument("--promote-per-treatment", type=int, default=1)
+    tournament.add_argument("--confirm-samples", type=int, default=31)
+    tournament.add_argument("--race-rounds", type=int, default=21)
+    tournament.add_argument("--stabilization-ms", type=float, default=250.0)
+    tournament.add_argument("--measurement-retries", type=int, default=2)
+    tournament.add_argument("--quiet", action="store_true")
 
     pretrain = subparsers.add_parser(
         "pretrain", help="fit portable cost models and conditional-effect rules"
@@ -2939,6 +3451,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         status = supervise_command(
             [sys.executable, "-m", "rtx.autotune.dataset", *raw_argv],
             stall_timeout_s=args.stall_timeout,
+            active_stall_timeout_s=args.active_stall_timeout,
         )
         raise SystemExit(status)
     if args.command == "evaluate-pretrained":
@@ -3167,6 +3680,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             treatments=args.treatment,
             device_ids=args.device_id,
             minimum_support=args.minimum_support,
+            allow_nonstationary=args.allow_nonstationary,
             dry_run=args.dry_run,
             force=args.force,
         )
@@ -3212,6 +3726,35 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         summary_path = campaign.verify_existing(promote=args.promote)
         print(json.dumps({"verification": str(summary_path)}, indent=2))
+        return
+    if args.command == "tournament-winners":
+        if not torch.cuda.is_available():
+            parser.error("CUDA is not available")
+        manifest = DatasetManifest.load(args.manifest)
+        if (args.shard_index is None) != (args.shard_count is None):
+            parser.error("--shard-index and --shard-count must be provided together")
+        if args.shard_index is not None:
+            manifest = manifest.with_shard(args.shard_index, args.shard_count)
+        calibration = None
+        if args.calibration is not None:
+            calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
+        campaign = DatasetCampaign(
+            manifest,
+            args.output_dir,
+            device=args.device,
+            calibration=calibration,
+            adopt_existing_context_identity=True,
+            progress=None if args.quiet else print,
+        )
+        summary_path = campaign.tournament_existing(
+            promote_per_treatment=args.promote_per_treatment,
+            confirm_samples=args.confirm_samples,
+            race_rounds=args.race_rounds,
+            stabilization_ms=args.stabilization_ms,
+            measurement_retries=args.measurement_retries,
+            families=args.family,
+        )
+        print(json.dumps({"tournament": str(summary_path)}, indent=2))
         return
     if not torch.cuda.is_available():
         parser.error("CUDA is not available")

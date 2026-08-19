@@ -31,7 +31,7 @@ PRETRAINED_SCHEMA_VERSION = 1
 # Bump this whenever training, validation, or deployment semantics change in a
 # way that can alter how an otherwise identical set of model files is used.
 # Schema version describes readability; trainer revision describes behavior.
-PRETRAINED_TRAINER_REVISION = 4
+PRETRAINED_TRAINER_REVISION = 5
 _ALL_FAILURES = (
     "compile_error",
     "runtime_error",
@@ -199,6 +199,17 @@ def analytical_baseline_ms(features: Mapping[str, float]) -> float:
     return max(1.0e-6, memory_ms, compute_ms)
 
 
+def _explicitly_nonstationary(outcome: TrialOutcome) -> bool:
+    sampling = outcome.metadata.get("sampling")
+    if not isinstance(sampling, Mapping):
+        return False
+    collection = sampling.get("collection")
+    return (
+        isinstance(collection, Mapping)
+        and collection.get("stationary") is False
+    )
+
+
 def load_offline_observations(
     paths: Iterable[Path | str],
     *,
@@ -271,6 +282,10 @@ def load_offline_observations(
                 }
             ).encode()
         )
+    nonstationary_successes = sum(
+        item.successful and _explicitly_nonstationary(item.outcome)
+        for item in observations
+    )
     report = {
         "source_files": sorted(source_files),
         "observations": len(observations),
@@ -282,6 +297,15 @@ def load_offline_observations(
             for item in observations
         ),
         "malformed": malformed,
+        "latency_view": {
+            "policy": "exclude_explicitly_nonstationary_successes",
+            "excluded_nonstationary_successes": nonstationary_successes,
+            "rows": len(observations) - nonstationary_successes,
+        },
+        "feasibility_view": {
+            "policy": "retain_all_statuses_including_nonstationary_successes",
+            "rows": len(observations),
+        },
         "campaign_filter": list(campaigns),
         "families": dict(Counter(item.family for item in observations)),
         "devices": sorted(
@@ -294,6 +318,14 @@ def load_offline_observations(
         ),
     }
     return observations, report
+
+
+def _usable_for_latency(item: Observation[object]) -> bool:
+    """Failures carry legality evidence; unstable successes carry no latency target."""
+
+    if not item.successful:
+        return True
+    return not _explicitly_nonstationary(item.outcome)
 
 
 class NormalizedCostModel:
@@ -1233,9 +1265,13 @@ def train_pretrained_bundle(
         grouped[(item.family, item.kernel_revision)].append(item)
     families: dict[str, object] = {}
     for family_index, ((family, revision), raw_rows) in enumerate(sorted(grouped.items())):
-        rows = _aggregate_config_replicates(raw_rows)
+        latency_raw_rows = [item for item in raw_rows if _usable_for_latency(item)]
+        rows = _aggregate_config_replicates(latency_raw_rows)
         family_seed = seed ^ (family_index + 1) * 104729
         balanced = _balanced_training_rows(rows, seed=family_seed)
+        feasibility_balanced = _balanced_training_rows(
+            raw_rows, seed=family_seed ^ 0xFEA5
+        )
         cost = NormalizedCostModel(
             GradientBoostedCostModel(
                 n_estimators=n_estimators,
@@ -1269,7 +1305,7 @@ def train_pretrained_bundle(
             negative_fraction=0.2,
             seed=family_seed ^ 0xFEA5,
         )
-        feasibility.fit(balanced)
+        feasibility.fit(feasibility_balanced)
         rules = extract_conditional_rules(
             rows,
             min_support=min_rule_support,
@@ -1522,7 +1558,10 @@ def train_pretrained_bundle(
             "kernel_revision": revision,
             "rows": len(rows),
             "raw_rows": len(raw_rows),
-            "aggregated_replicates": len(raw_rows) - len(rows),
+            "latency_raw_rows": len(latency_raw_rows),
+            "latency_excluded_nonstationary": len(raw_rows) - len(latency_raw_rows),
+            "feasibility_rows": len(feasibility_balanced),
+            "aggregated_replicates": len(latency_raw_rows) - len(rows),
             "successful_rows": sum(item.successful for item in rows),
             "statuses": dict(Counter(item.outcome.status for item in rows)),
             "contexts": len({item.context_id for item in rows}),
@@ -1560,6 +1599,10 @@ def train_pretrained_bundle(
             "feasibility_positive": ["ok"],
             "feasibility_negative": list(_ALL_FAILURES),
             "feasibility_negative_fraction": 0.2,
+            "latency_stationarity_policy": (
+                "exclude_explicitly_nonstationary_successes"
+            ),
+            "feasibility_stationarity_policy": "retain_all",
         },
         "input": load_report,
         "families": families,

@@ -357,6 +357,58 @@ class AutotuneOperationsTests(unittest.TestCase):
             self.assertEqual(document["config_id"], "config-id")
             self.assertEqual(document["median_ms"], 0.9)
 
+    def test_stationary_tournament_winner_is_promotable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            (bundle / "summary.json").unlink()
+            config = fwd_config_to_dict(normalize_fwd_config(quant_vec=2))
+            _write(
+                bundle / "tournament_verification.jsonl",
+                {
+                    "record_type": "verification_measurement",
+                    "context_id": "tournament-context",
+                    "config_id": "tournament-config",
+                    "family": "mxfp8_fused_fwd",
+                    "kernel_revision": MXFP8_FWD_KERNEL_REVISION,
+                    "outcome": {
+                        "status": "ok",
+                        "summary_ms": {"median": 0.7},
+                        "sampling": {"collection": {"stationary": True}},
+                    },
+                },
+            )
+            _write(
+                bundle / "tournament_summary.json",
+                {
+                    "type": "rtx_autotune_cross_treatment_tournament",
+                    "results": [
+                        {
+                            "context_id": "tournament-context",
+                            "family": "mxfp8_fused_fwd",
+                            "kernel_revision": MXFP8_FWD_KERNEL_REVISION,
+                            "shape": "m64_n128_k128",
+                            "regime": "hot",
+                            "treatment": "cross_treatment",
+                            "replicate": 0,
+                            "target_trials": 64,
+                            "verification": {
+                                "status": "ok",
+                                "winner_id": "tournament-config",
+                                "winner_config": config,
+                            },
+                        }
+                    ],
+                },
+            )
+            report = install_verified_winners(
+                (root,), cache_dir=root / "cache", dry_run=True
+            )
+            self.assertEqual(len(report["installed"]), 1)
+            self.assertEqual(
+                report["installed"][0]["config_id"], "tournament-config"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
