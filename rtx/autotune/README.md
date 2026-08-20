@@ -270,6 +270,19 @@ It rotates random, online-only, and validation-gated treatments across every
 kernel family and cache regime. Residual journals remain valid after deadline
 interruptions.
 
+The v3 study uses entirely new shapes and splits the prior arm into portable
+cost-model-only and cost-model-plus-pairwise treatments:
+
+```bash
+./run_blackwell_prospective_v3.sh 4h
+```
+
+It requires artifact `3317a6fef969ec5129c56732`. Place
+`blackwell_current_portable_v3.zip` in the repository root (the launcher
+extracts it), or set `RTX_AUTOTUNE_PRETRAINED_ARTIFACT` to the extracted
+directory. The launcher audits, exports, summarizes treatments, and performs
+an overlap-checked held-out evaluation when its wall-time expires.
+
 ## Architecture and SKU features
 
 Dataset campaigns pass a complete SM120/SM121 hardware profile into every

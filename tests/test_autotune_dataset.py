@@ -228,6 +228,7 @@ class DatasetTests(unittest.TestCase):
             "autotuner_prospective_5070_v1.json",
             "mxfp8_bwd_revision19_calibration_v1.json",
             "blackwell_diversity_atlas_v1.json",
+            "blackwell_prospective_v3.json",
         ):
             manifest = DatasetManifest.load(root / "autotune_manifests" / name)
             restored = DatasetManifest.from_dict(manifest.as_dict())

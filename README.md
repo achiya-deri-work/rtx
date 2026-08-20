@@ -660,6 +660,19 @@ The tournament is append-only and resumable at each confirmation and paired
 race. Partial family runs merge into the same summary. Promotion rejects an
 explicitly nonstationary confirmation unless `--allow-nonstationary` is used.
 
+For a fresh cross-SKU evaluation of the current portable prior, copy
+`blackwell_current_portable_v3.zip` to each machine and run:
+
+```bash
+git pull
+./run_blackwell_prospective_v3.sh 4h
+```
+
+The v3 manifest contains 12 unseen shapes and four separately randomized arms:
+random, online-only, portable cost model, and cost model plus pairwise priors.
+Every interrupted prefix remains balanced across these arms, kernel families,
+shapes, and cache regimes.
+
 The report includes validity and compiler-waste rates, evaluator time to first
 valid candidate, best latency and observed-oracle regret at 1/4/8/16/32/64
 trials, and treatment aggregates per machine and kernel family. Schema v3 also

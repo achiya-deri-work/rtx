@@ -72,12 +72,17 @@ residual journals and finalized as CSV and Parquet. Environment overrides can
 change visit duration and milestones, but a different experiment policy should
 normally receive a new manifest version.
 
-The prospective 5070 manifest expands every base workload across three search
-treatments and two independent replicates. Its order balances every prefix
-across kernel family, shape category, hot/rotating inputs, treatment, and
-replicate. Each context writes its own residual journal. Transfer learning is
-allowed between shapes inside one treatment/replicate, but never across
-experimental arms.
+Prospective manifests expand every base workload across independent search
+treatments. Their order balances every prefix across kernel family, shape
+category, hot/rotating inputs, treatment, and replicate. Each context writes
+its own residual journal. Transfer learning is allowed between shapes inside
+one treatment/replicate, but never across experimental arms.
+
+`blackwell_prospective_v3.json` is the strict held-out evaluation for portable
+artifact `3317a6fef969ec5129c56732`. Its 12 shapes do not occur in the artifact's
+training corpus. Four arms separate random search, online-only search, the
+validated portable cost model, and cost model plus pairwise priors. This makes
+the marginal value of each learned component identifiable.
 
 ## Legacy experiment-runner manifests
 

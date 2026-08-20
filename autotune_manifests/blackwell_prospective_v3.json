@@ -1,0 +1,146 @@
+{
+  "schema_version": 2,
+  "name": "blackwell_prospective_v3",
+  "seed": 20260820,
+  "storage_mode": "residual_context",
+  "rotation_mode": "balanced_categories",
+  "replicates": 1,
+  "shape_sets": {
+    "heldout_v3": [
+      {"m": 33, "n": 511, "k": 257, "name": "micro_ragged"},
+      {"m": 96, "n": 1280, "k": 768, "name": "underwave_rectangular"},
+      {"m": 192, "n": 3072, "k": 1280, "name": "decode_wide"},
+      {"m": 513, "n": 2047, "k": 1025, "name": "tile_boundary_ragged"},
+      {"m": 768, "n": 2560, "k": 1792, "name": "mid_projection"},
+      {"m": 1152, "n": 3840, "k": 1280, "name": "vision_wide"},
+      {"m": 1792, "n": 3072, "k": 1792, "name": "balanced_rectangular"},
+      {"m": 2048, "n": 10240, "k": 1536, "name": "very_wide"},
+      {"m": 2560, "n": 9216, "k": 2560, "name": "moe_up"},
+      {"m": 3585, "n": 4609, "k": 2305, "name": "ragged_large"},
+      {"m": 10240, "n": 5120, "k": 1280, "name": "long_wide"},
+      {"m": 32768, "n": 1280, "k": 1280, "name": "very_long_balanced"}
+    ]
+  },
+  "treatments": [
+    {
+      "name": "random",
+      "tags": {"optimizer_category": "unbiased_baseline"},
+      "tuning": {
+        "portfolio": "random",
+        "orchestration": "sequential",
+        "use_pretrained": false,
+        "use_pairwise": false
+      }
+    },
+    {
+      "name": "online_bandit",
+      "tags": {"optimizer_category": "online_only"},
+      "tuning": {
+        "portfolio": "hybrid",
+        "orchestration": "bandit",
+        "use_pretrained": false,
+        "use_pairwise": false
+      }
+    },
+    {
+      "name": "pretrained_only",
+      "tags": {"optimizer_category": "validation_gated_cost_model"},
+      "tuning": {
+        "portfolio": "hybrid",
+        "orchestration": "bandit",
+        "use_pretrained": true,
+        "use_pairwise": false
+      }
+    },
+    {
+      "name": "full_priors",
+      "tags": {"optimizer_category": "validation_gated_cost_and_pairwise"},
+      "tuning": {
+        "portfolio": "hybrid",
+        "orchestration": "bandit",
+        "use_pretrained": true,
+        "use_pairwise": true
+      }
+    }
+  ],
+  "job_defaults": {
+    "shape_set": "heldout_v3",
+    "regimes": ["hot", "rotate"],
+    "promote": 1,
+    "tuning": {
+      "portfolio": "hybrid",
+      "orchestration": "bandit",
+      "max_trials": 64,
+      "time_budget_s": 900.0,
+      "cost_model_trials": 40,
+      "model_warmup": 8,
+      "model_pool_size": 4096,
+      "model_initial_pool_cap": 1024,
+      "model_proposal_budget_s": 0.5,
+      "model_refit_interval": 8,
+      "model_exploration": 0.22,
+      "model_estimators": 24,
+      "model_ensembles": 3,
+      "model_max_depth": 4,
+      "model_min_leaf": 4,
+      "model_max_features": 128,
+      "local_beam_width": 6,
+      "local_model_refit_interval": 16,
+      "local_model_candidate_cap": 512,
+      "bandit_exploration": 0.4,
+      "bandit_coordinate_bootstrap": 3,
+      "bandit_learned_bootstrap": 2,
+      "bandit_model_local_bootstrap": 2,
+      "bandit_pairwise_bootstrap": 2,
+      "pairwise_pool_size": 2048,
+      "pairwise_exploration": 0.1,
+      "confirmation_repeats": 0,
+      "confirmation_ratio": 0.0,
+      "confirm_initial": true
+    },
+    "protocol": {
+      "warmup_calls": 4,
+      "samples": 3,
+      "confirm_samples": 15,
+      "race_rounds": 15,
+      "target_batch_ms": 25.0,
+      "stabilization_target_ms": 100.0,
+      "stabilization_max_batches": 8,
+      "measurement_retries": 1,
+      "screen_min_samples": 3,
+      "confirm_min_samples": 7,
+      "race_min_rounds": 9,
+      "screen_stable_cv": 0.005,
+      "confirm_stable_cv": 0.0025,
+      "race_stable_cv": 0.005,
+      "screen_max_relative_drift": 0.03,
+      "confirm_max_relative_drift": 0.01,
+      "screen_max_relative_range": 0.10,
+      "confirm_max_relative_range": 0.04,
+      "practical_threshold": 0.002,
+      "bootstrap_resamples": 500,
+      "rotation_l2_multiple": 2.0,
+      "max_rotation_buffers": 12,
+      "max_rotation_bytes": 805306368,
+      "telemetry": true
+    },
+    "tags": {
+      "study": "blackwell_prospective_v3",
+      "evaluation": "strict_shape_heldout",
+      "measurement": "stabilized_plateau_aware",
+      "pretrained_artifact": "3317a6fef969ec5129c56732"
+    }
+  },
+  "jobs": [
+    {"family": "mxfp8_fused_fwd", "tags": {"precision": "mxfp8", "state": "dynamic", "pass": "forward"}},
+    {"family": "mxfp8_prequant_fwd", "tags": {"precision": "mxfp8", "state": "materialized", "pass": "forward"}},
+    {"family": "mxfp8_weight_prequant_fwd", "tags": {"precision": "mxfp8", "state": "weight_prequant", "pass": "inference"}},
+    {"family": "mxfp8_fully_prequant_fwd", "tags": {"precision": "mxfp8", "state": "fully_prequant", "pass": "inference"}},
+    {"family": "mxfp8_bwd", "tags": {"precision": "mxfp8", "state": "dynamic", "pass": "backward"}},
+    {"family": "nvfp4_dynamic_fwd", "tags": {"precision": "nvfp4", "state": "block", "pass": "forward"}},
+    {"family": "nvfp4_delayed_fwd", "tags": {"precision": "nvfp4", "state": "delayed", "pass": "forward"}},
+    {"family": "nvfp4_jit_row_region_fwd", "tags": {"precision": "nvfp4", "state": "jit_region", "pass": "forward"}},
+    {"family": "nvfp4_weight_prequant_fwd", "tags": {"precision": "nvfp4", "state": "weight_prequant", "pass": "inference"}},
+    {"family": "nvfp4_fully_prequant_fwd", "tags": {"precision": "nvfp4", "state": "fully_prequant", "pass": "inference"}}
+  ]
+}
