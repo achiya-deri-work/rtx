@@ -526,8 +526,14 @@ class CoordinateDescentTuner:
         coordinate_value: object,
     ) -> TrialOutcome:
         config_id = fwd_config_id(config)
+        architecture_reason = self.architecture_validator(config, self.problem)
+        implementation_reason = (
+            None if architecture_reason is not None
+            else self.implementation_validator(config, self.problem)
+        )
+        legal = architecture_reason is None and implementation_reason is None
         memoized = self._session_outcomes.get(config_id)
-        if memoized is not None:
+        if legal and memoized is not None:
             self.reused_trials += 1
             score = (
                 ""
@@ -540,7 +546,7 @@ class CoordinateDescentTuner:
             )
             return memoized
 
-        if self.policy.resume and not self.policy.force:
+        if legal and self.policy.resume and not self.policy.force:
             cached = self.database.get_trial(config)
             if cached is not None:
                 self.reused_trials += 1
@@ -557,11 +563,9 @@ class CoordinateDescentTuner:
                 )
                 return outcome
 
-        architecture_reason = self.architecture_validator(config, self.problem)
         if architecture_reason is not None:
             outcome = TrialOutcome("architecture_rejected", error=architecture_reason)
         else:
-            implementation_reason = self.implementation_validator(config, self.problem)
             if implementation_reason is not None:
                 outcome = TrialOutcome(
                     "implementation_rejected", error=implementation_reason
@@ -621,6 +625,12 @@ class CoordinateDescentTuner:
         best_id: str | None = None
         try:
             cached_best = self.database.best() if self.policy.resume else None
+            if cached_best is not None and (
+                self.architecture_validator(cached_best[0], self.problem) is not None
+                or self.implementation_validator(cached_best[0], self.problem) is not None
+            ):
+                self._log("SKIP  cached best violates current legality; using initial seed")
+                cached_best = None
             current = cached_best[0] if cached_best is not None else initial
             initial_outcome = self._evaluate(
                 current,
@@ -681,16 +691,20 @@ class CoordinateDescentTuner:
                             budget_stopped = True
                             self._log("STOP  time budget exhausted")
                             break
+                        # Compound moves need not have an inverse property on
+                        # the physical config. The incumbent is already scored;
+                        # only scalar/property axes need its current value added.
+                        has_current_value = hasattr(current, coordinate)
+                        current_value = getattr(current, coordinate, None)
                         self._log(
                             f"AXIS  {coordinate} "
                             f"values={list(self.axes[coordinate])!r} "
-                            f"current={getattr(current, coordinate)!r}"
+                            f"current={current_value!r}"
                         )
                         axis_best = current
                         axis_best_score = current_score
                         values = list(self.axes[coordinate])
-                        current_value = getattr(current, coordinate)
-                        if current_value not in values:
+                        if has_current_value and current_value not in values:
                             values.insert(0, current_value)
                         for value in values:
                             if self._budget_exhausted():

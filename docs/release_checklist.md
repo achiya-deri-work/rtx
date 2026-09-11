@@ -5,8 +5,9 @@ or a test report from a different source revision does not satisfy the gate.
 
 ## Source and package
 
-- the worktree contains no generated datasets, checkpoints, local DINOv3
-  checkout, logs, or virtual environments;
+- tracked sources and built distributions contain no generated datasets,
+  checkpoints, local DINOv3 checkout, logs, or virtual environments (ignored
+  local evidence may remain in the worktree);
 - every retained autotuning manifest validates and has never been edited after
   producing data;
 - `python -m unittest discover -s tests -v` passes;
@@ -25,6 +26,16 @@ python -m unittest discover -s tests -v
 python benchmarks/validate_production.py \
   --output autotune_reports/release_1_0_production.json
 ```
+
+For one logged, bounded invocation with a fresh output directory:
+
+```bash
+bash benchmarks/run_release_qualification.sh .venv/bin/python
+```
+
+The same script powers the manual self-hosted GPU release-qualification CI.
+Run it separately for each supported environment; it does not modify installed
+dependencies or update the checkout.
 
 The matrix must cover eager and `torch.compile(fullgraph=True, dynamic=False)`,
 dynamic training, dynamic-X/prequantized-W and fully packed inference, ragged

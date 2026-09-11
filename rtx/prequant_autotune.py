@@ -797,17 +797,17 @@ class PrequantCoordinateDescentTuner:
         value: object,
     ) -> TrialOutcome:
         config_id = prequant_config_id(config)
-        if config_id in self._memo:
+        rejection = config.rejection(self.problem)
+        if rejection is None and config_id in self._memo:
             self.reused_trials += 1
             return self._memo[config_id]
-        if self.policy.resume and not self.policy.force:
+        if rejection is None and self.policy.resume and not self.policy.force:
             cached = self.database.get_trial(config)
             if cached is not None:
                 self.reused_trials += 1
                 self._memo[config_id] = cached
                 self._log(f"REUSE {config_id} {coordinate} status={cached.status}")
                 return cached
-        rejection = config.rejection(self.problem)
         if rejection is None:
             self._log(f"RUN   {config_id} {coordinate} compile -> check -> E2E benchmark")
             try:
@@ -888,6 +888,9 @@ class PrequantCoordinateDescentTuner:
         status = "failed"
         try:
             cached = self.database.best() if self.policy.resume else None
+            if cached is not None and cached[0].rejection(self.problem) is not None:
+                self._log("SKIP  cached best violates current legality; using initial seed")
+                cached = None
             global_config = cached[0] if cached is not None else initial
             first = self._evaluate(global_config, -1, "initial", None)
             if not first.successful:

@@ -147,7 +147,13 @@ separately control actual operand reuse.
 The low-level `NVFP4GemmConfig` also exposes
 `regional_epilogue_schedule`, `regional_epilogue_warps`,
 `regional_epilogue_registers`, and `regional_epilogue_values`.
-`warp_specialized` remains an experimental coordinate: it assigns independent
+Physical 64-row NVFP4 GEMM tiles are quarantined after large-grid numerical
+failures; 128/256-row tiles remain available. Logical 64-row and ragged inputs
+are supported through tail masking and do not require changing the user tensor.
+`warp_specialized` is currently rejected by static validation following
+reproduced GPU hangs during first-use autotuning. Its implementation is retained
+for repair; use the default `mma` schedule with direct or fragment-register
+epilogues. The quarantined implementation assigns independent
 warps to the FP32 regional-scale/BF16-store epilogue and overlaps it with the
 next persistent tile's MMA, but its 128x128 FP32 handoff consumes 64 KiB of
 SMEM. Revision 8 instead seeds the faster TMA/direct-MMA basin. Its CTA

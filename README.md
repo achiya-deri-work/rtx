@@ -167,6 +167,8 @@ See the [runtime/checkpoint contract](docs/runtime_contract.md) and
 [troubleshooting guide](docs/troubleshooting.md) for deployment behavior. The
 [1.0 release checklist](docs/release_checklist.md) defines the exact source,
 GPU, autotuning, numerical, and packaging gates used for a release tag.
+The [local v1 hardening report](docs/release_status_20260912.md) records current
+qualification evidence, quarantined experimental schedules, and remaining gates.
 
 TorchAO-style MXFP8 PTQ is available for existing no-bias BF16 models:
 

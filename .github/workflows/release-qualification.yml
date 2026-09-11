@@ -1,0 +1,40 @@
+name: release-qualification
+
+on:
+  workflow_dispatch:
+
+jobs:
+  qualify:
+    runs-on: [self-hosted, linux, x64, sm120]
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # One GPU must not benchmark/test two stacks concurrently.
+      max-parallel: 1
+      matrix:
+        stack: [torch212, torch213]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create isolated supported runtime
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/rtx-release-${{ matrix.stack }}"
+          runtime_python="$RUNNER_TEMP/rtx-release-${{ matrix.stack }}/bin/python"
+          "$runtime_python" -m pip install --upgrade pip
+          requirements_file=requirements.txt
+          if [[ '${{ matrix.stack }}' == torch212 ]]; then
+            requirements_file=requirements-torch212-cu132.txt
+          fi
+          "$runtime_python" -m pip install -r "$requirements_file"
+          "$runtime_python" -m pip install --no-deps -e .
+      - name: Qualify kernels and frontends
+        shell: bash
+        run: |
+          runtime_python="$RUNNER_TEMP/rtx-release-${{ matrix.stack }}/bin/python"
+          bash benchmarks/run_release_qualification.sh "$runtime_python" \
+            autotune_reports/release_${{ matrix.stack }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-${{ matrix.stack }}-${{ runner.name }}-${{ github.sha }}
+          path: autotune_reports/release_*/

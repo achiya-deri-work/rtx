@@ -72,9 +72,9 @@ class NVFP4QuantKernel:
         lane_idx: Int32,
     ):
         maximum_bits = value.bitcast(Int32) & Int32(0x7FFFFFFF)
+        group_base = lane_idx & Int32(~(threads_in_group - 1))
+        member_mask = Int32((1 << threads_in_group) - 1) << group_base
         if cutlass.const_expr(self.config.reduction == "redux"):
-            group_base = lane_idx & Int32(~(threads_in_group - 1))
-            member_mask = Int32((1 << threads_in_group) - 1) << group_base
             return nvvm.redux_sync(
                 maximum_bits,
                 nvvm.ReductionKind.UMAX,
@@ -88,6 +88,7 @@ class NVFP4QuantKernel:
             other = cute.arch.shuffle_sync_bfly(
                 maximum,
                 (threads_in_group // 2) >> level,
+                mask=member_mask,
                 mask_and_clamp=mask_and_clamp,
             )
             maximum = cute.arch.fmax(maximum, other, nan=True)
@@ -258,10 +259,11 @@ class NVFP4QuantKernel:
             group_base = cute.arch.lane_idx() & Int32(
                 ~(cfg.threads_per_scale - 1)
             )
+            member_mask = Int32((1 << cfg.threads_per_scale) - 1) << group_base
             block_scale_bits = cute.arch.shuffle_sync(
-                block_scale_bits, group_base
+                block_scale_bits, group_base, mask=member_mask
             )
-            reciprocal = cute.arch.shuffle_sync(reciprocal, group_base)
+            reciprocal = cute.arch.shuffle_sync(reciprocal, group_base, mask=member_mask)
             block_scale = Uint8(block_scale_bits).bitcast(Float8E4M3FN)
         else:
             raw_block_scale = block_amax / (
@@ -1055,10 +1057,11 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
                     group_base = lane_idx & Int32(
                         ~(cfg.threads_per_scale - 1)
                     )
+                    member_mask = Int32((1 << cfg.threads_per_scale) - 1) << group_base
                     block_scale_bits = cute.arch.shuffle_sync(
-                        block_scale_bits, group_base
+                        block_scale_bits, group_base, mask=member_mask
                     )
-                    reciprocal = cute.arch.shuffle_sync(reciprocal, group_base)
+                    reciprocal = cute.arch.shuffle_sync(reciprocal, group_base, mask=member_mask)
                     block_scale = Uint8(block_scale_bits).bitcast(
                         Float8E4M3FN
                     )

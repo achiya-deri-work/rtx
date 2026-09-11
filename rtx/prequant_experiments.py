@@ -1023,12 +1023,12 @@ class PrequantBenchmarkHarness:
             runner(self.x, self.weight, out)
             torch.cuda.synchronize(self.device)
             max_abs_error = float((out.float() - self._expected.float()).abs().max())
-            if not torch.allclose(
+            if not math.isfinite(max_abs_error) or not torch.allclose(
                 out,
                 self._expected,
                 rtol=self.protocol.correctness_rtol,
                 atol=self.protocol.correctness_atol,
-                equal_nan=True,
+                equal_nan=False,
             ):
                 raise CandidateCorrectnessError(
                     f"candidate differs from reference (max abs {max_abs_error})"

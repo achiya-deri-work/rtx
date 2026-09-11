@@ -234,6 +234,11 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                         error=f"{type(exc).__name__}: {exc}"[:4000],
                     )
                 outcomes.append(outcome)
+                # One failed repeat invalidates the candidate. In particular,
+                # do not launch again after a sticky device fault. Persist the
+                # failed outcome below before run() propagates the fatal error.
+                if not outcome.successful:
+                    break
             successful = [item for item in outcomes if item.successful]
             timings = [
                 timing
@@ -250,7 +255,10 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 )
             else:
                 median_ms = None
-            if median_ms is not None:
+            failed = next((item for item in outcomes if not item.successful), None)
+            if failed is not None:
+                observation.outcome = failed
+            elif median_ms is not None:
                 compile_values = [
                     float(item.compile_ms)
                     for item in successful
@@ -271,6 +279,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                     max_abs_error=(
                         None if not error_values else max(error_values)
                     ),
+                    metadata=dict(screen.metadata),
                 )
             confirmation_elapsed = time.monotonic() - confirmation_started
             observation.elapsed_s += confirmation_elapsed

@@ -1165,17 +1165,17 @@ class BwdCoordinateDescentTuner:
         value: object,
     ) -> TrialOutcome:
         key = bwd_config_id(config)
-        if key in self.memo:
+        reason = config.implementation_rejection(self.evaluator.problem)
+        if reason is None and key in self.memo:
             self.reused += 1
             return self.memo[key]
-        if self.policy.resume and not self.policy.force:
+        if reason is None and self.policy.resume and not self.policy.force:
             cached = self.database.get_trial(config)
             if cached is not None:
                 self.memo[key] = cached
                 self.reused += 1
                 self._log(f"REUSE {key} {coordinate} status={cached.status}")
                 return cached
-        reason = config.implementation_rejection(self.evaluator.problem)
         if reason is None:
             self._log(f"RUN   {key} {coordinate} compile -> check -> BWD E2E")
             outcome = self.evaluator(config)
@@ -1251,6 +1251,9 @@ class BwdCoordinateDescentTuner:
         status = "failed"
         try:
             cached = self.database.best() if self.policy.resume else None
+            if cached is not None and cached[0].implementation_rejection(self.evaluator.problem) is not None:
+                self._log("SKIP  cached best violates current legality; using initial seed")
+                cached = None
             best_config = cached[0] if cached is not None else initial
             first = self._evaluate(best_config, -1, "initial", None)
             if not first.successful:

@@ -42,6 +42,31 @@ def _has_sm12x() -> bool:
 
 
 class NVFP4ConfigTests(unittest.TestCase):
+    def test_large_grid_unsafe_64_row_tiles_are_rejected(self) -> None:
+        config = NVFP4GemmConfig(tile_m=64, atom_layout_m=2, stages=1)
+        for shape in ((64, 128, 128), (32768, 1280, 1280)):
+            self.assertIn("quarantined", config.rejection(NVFP4Problem(*shape)))
+
+    def test_sub_warpgroup_regional_epilogue_is_quarantined(self) -> None:
+        from rtx.configs.nvfp4 import NVFP4GemmConfig
+        for warps in (1, 2, 4, 8):
+            config = NVFP4GemmConfig(regional_epilogue_schedule="warp_specialized",
+                                    regional_epilogue_warps=warps)
+            self.assertIn("quarantined", config.rejection(NVFP4Problem(512, 512, 128)))
+        persistent = NVFP4GemmConfig(regional_epilogue_schedule="warp_specialized",
+                                     regional_epilogue_warps=4, persistent_waves=1)
+        self.assertIn("quarantined", persistent.rejection(NVFP4Problem(512, 512, 128)))
+
+    def test_swizzle_respects_packed_operand_width(self) -> None:
+        from rtx.configs.nvfp4 import NVFP4GemmConfig
+        problem = NVFP4Problem(128, 128, 256)
+        self.assertIn("packed K tile", NVFP4GemmConfig(
+            tile_k=128, a_swizzle="128b", b_swizzle="64b"
+        ).rejection(problem))
+        self.assertIsNone(NVFP4GemmConfig(
+            tile_k=128, a_swizzle="64b", b_swizzle="64b"
+        ).rejection(problem))
+
     def test_regional_epilogue_strategies_are_tunable_and_bounded(self) -> None:
         problem = NVFP4Problem(257, 769, 768)
         base = preferred_jit_row_region_config(problem)
@@ -262,11 +287,11 @@ class NVFP4ConfigTests(unittest.TestCase):
         ):
             with self.subTest(family=family):
                 expected_revision = {
-                    "nvfp4_dynamic_fwd": 7,
-                    "nvfp4_delayed_fwd": 2,
-                    "nvfp4_jit_row_region_fwd": 9,
-                    "nvfp4_weight_prequant_fwd": 4,
-                    "nvfp4_fully_prequant_fwd": 4,
+                    "nvfp4_dynamic_fwd": 8,
+                    "nvfp4_delayed_fwd": 3,
+                    "nvfp4_jit_row_region_fwd": 10,
+                    "nvfp4_weight_prequant_fwd": 5,
+                    "nvfp4_fully_prequant_fwd": 5,
                 }[family]
                 self.assertEqual(
                     _current_revision(family),
@@ -422,6 +447,34 @@ class NVFP4ConfigTests(unittest.TestCase):
 
 @unittest.skipUnless(_has_sm12x(), "requires an SM120/SM121 CUDA GPU")
 class NVFP4CudaTests(unittest.TestCase):
+    def test_partial_warp_shuffle_quantization_matches_redux(self) -> None:
+        from rtx.nvfp4_inference_experiments import NVFP4DelayedBenchmarkHarness
+        from rtx.prequant_experiments import BenchmarkProtocol, ShapeSpec
+        harness = NVFP4DelayedBenchmarkHarness(
+            ShapeSpec(33, 511, 257), "hot", BenchmarkProtocol(), seed=0
+        )
+        baseline = harness._build_runner(NVFP4DynamicConfig())
+        expected = torch.empty_like(harness._expected)
+        baseline(harness.x, harness.weight, expected)
+        torch.cuda.synchronize()
+        for values in (2, 4, 8, 16):
+            for scale_compute in ("redundant", "leader_broadcast"):
+                with self.subTest(values=values, scale_compute=scale_compute):
+                    config = NVFP4DynamicConfig(quant=NVFP4QuantConfig(
+                        values_per_lane=values, load_bits=min(128, values * 16),
+                        reduction="shuffle", scale_compute=scale_compute,
+                    ))
+                    runner = harness._build_runner(config)
+                    actual = torch.empty_like(expected)
+                    runner(harness.x, harness.weight, actual)
+                    torch.cuda.synchronize()
+                    for name in ("qx", "qw", "sx", "sw"):
+                        self.assertTrue(torch.equal(
+                            getattr(runner.runner, name).view(torch.uint8),
+                            getattr(baseline.runner, name).view(torch.uint8),
+                        ), name)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_register_cached_jit_quantization_is_bitwise_exact(self) -> None:
         from rtx.fp4 import _make_jit_region_dynamic_runner
 
@@ -465,6 +518,7 @@ class NVFP4CudaTests(unittest.TestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
+    @unittest.skip("specialized regional epilogue quarantined after runtime GPU hangs")
     def test_jit_regional_warp_specialized_epilogue(self) -> None:
         from rtx.fp4 import _make_jit_region_dynamic_runner
 
@@ -877,7 +931,7 @@ class NVFP4CudaTests(unittest.TestCase):
             )
             self.assertGreater(float(cosine), 0.8)
 
-    def test_native_64_row_packed_gemm_matches_dequantized_reference(self) -> None:
+    def test_logical_64_row_packed_gemm_matches_dequantized_reference(self) -> None:
         torch.manual_seed(1908)
         x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
         weight = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
@@ -887,9 +941,11 @@ class NVFP4CudaTests(unittest.TestCase):
         from rtx.formats.nvfp4 import nvfp4_tensor_scale
 
         config = NVFP4GemmConfig(
-            tile_m=64,
-            atom_layout_m=2,
+            tile_m=128,
+            atom_layout_m=4,
             stages=1,
+            epilogue="direct",
+            store_vec=1,
         )
         problem = NVFP4Problem(64, 128, 128)
         self.assertIsNone(config.rejection(problem))

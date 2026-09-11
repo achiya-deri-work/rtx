@@ -48,6 +48,30 @@ def _reference_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 class MXFP8ConfigTests(unittest.TestCase):
+    def test_quantizer_register_decrease_fits_initial_allocation(self) -> None:
+        config = normalize_fwd_config(load_engine="tma", schedule="three_role",
+                                      quantizer_warps=16, bf16_tile_k=32,
+                                      bf16_swizzle="none", bf16_stages=2)
+        self.assertIn("initial CTA register ceiling", config.implementation_rejection(
+            MXFP8Problem(96, 768, 1280)))
+        self.assertIsNone(normalize_fwd_config(config, quantizer_warps=8).implementation_rejection(
+            MXFP8Problem(96, 768, 1280)))
+
+    def test_tma_checks_physical_stride_for_each_orientation(self) -> None:
+        config = normalize_fwd_config(load_engine="tma")
+        self.assertIn("TMA A BF16 row stride", config.implementation_rejection(
+            MXFP8Problem(33, 511, 257)))
+        self.assertIsNone(config.implementation_rejection(MXFP8Problem(33, 511, 264)))
+        self.assertIn("TMA A BF16 row stride", config.oriented_implementation_rejection(
+            MXFP8Problem(33, 512, 264), "transpose", "row"))
+        self.assertIn("TMA B BF16 row stride", config.oriented_implementation_rejection(
+            MXFP8Problem(40, 511, 264), "transpose", "transpose"))
+        # Logical K can be odd when both physical row strides remain aligned.
+        self.assertIsNone(config.oriented_implementation_rejection(
+            MXFP8Problem(40, 512, 257), "transpose", "transpose"))
+        self.assertIsNone(MXFP8FwdConfig().implementation_rejection(
+            MXFP8Problem(33, 511, 257)))
+
     def test_default_config_is_explicitly_implemented(self) -> None:
         problem = MXFP8Problem(37, 70, 128)
         self.assertIsNone(MXFP8FwdConfig().implementation_rejection(problem))
@@ -131,10 +155,7 @@ class MXFP8ConfigTests(unittest.TestCase):
             misaligned.implementation_rejection(problem),
         )
         overprovisioned = normalize_fwd_config(config, quantizer_warps=8)
-        self.assertIn(
-            "four quantizer warps",
-            overprovisioned.implementation_rejection(problem),
-        )
+        self.assertIsNotNone(overprovisioned.implementation_rejection(problem))
         unsupported_n_atoms = normalize_fwd_config(
             config, tile_m=64, tile_n=384
         )

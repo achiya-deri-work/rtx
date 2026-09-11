@@ -6,6 +6,7 @@ import argparse
 from contextlib import nullcontext
 from datetime import datetime, timezone
 import json
+import hashlib
 from pathlib import Path
 import traceback
 
@@ -16,12 +17,14 @@ import validate_mxfp8_production as mx
 
 
 def _nv_dynamic_case(
-    *, compiled: bool, training: bool, scaling: str, backend: str
+    *, compiled: bool, training: bool, scaling: str, backend: str,
+    shape: tuple[int, int, int] = (128, 128, 128),
 ) -> dict[str, object]:
     torch.manual_seed(601 + int(compiled) + 2 * int(training))
+    m, n, k = shape
     layer = rtx.NVFP4Linear(
-        128,
-        128,
+        k,
+        n,
         device="cuda",
         scaling=scaling,
         backend=backend,
@@ -30,10 +33,10 @@ def _nv_dynamic_case(
     layer.train(training)
     if scaling == "delayed":
         with torch.no_grad():
-            layer(torch.randn(128, 128, device="cuda", dtype=torch.bfloat16))
+            layer(torch.randn(m, k, device="cuda", dtype=torch.bfloat16))
     x = torch.randn(
-        128,
-        128,
+        m,
+        k,
         device="cuda",
         dtype=torch.bfloat16,
         requires_grad=training,
@@ -56,6 +59,7 @@ def _nv_dynamic_case(
         result: dict[str, object] = {
             "scaling": scaling,
             "backend": backend,
+            "shape": list(shape),
             "forward_relative_l2": mx._relative_error(actual, expected),
         }
         if training:
@@ -234,6 +238,19 @@ def _nvfp4_cases() -> dict[str, object]:
     cases: dict[str, object] = {}
     for compiled in (False, True):
         prefix = "compiled" if compiled else "eager"
+        for training in (False, True):
+            mode = "training" if training else "inference"
+            for shape in ((128, 128, 128), (33, 129, 257)):
+                suffix = "_ragged" if shape[0] == 33 else ""
+                cases[f"{prefix}_jit_region_{mode}{suffix}"] = (
+                    lambda compiled=compiled, training=training, shape=shape: _nv_dynamic_case(
+                        compiled=compiled, training=training,
+                        scaling="jit_row_region", backend="auto", shape=shape,
+                    )
+                )
+        cases[f"{prefix}_delayed_inference"] = lambda compiled=compiled: _nv_dynamic_case(
+            compiled=compiled, training=False, scaling="delayed", backend="materialized"
+        )
         cases[f"{prefix}_delayed_training"] = lambda compiled=compiled: _nv_dynamic_case(
             compiled=compiled, training=True, scaling="delayed", backend="materialized"
         )
@@ -271,10 +288,19 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--long-m", type=int, default=8192)
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--case", help="Run only case names containing this substring")
     parser.add_argument(
         "--frontend", choices=("both", "mxfp8", "nvfp4"), default="both"
     )
     args = parser.parse_args()
+    from rtx.autotune.dataset import _source_snapshot
+    from rtx.autotune.winners import current_kernel_revision
+    from rtx.autotune.outcomes import is_fatal_device_context_error
+    source = _source_snapshot()
+    source["validation_sources_sha256"] = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (Path(__file__), Path(mx.__file__))
+    }
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         parser.error("validation requires an SM120/SM121 CUDA GPU")
 
@@ -284,9 +310,12 @@ def main() -> None:
     if args.frontend in ("both", "nvfp4"):
         groups["nvfp4"] = _nvfp4_cases()
     results: dict[str, object] = {}
+    fatal_device_error = False
     for frontend, cases in groups.items():
         for name, case in cases.items():
             qualified = f"{frontend}.{name}"
+            if args.case and args.case not in qualified:
+                continue
             started = torch.cuda.Event(enable_timing=True)
             finished = torch.cuda.Event(enable_timing=True)
             try:
@@ -306,16 +335,30 @@ def main() -> None:
                 }
                 print(f"PASS {qualified}", flush=True)
             except Exception as exc:
-                torch.cuda.synchronize()
                 results[qualified] = {
                     "status": "failed",
                     "error": f"{type(exc).__name__}: {exc}",
                     "traceback": traceback.format_exc(),
                 }
                 print(f"FAIL {qualified}: {type(exc).__name__}: {exc}", flush=True)
+                if is_fatal_device_context_error(exc):
+                    fatal_device_error = True
+                    break
+        if fatal_device_error:
+            break
+    if not results:
+        parser.error("no cases matched")
     report = {
         "schema_version": 1,
         "type": "rtx_production_matrix",
+        "source": source,
+        "runtime": rtx.validate_runtime_environment(),
+        "kernel_revisions": {family: current_kernel_revision(family) for family in (
+            "mxfp8_fused_fwd", "mxfp8_prequant_fwd", "mxfp8_bwd",
+            "nvfp4_dynamic_fwd", "nvfp4_delayed_fwd", "nvfp4_jit_row_region_fwd",
+        )},
+        "arguments": {key: str(value) if isinstance(value, Path) else value
+                      for key, value in vars(args).items()},
         "frontends": list(groups),
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "device": torch.cuda.get_device_name(),
@@ -324,6 +367,7 @@ def main() -> None:
         "torch_cuda": torch.version.cuda,
         "passed": sum(value["status"] == "ok" for value in results.values()),
         "failed": sum(value["status"] != "ok" for value in results.values()),
+        "aborted_after_device_fault": fatal_device_error,
         "results": results,
     }
     encoded = json.dumps(report, indent=2, sort_keys=True)

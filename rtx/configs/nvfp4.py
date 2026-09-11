@@ -189,6 +189,11 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
             return str(exc)
         if self.tile_k % 64:
             return "NVFP4 tile K must be divisible by 64"
+        if self.tile_m == 64:
+            return (
+                "64-row NVFP4 GEMM is quarantined after large-grid scale mismatches; "
+                "use 128/256-row CTAs with logical tail masking"
+            )
         if self.tile_k == 64 and (
             self.a_swizzle not in ("none", "32b")
             or self.b_swizzle not in ("none", "32b")
@@ -198,6 +203,10 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
             )
         if self.scale_layout not in ("row_major", "mma128"):
             return "NVFP4 GEMM scales must use row_major or mma128 layout"
+        packed_row_bytes = self.tile_k // 2
+        for swizzle in (self.a_swizzle, self.b_swizzle):
+            if {"none": 0, "32b": 32, "64b": 64, "128b": 128}.get(swizzle, 0) > packed_row_bytes:
+                return "NVFP4 SMEM swizzle exceeds the packed K tile bytes"
         if self.regional_scale_epilogue not in (
             "direct",
             "expanded_factors",
@@ -213,6 +222,11 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
             )
         if self.regional_epilogue_schedule not in ("mma", "warp_specialized"):
             return "regional epilogue schedule must be mma or warp_specialized"
+        if self.regional_epilogue_schedule == "warp_specialized":
+            return (
+                "regional epilogue schedule is quarantined: runtime autotuning "
+                "reproduced GPU hangs; use regional_epilogue_schedule='mma'"
+            )
         if self.regional_epilogue_warps not in (1, 2, 4, 8):
             return "regional epilogue warps must be 1, 2, 4, or 8"
         if self.regional_epilogue_registers not in (24, 32, 40, 48, 64, 80):

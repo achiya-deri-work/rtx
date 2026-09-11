@@ -321,6 +321,11 @@ class MXFP8FwdConfig:
     def implementation_rejection(self, problem: MXFP8Problem) -> str | None:
         """Return why this revision cannot execute a candidate, or ``None``."""
 
+        return self.oriented_implementation_rejection(problem)
+
+    def _implementation_rejection(self, problem: MXFP8Problem) -> str | None:
+        """Schedule legality independent of the physical operand orientation."""
+
         reason = self.architecture_rejection(problem)
         if reason is not None:
             return reason
@@ -344,6 +349,17 @@ class MXFP8FwdConfig:
             return "three-role forward requires the TMA load engine"
         if self.schedule == "three_role" and self.quantizer_warps % 4:
             return "three-role quantizers must occupy complete warpgroups"
+        if self.schedule in ("warp_specialized", "three_role"):
+            # A decrease cannot request more registers than the initial CTA
+            # allocation can possibly supply. The 800-thread/96-register
+            # quantizer case faults with cudaErrorIllegalInstruction on SM120.
+            initial_register_ceiling = min(self.maxrregcount, 65536 // self.num_threads)
+            decrease_registers = max(
+                self.producer_registers,
+                self.quantizer_registers if self.schedule == "three_role" else 0,
+            )
+            if decrease_registers > initial_register_ceiling:
+                return "setmaxregister decrease exceeds the initial CTA register ceiling"
         if self.load_engine == "cpasync" and self.schedule != "cooperative":
             return "cp.async staging currently uses the cooperative schedule"
         if self.schedule == "cooperative" and self.producer_warps != 0:
@@ -510,13 +526,23 @@ class MXFP8FwdConfig:
         quantizer emits the ordinary K-major FP8 MMA tile without a transpose.
         """
 
-        reason = self.implementation_rejection(problem)
+        reason = self._implementation_rejection(problem)
         if reason is not None:
             return reason
         if a_orientation not in ("row", "transpose"):
             return "A orientation must be row or transpose"
         if b_orientation not in ("row", "transpose"):
             return "B orientation must be row or transpose"
+        if self.load_engine == "tma":
+            # Tensor-map byte strides must be multiples of 16. Logical
+            # transposes change which extent is the physical BF16 row stride.
+            # An aligned base pointer alone cannot satisfy this constraint.
+            for label, stride in (
+                ("A", problem.m if a_orientation == "transpose" else problem.k),
+                ("B", problem.n if b_orientation == "transpose" else problem.k),
+            ):
+                if stride % 8:
+                    return f"TMA {label} BF16 row stride must be divisible by 8 (16 bytes)"
         transposed = a_orientation == "transpose" or b_orientation == "transpose"
         if self.load_engine == "cpasync":
             cp_values = 128 // 16

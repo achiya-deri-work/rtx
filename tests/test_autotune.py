@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 from rtx.autotune import (
     CoordinateDescentPolicy,
@@ -14,6 +15,7 @@ from rtx.autotune import (
 )
 from rtx.kernels.mxfp8 import (
     DEFAULT_MXFP8_FWD_CONFIG,
+    FWD_SEARCH_SPACE,
     MXFP8Problem,
     normalize_fwd_config,
 )
@@ -37,6 +39,91 @@ def _fingerprint() -> DeviceFingerprint:
 
 
 class PersistentCoordinateDescentTests(unittest.TestCase):
+    def test_prequant_and_backward_cache_hits_obey_new_legality(self) -> None:
+        from rtx.prequant_autotune import PrequantCoordinateDescentTuner, prequant_config_id
+        from rtx.prequant_autotune import DEFAULT_MXFP8_PREQUANT_CONFIG
+        from rtx.bwd_autotune import BwdCoordinateDescentTuner, bwd_config_id
+        from rtx.fp8_bwd import DEFAULT_MXFP8_BWD_CONFIG
+
+        problem = MXFP8Problem(128, 128, 128)
+        policy = CoordinateDescentPolicy(coordinate_order=())
+        for family in ("prequant", "backward"):
+            for memoized in (False, True):
+                with self.subTest(family=family, memoized=memoized):
+                    database = Mock()
+                    database.get_trial.return_value = TrialOutcome("ok", median_ms=1)
+                    evaluator = Mock(problem=problem)
+                    if family == "prequant":
+                        config = DEFAULT_MXFP8_PREQUANT_CONFIG
+                        tuner = PrequantCoordinateDescentTuner(
+                            problem, evaluator, database, policy, axes={}, progress=None,
+                        )
+                        memo, key, method = tuner._memo, prequant_config_id(config), "rejection"
+                    else:
+                        config = DEFAULT_MXFP8_BWD_CONFIG
+                        tuner = BwdCoordinateDescentTuner(
+                            evaluator, database, policy, axes={}, progress=None,
+                        )
+                        memo, key, method = tuner.memo, bwd_config_id(config), "implementation_rejection"
+                    if memoized:
+                        memo[key] = TrialOutcome("ok", median_ms=1)
+                    with patch.object(type(config), method, return_value="quarantined"):
+                        result = tuner._evaluate(config, 0, "initial", None)
+                    self.assertEqual(result.status, "implementation_rejected")
+                    database.get_trial.assert_not_called()
+                    evaluator.assert_not_called()
+
+    def test_cached_trials_and_winner_are_rechecked_for_legality(self) -> None:
+        axes = {"quant_vec": (1, 2)}
+        policy = CoordinateDescentPolicy(
+            time_budget_s=10, max_passes=1, restarts=1,
+            coordinate_order=("quant_vec",), min_improvement=0,
+        )
+        problem = MXFP8Problem(128, 128, 128)
+        initial = normalize_fwd_config(quant_vec=1)
+        evaluator = lambda config: TrialOutcome(
+            "ok", median_ms=1 / config.quant_vec,
+            timings_ms=[1 / config.quant_vec],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            database = JsonTuningDatabase(directory, _fingerprint(), problem, axes)
+            first = CoordinateDescentTuner(
+                problem, evaluator, database, policy, axes=axes, progress=None,
+            ).tune(initial)
+            self.assertEqual(first.config.quant_vec, 2)
+            second = CoordinateDescentTuner(
+                problem, evaluator, database, policy, axes=axes, progress=None,
+                implementation_validator=lambda config, _: (
+                    "quarantined" if config.quant_vec == 2 else None
+                ),
+            ).tune(initial)
+            self.assertEqual(second.config.quant_vec, 1)
+            self.assertEqual(second.median_ms, 1)
+
+    def test_compound_axis_without_config_property_is_searchable(self) -> None:
+        coordinate = "cpasync_ldmatrix_pipeline"
+        self.assertFalse(hasattr(DEFAULT_MXFP8_FWD_CONFIG, coordinate))
+        axes = {coordinate: FWD_SEARCH_SPACE[coordinate][:2]}
+        policy = CoordinateDescentPolicy(
+            time_budget_s=10, max_passes=1, restarts=1,
+            coordinate_order=(coordinate,), min_improvement=0,
+        )
+        problem = MXFP8Problem(128, 128, 128)
+        seen = []
+
+        def evaluator(config):
+            seen.append(config)
+            score = 0.5 if config.load_engine == "cpasync" else 1.0
+            return TrialOutcome("ok", median_ms=score, timings_ms=[score])
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = JsonTuningDatabase(directory, _fingerprint(), problem, axes)
+            result = CoordinateDescentTuner(
+                problem, evaluator, database, policy, axes=axes, progress=None,
+            ).tune(DEFAULT_MXFP8_FWD_CONFIG)
+        self.assertTrue(any(config.load_engine == "cpasync" for config in seen))
+        self.assertEqual(result.median_ms, 0.5)
+
     def test_dependent_launch_coordinates_are_normalized(self) -> None:
         config = normalize_fwd_config(
             atom_layout_m=2,

@@ -536,12 +536,12 @@ class FusedFwdBenchmarkHarness:
         launcher(self.x, self.weight, out)
         torch.cuda.synchronize(self.device)
         max_error = float((out.float() - self._expected.float()).abs().max())
-        if not torch.allclose(
+        if not math.isfinite(max_error) or not torch.allclose(
             out,
             self._expected,
             rtol=self.protocol.correctness_rtol,
             atol=self.protocol.correctness_atol,
-            equal_nan=True,
+            equal_nan=False,
         ):
             raise FusedCandidateCorrectnessError(
                 f"candidate differs from baseline (max abs {max_error})"

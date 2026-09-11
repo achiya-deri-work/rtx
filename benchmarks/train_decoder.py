@@ -838,9 +838,13 @@ def main() -> None:
     initial_state = {name: value.clone() for name, value in initial.items()}
     base_model_config = asdict(base_config)
     base_model_config["dtype"] = str(base_config.dtype)
+    from rtx.autotune.dataset import _source_snapshot
+
     manifest = {
         "format_version": FORMAT_VERSION,
         "git_commit": _git_commit(),
+        "source": _source_snapshot(),
+        "trainer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "command": sys.argv,
         "device": torch.cuda.get_device_name(args.device),
         "torch_version": torch.__version__,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass
 import time
 from typing import Literal, Mapping
@@ -109,12 +111,12 @@ class NVFP4DynamicBenchmarkHarness(PrequantBenchmarkHarness):
     def _validate_output(
         self, out: torch.Tensor, max_abs_error: float
     ) -> None:
-        if not torch.allclose(
+        if not math.isfinite(max_abs_error) or not torch.allclose(
             out,
             self._expected,
             rtol=self.protocol.correctness_rtol,
             atol=self.protocol.correctness_atol,
-            equal_nan=True,
+            equal_nan=False,
         ):
             raise CandidateCorrectnessError(
                 f"candidate differs from reference (max abs {max_abs_error})"
@@ -572,12 +574,12 @@ class NVFP4InferenceBenchmarkHarness(PrequantBenchmarkHarness):
             max_abs_error = float(
                 (out.float() - self._expected.float()).abs().max()
             )
-            if not torch.allclose(
+            if not math.isfinite(max_abs_error) or not torch.allclose(
                 out,
                 self._expected,
                 rtol=self.protocol.correctness_rtol,
                 atol=self.protocol.correctness_atol,
-                equal_nan=True,
+                equal_nan=False,
             ):
                 raise CandidateCorrectnessError(
                     f"candidate differs from reference (max abs {max_abs_error})"

@@ -47,6 +47,11 @@ def _reference(
 
 
 class MXFP8QuantConfigTests(unittest.TestCase):
+    def test_transposed_layout_constraints_reject_before_compilation(self) -> None:
+        config = MXFP8QuantConfig(quant_vec=8, num_warps=16, transposed_tile_rows=64)
+        self.assertIn("num_warps * quant_vec", config.transposed_rejection(128, 128))
+        self.assertIn("full SMEM tiles", MXFP8QuantConfig().transposed_rejection(96, 128))
+
     def test_legality_is_explicit(self) -> None:
         self.assertIsNone(MXFP8QuantConfig().rejection(128, 256))
         self.assertIsNone(

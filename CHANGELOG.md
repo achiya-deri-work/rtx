@@ -5,6 +5,22 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Fix NVFP4 shuffle and leader-broadcast participation masks for incomplete
+  warps. Invalidate NVFP4 runtime winners (dynamic r8, delayed r3, regional
+  r10, packed inference r5). Historical model heads require retraining.
+- Reject incorrect TMA physical strides, oversized packed SMEM swizzles,
+  impossible register-decrease requests and transposed quantizer partitions
+  before compilation. Preserve arbitrary logical dimensions with safe loads.
+- Quarantine experimental specialized regional epilogues (GPU hangs) and
+  64-row NVFP4 GEMMs (large-grid numerical failures). Retained 128/256-row
+  NVFP4 schedules mask logical tails; MXFP8 64-row CTAs are unaffected.
+- Reject failed winner confirmations and nonfinite numerical comparisons.
+- Fix first-hit fused MXFP8 tuning over compound coordinates without config
+  properties. Revalidate legacy fused, prequantized, and backward cached
+  trials/winners against current legality before reuse.
+- Expand production qualification to default JIT-region and delayed inference,
+  record source/runtime identities, and add serial dual-stack GPU release CI.
+
 - Add evidence-oriented cross-SKU autotuning analysis: paired mutation effects,
   complete-shape-held-out pair ranking and fixed-budget replay, schedule
   archetypes, typed failure enrichment, raw-timing convergence, and

@@ -98,6 +98,10 @@ class MXFP8QuantConfig:
         reason = self.rejection(rows, k)
         if reason is not None:
             return reason
+        if rows % self.transposed_tile_rows:
+            return "logical-transpose rows must contain full SMEM tiles"
+        if self.transposed_tile_rows % (self.num_warps * self.quant_vec):
+            return "transposed_tile_rows must be divisible by num_warps * quant_vec"
         if k % SF_VEC_SIZE:
             return "decomposed logical-transpose K must be divisible by 32"
         if k % self.transposed_tile_k:

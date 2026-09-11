@@ -644,6 +644,41 @@ class ComposableAutotuneTests(unittest.TestCase):
         self.assertAlmostEqual(float(contender.outcome.median_ms), 1.05)
         self.assertEqual(contender.metadata["confirmation"]["repeats"], 1)
 
+    def test_failed_confirmation_invalidates_candidate_and_persists_fatal(self) -> None:
+        for status in ("correctness_error", "runtime_error"):
+            with self.subTest(status=status):
+                adapter = _toy_adapter()
+                calls = []
+
+                def evaluate(config):
+                    calls.append(config)
+                    if len(calls) == 1:
+                        return TrialOutcome("ok", median_ms=1.0, timings_ms=[1.0])
+                    return TrialOutcome(
+                        status,
+                        error=("CUDA error: an illegal instruction was encountered"
+                               if status == "runtime_error" else "confirmation mismatch"),
+                    )
+
+                adapter.evaluator = evaluate
+                store = InMemoryTuningStore()
+                tuner = AutotuneOrchestrator(
+                    adapter, store, [RandomSearch()], UCB1Scheduler(),
+                    TuningBudget(max_trials=1, time_budget_s=10),
+                    confirmation=ConfirmationPolicy(repeats=3, confirm_initial=True),
+                )
+                # With no surviving candidate a nonfatal failure yields no winner;
+                # a sticky fault must propagate after its observation is saved.
+                with self.assertRaises(FatalDeviceContextError if status == "runtime_error" else RuntimeError):
+                    tuner.tune()
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(len(store.observations), 1)
+                observation = store.observations[0]
+                self.assertEqual(observation.outcome.status, status)
+                self.assertFalse(observation.successful)
+                self.assertIsNone(observation.outcome.median_ms)
+                self.assertEqual(observation.metadata["confirmation"]["successful_runs"], 1)
+
     def test_jsonl_store_is_append_only_and_resumable(self) -> None:
         adapter = _toy_adapter()
         with tempfile.TemporaryDirectory() as directory:

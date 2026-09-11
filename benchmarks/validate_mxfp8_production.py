@@ -18,6 +18,8 @@ from rtx.kernels.mxfp8 import normalize_fwd_config
 
 
 def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    if not bool(torch.isfinite(actual).all()) or not bool(torch.isfinite(expected).all()):
+        raise AssertionError("nonfinite candidate or reference in production validation")
     numerator = (actual.detach().float() - expected.detach().float()).norm()
     denominator = expected.detach().float().norm().clamp_min(1.0e-12)
     return float(numerator / denominator)
