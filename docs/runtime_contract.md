@@ -91,11 +91,15 @@ The production compile target is:
 torch.compile(module, fullgraph=True, dynamic=False)
 ```
 
-Every positive M/N/K is logically supported. Ragged problems use predication,
+The linear APIs logically support every positive M/N/K. Ragged problems use predication,
 zero-filled physical tails, or direct stores without eager BF16 padding or an
 explicit transpose. A new static shape may select a different runtime winner
 and compile a distinct launcher.
 
-Use `module.explain(x)` before execution to inspect routing without compiling
+For linear modules, use `module.explain(x)` before execution to inspect routing without compiling
 or tuning. Use `rtx.clear_runtime_caches()` when intentionally testing cold
 selection behavior.
+
+Feature-branch GLU/MLP APIs have separate contracts and do not expose this
+linear winner-selection interface. See [MLP qualification](mxfp8_mlp.md),
+including the known singleton fault in its optional packed-down schedule.

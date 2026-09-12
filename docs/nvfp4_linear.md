@@ -223,6 +223,10 @@ cost-model bundle; the runtime never silently trains on copied campaign data.
 
 ## Training
 
+The stateful `delayed` policy is available on this module, not on the stateless
+`rtx.nvfp4_linear` function. Functional scaling accepts only `current`,
+`jit_row_region`, or `block`.
+
 ```python
 layer = rtx.NVFP4Linear(1536, 3072, device="cuda").train()
 x = torch.randn(64, 512, 1536, device="cuda", dtype=torch.bfloat16)

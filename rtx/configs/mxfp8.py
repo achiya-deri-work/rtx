@@ -251,6 +251,8 @@ class MXFP8GemmConfig:
             return "vector-load cache controls are inactive for scalar scale loads"
         if self.scale_layout not in ("row_major", "mma128", "mma64x128"):
             return "scale_layout must be row_major, mma128, or mma64x128"
+        if self.scale_layout == "mma64x128" and self.scale_role != "tma":
+            return "mma64x128 native scales require TMA; scalar staging reads row-major scales"
         if self.scale_layout == "mma128" and (
             self.scale_role != "tma"
             or self.tile_m != 128

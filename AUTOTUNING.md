@@ -1,5 +1,11 @@
 # RTX kernel autotuning
 
+This is the historical kernel-tuning notebook, including old schedules and
+measurement snapshots. For current user-facing modes, dataset operations and
+winner deployment, start with [the autotuning guide](docs/autotuning.md).
+For the current composable framework, use [its reference](rtx/autotune/README.md).
+Do not interpret a historical benchmark or planned family as current support.
+
 The legacy name `prequant` in APIs, cache keys, and v1/v2 datasets means a
 *materialized dynamic* pipeline: BF16 X and BF16 W are quantized every call,
 then consumed by a separate GEMM. It must not be confused with the persistent

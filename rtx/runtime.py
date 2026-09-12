@@ -261,7 +261,7 @@ def clear_runtime_caches(*, synchronize: bool = True, device=None) -> dict[str, 
         if torch.cuda.is_available():
             torch.cuda.synchronize(device)
     released: dict[str, object] = {}
-    for module_name in ("fp8", "fp8_bwd", "fp4"):
+    for module_name in ("fp8", "fp8_bwd", "fp4", "glu", "mlp"):
         module = import_module(f".{module_name}", __package__)
         clear = getattr(module, "_clear_runtime_caches", None)
         if clear is not None:

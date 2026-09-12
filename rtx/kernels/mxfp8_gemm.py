@@ -69,6 +69,12 @@ class MXFP8GemmKernel:
                 scale_cache="default",
             )
         self.ab_dtype = Float8E4M3FN
+        self.glu = False
+        self.cooperative_quant = False
+        self.glu_tma_store = False
+        self.glu_store_stages = 1
+        self.glu_interleaved_operands = False
+        self.glu_scratch_elems = 0
         self.sf_dtype = Float8E8M0FNU
         self.sf_vec_size = SF_VEC_SIZE
         self.use_mxf8f6f4 = True
@@ -282,7 +288,8 @@ class MXFP8GemmKernel:
                 cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128,
                 BFloat16,
             ),
-            (cfg.tile_m, cfg.tile_n, cfg.epilogue_stages),
+            (cfg.tile_m, cfg.tile_n//2 if self.glu_tma_store else cfg.tile_n,
+             self.glu_store_stages if self.glu_tma_store else cfg.epilogue_stages),
             order=(0, 1, 2),
         )
 
@@ -531,9 +538,16 @@ class MXFP8GemmKernel:
         sx: cute.Tensor,
         sw: cute.Tensor,
         out: cute.Tensor,
-        output_scale: cute.Tensor,
+        output_scale,
         stream: cuda.CUstream,
     ):
+        if cutlass.const_expr(self.glu and not self.glu_interleaved_operands):
+            qw = cute.make_tensor(qw.iterator, cute.make_layout(
+                ((2, self.problem.n // 2), self.problem.k),
+                stride=((self.problem.n // 2 * self.problem.k, self.problem.k), 1)))
+            sw = cute.make_tensor(sw.iterator, cute.make_layout(
+                ((2, self.problem.n // 2), self.problem.k // 32),
+                stride=((self.problem.n // 2 * (self.problem.k // 32), self.problem.k // 32), 1)))
         self._setup_static_layouts()
         cfg = self.config
         tma_x, tma_x_tensor = cpasync.make_tiled_tma_atom(
@@ -562,19 +576,20 @@ class MXFP8GemmKernel:
             (scale_b_tile_elems, cfg.stages),
             stride=(1, scale_b_tile_elems),
         )
-        if cutlass.const_expr(cfg.epilogue == "tma"):
+        if cutlass.const_expr(cfg.epilogue == "tma" or self.glu_tma_store):
             out_view = cute.make_tensor(
                 out.iterator,
                 cute.make_layout(
-                    (self.problem.m, self.problem.n, 1),
-                    stride=(self.problem.n, 1, self.problem.m * self.problem.n),
+                    (self.problem.m, self.problem.n//2 if self.glu_tma_store else self.problem.n, 1),
+                    stride=(self.problem.n//2 if self.glu_tma_store else self.problem.n, 1,
+                            self.problem.m*(self.problem.n//2 if self.glu_tma_store else self.problem.n)),
                 ),
             )
             tma_out, tma_out_tensor = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileS2GOp(),
                 out_view,
                 cute.slice_(self.out_layout, (None, None, 0)),
-                (cfg.tile_m, cfg.tile_n),
+                (cfg.tile_m, cfg.tile_n//2 if self.glu_tma_store else cfg.tile_n),
             )
         else:
             # Direct and split-K epilogues never instantiate the constexpr TMA
@@ -584,6 +599,9 @@ class MXFP8GemmKernel:
 
         @cute.struct
         class SharedStorage:
+            glu_scratch: cute.struct.Align[
+                cute.struct.MemRange[Float32, self.glu_scratch_elems], 16,
+            ]
             a: cute.struct.Align[
                 cute.struct.MemRange[self.ab_dtype, cute.cosize(self.a_layout)],
                 1024,
@@ -611,7 +629,7 @@ class MXFP8GemmKernel:
             out: cute.struct.Align[
                 cute.struct.MemRange[
                     BFloat16,
-                    cute.cosize(self.out_layout) if cfg.epilogue == "tma" else 0,
+                    cute.cosize(self.out_layout) if cfg.epilogue == "tma" or self.glu_tma_store else 0,
                 ],
                 1024,
             ]
@@ -698,6 +716,7 @@ class MXFP8GemmKernel:
                     block=(cfg.num_threads, 1, 1),
                     stream=stream,
                     use_pdl=self.use_pdl,
+                    cooperative=self.cooperative_quant,
                 )
         else:
             launch = self.kernel(
@@ -723,6 +742,7 @@ class MXFP8GemmKernel:
                     block=(cfg.num_threads, 1, 1),
                     stream=stream,
                     use_pdl=self.use_pdl,
+                    cooperative=self.cooperative_quant,
                 )
 
     @cute.kernel
@@ -733,7 +753,7 @@ class MXFP8GemmKernel:
         sx: cute.Tensor,
         sw: cute.Tensor,
         out: cute.Tensor,
-        output_scale: cute.Tensor,
+        output_scale,
         tma_x: cute.CopyAtom,
         tma_x_tensor: cute.Tensor,
         tma_w: cute.CopyAtom,
@@ -754,6 +774,9 @@ class MXFP8GemmKernel:
         out_layout: cute.ComposedLayout,
     ):
         cfg = self.config
+        if cutlass.const_expr(self.cooperative_quant):
+            self._cooperative_quantize(qx,qw,sx,sw,output_scale)
+            output_scale=output_scale[0]
         if cutlass.const_expr(self.use_pdl):
             if nvvm.elect_sync():
                 nvvm.griddepcontrol("wait")
@@ -793,6 +816,8 @@ class MXFP8GemmKernel:
                 stride=(self.problem.k // self.sf_vec_size, 1),
             ),
         )
+        if cutlass.const_expr(self.glu and not self.glu_interleaved_operands):
+            sw_row_view = sw
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         cta_idx, _, _ = cute.arch.block_idx()
@@ -1222,7 +1247,7 @@ class MXFP8GemmKernel:
             )
             t_cg_out = thr_mma.partition_C(g_out)
             t_cc_out = thr_mma.partition_C(c_out)
-            accumulators = cute.make_rmem_tensor(t_cg_out.shape, Float32)
+            accumulators = cute.make_rmem_tensor(t_cc_out.shape, Float32)
             accumulators.fill(0.0)
 
             if cutlass.const_expr(cfg.epilogue == "tma"):
@@ -1651,7 +1676,10 @@ class MXFP8GemmKernel:
                                     coord[1] - block_n * cfg.tile_n,
                                 )
 
-            if cutlass.const_expr(self.warp_specialized_epilogue):
+            if cutlass.const_expr(self.glu):
+                self._glu_epilogue(storage, accumulators, t_cc_out, out, output_scale,
+                                   block_m, block_n, tidx, tma_out, tma_out_tensor, out_layout, work_slot)
+            elif cutlass.const_expr(self.warp_specialized_epilogue):
                 first_epilogue_thread = (cfg.num_mma_warps + 1) * 32
                 epilogue_threads = self.num_epilogue_warps * 32
                 if warp_idx < cfg.num_mma_warps:
@@ -2028,7 +2056,7 @@ class MXFP8GemmKernel:
                 # stale mbarrier phases and intermittently consumes old data.
                 tma_pipeline.producer_tail(final_producer_state)
 
-        if cutlass.const_expr(cfg.epilogue == "tma"):
+        if cutlass.const_expr(cfg.epilogue == "tma" or self.glu_tma_store):
             if warp_idx == 0:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
 

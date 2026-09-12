@@ -40,6 +40,7 @@ from cutlass import (
     Int32,
     Uint16,
     Uint32,
+    Uint64,
     Uint8,
 )
 from cutlass.cute.nvgpu import cpasync, warp
@@ -76,18 +77,20 @@ def _make_sm120_sfa_layout_64(
     tile_k: int,
     sf_vec_size: int,
     num_stages: int,
+    logical_rows: int = 64,
 ):
-    """SM120 SFA layout for a logical 64-row tile in a padded 128-row block.
+    """SM120 SFA layout for a logical 32/64-row tile in a 128-row block.
 
     NVIDIA's public helper materializes ``(32, 4)`` row groups and therefore
     requires M to be divisible by 128.  The first 64 logical rows are exactly
     the first two of those four interleaved groups: ``(32, 2):(16, 4)``.  The
     unchanged strides preserve the hardware's 128-row address encoding while
-    the logical extent seen by fragment partitioning is genuinely 64.
+    the logical extent seen by fragment partitioning is genuinely 64. A
+    32-row tile similarly uses only the first group, preserving its strides.
     """
 
     mma_nsf = tiled_mma.shape_mnk[2] // sf_vec_size
-    mn_shape = ((32, 2), 1)
+    mn_shape = ((32, logical_rows // 32), 1)
     mn_stride = ((16, 4), 512)
     k_shape = (
         (sf_vec_size, mma_nsf),
@@ -148,6 +151,18 @@ class MXFP8LinearFwdKernel:
         self.atomic_output = atomic_output
         self.cluster_output = cluster_output
         self.nvfp4 = nvfp4
+        self.glu = False
+        self.a_prequantized = False
+        self.full_scalar_tiles = (
+            config.scalar_bounds == "auto" and config.load_engine == "scalar"
+            and a_orientation == "row" and b_orientation == "row"
+            and problem.m % config.tile_m == 0 and problem.n % config.tile_n == 0
+            and problem.k % config.bf16_tile_k == 0
+        )
+        self.glu_tma_store = False
+        self.glu_store_stages = 1
+        self.glu_scratch_elems = 0
+        self.glu_alias_bytes = 0
         self.delayed_scale_elems = 0
         if nvfp4 and getattr(config, "jit_cta_scale", False):
             self.delayed_scale_elems = 6 + 2 * (config.num_threads // 32)
@@ -307,6 +322,8 @@ class MXFP8LinearFwdKernel:
         self.tiled_mma = cute.make_tiled_mma(
             mma_op, atom_layout, permutation_mnk=permutation_mnk
         )
+        if cutlass.const_expr(self.glu):
+            self._prepare_glu()
 
         swizzle_kinds = {
             "none": cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_INTER,
@@ -376,12 +393,13 @@ class MXFP8LinearFwdKernel:
             ((cfg.tile_n + 127) // 128) * 128,
             cfg.tile_k,
         )
-        if cfg.tile_m == 64:
+        if cfg.tile_m < 128:
             self.sfa_smem_layout = _make_sm120_sfa_layout_64(
                 self.tiled_mma,
                 cfg.tile_k,
                 self.sf_vec_size,
                 cfg.mxfp8_stages,
+                cfg.tile_m,
             )
         else:
             self.sfa_smem_layout = blockscaled_utils.sm120_make_smem_layout_sfa(
@@ -453,7 +471,8 @@ class MXFP8LinearFwdKernel:
         )
         self.out_smem_layout = cute.tile_to_shape(
             out_atom,
-            (cfg.tile_m, cfg.tile_n, cfg.epilogue_stages),
+            (cfg.tile_m, cfg.tile_n//2 if self.glu_tma_store else cfg.tile_n,
+             self.glu_store_stages if self.glu_tma_store else cfg.epilogue_stages),
             order=(0, 1, 2),
         )
 
@@ -472,6 +491,14 @@ class MXFP8LinearFwdKernel:
         # Runtime receives original contiguous operands. Logical transpose is a
         # CuTe layout over the same pointer, created before any TMA/cp.async
         # descriptor; Python never constructs a torch.Tensor .T view.
+        if cutlass.const_expr(self.glu):
+            weight = cute.make_tensor(
+                weight.iterator,
+                cute.make_layout(
+                    ((2, self.problem.n // 2), self.problem.k),
+                    stride=((self.problem.n // 2 * self.problem.k, self.problem.k), 1),
+                ),
+            )
         if cutlass.const_expr(self.a_orientation == "transpose"):
             x = cute.make_tensor(
                 x.iterator,
@@ -517,15 +544,16 @@ class MXFP8LinearFwdKernel:
         out_tma_view = cute.make_tensor(
             out.iterator,
             cute.make_layout(
-                (self.problem.m, self.problem.n, 1),
-                stride=(self.problem.n, 1, self.problem.m * self.problem.n),
+                (self.problem.m, self.problem.n//2 if self.glu_tma_store else self.problem.n, 1),
+                stride=(self.problem.n//2 if self.glu_tma_store else self.problem.n, 1,
+                        self.problem.m*(self.problem.n//2 if self.glu_tma_store else self.problem.n)),
             ),
         )
         tma_atom_out, tma_tensor_out = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(),
             out_tma_view,
             out_stage_layout,
-            (cfg.tile_m, cfg.tile_n),
+            (cfg.tile_m, cfg.tile_n//2 if self.glu_tma_store else cfg.tile_n),
         )
         cp_async_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
@@ -568,6 +596,13 @@ class MXFP8LinearFwdKernel:
             cfg.tile_n, self.b_orientation
         )
 
+        # A/B operand arrays and GLU exchange form a lifetime-disjoint union.
+        # Extend B's backing allocation when exchange is larger, without
+        # changing its logical layout or allocating redundant operand stages.
+        self.q_b_storage_elems = cute.cosize(self.b_packed_layout)
+        if cutlass.const_expr(self.glu_alias_bytes > 0):
+            self.q_b_storage_elems += max(0,self.glu_alias_bytes-cute.cosize(self.a_packed_layout)-cute.cosize(self.b_packed_layout))
+
         @cute.struct
         class SharedStorageStaged:
                 bf16_a: cute.struct.Align[
@@ -592,7 +627,7 @@ class MXFP8LinearFwdKernel:
                 q_b: cute.struct.Align[
                     cute.struct.MemRange[
                         self.q_storage_dtype,
-                        cute.cosize(self.b_packed_layout),
+                        self.q_b_storage_elems,
                     ],
                     1024,
                 ]
@@ -625,7 +660,7 @@ class MXFP8LinearFwdKernel:
                         self.c_dtype,
                         (
                             cute.cosize(self.out_smem_layout)
-                            if cfg.epilogue == "tma"
+                            if cfg.epilogue == "tma" or self.glu_tma_store
                             else 0
                         ),
                     ],
@@ -636,6 +671,9 @@ class MXFP8LinearFwdKernel:
                         cutlass.Int64, 2 if self.cluster_output else 0
                     ],
                     8,
+                ]
+                glu_scratch: cute.struct.Align[
+                    cute.struct.MemRange[Float32, self.glu_scratch_elems], 16,
                 ]
                 delayed_scale: cute.struct.Align[
                     cute.struct.MemRange[
@@ -656,7 +694,7 @@ class MXFP8LinearFwdKernel:
                 q_b: cute.struct.Align[
                     cute.struct.MemRange[
                         self.q_storage_dtype,
-                        cute.cosize(self.b_packed_layout),
+                        self.q_b_storage_elems,
                     ],
                     1024,
                 ]
@@ -677,7 +715,7 @@ class MXFP8LinearFwdKernel:
                         self.c_dtype,
                         (
                             cute.cosize(self.out_smem_layout)
-                            if cfg.epilogue == "tma"
+                            if cfg.epilogue == "tma" or self.glu_tma_store
                             else 0
                         ),
                     ],
@@ -688,6 +726,9 @@ class MXFP8LinearFwdKernel:
                         cutlass.Int64, 2 if self.cluster_output else 0
                     ],
                     8,
+                ]
+                glu_scratch: cute.struct.Align[
+                    cute.struct.MemRange[Float32, self.glu_scratch_elems], 16,
                 ]
                 delayed_scale: cute.struct.Align[
                     cute.struct.MemRange[
@@ -750,6 +791,19 @@ class MXFP8LinearFwdKernel:
                 block=[self.threads_per_cta, 1, 1],
                 stream=stream,
             )
+
+    @cute.jit
+    def _store_quant_word(self,tensor,row,k,stage,word,swizzle):
+        # Materialize the swizzle in the byte offset before removing pointer
+        # metadata. A dtype recast alone does not preserve this address map.
+        layout = cute.make_composed_layout(swizzle,0,tensor.layout)
+        pointer = cute.recast_ptr(tensor.iterator,dtype=Uint8) + layout((row,k,stage))
+        if cutlass.const_expr(self.config.quant_store_bits == 16):
+            nvvm.store_ext(Uint16(word).ir_value(),pointer)
+        elif cutlass.const_expr(self.config.quant_store_bits == 32):
+            nvvm.store_ext(Uint32(word).ir_value(),pointer)
+        else:
+            nvvm.store_ext(Uint64(word).ir_value(),pointer)
 
     @cute.jit
     def _scale_from_amax(self, amax: Float32):
@@ -1124,6 +1178,8 @@ class MXFP8LinearFwdKernel:
                 b_smem_layout.outer, swizzle=b_smem_layout.inner
             )
         s_sfa = storage.scale_a.get_tensor(sfa_smem_layout)
+        if cutlass.const_expr(not self.nvfp4 and cfg.quant_store_bits > 8):
+            quant_store_type = {16:Uint16,32:Uint32,64:Uint64}[cfg.quant_store_bits]
         s_sfb = storage.scale_b.get_tensor(sfb_smem_layout)
         if cutlass.const_expr(self.cluster_output):
             s_cluster_barrier = storage.cluster_barrier.get_tensor(
@@ -1558,6 +1614,11 @@ class MXFP8LinearFwdKernel:
             # same per-thread coordinate order.  The identity tensor supplies tail
             # predicates for non-multiple M/N dimensions.
             out_matrix = out
+            if cutlass.const_expr(self.glu):
+                # GLU has only H columns in global memory. Build accumulator
+                # partitions from virtual paired coordinates, never a 2H
+                # output view over the smaller allocation.
+                out_matrix = cute.make_identity_tensor((self.problem.m, self.problem.n))
             if cutlass.const_expr(
                 self.split_reduction > 1
                 and not self.atomic_output
@@ -1583,7 +1644,7 @@ class MXFP8LinearFwdKernel:
             )
             t_cg_out = thr_mma.partition_C(g_out_tile)
             t_cc_out = thr_mma.partition_C(c_out_tile)
-            accumulators = cute.make_rmem_tensor(t_cg_out.shape, self.acc_dtype)
+            accumulators = cute.make_rmem_tensor(t_cc_out.shape, self.acc_dtype)
             accumulators.fill(0.0)
     
             if cutlass.const_expr(cfg.epilogue == "tma"):
@@ -1803,6 +1864,8 @@ class MXFP8LinearFwdKernel:
                 warp_amax_b = Float32(0.0)
                 quant_warp_idx = warp_idx
                 quant_warp_count = self.num_mma_warps
+                if cutlass.const_expr(cfg.cooperative_warps):
+                    quant_warp_count = cfg.cooperative_warps
                 if cutlass.const_expr(cfg.schedule == "warp_specialized"):
                     if warp_idx == self.num_mma_warps:
                         quant_warp_idx = Int32(scale_groups)
@@ -1828,512 +1891,592 @@ class MXFP8LinearFwdKernel:
                             first_task_group = a_task_groups + quant_warp_idx
                         else:
                             final_task_group = a_task_groups
-                for task_group in cutlass.range(
-                    first_task_group,
-                    final_task_group,
-                    quant_warp_count,
-                    unroll=1,
-                ):
-                    task = task_group * blocks_per_warp + scale_in_warp
-                    # A's task count is a multiple of every represented
-                    # quant_vec, making this branch warp-uniform.  That is
-                    # required by the transposing ldmatrix collective.
-                    is_a = task_group * blocks_per_warp < a_scale_blocks
-                    local_task = task if is_a else task - a_scale_blocks
-                    row = local_task // blocks_per_load
-                    scale_block = local_task % blocks_per_load
-                    global_row = (
-                        block_m * cfg.tile_m + row
-                        if is_a
-                        else block_n * cfg.tile_n + row
-                    )
-                    row_limit = self.problem.m if is_a else self.problem.n
-    
-                    bf16_values = [BFloat16(0.0)] * cfg.quant_vec
-                    values = [Float32(0.0)] * cfg.quant_vec
-                    local_ks = [Int32(0)] * cfg.quant_vec
-                    bf16_ks = [Int32(0)] * cfg.quant_vec
-                    local_maximum = Float32(0.0)
-                    local_maximum_bits = Int32(0)
-                    if cutlass.const_expr(cfg.quant_load_bits > 16):
-                        values_per_load = cfg.quant_load_bits // BFloat16.width
-                        load_count = cfg.quant_vec // values_per_load
-                        for load_idx in cutlass.range_constexpr(load_count):
-                            vec_base = load_idx * values_per_load
-                            bf16_k_base = (
+                if cutlass.const_expr(self.a_prequantized):
+                    # Stage the packed activation directly. Do not run its
+                    # values through BF16 loads, amax, reciprocal scaling,
+                    # and E4M3 conversion just to overwrite them afterward.
+                    a_task_groups = a_scale_blocks // blocks_per_warp
+                    a_first_group = quant_warp_idx
+                    if cutlass.const_expr(cfg.cluster_reuse == "a"):
+                        if cute.arch.block_idx_in_cluster() != 0:
+                            a_first_group = Int32(a_task_groups)
+                    for a_group in cutlass.range(a_first_group,a_task_groups,quant_warp_count,unroll=cfg.quant_unroll):
+                        a_task = a_group*blocks_per_warp+scale_in_warp
+                        a_row = a_task//blocks_per_load
+                        a_block = a_task%blocks_per_load
+                        global_a_row = block_m*cfg.tile_m+a_row
+                        if cutlass.const_expr(cfg.quant_store_bits == 8):
+                            for v in cutlass.range_constexpr(cfg.quant_vec):
+                                offset = a_block*self.sf_vec_size+lane_in_scale*cfg.quant_vec+v
+                                global_a_k = k_tile*cfg.bf16_tile_k+offset
+                                packed_value = Float8E4M3FN(0)
+                                if cutlass.const_expr(self.full_scalar_tiles) or (global_a_row < self.problem.m and global_a_k < self.problem.k):
+                                    packed_value = x[global_a_row,global_a_k]
+                                s_a[a_row,scale_block_base*self.sf_vec_size+offset,stage] = packed_value
+                        else:
+                            packed_type = Uint16
+                            if cutlass.const_expr(cfg.quant_store_bits == 32):
+                                packed_type = Uint32
+                            elif cutlass.const_expr(cfg.quant_store_bits == 64):
+                                packed_type = Uint64
+                            word_bytes = cfg.quant_store_bits // 8
+                            for v in cutlass.range_constexpr(cfg.quant_vec // word_bytes):
+                                offset = a_block*self.sf_vec_size+lane_in_scale*cfg.quant_vec+v*word_bytes
+                                global_a_k = k_tile*cfg.bf16_tile_k+offset
+                                word = packed_type(0)
+                                if cutlass.const_expr(self.full_scalar_tiles) or (global_a_row < self.problem.m and global_a_k+word_bytes <= self.problem.k):
+                                    pointer = x.iterator+x.layout((global_a_row,global_a_k))
+                                    packed = cute.make_tensor(cute.recast_ptr(pointer,dtype=packed_type),cute.make_layout((1,)))
+                                    word = packed_type(packed[0])
+                                else:
+                                    for byte in cutlass.range_constexpr(word_bytes):
+                                        if global_a_row < self.problem.m and global_a_k+byte < self.problem.k:
+                                            value = x[global_a_row,global_a_k+byte].bitcast(Uint8)
+                                            word = packed_type(word | (packed_type(value) << (8*byte)))
+                                self._store_quant_word(s_a,a_row,scale_block_base*self.sf_vec_size+offset,stage,word,a_smem_layout.inner)
+                        if lane_in_scale == 0:
+                            a_scale = Float8E8M0FNU(1)
+                            a_col = k_tile*cfg.bf16_tile_k//32+a_block
+                            if global_a_row < self.problem.m and a_col < cute.size(x_tensor_scale,mode=[1]):
+                                a_scale = x_tensor_scale[global_a_row,a_col]
+                            s_sfa[a_row,(scale_block_base+a_block)*self.sf_vec_size,stage] = a_scale
+                    first_task_group = cutlass.max(first_task_group,Int32(a_task_groups)+quant_warp_idx)
+                for operand_group in cutlass.range_constexpr(2 if cfg.quant_schedule == "split_a_b" else 1):
+                    operand_first = first_task_group
+                    operand_last = final_task_group
+                    if cutlass.const_expr(cfg.quant_schedule == "split_a_b"):
+                        a_groups = Int32(a_scale_blocks // blocks_per_warp)
+                        if cutlass.const_expr(operand_group == 0):
+                            operand_last = cutlass.min(operand_last, a_groups)
+                        else:
+                            operand_first = cutlass.max(operand_first, a_groups + quant_warp_idx)
+                    for task_group in cutlass.range(
+                        operand_first,
+                        operand_last,
+                        quant_warp_count,
+                        unroll=cfg.quant_unroll,
+                    ):
+                        task = task_group * blocks_per_warp + scale_in_warp
+                        # A's task count is a multiple of every represented
+                        # quant_vec, making this branch warp-uniform.  That is
+                        # required by the transposing ldmatrix collective.
+                        is_a = task_group * blocks_per_warp < a_scale_blocks
+                        if cutlass.const_expr(self.a_prequantized):
+                            is_a = False
+                        if cutlass.const_expr(cfg.quant_schedule == "split_a_b"):
+                            is_a = cutlass.const_expr(operand_group == 0)
+                        local_task = task if is_a else task - a_scale_blocks
+                        row = local_task // blocks_per_load
+                        scale_block = local_task % blocks_per_load
+                        global_row = (
+                            block_m * cfg.tile_m + row
+                            if is_a
+                            else block_n * cfg.tile_n + row
+                        )
+                        row_limit = self.problem.m if is_a else self.problem.n
+
+                        bf16_values = [BFloat16(0.0)] * cfg.quant_vec
+                        values = [Float32(0.0)] * cfg.quant_vec
+                        local_ks = [Int32(0)] * cfg.quant_vec
+                        bf16_ks = [Int32(0)] * cfg.quant_vec
+                        local_maximum = Float32(0.0)
+                        local_maximum_bits = Int32(0)
+                        if cutlass.const_expr(cfg.quant_load_bits > 16):
+                            values_per_load = cfg.quant_load_bits // BFloat16.width
+                            load_count = cfg.quant_vec // values_per_load
+                            for load_idx in cutlass.range_constexpr(load_count):
+                                vec_base = load_idx * values_per_load
+                                bf16_k_base = (
+                                    scale_block * self.sf_vec_size
+                                    + lane_in_scale * cfg.quant_vec
+                                    + vec_base
+                                )
+                                loaded_values = [BFloat16(0.0)] * values_per_load
+                                if cutlass.const_expr(cfg.load_engine != "scalar"):
+                                    if is_a:
+                                        if cutlass.const_expr(
+                                            self.a_orientation == "transpose"
+                                        ):
+                                            row_base = row - scale_in_warp
+                                            source_stage = s_bf16_a[
+                                                None, None, bf16_stage
+                                            ]
+                                            source_ptr = (
+                                                source_stage.iterator
+                                                + source_stage.layout(
+                                                    (row_base, lane_idx)
+                                                )
+                                            )
+                                            packed_rows = nvvm.inline_ptx_hl(
+                                                "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+                                                "{{$w0}, {$w1}, {$w2}, {$w3}}, "
+                                                "[{$r0}];",
+                                                write_only_types=[Int32] * 4,
+                                                read_only_args=[
+                                                    Uint32(source_ptr.toint())
+                                                ],
+                                            )
+                                            for register in cutlass.range_constexpr(4):
+                                                packed_pair = packed_rows[register]
+                                                loaded_values[register * 2] = Uint16(
+                                                    packed_pair & Int32(0xFFFF)
+                                                ).bitcast(BFloat16)
+                                                loaded_values[register * 2 + 1] = Uint16(
+                                                    (packed_pair >> Int32(16))
+                                                    & Int32(0xFFFF)
+                                                ).bitcast(BFloat16)
+                                        else:
+                                            src_row_a = s_bf16_a[
+                                                row, None, bf16_stage
+                                            ]
+                                            loaded = nvvm.load_ext(
+                                                src_row_a.iterator
+                                                + src_row_a.layout(bf16_k_base),
+                                                dtype=Uint16,
+                                                count=values_per_load,
+                                            ).bitcast(BFloat16)
+                                            for load_vec in cutlass.range_constexpr(
+                                                values_per_load
+                                            ):
+                                                loaded_values[load_vec] = loaded[load_vec]
+                                    else:
+                                        if cutlass.const_expr(
+                                            self.b_orientation == "transpose"
+                                        ):
+                                            row_base = row - scale_in_warp
+                                            source_stage = s_bf16_b[
+                                                None, None, bf16_stage
+                                            ]
+                                            source_ptr = (
+                                                source_stage.iterator
+                                                + source_stage.layout(
+                                                    (row_base, lane_idx)
+                                                )
+                                            )
+                                            packed_rows = nvvm.inline_ptx_hl(
+                                                "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
+                                                "{{$w0}, {$w1}, {$w2}, {$w3}}, "
+                                                "[{$r0}];",
+                                                write_only_types=[Int32] * 4,
+                                                read_only_args=[
+                                                    Uint32(source_ptr.toint())
+                                                ],
+                                            )
+                                            for register in cutlass.range_constexpr(4):
+                                                packed_pair = packed_rows[register]
+                                                loaded_values[register * 2] = Uint16(
+                                                    packed_pair & Int32(0xFFFF)
+                                                ).bitcast(BFloat16)
+                                                loaded_values[register * 2 + 1] = Uint16(
+                                                    (packed_pair >> Int32(16))
+                                                    & Int32(0xFFFF)
+                                                ).bitcast(BFloat16)
+                                        else:
+                                            src_row_b = s_bf16_b[
+                                                row, None, bf16_stage
+                                            ]
+                                            loaded = nvvm.load_ext(
+                                                src_row_b.iterator
+                                                + src_row_b.layout(bf16_k_base),
+                                                dtype=Uint16,
+                                                count=values_per_load,
+                                            ).bitcast(BFloat16)
+                                            for load_vec in cutlass.range_constexpr(
+                                                values_per_load
+                                            ):
+                                                loaded_values[load_vec] = loaded[load_vec]
+                                    for load_vec in cutlass.range_constexpr(
+                                        values_per_load
+                                    ):
+                                        bf16_values[vec_base + load_vec] = loaded_values[
+                                            load_vec
+                                        ]
+                                else:
+                                    global_k_base = (
+                                        k_tile * cfg.bf16_tile_k + bf16_k_base
+                                    )
+                                    if is_a:
+                                        src_row_a = x[global_row, None]
+                                        load_bytes = cfg.quant_load_bits // 8
+                                        naturally_aligned = (
+                                            x.layout((global_row,global_k_base))
+                                            * (BFloat16.width // 8)
+                                        ) % load_bytes == 0
+                                        if cutlass.const_expr(self.full_scalar_tiles) or (
+                                            global_row < row_limit
+                                            and global_k_base + values_per_load
+                                            <= self.problem.k
+                                            and naturally_aligned
+                                        ):
+                                            loaded = nvvm.load_ext(
+                                                src_row_a.iterator
+                                                + src_row_a.layout(global_k_base),
+                                                dtype=Uint16,
+                                                count=values_per_load,
+                                            ).bitcast(BFloat16)
+                                            for load_vec in cutlass.range_constexpr(
+                                                values_per_load
+                                            ):
+                                                bf16_values[vec_base + load_vec] = loaded[
+                                                    load_vec
+                                                ]
+                                        else:
+                                            for load_vec in cutlass.range_constexpr(
+                                                values_per_load
+                                            ):
+                                                scalar_k = global_k_base + load_vec
+                                                if (
+                                                    global_row < row_limit
+                                                    and scalar_k < self.problem.k
+                                                ):
+                                                    bf16_values[vec_base + load_vec] = (
+                                                        BFloat16(x[global_row, scalar_k])
+                                                    )
+                                    else:
+                                        src_row_b = weight[global_row, None]
+                                        load_bytes = cfg.quant_load_bits // 8
+                                        naturally_aligned = (
+                                            weight.layout((global_row,global_k_base))
+                                            * (BFloat16.width // 8)
+                                        ) % load_bytes == 0
+                                        if cutlass.const_expr(self.full_scalar_tiles) or (
+                                            global_row < row_limit
+                                            and global_k_base + values_per_load
+                                            <= self.problem.k
+                                            and naturally_aligned
+                                        ):
+                                            loaded = nvvm.load_ext(
+                                                src_row_b.iterator
+                                                + src_row_b.layout(global_k_base),
+                                                dtype=Uint16,
+                                                count=values_per_load,
+                                            ).bitcast(BFloat16)
+                                            for load_vec in cutlass.range_constexpr(
+                                                values_per_load
+                                            ):
+                                                bf16_values[vec_base + load_vec] = loaded[
+                                                    load_vec
+                                                ]
+                                        else:
+                                            for load_vec in cutlass.range_constexpr(
+                                                values_per_load
+                                            ):
+                                                scalar_k = global_k_base + load_vec
+                                                if (
+                                                    global_row < row_limit
+                                                    and scalar_k < self.problem.k
+                                                ):
+                                                    bf16_values[vec_base + load_vec] = (
+                                                        weight[global_row, scalar_k]
+                                                    )
+                        for vec in cutlass.range_constexpr(cfg.quant_vec):
+                            bf16_k = (
                                 scale_block * self.sf_vec_size
                                 + lane_in_scale * cfg.quant_vec
-                                + vec_base
+                                + vec
                             )
-                            loaded_values = [BFloat16(0.0)] * values_per_load
-                            if cutlass.const_expr(cfg.load_engine != "scalar"):
+                            # ldmatrix.x4.trans distributes one two-BF16 pair from
+                            # each 8-K matrix to a lane: register r owns
+                            # K=8*r+2*lane_in_scale+{0,1}. Preserve that measured
+                            # delivery rather than pretending each lane received
+                            # eight consecutive K values.
+                            ldmatrix_k = (
+                                scale_block * self.sf_vec_size
+                                + (vec // 2) * 8
+                                + lane_in_scale * 2
+                                + vec % 2
+                            )
+                            if cutlass.const_expr(
+                                self.a_orientation == "transpose"
+                                and self.b_orientation == "transpose"
+                                and cfg.quant_load_bits == 128
+                            ):
+                                bf16_k = ldmatrix_k
+                            elif cutlass.const_expr(
+                                self.a_orientation == "transpose"
+                                and cfg.quant_load_bits == 128
+                            ):
                                 if is_a:
-                                    if cutlass.const_expr(
-                                        self.a_orientation == "transpose"
-                                    ):
-                                        row_base = row - scale_in_warp
-                                        source_stage = s_bf16_a[
-                                            None, None, bf16_stage
-                                        ]
-                                        source_ptr = (
-                                            source_stage.iterator
-                                            + source_stage.layout(
-                                                (row_base, lane_idx)
-                                            )
+                                    bf16_k = ldmatrix_k
+                            elif cutlass.const_expr(
+                                self.b_orientation == "transpose"
+                                and cfg.quant_load_bits == 128
+                            ):
+                                if not is_a:
+                                    bf16_k = ldmatrix_k
+                            local_k = scale_block_base * self.sf_vec_size + bf16_k
+                            bf16_ks[vec] = bf16_k
+                            local_ks[vec] = local_k
+                            global_k = k_tile * cfg.bf16_tile_k + bf16_k
+                            value_bf16 = bf16_values[vec]
+                            if cutlass.const_expr(cfg.quant_load_bits == 16):
+                                if cutlass.const_expr(self.full_scalar_tiles) or (global_row < row_limit and global_k < self.problem.k):
+                                    if cutlass.const_expr(cfg.load_engine != "scalar"):
+                                        value_bf16 = (
+                                            s_bf16_a[row, bf16_ks[vec], bf16_stage]
+                                            if is_a
+                                            else s_bf16_b[
+                                                row, bf16_ks[vec], bf16_stage
+                                            ]
                                         )
-                                        packed_rows = nvvm.inline_ptx_hl(
-                                            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
-                                            "{{$w0}, {$w1}, {$w2}, {$w3}}, "
-                                            "[{$r0}];",
-                                            write_only_types=[Int32] * 4,
-                                            read_only_args=[
-                                                Uint32(source_ptr.toint())
-                                            ],
-                                        )
-                                        for register in cutlass.range_constexpr(4):
-                                            packed_pair = packed_rows[register]
-                                            loaded_values[register * 2] = Uint16(
-                                                packed_pair & Int32(0xFFFF)
-                                            ).bitcast(BFloat16)
-                                            loaded_values[register * 2 + 1] = Uint16(
-                                                (packed_pair >> Int32(16))
-                                                & Int32(0xFFFF)
-                                            ).bitcast(BFloat16)
                                     else:
-                                        src_row_a = s_bf16_a[
-                                            row, None, bf16_stage
-                                        ]
-                                        loaded = nvvm.load_ext(
-                                            src_row_a.iterator
-                                            + src_row_a.layout(bf16_k_base),
-                                            dtype=Uint16,
-                                            count=values_per_load,
-                                        ).bitcast(BFloat16)
-                                        for load_vec in cutlass.range_constexpr(
-                                            values_per_load
-                                        ):
-                                            loaded_values[load_vec] = loaded[load_vec]
-                                else:
-                                    if cutlass.const_expr(
-                                        self.b_orientation == "transpose"
-                                    ):
-                                        row_base = row - scale_in_warp
-                                        source_stage = s_bf16_b[
-                                            None, None, bf16_stage
-                                        ]
-                                        source_ptr = (
-                                            source_stage.iterator
-                                            + source_stage.layout(
-                                                (row_base, lane_idx)
-                                            )
+                                        value_bf16 = (
+                                            BFloat16(x[global_row, global_k])
+                                            if is_a
+                                            else weight[global_row, global_k]
                                         )
-                                        packed_rows = nvvm.inline_ptx_hl(
-                                            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
-                                            "{{$w0}, {$w1}, {$w2}, {$w3}}, "
-                                            "[{$r0}];",
-                                            write_only_types=[Int32] * 4,
-                                            read_only_args=[
-                                                Uint32(source_ptr.toint())
-                                            ],
-                                        )
-                                        for register in cutlass.range_constexpr(4):
-                                            packed_pair = packed_rows[register]
-                                            loaded_values[register * 2] = Uint16(
-                                                packed_pair & Int32(0xFFFF)
-                                            ).bitcast(BFloat16)
-                                            loaded_values[register * 2 + 1] = Uint16(
-                                                (packed_pair >> Int32(16))
-                                                & Int32(0xFFFF)
-                                            ).bitcast(BFloat16)
-                                    else:
-                                        src_row_b = s_bf16_b[
-                                            row, None, bf16_stage
-                                        ]
-                                        loaded = nvvm.load_ext(
-                                            src_row_b.iterator
-                                            + src_row_b.layout(bf16_k_base),
-                                            dtype=Uint16,
-                                            count=values_per_load,
-                                        ).bitcast(BFloat16)
-                                        for load_vec in cutlass.range_constexpr(
-                                            values_per_load
-                                        ):
-                                            loaded_values[load_vec] = loaded[load_vec]
-                                for load_vec in cutlass.range_constexpr(
-                                    values_per_load
-                                ):
-                                    bf16_values[vec_base + load_vec] = loaded_values[
-                                        load_vec
-                                    ]
-                            else:
-                                global_k_base = (
-                                    k_tile * cfg.bf16_tile_k + bf16_k_base
+                            bf16_values[vec] = value_bf16
+                            value = Float32(value_bf16)
+                            values[vec] = value
+                            if cutlass.const_expr(cfg.quant_amax == "fp32"):
+                                magnitude = (
+                                    value.bitcast(Int32) & Int32(0x7FFFFFFF)
+                                ).bitcast(Float32)
+                                local_maximum = cute.arch.fmax(
+                                    local_maximum, magnitude, nan=True
                                 )
-                                if is_a:
-                                    src_row_a = x[global_row, None]
-                                    load_bytes = cfg.quant_load_bits // 8
-                                    naturally_aligned = (
-                                        (global_row * self.problem.k + global_k_base)
-                                        * (BFloat16.width // 8)
-                                    ) % load_bytes == 0
-                                    if (
-                                        global_row < row_limit
-                                        and global_k_base + values_per_load
-                                        <= self.problem.k
-                                        and naturally_aligned
-                                    ):
-                                        loaded = nvvm.load_ext(
-                                            src_row_a.iterator
-                                            + src_row_a.layout(global_k_base),
-                                            dtype=Uint16,
-                                            count=values_per_load,
-                                        ).bitcast(BFloat16)
-                                        for load_vec in cutlass.range_constexpr(
-                                            values_per_load
-                                        ):
-                                            bf16_values[vec_base + load_vec] = loaded[
-                                                load_vec
-                                            ]
-                                    else:
-                                        for load_vec in cutlass.range_constexpr(
-                                            values_per_load
-                                        ):
-                                            scalar_k = global_k_base + load_vec
-                                            if (
-                                                global_row < row_limit
-                                                and scalar_k < self.problem.k
-                                            ):
-                                                bf16_values[vec_base + load_vec] = (
-                                                    x[global_row, scalar_k]
-                                                )
-                                else:
-                                    src_row_b = weight[global_row, None]
-                                    load_bytes = cfg.quant_load_bits // 8
-                                    naturally_aligned = (
-                                        (global_row * self.problem.k + global_k_base)
-                                        * (BFloat16.width // 8)
-                                    ) % load_bytes == 0
-                                    if (
-                                        global_row < row_limit
-                                        and global_k_base + values_per_load
-                                        <= self.problem.k
-                                        and naturally_aligned
-                                    ):
-                                        loaded = nvvm.load_ext(
-                                            src_row_b.iterator
-                                            + src_row_b.layout(global_k_base),
-                                            dtype=Uint16,
-                                            count=values_per_load,
-                                        ).bitcast(BFloat16)
-                                        for load_vec in cutlass.range_constexpr(
-                                            values_per_load
-                                        ):
-                                            bf16_values[vec_base + load_vec] = loaded[
-                                                load_vec
-                                            ]
-                                    else:
-                                        for load_vec in cutlass.range_constexpr(
-                                            values_per_load
-                                        ):
-                                            scalar_k = global_k_base + load_vec
-                                            if (
-                                                global_row < row_limit
-                                                and scalar_k < self.problem.k
-                                            ):
-                                                bf16_values[vec_base + load_vec] = (
-                                                    weight[global_row, scalar_k]
-                                                )
-                    for vec in cutlass.range_constexpr(cfg.quant_vec):
-                        bf16_k = (
-                            scale_block * self.sf_vec_size
-                            + lane_in_scale * cfg.quant_vec
-                            + vec
-                        )
-                        # ldmatrix.x4.trans distributes one two-BF16 pair from
-                        # each 8-K matrix to a lane: register r owns
-                        # K=8*r+2*lane_in_scale+{0,1}. Preserve that measured
-                        # delivery rather than pretending each lane received
-                        # eight consecutive K values.
-                        ldmatrix_k = (
-                            scale_block * self.sf_vec_size
-                            + (vec // 2) * 8
-                            + lane_in_scale * 2
-                            + vec % 2
-                        )
-                        if cutlass.const_expr(
-                            self.a_orientation == "transpose"
-                            and self.b_orientation == "transpose"
-                            and cfg.quant_load_bits == 128
-                        ):
-                            bf16_k = ldmatrix_k
-                        elif cutlass.const_expr(
-                            self.a_orientation == "transpose"
-                            and cfg.quant_load_bits == 128
-                        ):
-                            if is_a:
-                                bf16_k = ldmatrix_k
-                        elif cutlass.const_expr(
-                            self.b_orientation == "transpose"
-                            and cfg.quant_load_bits == 128
-                        ):
-                            if not is_a:
-                                bf16_k = ldmatrix_k
-                        local_k = scale_block_base * self.sf_vec_size + bf16_k
-                        bf16_ks[vec] = bf16_k
-                        local_ks[vec] = local_k
-                        global_k = k_tile * cfg.bf16_tile_k + bf16_k
-                        value_bf16 = bf16_values[vec]
-                        if cutlass.const_expr(cfg.quant_load_bits == 16):
-                            if global_row < row_limit and global_k < self.problem.k:
-                                if cutlass.const_expr(cfg.load_engine != "scalar"):
-                                    value_bf16 = (
-                                        s_bf16_a[row, bf16_ks[vec], bf16_stage]
-                                        if is_a
-                                        else s_bf16_b[
-                                            row, bf16_ks[vec], bf16_stage
-                                        ]
-                                    )
-                                else:
-                                    value_bf16 = (
-                                        x[global_row, global_k]
-                                        if is_a
-                                        else weight[global_row, global_k]
-                                    )
-                        bf16_values[vec] = value_bf16
-                        value = Float32(value_bf16)
-                        values[vec] = value
-                        if cutlass.const_expr(cfg.quant_amax == "fp32"):
-                            magnitude = (
-                                value.bitcast(Int32) & Int32(0x7FFFFFFF)
-                            ).bitcast(Float32)
-                            local_maximum = cute.arch.fmax(
-                                local_maximum, magnitude, nan=True
-                            )
-                        else:
-                            # BF16 magnitudes have the same unsigned ordering
-                            # as their numerical values, with NaNs above all
-                            # finite encodings. Reduce those exact source bits
-                            # and widen only the final per-thread maximum.
-                            magnitude_bits = Int32(
-                                value_bf16.bitcast(Uint16)
-                            ) & Int32(0x7FFF)
-                            local_maximum_bits = cutlass.max(
-                                local_maximum_bits, magnitude_bits
+                            else:
+                                # BF16 magnitudes have the same unsigned ordering
+                                # as their numerical values, with NaNs above all
+                                # finite encodings. Reduce those exact source bits
+                                # and widen only the final per-thread maximum.
+                                magnitude_bits = Int32(
+                                    value_bf16.bitcast(Uint16)
+                                ) & Int32(0x7FFF)
+                                local_maximum_bits = cutlass.max(
+                                    local_maximum_bits, magnitude_bits
+                                )
+
+                        if cutlass.const_expr(cfg.quant_amax == "bf16_bits"):
+                            local_maximum = Float32(
+                                Uint16(local_maximum_bits).bitcast(BFloat16)
                             )
 
-                    if cutlass.const_expr(cfg.quant_amax == "bf16_bits"):
-                        local_maximum = Float32(
-                            Uint16(local_maximum_bits).bitcast(BFloat16)
+                        amax = self._warp_amax(
+                            local_maximum,
+                            threads_per_scale,
+                            lane_idx,
                         )
-    
-                    amax = self._warp_amax(
-                        local_maximum,
-                        threads_per_scale,
-                        lane_idx,
-                    )
-                    if cutlass.const_expr(
-                        self.nvfp4 and self.config.collect_amax
-                    ):
-                        if is_a:
-                            if cutlass.const_expr(
-                                cfg.telemetry_ownership == "all"
-                            ) or block_n == 0:
-                                warp_amax_a = cute.arch.fmax(
-                                    warp_amax_a, amax, nan=True
-                                )
-                        else:
-                            if cutlass.const_expr(
-                                cfg.telemetry_ownership == "all"
-                            ) or block_m == 0:
-                                warp_amax_b = cute.arch.fmax(
-                                    warp_amax_b, amax, nan=True
-                                )
-                    if cutlass.const_expr(self.nvfp4):
-                        tensor_scale = (
-                            x_tensor_scale_value
-                            if is_a
-                            else weight_tensor_scale_value
-                        )
-                        inv_tensor_scale = (
-                            x_inv_tensor_scale
-                            if is_a
-                            else weight_inv_tensor_scale
-                        )
-                        quant_multiplier = (
-                            x_quant_multiplier
-                            if is_a
-                            else weight_quant_multiplier
-                        )
-                        if is_a:
-                            if cutlass.const_expr(cfg.x_scale_region_rows != 0):
-                                scale_pack_base = (
-                                    global_row // cfg.x_scale_region_rows
-                                ) * 3
-                                tensor_scale = Float32(
-                                    x_tensor_scale[scale_pack_base]
-                                )
-                                inv_tensor_scale = Float32(
-                                    x_tensor_scale[scale_pack_base + 1]
-                                )
-                                quant_multiplier = Float32(
-                                    x_tensor_scale[scale_pack_base + 2]
-                                )
-                        else:
-                            if cutlass.const_expr(
-                                cfg.weight_scale_region_rows != 0
-                            ):
-                                scale_pack_base = (
-                                    global_row // cfg.weight_scale_region_rows
-                                ) * 3
-                                tensor_scale = Float32(
-                                    weight_tensor_scale[scale_pack_base]
-                                )
-                                inv_tensor_scale = Float32(
-                                    weight_tensor_scale[scale_pack_base + 1]
-                                )
-                                quant_multiplier = Float32(
-                                    weight_tensor_scale[scale_pack_base + 2]
-                                )
-                        scale_e8m0 = Float8E4M3FN(1.0)
-                        inv_scale_fp32 = Float32(1.0)
-                        if is_a:
-                            scale_e8m0, inv_scale_fp32 = (
-                                self._nvfp4_scale_from_amax(
-                                    amax,
-                                    tensor_scale,
-                                    inv_tensor_scale,
-                                    quant_multiplier,
-                                )
-                            )
-                        else:
-                            scale_e8m0, inv_scale_fp32 = (
-                                self._nvfp4_scale_from_amax(
-                                    amax,
-                                    tensor_scale,
-                                    inv_tensor_scale,
-                                    quant_multiplier,
-                                )
-                            )
-                    else:
-                        scale_e8m0, inv_scale_fp32 = self._scale_from_amax(amax)
-                    # The converter consumes two distinct FP32 values per issue.
-                    # PTX places operand 0 in the high byte and operand 1 in the
-                    # low byte, so store the bytes back in that order.  quant_vec=1
-                    # retains a duplicated tail but every wider tuning choice uses
-                    # the full x2 converter throughput.
-                    pair_count = (cfg.quant_vec + 1) // 2
-                    for pair in cutlass.range_constexpr(pair_count):
-                        vec0 = pair * 2
-                        vec1 = cutlass.min(vec0 + 1, cfg.quant_vec - 1)
                         if cutlass.const_expr(
-                            self.nvfp4 and cfg.quant_math == "bf16x2"
+                            self.nvfp4 and self.config.collect_amax
                         ):
-                            # CUDA 13.2 exposes the native packed BF16x2 ->
-                            # E2M1x2 converter.  E2M1 is much coarser than the
-                            # BF16 reciprocal rounding, so keep the entire
-                            # per-value path packed: one mul.bf16x2 followed
-                            # by one cvt.e2m1x2.bf16x2 for two distinct values.
-                            bits0 = bf16_values[vec0].bitcast(Uint16)
-                            bits1 = bf16_values[vec1].bitcast(Uint16)
-                            packed_values = Int32(bits0) | (Int32(bits1) << 16)
-                            inv_bits = BFloat16(inv_scale_fp32).bitcast(Uint16)
-                            packed_inv = Int32(inv_bits) | (Int32(inv_bits) << 16)
-                            scaled_bf16x2 = nvvm.mul_bf16x2(
-                                packed_values, packed_inv
-                            )
-                            packed = nvvm.inline_ptx_hl(
-                                "{.reg .b8 b; "
-                                "cvt.rn.satfinite.e2m1x2.bf16x2 b, {$r0}; "
-                                "mov.b16 {$w0}, {b, 0};}",
-                                write_only_types=[Int16],
-                                read_only_args=[scaled_bf16x2],
-                            )
-                            quantized0 = Uint8(packed)
-                            quantized1 = Uint8(0)
-                        elif cutlass.const_expr(self.nvfp4):
-                            packed = nvvm.inline_ptx_hl(
-                                "{.reg .b8 b; "
-                                "cvt.rn.satfinite.e2m1x2.f32 b, {$r1}, {$r0}; "
-                                "mov.b16 {$w0}, {b, 0};}",
-                                write_only_types=[Int16],
-                                read_only_args=[
-                                    values[vec0] * inv_scale_fp32,
-                                    values[vec1] * inv_scale_fp32,
-                                ],
-                            )
-                            quantized0 = Uint8(packed)
-                            quantized1 = Uint8(0)
-                        elif cutlass.const_expr(cfg.quant_math == "bf16x2"):
-                            # Both the reciprocal and source values are exact
-                            # BF16 powers/values. Pack two independent lanes,
-                            # scale them with one native mul.bf16x2, then feed
-                            # the result directly to the SM120 packed E4M3
-                            # converter. Saturation is part of the conversion.
-                            bits0 = bf16_values[vec0].bitcast(Uint16)
-                            bits1 = bf16_values[vec1].bitcast(Uint16)
-                            packed_values = Int32(bits0) | (Int32(bits1) << 16)
-                            inv_bits = BFloat16(inv_scale_fp32).bitcast(Uint16)
-                            packed_inv = Int32(inv_bits) | (Int32(inv_bits) << 16)
-                            scaled_bf16x2 = nvvm.mul_bf16x2(
-                                packed_values, packed_inv
-                            )
-                            packed = nvvm.inline_ptx_hl(
-                                "cvt.rn.satfinite.e4m3x2.bf16x2 {$w0}, {$r0};",
-                                write_only_types=[Int16],
-                                read_only_args=[scaled_bf16x2],
-                            )
-                            quantized0 = Uint8(
-                                packed & Int16(0xFF)
-                            ).bitcast(Float8E4M3FN)
-                            quantized1 = Uint8(
-                                (packed >> Int16(8)) & Int16(0xFF)
-                            ).bitcast(Float8E4M3FN)
-                        else:
-                            scaled0 = values[vec0] * inv_scale_fp32
-                            scaled1 = values[vec1] * inv_scale_fp32
-                            scaled0 = cute.arch.fmax(scaled0, -F8_MAX, nan=True)
-                            scaled0 = cute.arch.fmin(scaled0, F8_MAX, nan=True)
-                            scaled1 = cute.arch.fmax(scaled1, -F8_MAX, nan=True)
-                            scaled1 = cute.arch.fmin(scaled1, F8_MAX, nan=True)
-                            packed = nvvm.inline_ptx_hl(
-                                "cvt.rn.satfinite.e4m3x2.f32 {$w0}, {$r0}, {$r1};",
-                                write_only_types=[Int16],
-                                read_only_args=[scaled0, scaled1],
-                            )
-                            quantized0 = Uint8(
-                                (packed >> Int16(8)) & Int16(0xFF)
-                            ).bitcast(Float8E4M3FN)
-                            quantized1 = Uint8(packed & Int16(0xFF)).bitcast(
-                                Float8E4M3FN
-                            )
-    
+                            if is_a:
+                                if cutlass.const_expr(
+                                    cfg.telemetry_ownership == "all"
+                                ) or block_n == 0:
+                                    warp_amax_a = cute.arch.fmax(
+                                        warp_amax_a, amax, nan=True
+                                    )
+                            else:
+                                if cutlass.const_expr(
+                                    cfg.telemetry_ownership == "all"
+                                ) or block_m == 0:
+                                    warp_amax_b = cute.arch.fmax(
+                                        warp_amax_b, amax, nan=True
+                                    )
                         if cutlass.const_expr(self.nvfp4):
+                            tensor_scale = (
+                                x_tensor_scale_value
+                                if is_a
+                                else weight_tensor_scale_value
+                            )
+                            inv_tensor_scale = (
+                                x_inv_tensor_scale
+                                if is_a
+                                else weight_inv_tensor_scale
+                            )
+                            quant_multiplier = (
+                                x_quant_multiplier
+                                if is_a
+                                else weight_quant_multiplier
+                            )
                             if is_a:
-                                s_a_bytes[
-                                    row, local_ks[vec0] // 2, stage
-                                ] = quantized0
+                                if cutlass.const_expr(cfg.x_scale_region_rows != 0):
+                                    scale_pack_base = (
+                                        global_row // cfg.x_scale_region_rows
+                                    ) * 3
+                                    tensor_scale = Float32(
+                                        x_tensor_scale[scale_pack_base]
+                                    )
+                                    inv_tensor_scale = Float32(
+                                        x_tensor_scale[scale_pack_base + 1]
+                                    )
+                                    quant_multiplier = Float32(
+                                        x_tensor_scale[scale_pack_base + 2]
+                                    )
                             else:
-                                s_b_bytes[
-                                    row, local_ks[vec0] // 2, stage
-                                ] = quantized0
-                        else:
+                                if cutlass.const_expr(
+                                    cfg.weight_scale_region_rows != 0
+                                ):
+                                    scale_pack_base = (
+                                        global_row // cfg.weight_scale_region_rows
+                                    ) * 3
+                                    tensor_scale = Float32(
+                                        weight_tensor_scale[scale_pack_base]
+                                    )
+                                    inv_tensor_scale = Float32(
+                                        weight_tensor_scale[scale_pack_base + 1]
+                                    )
+                                    quant_multiplier = Float32(
+                                        weight_tensor_scale[scale_pack_base + 2]
+                                    )
+                            scale_e8m0 = Float8E4M3FN(1.0)
+                            inv_scale_fp32 = Float32(1.0)
                             if is_a:
-                                s_a[row, local_ks[vec0], stage] = quantized0
-                                if vec1 != vec0:
-                                    s_a[row, local_ks[vec1], stage] = quantized1
+                                scale_e8m0, inv_scale_fp32 = (
+                                    self._nvfp4_scale_from_amax(
+                                        amax,
+                                        tensor_scale,
+                                        inv_tensor_scale,
+                                        quant_multiplier,
+                                    )
+                                )
                             else:
-                                s_b[row, local_ks[vec0], stage] = quantized0
-                                if vec1 != vec0:
-                                    s_b[row, local_ks[vec1], stage] = quantized1
-    
-                    if lane_in_scale == 0:
-                        scale_k = (
-                            scale_block_base + scale_block
-                        ) * self.sf_vec_size
-                        if is_a:
-                            s_sfa[row, scale_k, stage] = scale_e8m0
+                                scale_e8m0, inv_scale_fp32 = (
+                                    self._nvfp4_scale_from_amax(
+                                        amax,
+                                        tensor_scale,
+                                        inv_tensor_scale,
+                                        quant_multiplier,
+                                    )
+                                )
                         else:
-                            s_sfb[row, scale_k, stage] = scale_e8m0
+                            scale_e8m0, inv_scale_fp32 = self._scale_from_amax(amax)
+                        # The converter consumes two distinct FP32 values per issue.
+                        # PTX places operand 0 in the high byte and operand 1 in the
+                        # low byte, so store the bytes back in that order.  quant_vec=1
+                        # retains a duplicated tail but every wider tuning choice uses
+                        # the full x2 converter throughput.
+                        pair_count = (cfg.quant_vec + 1) // 2
+                        if cutlass.const_expr(not self.nvfp4 and cfg.quant_store_bits > 8):
+                            quantized_values = [Float8E4M3FN(0)] * cfg.quant_vec
+                        for pair in cutlass.range_constexpr(pair_count):
+                            vec0 = pair * 2
+                            vec1 = cutlass.min(vec0 + 1, cfg.quant_vec - 1)
+                            if cutlass.const_expr(
+                                self.nvfp4 and cfg.quant_math == "bf16x2"
+                            ):
+                                # CUDA 13.2 exposes the native packed BF16x2 ->
+                                # E2M1x2 converter.  E2M1 is much coarser than the
+                                # BF16 reciprocal rounding, so keep the entire
+                                # per-value path packed: one mul.bf16x2 followed
+                                # by one cvt.e2m1x2.bf16x2 for two distinct values.
+                                bits0 = bf16_values[vec0].bitcast(Uint16)
+                                bits1 = bf16_values[vec1].bitcast(Uint16)
+                                packed_values = Int32(bits0) | (Int32(bits1) << 16)
+                                inv_bits = BFloat16(inv_scale_fp32).bitcast(Uint16)
+                                packed_inv = Int32(inv_bits) | (Int32(inv_bits) << 16)
+                                scaled_bf16x2 = nvvm.mul_bf16x2(
+                                    packed_values, packed_inv
+                                )
+                                packed = nvvm.inline_ptx_hl(
+                                    "{.reg .b8 b; "
+                                    "cvt.rn.satfinite.e2m1x2.bf16x2 b, {$r0}; "
+                                    "mov.b16 {$w0}, {b, 0};}",
+                                    write_only_types=[Int16],
+                                    read_only_args=[scaled_bf16x2],
+                                )
+                                quantized0 = Uint8(packed)
+                                quantized1 = Uint8(0)
+                            elif cutlass.const_expr(self.nvfp4):
+                                packed = nvvm.inline_ptx_hl(
+                                    "{.reg .b8 b; "
+                                    "cvt.rn.satfinite.e2m1x2.f32 b, {$r1}, {$r0}; "
+                                    "mov.b16 {$w0}, {b, 0};}",
+                                    write_only_types=[Int16],
+                                    read_only_args=[
+                                        values[vec0] * inv_scale_fp32,
+                                        values[vec1] * inv_scale_fp32,
+                                    ],
+                                )
+                                quantized0 = Uint8(packed)
+                                quantized1 = Uint8(0)
+                            elif cutlass.const_expr(cfg.quant_math == "bf16x2"):
+                                # Both the reciprocal and source values are exact
+                                # BF16 powers/values. Pack two independent lanes,
+                                # scale them with one native mul.bf16x2, then feed
+                                # the result directly to the SM120 packed E4M3
+                                # converter. Saturation is part of the conversion.
+                                bits0 = bf16_values[vec0].bitcast(Uint16)
+                                bits1 = bf16_values[vec1].bitcast(Uint16)
+                                packed_values = Int32(bits0) | (Int32(bits1) << 16)
+                                inv_bits = BFloat16(inv_scale_fp32).bitcast(Uint16)
+                                packed_inv = Int32(inv_bits) | (Int32(inv_bits) << 16)
+                                scaled_bf16x2 = nvvm.mul_bf16x2(
+                                    packed_values, packed_inv
+                                )
+                                packed = nvvm.inline_ptx_hl(
+                                    "cvt.rn.satfinite.e4m3x2.bf16x2 {$w0}, {$r0};",
+                                    write_only_types=[Int16],
+                                    read_only_args=[scaled_bf16x2],
+                                )
+                                quantized0 = Uint8(
+                                    packed & Int16(0xFF)
+                                ).bitcast(Float8E4M3FN)
+                                quantized1 = Uint8(
+                                    (packed >> Int16(8)) & Int16(0xFF)
+                                ).bitcast(Float8E4M3FN)
+                            else:
+                                scaled0 = values[vec0] * inv_scale_fp32
+                                scaled1 = values[vec1] * inv_scale_fp32
+                                scaled0 = cute.arch.fmax(scaled0, -F8_MAX, nan=True)
+                                scaled0 = cute.arch.fmin(scaled0, F8_MAX, nan=True)
+                                scaled1 = cute.arch.fmax(scaled1, -F8_MAX, nan=True)
+                                scaled1 = cute.arch.fmin(scaled1, F8_MAX, nan=True)
+                                packed = nvvm.inline_ptx_hl(
+                                    "cvt.rn.satfinite.e4m3x2.f32 {$w0}, {$r0}, {$r1};",
+                                    write_only_types=[Int16],
+                                    read_only_args=[scaled0, scaled1],
+                                )
+                                quantized0 = Uint8(
+                                    (packed >> Int16(8)) & Int16(0xFF)
+                                ).bitcast(Float8E4M3FN)
+                                quantized1 = Uint8(packed & Int16(0xFF)).bitcast(
+                                    Float8E4M3FN
+                                )
+
+                            if cutlass.const_expr(self.nvfp4):
+                                if is_a:
+                                    s_a_bytes[
+                                        row, local_ks[vec0] // 2, stage
+                                    ] = quantized0
+                                else:
+                                    s_b_bytes[
+                                        row, local_ks[vec0] // 2, stage
+                                    ] = quantized0
+                            elif cutlass.const_expr(cfg.quant_store_bits > 8):
+                                quantized_values[vec0] = quantized0
+                                quantized_values[vec1] = quantized1
+                            else:
+                                if is_a:
+                                    s_a[row, local_ks[vec0], stage] = quantized0
+                                    if vec1 != vec0:
+                                        s_a[row, local_ks[vec1], stage] = quantized1
+                                else:
+                                    s_b[row, local_ks[vec0], stage] = quantized0
+                                    if vec1 != vec0:
+                                        s_b[row, local_ks[vec1], stage] = quantized1
+
+                        if cutlass.const_expr(not self.nvfp4 and cfg.quant_store_bits > 8):
+                            store_values = cfg.quant_store_bits // 8
+                            for store_idx in cutlass.range_constexpr(cfg.quant_vec // store_values):
+                                store_base = store_idx*store_values
+                                word = quant_store_type(0)
+                                for byte in cutlass.range_constexpr(store_values):
+                                    word = word | (quant_store_type(quantized_values[store_base+byte].bitcast(Uint8)) << (8*byte))
+                                if is_a:
+                                    self._store_quant_word(s_a,row,local_ks[store_base],stage,word,a_smem_layout.inner)
+                                else:
+                                    self._store_quant_word(s_b,row,local_ks[store_base],stage,word,b_smem_layout.inner)
+
+                        if lane_in_scale == 0:
+                            scale_k = (
+                                scale_block_base + scale_block
+                            ) * self.sf_vec_size
+                            if is_a:
+                                s_sfa[row, scale_k, stage] = scale_e8m0
+                            else:
+                                s_sfb[row, scale_k, stage] = scale_e8m0
 
                 if cutlass.const_expr(
                     self.nvfp4 and self.config.collect_amax
@@ -2647,7 +2790,20 @@ class MXFP8LinearFwdKernel:
                     ):
                         quant_pipeline.producer_tail(quant_producer_state)
     
-            if cutlass.const_expr(cfg.epilogue == "direct"):
+            if cutlass.const_expr(self.glu):
+                if cutlass.const_expr(self.reuse_glu_scratch and cfg.schedule != "cooperative"):
+                    # Producer/quantizer warps may leave their loops before the
+                    # last MMA reads. Join every role before reusing operands.
+                    cute.arch.sync_threads()
+                self._glu_epilogue(
+                    storage, accumulators, t_cc_out, out, x_tensor_scale,
+                    block_m, block_n, tidx,
+                    tma_atom_out, tma_tensor_out, out_smem_layout, work_slot,
+                )
+                if cutlass.const_expr(self.quant_down):
+                    self._quantize_down(weight_tensor_scale,x_amax_out,weight_amax_out,
+                                        tidx,linear_tile,total_tiles)
+            elif cutlass.const_expr(cfg.epilogue == "direct"):
                 if cutlass.const_expr(self.cluster_output):
                     # The quantized A stages are dead after the mainloop. Reuse
                     # them as a chunked FP32 DSMEM reduction window so fused
@@ -2881,6 +3037,10 @@ class MXFP8LinearFwdKernel:
                                     accumulators[elem] * output_scale
                                 )
 
+        if cutlass.const_expr(self.glu_tma_store):
+            if warp_idx == 0:
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+            cute.arch.sync_threads()
         if cutlass.const_expr(
             (self.split_reduction == 1 or cfg.persistent)
             and cfg.load_engine == "tma"
@@ -2938,6 +3098,7 @@ class _UnitScaleLauncher:
 
     def __init__(self, launcher):
         self.launcher = launcher
+        self._singleton_placeholders = {}
 
     def __call__(self, x, weight, destination):
         # The common generated signature reserves four FP32 pointers for the
@@ -2946,9 +3107,21 @@ class _UnitScaleLauncher:
         # not require a logically contiguous innermost dimension: backward
         # intentionally presents transposed CuTe layouts without materializing
         # a physical transpose.
-        placeholder = x.as_strided(
-            (2,), (1,), storage_offset=x.storage_offset()
-        ).view(torch.float32)
+        source = next((t for t in (x,weight,destination)
+                       if t.numel() >= 2 and t.storage_offset() % 2 == 0),None)
+        if source is not None:
+            placeholder = source.as_strided(
+                (2,), (1,), storage_offset=source.storage_offset()
+            ).view(torch.float32)
+        else:
+            # A 1x1 backward GEMM may have only one BF16 element in every
+            # operand. Never fabricate an out-of-bounds FP32 view for its
+            # unused auxiliary argument. This four-byte allocation is reused
+            # per device, contains no activation, and is never read by MXFP8.
+            placeholder = self._singleton_placeholders.get(destination.device)
+            if placeholder is None:
+                placeholder = torch.empty(1,device=destination.device,dtype=torch.float32)
+                self._singleton_placeholders[destination.device] = placeholder
         return self.launcher(
             x,
             weight,

@@ -57,6 +57,7 @@ class MXFP8QuantKernel:
         if rejection is not None:
             raise ValueError(f"illegal MXFP8 quantizer configuration: {rejection}")
         self.rows = rows
+        self.glu_interleave = False
         self.k = k
         self.storage_k = (k + SF_VEC_SIZE - 1) // SF_VEC_SIZE * SF_VEC_SIZE
         self.config = config
@@ -78,6 +79,10 @@ class MXFP8QuantKernel:
         scales: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        if cutlass.const_expr(self.glu_interleave):
+            src = cute.make_tensor(src.iterator, cute.make_layout(
+                ((2, self.rows // 2), self.k),
+                stride=((self.rows // 2 * self.k, self.k), 1)))
         self.kernel(src, quantized, scales).launch(
             grid=(self.grid_ctas, 1, 1),
             block=(self.config.num_warps * 32, 1, 1),
@@ -174,7 +179,7 @@ class MXFP8QuantKernel:
             else:
                 load_bytes = cfg.load_bits // 8
                 naturally_aligned = (
-                    (row * self.k + global_k_base) * (BFloat16.width // 8)
+                    src.layout((row, global_k_base)) * (BFloat16.width // 8)
                 ) % load_bytes == 0
                 if (
                     global_k_base + values_per_load <= self.k
@@ -420,6 +425,7 @@ class MXFP8DualQuantKernel(MXFP8QuantKernel):
                     f"illegal dual MXFP8 quantizer configuration: {rejection}"
                 )
         self.x_rows = x_rows
+        self.glu_interleave = False
         self.weight_rows = weight_rows
         self.k = k
         self.storage_k = (k + SF_VEC_SIZE - 1) // SF_VEC_SIZE * SF_VEC_SIZE
@@ -452,6 +458,10 @@ class MXFP8DualQuantKernel(MXFP8QuantKernel):
         sw: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        if cutlass.const_expr(self.glu_interleave):
+            weight = cute.make_tensor(weight.iterator, cute.make_layout(
+                ((2, self.weight_rows // 2), self.k),
+                stride=((self.weight_rows // 2 * self.k, self.k), 1)))
         self.kernel(x, weight, qx, qw, sx, sw).launch(
             grid=(self.grid_ctas, 1, 1),
             block=(self.config.num_warps * 32, 1, 1),
@@ -1768,10 +1778,14 @@ def compile_mxfp8_quant(
     rows: int,
     k: int,
     config: MXFP8QuantConfig = MXFP8QuantConfig(),
+    *, interleave_rows: bool = False,
 ):
     """Compile and cache a shape/config-specialized TVM-FFI launcher."""
 
     kernel = MXFP8QuantKernel(rows, k, config)
+    if interleave_rows and rows % 2:
+        raise ValueError("paired quantization requires an even row count")
+    kernel.glu_interleave = interleave_rows
     src = cute.runtime.make_fake_tensor(
         BFloat16,
         (rows, k),
@@ -1825,12 +1839,16 @@ def compile_mxfp8_dual_quant(
     k: int,
     config: MXFP8QuantConfig = MXFP8QuantConfig(),
     weight_scale_layout: str | None = None,
+    *, interleave_weight: bool = False,
 ):
     """Compile one launcher that dynamically quantizes X and W together."""
 
     kernel = MXFP8DualQuantKernel(
         x_rows, weight_rows, k, config, weight_scale_layout
     )
+    if interleave_weight and weight_rows % 2:
+        raise ValueError("paired quantization requires an even row count")
+    kernel.glu_interleave = interleave_weight
 
     def fake(dtype, rows: int, columns: int):
         return cute.runtime.make_fake_tensor(

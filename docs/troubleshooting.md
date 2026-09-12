@@ -62,3 +62,34 @@ Published timings are device-, shape-, cache-regime-, and software-specific.
 Confirm that BF16 and low-precision runs share compilation, optimizer, batch,
 and measurement policies. Install verified local winners rather than copying a
 winner from another SKU.
+
+## Illegal instruction or illegal memory access
+
+Stop GPU work in the affected process; asynchronous errors can poison its CUDA
+context and make later failures misleading. Preserve the exact configuration,
+shape, seed, stack versions, and first error. Reproduce in a fresh dedicated
+process with `CUDA_LAUNCH_BLOCKING=1`, then use Compute Sanitizer as appropriate.
+Do not classify a device fault as an ordinary numerical-tolerance failure.
+
+Known feature-branch issue: the producer-quantized packed-down MLP policy faults
+for M=K=H=O=1. The conservative default passes. See the
+[stress report](mxfp8_mlp_numerics.md) for a bounded reproducer; it deliberately
+triggers the fault, so do not run it inside an application process.
+
+## My model conversion lost bias or optimizer state
+
+RTX does not support bias and rejects selected biased modules; filter them out
+or change the source architecture intentionally. Linear training conversion
+preserves parameter objects, while PTQ removes BF16 parameters. MLP
+`from_linears` copies into new packed gate/up parameters and therefore needs a
+new optimizer. These are different conversion contracts, not interchangeable
+entry points. See [conversion](model_conversion.md) and [MLP](mxfp8_mlp.md).
+
+## CUDA is unavailable although the machine has a GPU
+
+Check `nvidia-smi` and `torch.cuda.is_available()` inside the exact process,
+container or remote session running the job. Host visibility alone does not
+prove the process has driver/device access. Check deployment permissions and
+the installed CUDA wheel; do not change unrelated services or reset the GPU
+while other workloads are active. Environment probes are diagnostic, not
+permission to alter a shared machine.

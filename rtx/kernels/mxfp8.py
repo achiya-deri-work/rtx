@@ -108,6 +108,15 @@ class MXFP8FwdConfig:
     # vector loads and are independently tuned from quant_vec/math.
     quant_load_bits: int = 16
     quant_vec: int = 1
+    # Specialize operand address arithmetic rather than selecting A/B inside
+    # each quantization task. Code size/register tradeoffs remain searchable.
+    quant_schedule: str = "combined"
+    quant_store_bits: int = 8
+    # Zero uses just the MMA warps; additional cooperative warps quantize
+    # operands and participate in CTA barriers, but do not issue MMA.
+    cooperative_warps: int = 0
+    quant_unroll: int = 1
+    scalar_bounds: str = "always"
     k_unroll: int = 1
 
     # Hardware issue and resource controls.
@@ -203,8 +212,10 @@ class MXFP8FwdConfig:
             problem.validate()
         except ValueError as exc:
             return str(exc)
-        if (self.tile_m != 64 and self.tile_m % 128) or self.tile_n % 128:
-            return "SM120 block-scale tiles require M=64 or M/N divisible by 128"
+        if (self.tile_m not in (32,64) and self.tile_m % 128) or self.tile_n % 128:
+            return "SM120 block-scale tiles require M=32/64 or M/N divisible by 128"
+        if self.native_operand_bits != 8 and self.tile_m == 32:
+            return "32-row tiles currently implement MXFP8 only"
         if self.tile_k % 128:
             return "MXFP8/E8M0 SM120 scale layouts require tile K divisible by 128"
         if self.atom_layout_m * self.atom_layout_n != self.num_mma_warps:
@@ -224,8 +235,8 @@ class MXFP8FwdConfig:
             return "SM120 SFB fragments require tile_n == 64 * atom_layout_n"
         if self.tile_m == 256 and self.atom_layout_m != 8:
             return "the 256-row SFA fragment requires atom_layout_m == 8"
-        if self.tile_m == 64 and self.atom_layout_m != 2:
-            return "the 64-row SFA fragment requires atom_layout_m == 2"
+        if self.tile_m in (32,64) and self.atom_layout_m != 2:
+            return "the 32/64-row SFA fragment requires atom_layout_m == 2"
         if self.quantizer_warps not in (1, 2, 4, 8, 16):
             return "quantizer_warps must be one of 1, 2, 4, 8, 16"
         expected_threads = 32 * (
@@ -233,6 +244,14 @@ class MXFP8FwdConfig:
             + self.producer_warps
             + (self.quantizer_warps if self.schedule == "three_role" else 0)
         )
+        if self.cooperative_warps not in (0,4,8,16,20,24,32):
+            return "cooperative_warps must be 0/4/8/16/20/24/32"
+        if self.cooperative_warps:
+            if self.schedule != "cooperative" or self.load_engine != "scalar" or self.native_operand_bits != 8:
+                return "extra cooperative quantizers currently require scalar MXFP8"
+            if self.cooperative_warps < self.num_mma_warps:
+                return "cooperative warp count cannot be below the MMA warp count"
+            expected_threads = 32 * self.cooperative_warps
         if self.num_threads != expected_threads:
             return "num_threads does not match the selected pipeline roles"
         if self.bf16_stages not in (1, 2, 3, 4):
@@ -250,10 +269,24 @@ class MXFP8FwdConfig:
             return "scale_rounding must be floor or infinity"
         if self.quant_load_bits not in (16, 32, 64, 128):
             return "quantizer BF16 load width must be 16, 32, 64, or 128 bits"
+        if self.quant_vec not in (1,2,4,8,16,32):
+            return "quant_vec must be a power of two from 1 through 32"
+        if self.native_operand_bits != 8 and self.quant_vec > 8:
+            return "quant_vec above eight currently implements MXFP8 only"
         if self.quant_load_bits > self.quant_vec * 16:
             return "quantizer BF16 load width exceeds quant_vec"
         if (self.quant_vec * 16) % self.quant_load_bits:
             return "quant_vec must contain an integer number of BF16 vector loads"
+        if self.quant_schedule not in ("combined", "split_a_b"):
+            return "quant_schedule must be combined or split_a_b"
+        if self.quant_store_bits not in (8,16,32,64) or (self.quant_vec*8)%self.quant_store_bits:
+            return "quant_store_bits must divide the quantized per-thread vector (8/16/32/64)"
+        if self.quant_unroll not in (1,2,4,8):
+            return "quant_unroll must be 1/2/4/8"
+        if self.scalar_bounds not in ("always","auto"):
+            return "scalar_bounds must be always or auto"
+        if self.native_operand_bits != 8 and self.quant_store_bits != 8:
+            return "wide quantizer shared stores currently support MXFP8 only"
         if self.a_ldmatrix_matrices not in (1, 2, 4):
             return "A ldmatrix width must be one of x1, x2, x4"
         if self.b_ldmatrix_matrices not in (1, 2, 4):
@@ -476,6 +509,11 @@ class MXFP8FwdConfig:
             "bf16_stages",
             "producer_warps",
             "quant_vec",
+            "quant_schedule",
+            "quant_store_bits",
+            "cooperative_warps",
+            "quant_unroll",
+            "scalar_bounds",
             "mxfp8_stages",
             "k_unroll",
             "num_threads",
@@ -533,6 +571,10 @@ class MXFP8FwdConfig:
             return "A orientation must be row or transpose"
         if b_orientation not in ("row", "transpose"):
             return "B orientation must be row or transpose"
+        if self.quant_vec > 8 and "transpose" in (a_orientation,b_orientation):
+            return "quant_vec above eight currently requires row-oriented operands"
+        if self.quant_store_bits > 16 and self.load_engine != "scalar" and "transpose" in (a_orientation,b_orientation):
+            return "transposing ldmatrix quantizers currently support only scalar or paired shared stores"
         if self.load_engine == "tma":
             # Tensor-map byte strides must be multiples of 16. Logical
             # transposes change which extent is the physical BF16 row stride.
@@ -572,7 +614,7 @@ class MXFP8FwdConfig:
 
 
 DEFAULT_MXFP8_FWD_CONFIG = MXFP8FwdConfig()
-MXFP8_FWD_KERNEL_REVISION = 22
+MXFP8_FWD_KERNEL_REVISION = 24
 
 
 # Block coordinates supplement, rather than replace, their primitive fields.
@@ -683,7 +725,7 @@ FWD_SEARCH_SPACE: dict[str, tuple[object, ...]] = {
     "bf16_pipeline": BF16_PIPELINE_COORDINATES,
     "cpasync_ldmatrix_pipeline": CPASYNC_LDMATRIX_PIPELINE_COORDINATES,
     "persistent_tma_pipeline": PERSISTENT_TMA_PIPELINE_COORDINATES,
-    "tile_m": (64, 128, 256),
+    "tile_m": (32, 64, 128, 256),
     "tile_n": (128, 256),
     "tile_k": (128, 256),
     "atom_layout_m": (2, 4, 8),
@@ -699,7 +741,12 @@ FWD_SEARCH_SPACE: dict[str, tuple[object, ...]] = {
     "quant_math": ("fp32", "bf16x2"),
     "quant_amax": ("fp32", "bf16_bits"),
     "quant_load_bits": (16, 32, 64, 128),
-    "quant_vec": (1, 2, 4, 8),
+    "quant_vec": (1, 2, 4, 8,16,32),
+    "quant_schedule": ("combined", "split_a_b"),
+    "quant_store_bits": (8,16,32,64),
+    "cooperative_warps": (0,4,8,16,20,24,32),
+    "quant_unroll": (1,2,4,8),
+    "scalar_bounds": ("always","auto"),
     "k_unroll": (1, 2, 4),
     "maxrregcount": (128, 160, 192, 224, 255),
     "producer_registers": (32, 40, 48, 56),
@@ -740,6 +787,8 @@ FWD_COORDINATE_ORDER: tuple[str, ...] = (
     # TMA candidate illegal and strand ordinary coordinate descent.
     "load_engine",
     "quant_vec",
+    "quant_schedule",
+    "quant_store_bits",
     "quant_math",
     "quant_amax",
     "quant_load_bits",
@@ -990,6 +1039,7 @@ def normalize_fwd_config(
     # win, which lets callers test/reject arbitrary combinations deliberately.
     if "tile_m" in updates and "atom_layout_m" not in updates:
         values["atom_layout_m"] = {
+            32: 2,
             64: 2,
             128: 4,
             256: 8,
@@ -1010,7 +1060,7 @@ def normalize_fwd_config(
         num_mma_warps=mma_warps,
         producer_warps=producer_warps,
         quantizer_warps=int(values["quantizer_warps"]),
-        num_threads=32 * (mma_warps + producer_warps + role_quantizer_warps),
+        num_threads=32 * (int(values["cooperative_warps"]) or (mma_warps + producer_warps + role_quantizer_warps)),
     )
     return MXFP8FwdConfig(**values)
 

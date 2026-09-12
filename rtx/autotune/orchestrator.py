@@ -103,6 +103,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         transfer_history: bool = True,
         confirmation: ConfirmationPolicy = ConfirmationPolicy(),
         progress: Callable[[str], None] | None = None,
+        coverage_proposals: Sequence[Proposal[ConfigT]] = (),
     ) -> None:
         if not strategies:
             raise ValueError("at least one search strategy is required")
@@ -120,6 +121,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         self.transfer_history = transfer_history
         self.confirmation = confirmation
         self.progress = progress
+        self.coverage_proposals = tuple(coverage_proposals)
 
     def _log(self, started: float, message: str) -> None:
         if self.progress is not None:
@@ -397,6 +399,19 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                     f"initial configuration failed: {initial.outcome.status}: {initial.outcome.error}"
                 )
 
+        # Deterministic, resumable structural coverage precedes exploitation.
+        # These trials share the ordinary budget, journal, correctness gates,
+        # confirmations and history; they are not unrecorded pilot timings.
+        coverage_evaluated = 0
+        for proposal in self.coverage_proposals:
+            if (resumed_active + evaluated >= self.budget.max_trials
+                    or time.monotonic() - started >= self.budget.time_budget_s):
+                break
+            if self.adapter.config_id(proposal.config) in history.seen_ids:
+                continue
+            run(proposal)
+            coverage_evaluated += 1
+
         names = tuple(self.strategies)
         empty_attempts = 0
         while resumed_active + evaluated < self.budget.max_trials:
@@ -506,7 +521,8 @@ class AutotuneOrchestrator(Generic[ConfigT]):
             context_id=self.adapter.context.identifier,
             evaluated_trials=evaluated,
             elapsed_s=elapsed,
-            strategy_trials={name: arm.pulls for name, arm in statistics.items()},
+            strategy_trials={**{name: arm.pulls for name, arm in statistics.items()},
+                             **({"coverage": coverage_evaluated} if self.coverage_proposals else {})},
             store_path=None if self.store.path is None else str(self.store.path),
         )
 
