@@ -10,11 +10,11 @@ class CombinedCollectionTests(unittest.TestCase):
         mlp=command("mlp",Path("/tmp/study"),900,"cuda:1")
         linear=command("linears",Path("/tmp/study"),900,"cuda:1")
         self.assertIn("rtx.autotune.first_hit_study",mlp)
-        self.assertIn("rtx.autotune.dataset",linear)
+        self.assertIn("rtx.autotune.linear_pipeline",linear)
         self.assertEqual(mlp[mlp.index("--device")+1],"cuda:1")
         self.assertEqual(linear[linear.index("--device")+1],"cuda:1")
         self.assertNotIn("--stall-timeout",linear)
-        self.assertIn("--wall-time",linear)
+        self.assertIn("--seconds",linear)
         self.assertIn("--hours",mlp)
 
     def test_invalid_duration(self):

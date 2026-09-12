@@ -312,10 +312,26 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
                     reason=reason or "prequant recompute requires row-major paired-register direct epilogue"
         return None if reason is None else ("implementation_rejected",reason)
 
+    prepared={}
+    def measure(graph,errors,compile_ms,reused):
+        graph.replay()
+        timings=[]
+        for _ in range(samples):
+            a,b=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
+            a.record();graph.replay();b.record();b.synchronize()
+            timings.append(a.elapsed_time(b)/calls_per_sample)
+        return TrialOutcome("ok",median_ms=statistics.median(timings),timings_ms=timings,
+            compile_ms=compile_ms,metadata={"relative_l2":errors,"phase":phase,
+                                          "prepared_benchmark_reused":reused})
+
     def evaluate(c):
         started=time.monotonic()
         stage="compile"
         try:
+            if prepared.get("config")==c:
+                stage="runtime"
+                return measure(prepared["graph"],prepared["errors"],0.0,True)
+            prepared.clear()
             def forward():
                 return mxfp8_mlp(x,gu,down,activation=activation,config=c,precision=precision)
             # Both policies measure the same compiler/capture contract. Retire
@@ -348,14 +364,8 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
             with torch.cuda.graph(graph,stream=stream):
                 for _ in range(calls_per_sample):
                     result=run()
-            graph.replay()
-            timings=[]
-            for _ in range(samples):
-                a,b=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
-                a.record();graph.replay();b.record();b.synchronize()
-                timings.append(a.elapsed_time(b)/calls_per_sample)
-            return TrialOutcome("ok",median_ms=statistics.median(timings),timings_ms=timings,
-                                compile_ms=compile_ms,metadata={"relative_l2":errors,"phase":phase})
+            prepared.update(config=c,graph=graph,outputs=result,errors=errors)
+            return measure(graph,errors,compile_ms,False)
         except Exception as exc:
             raise_if_fatal_device_context_error(exc)
             return TrialOutcome("compile_error" if stage=="compile" else "runtime_error",error=str(exc),compile_ms=(time.monotonic()-started)*1000)

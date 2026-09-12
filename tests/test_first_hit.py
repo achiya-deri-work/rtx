@@ -95,11 +95,11 @@ class FirstHitTests(unittest.TestCase):
         manifest["shapes"]=manifest["shapes"][:1];manifest["milestones"]=[4]
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/"manifest.json";path.write_text(json.dumps(manifest))
-            process=MagicMock();process.wait.return_value=1
+            process=MagicMock();process.wait.return_value=1;process.poll.return_value=1
             with patch("rtx.autotune.first_hit_study.subprocess.Popen",return_value=process) as launch,redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(RuntimeError,"three consecutive"):
                     run(path,Path(tmp)/"output",1,"cuda:0")
-            self.assertEqual(launch.call_count,3)
+            self.assertEqual(launch.call_count,4)
             self.assertEqual(launch.call_args.args[0][2],"rtx.autotune.first_hit_study")
             self.assertTrue(launch.call_args.kwargs["start_new_session"])
 

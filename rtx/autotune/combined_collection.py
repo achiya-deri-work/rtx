@@ -19,17 +19,11 @@ def command(kind, root, seconds, device):
         return base+["rtx.autotune.first_hit_study","run",
             "autotune_manifests/blackwell_first_hit_anchors_v1.json",
             "--output",str(root/"mlp"),"--hours",str(seconds/3600),"--device",device]
-    return base+["rtx.autotune.dataset","run",
-        "autotune_manifests/blackwell_diversity_atlas_v1.json",
-        "--output-dir",str(root/"linears"),"--device",device,"--format","none",
-        "--wall-time",f"{seconds}s","--context-slice","45s",
-        "--trial-milestones","1,2,4,8,16,32,64,128",
-        "--initial-promote","1","--context-orchestration","breadth_first",
-        "--max-milestone-lead","1","--strategy-orchestration","bandit",
-        "--reuse-deterministic-failures"]
+    return base+["rtx.autotune.linear_pipeline","--output",str(root/"linears"),
+                 "--device",device,"--seconds",str(seconds)]
 
 
-def run(output, hours=6, slice_minutes=15, device="cuda:0"):
+def run(output, hours=6, slice_minutes=15, device="cuda:0",adopt_source=False):
     if not all(math.isfinite(v) and v>0 for v in (hours,slice_minutes)):
         raise ValueError("duration and slice must be finite and positive")
     root=Path(output).resolve();root.mkdir(parents=True,exist_ok=True)
@@ -43,9 +37,9 @@ def run(output, hours=6, slice_minutes=15, device="cuda:0"):
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         identity={"source_id":source_id(),"device":device,"schema_version":1}
         identity_path=root/"identity.json"
-        if identity_path.exists() and json.loads(identity_path.read_text())!=identity:
-            raise ValueError("source/device changed: use a fresh combined output directory")
-        atomic_json(identity_path,identity)
+        from .compile_pipeline import adopt_identity
+        adopt_identity(identity_path,identity,adopt_source)
+        if adopt_source:os.environ["RTX_AUTOTUNE_ADOPT_SOURCE"]="1"
         state_path=root/"cursor.json"
         state=json.loads(state_path.read_text()) if state_path.exists() else {"next":"mlp","visit":0}
         deadline=time.monotonic()+hours*3600
@@ -97,10 +91,11 @@ def main():
     parser.add_argument("--hours",type=float,default=6)
     parser.add_argument("--slice-minutes",type=float,default=15)
     parser.add_argument("--device",default="cuda:0")
+    parser.add_argument("--adopt-source",action="store_true",help="Explicitly adopt execution-only source changes while preserving all workload/portfolio identities")
     args=parser.parse_args()
     def stop(signum,frame):raise KeyboardInterrupt("combined collection stopped")
     signal.signal(signal.SIGTERM,stop)
-    run(args.output,args.hours,args.slice_minutes,args.device)
+    run(args.output,args.hours,args.slice_minutes,args.device,args.adopt_source)
 
 
 if __name__=="__main__":main()

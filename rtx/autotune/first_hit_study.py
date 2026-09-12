@@ -115,6 +115,13 @@ def anchor_candidates(adapter, precision, phase, count, seed):
 
 
 def worker(manifest, output, index, milestone, device):
+    from .compile_pipeline import compile_pipeline
+    lease_path=Path(output)/"gpu_execution.lock"
+    with compile_pipeline(lease_path,device):
+        return _worker(manifest,output,index,milestone,device)
+
+
+def _worker(manifest, output, index, milestone, device):
     import torch
     from .mlp import make_mlp_adapter
     from .store import ResidualTuningStore
@@ -138,10 +145,8 @@ def worker(manifest, output, index, milestone, device):
               "contract":contract(adapter.context),"portfolio_id":stable_id(payload),
               "candidate_ids":[adapter.config_id(c) for c in candidates],
               "manifest_id":stable_id(manifest),"source_id":source_id()}
-    prior=root/"anchor.json"
-    if prior.exists() and json.loads(prior.read_text())!=metadata:
-        raise ValueError("anchor identity changed; use a new output directory")
-    atomic_json(prior,metadata)
+    from .compile_pipeline import adopt_identity
+    adopt_identity(root/"anchor.json",metadata,os.getenv("RTX_AUTOTUNE_ADOPT_SOURCE")=="1")
     strategy=PortfolioSearch(candidates)
     print(f"ANCHOR {index} {task['shape']} {task['precision']} {task['phase']} "
           f"portfolio={metadata['portfolio_id']} trials={milestone}",flush=True)
@@ -158,13 +163,13 @@ def run(manifest_path, output, hours, device):
     with (root/"collection.lock").open("w") as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         identity={"manifest":manifest,"manifest_id":stable_id(manifest),"source_id":source_id()}
-        identity_path=root/"study.json"
-        if identity_path.exists() and json.loads(identity_path.read_text())!=identity:
-            raise ValueError("manifest changed; use a new output directory")
-        atomic_json(identity_path,identity)
+        from .compile_pipeline import adopt_identity,run_workers
+        adopt_identity(root/"study.json",identity,os.getenv("RTX_AUTOTUNE_ADOPT_SOURCE")=="1")
         deadline=time.monotonic()+hours*3600
-        consecutive_failures=0
+        workers=max(1,int(os.getenv("RTX_AUTOTUNE_CPU_WORKERS","4")))
+        print(f"PIPELINE cpu_workers={workers} GPU measurement leases=1",flush=True)
         for milestone in manifest["milestones"]:
+            pending=[]
             for index,task in enumerate(study_tasks(manifest)):
                 # Do not repeatedly initialize CUDA for completed anchors when
                 # a combined campaign revisits this collector in short slices.
@@ -178,36 +183,9 @@ def run(manifest_path, output, hours, device):
                             continue
                     if completed>=milestone:
                         continue
-                remaining=deadline-time.monotonic()
-                if remaining<=0:
-                    print("DEADLINE residuals are resumable",flush=True); return
-                log=root/f"worker-{index:03d}-{milestone:03d}.log"
-                command=[sys.executable,"-m","rtx.autotune.first_hit_study","worker",str(Path(manifest_path).resolve()),
-                         "--output",str(root.resolve()),"--index",str(index),
-                         "--milestone",str(milestone),"--device",device]
-                print(f"START task={index} milestone={milestone} remaining={remaining:.1f}s log={log}",flush=True)
-                started=time.monotonic()
-                with log.open("a") as stream:
-                    process=subprocess.Popen(command,stdout=stream,stderr=subprocess.STDOUT,start_new_session=True)
-                    try:
-                        status=process.wait(timeout=min(remaining,manifest["worker_timeout_seconds"]))
-                    except subprocess.TimeoutExpired:
-                        os.killpg(process.pid,signal.SIGTERM)
-                        try:
-                            process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            os.killpg(process.pid,signal.SIGKILL); process.wait()
-                        status=124
-                    except BaseException:
-                        os.killpg(process.pid,signal.SIGKILL); process.wait(); raise
-                with (root/"supervisor.jsonl").open("a") as stream:
-                    stream.write(json.dumps({"task":task["id"],"milestone":milestone,
-                        "status":status,"elapsed_s":time.monotonic()-started})+"\n")
-                    stream.flush(); os.fsync(stream.fileno())
-                print(f"DONE task={index} milestone={milestone} status={status}",flush=True)
-                consecutive_failures=consecutive_failures+1 if status else 0
-                if consecutive_failures>=3:
-                    raise RuntimeError("three consecutive workers failed; inspect worker logs before resuming")
+                pending.append((index,task))
+            if not run_workers(pending,manifest,manifest_path,root,milestone,device,deadline,workers):
+                print("DEADLINE residuals are resumable",flush=True);return
         print("COMPLETE planned anchors exhausted; no unbounded search started",flush=True)
         atomic_json(root/"collection_complete.json",identity)
 

@@ -92,14 +92,37 @@ evidence. Each anchor records its portfolio hash, source hash and software/GPU
 context. Export rejects mismatched portfolios for an otherwise matched task.
 
 Each context has independent residual journals and worker logs. The supervisor
-uses an output-directory lock, a total deadline, and a 180-second worker
-watchdog. A failed worker does not poison the next context's CUDA process.
-Only the supervisor's own process group is terminated on timeout.
+uses an output-directory lock and a total deadline. Up to four isolated CPU
+workers prepare candidates. A conservative VRAM estimate limits admission;
+large contexts may run alone. The worker wall-time watchdog is 180 seconds
+times the requested concurrency; an outstanding CuTe compilation has a separate
+60-second watchdog (`RTX_AUTOTUNE_COMPILE_TIMEOUT`). A failed worker does not
+poison the next context's CUDA process. Only owned worker groups are terminated.
 Three consecutive worker failures stop the campaign for inspection. SIGTERM
-to the supervisor is handled so its active worker is also stopped.
+to the supervisor is handled so its active workers are also stopped.
+
+`RTX_AUTOTUNE_CPU_WORKERS` controls concurrency (default four). A worker-only
+hook releases a shared GPU execution lease around `cute.compile`, after draining
+that worker's stream work. Tensor creation, Torch tracing, correctness checks,
+graph capture and measurement hold the lease. Thus compilation can overlap
+compilation or another worker's measurements without concurrent benchmark
+workloads. This is not a system-wide lock against unrelated GPU applications.
+MLP winner confirmations reuse the last validated CUDA graph instead of
+recreating and recompiling it; observations record `prepared_benchmark_reused`.
+
+The combined collector also pipelines linear collection through independent
+context shards. Its concurrency is capped at one worker per eight GB of VRAM
+(two on a 16 GB card, four on a 32 GB card), with the same GPU lease. Linear
+shards currently use the overall slice deadline, not the MLP compile watchdog.
+Changing this shard count changes the residual shard layout: old data remains
+available but is not automatically repartitioned. CPU compilation still costs
+time; this pipeline does not guarantee continuous GPU utilization.
 
 Rerun the same command/output to resume. Manifest/source changes require a new
-output directory. Completed candidates are skipped by the existing residual
+output directory. For reviewed execution-only source changes, the combined
+collector's explicit `--adopt-source` preserves source history while requiring
+the workload and portfolio identities to match. Do not use it to mix changed
+kernel semantics into an existing experiment. Completed candidates are skipped by the existing residual
 orchestrator; abandoned attempts are excluded on recovery. The campaign exits
 when its finite plan is exhausted, even if time remains. It does not silently
 start an unbounded search or repeat measurements as additional independent data.
