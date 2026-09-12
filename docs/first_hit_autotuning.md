@@ -45,6 +45,14 @@ For the combined **six-hour MLP + linear** campaign:
 bash benchmarks/launch_combined_collection.sh 6
 ```
 
+The launcher creates `.venv` if absent, installs the pinned `requirements.txt`
+stack and the editable package, then checks runtime versions and dependency
+imports before detaching. Installation time is outside the collection budget.
+This selects the preferred Torch 2.13.0 CUDA 13.2 stack. Set
+`RTX_INSTALL_DEPS=0` to preserve an already provisioned supported stack (including
+Torch 2.12.1); preflight checks still run. `RTX_PYTHON` selects another venv's
+Python. Do not install into an environment used by an active collection job.
+
 This alternates 15-minute foreground collection slices, never launching the two
 GPU collectors concurrently. It persists the next category and resumes each
 dataset independently. Once MLP anchors finish, remaining time goes to linear
