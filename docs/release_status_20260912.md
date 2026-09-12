@@ -129,6 +129,42 @@ matches the repaired source used for final qualification.
 
 ## Remaining release requirements
 
+### Laptop archive received after local qualification
+
+`release_20260911T213951Z.zip` is from the RTX 5070 Laptop GPU with PyTorch
+2.13.0+cu132, clean commit `f325b25`, and matching package/kernel/validator
+hashes. Its production matrix passed 49/49, but `tests_exit=1`: all 34 schedule
+subcases in `test_real_schedule_variants_match_reference` disagreed at the
+same element `(91, 247)` of a 257x385 output. Each disagreement was one BF16
+ULP (0.00390625). There were 22 skips: 21 missing-DINO-checkpoint tests and the
+quarantined epilogue. This archive does **not** clear the laptop release gate.
+
+Local replay with the same seed did not reproduce the discrepancy and gives a
+different value at that coordinate, so the laptop's actual inputs are needed.
+Do not loosen the zero-tolerance test or blame a kernel based only on this log.
+Run this small diagnostic on the laptop; it saves `inputs.pt` and `report.json`:
+
+```bash
+python benchmarks/diagnose_mxfp8_rounding.py \
+  --output-dir autotune_reports/mxfp8_rounding_laptop_v1
+```
+
+Copy that directory back. It can be replayed without depending on device RNG:
+
+```bash
+python benchmarks/diagnose_mxfp8_rounding.py \
+  --inputs autotune_reports/mxfp8_rounding_laptop_v1/inputs.pt \
+  --output-dir autotune_reports/mxfp8_rounding_laptop_replay
+```
+
+The diagnostic compares five schedules with FP32 and CPU FP64 references,
+records exact rational dot products at discrepant cells, and checks BF16
+rounding without an intermediate FP32 cast. It is deliberately not a release
+gate: legal FP32 accumulation need not equal an exactly rounded FP64 dot
+product. No numerical tolerance or production kernel was changed.
+
+Laptop PyTorch 2.12.1 qualification remains outstanding.
+
 The same final source needs qualification on the laptop 5070, and the 5090
 when available. Historical cross-device datasets cannot satisfy a new-kernel
 correctness gate. Rebuild and remeasure before promoting new NVFP4 winners.
