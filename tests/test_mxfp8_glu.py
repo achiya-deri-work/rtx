@@ -238,7 +238,7 @@ class CudaTests(unittest.TestCase):
                                            quant_vec=8,quant_load_bits=128,persistent=True,raster="n")
                 else:
                     b=MXFP8GLUPrequantConfig()
-                    c=replace(b,gemm=replace(b.gemm,tile_m=64,atom_layout_m=2,stages=1,
+                    c=replace(b,gemm=replace(b.gemm,tile_m=64,atom_layout_m=2,stages=2,
                                             glu_store="tma",glu_store_stages=stages,tiles_per_cta=8))
                 with self.subTest(backend=backend,stages=stages):
                     self.assertIsNone(a.rejection(c))

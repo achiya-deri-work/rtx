@@ -242,7 +242,7 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
             quant=MXFP8QuantConfig(quant_vec=4,load_bits=32,quant_store_bits=32,
                                    scale_layout="row_major",transposed_tile_rows=value)
             dx=replace(current.dx,backend="decomposed",quant_a=quant,quant_b=quant,
-                       gemm=MXFP8GemmConfig(tile_m=64,atom_layout_m=2,stages=1,
+                       gemm=MXFP8GemmConfig(tile_m=64,atom_layout_m=2,stages=2,
                                            scale_layout="row_major",scale_role="consumers",
                                            epilogue="direct",store_vec=1))
             return replace(c,**{group:replace(current,dx=dx)})
@@ -332,8 +332,15 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
                 stage="runtime"
                 return measure(prepared["graph"],prepared["errors"],0.0,True)
             prepared.clear()
+            # AccumulateGrad belongs to the leaf, not just to the temporary
+            # loss. Never reuse leaves first exercised on the default stream
+            # (or a previous candidate's stream) in a new capture.
+            stream=torch.cuda.Stream(device=x.device)
+            stream.wait_stream(torch.cuda.current_stream(x.device))
+            with torch.cuda.stream(stream):
+                capture_inputs=tuple(t.detach().requires_grad_() for t in (x,gu,down))
             def forward():
-                return mxfp8_mlp(x,gu,down,activation=activation,config=c,precision=precision)
+                return mxfp8_mlp(*capture_inputs,activation=activation,config=c,precision=precision)
             # Both policies measure the same compiler/capture contract. Retire
             # only this candidate closure, not unrelated model compilations.
             torch._dynamo.reset_code(forward.__code__)
@@ -343,19 +350,21 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
                     with torch.no_grad():
                         return (forward_fn(),)
                 y=forward_fn()
-                return (y,*torch.autograd.grad(y,(x,gu,down),dy))
-            actual=run()
+                return (y,*torch.autograd.grad(y,capture_inputs,dy))
+            # Compilation, correctness, warmup, and capture must all exercise
+            # these candidate-local leaves on the same stream.
+            with torch.cuda.stream(stream):
+                actual=run()
+            stream.synchronize()
             errors=[]
             for a,b in zip(actual,expected):
-                error=((a.float()-b.float()).norm()/b.float().norm().clamp_min(1e-20)).item()
+                error=((a.detach().float()-b.float()).norm()/b.float().norm().clamp_min(1e-20)).item()
                 errors.append(error)
                 if not a.isfinite().all() or error>(.003 if precision=="bf16_gate" else .025):
                     return TrialOutcome("correctness_error",error=f"relative L2 {errors}")
             compile_ms=(time.monotonic()-started)*1000
             stage="runtime"
             del actual
-            stream=torch.cuda.Stream(device=x.device)
-            stream.wait_stream(torch.cuda.current_stream(x.device))
             with torch.cuda.stream(stream):
                 for _ in range(warmup):
                     run()
@@ -364,7 +373,8 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
             with torch.cuda.graph(graph,stream=stream):
                 for _ in range(calls_per_sample):
                     result=run()
-            prepared.update(config=c,graph=graph,outputs=result,errors=errors)
+            prepared.update(config=c,graph=graph,outputs=result,errors=errors,
+                            inputs=capture_inputs,stream=stream)
             return measure(graph,errors,compile_ms,False)
         except Exception as exc:
             raise_if_fatal_device_context_error(exc)
@@ -376,7 +386,7 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
                                                       "precision":precision,"silu_math":initial.gate_up.glu_silu_math},
                               device=hardware,
                               tags={"warmup":warmup,"samples":samples,"calls_per_sample":calls_per_sample,
-                                    "capture_warmup":"same_stream_v1","compile":"fullgraph_static",
+                                    "capture_warmup":"candidate_leaves_same_stream_v2","compile":"fullgraph_static",
                                     "gradient_probe":"normal_seed1729"}),
         initial_config=initial,axes=axes,config_id_fn=lambda c:stable_id(active_schedule(c,precision,phase)),serialize_fn=asdict,
         deserialize_fn=lambda v:_parse(json.dumps({"revision":MLP_CONFIG_REVISION,**v},sort_keys=True)),update_fn=update,
@@ -408,8 +418,15 @@ def mlp_structural_seeds(adapter,precision,phase):
 def tune_mxfp8_mlp(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT_MLP_CONFIG,
                    precision="mxfp8",max_trials=32,time_budget_s=120,output_dir="autotune_results/mlp",seed=0,progress=print,
                    coverage_fraction=2/3,warmup=3,samples=7,calls_per_sample=3,confirmation_repeats=2,
-                   search="discovery",ranker_path=None,portfolio=()):
+                   search="discovery",ranker_path=None,portfolio=(),tuning_policy=None):
     """Tune total forward or forward+recomputed-backward replay time; persist every trial."""
+    tuning_started=time.monotonic()
+    from .effort import AutotunePolicy,make_effort_autotuner
+    if tuning_policy is not None:
+        if not isinstance(tuning_policy,AutotunePolicy):raise TypeError('tuning_policy must be AutotunePolicy')
+        tuning_policy=tuning_policy.for_pass(phase=='train')
+        max_trials,time_budget_s=tuning_policy.max_trials,tuning_policy.max_seconds
+        warmup,samples,calls_per_sample=tuning_policy.warmup,tuning_policy.samples,tuning_policy.calls_per_sample
     if torch.compiler.is_compiling():
         raise RuntimeError("tune before compile/capture")
     if not 0<=coverage_fraction<=1:
@@ -423,6 +440,8 @@ def tune_mxfp8_mlp(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT_M
                                  warmup=warmup,samples=samples,calls_per_sample=calls_per_sample)
         store=ResidualTuningStore(Path(output_dir)/adapter.context.identifier,transfer_root=output_dir)
         seeds=mlp_structural_seeds(adapter,precision,phase)
+        if tuning_policy is not None:
+            return make_effort_autotuner(adapter,store,tuning_policy,progress=progress,candidates=[*portfolio,*seeds],started_at=tuning_started).tune()
         if search=="balanced":
             from .first_hit import FirstHitPolicy,FrozenRanker,tune_first_hit
             ranker=None if ranker_path is None else FrozenRanker.load(ranker_path)

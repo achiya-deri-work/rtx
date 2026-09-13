@@ -11,11 +11,36 @@
 | `online` | Compatibility alias for balanced |
 | `coordinate` | Explicit deeper search; legacy default can be 30 minutes |
 
-Balanced defaults to 24 trials / 30 seconds per new context. These are search
+Balanced defaults to the shared `AutotunePolicy`: 16 trials / 30 seconds per new context. These are search
 budgets, not a hard interruption of an in-flight compiler or CUDA operation.
 Backward and additional operand states can create their own contexts. Repeated
 matching calls reuse selection. Filesystem locking and atomic publication avoid
 duplicate same-context local work when processes share the cache.
+
+Compile first and call normally—neither eager warmup nor an explicit tuning
+call is required for `MXFP8Linear` and `NVFP4Linear`:
+
+```python
+layer = rtx.MXFP8Linear(768, 3072, device="cuda")
+compiled = torch.compile(layer, fullgraph=True)
+y = compiled(x)  # Tunes a missing forward context using real inputs.
+y.sum().backward()  # Tunes a missing backward context.
+```
+
+Fake/meta tracing never benchmarks. The registered runtime launcher resolves
+the request on real tensors; subsequent matching calls reuse its selection
+without a graph recompile caused by cache mutation. A new shape can require
+new tuning (and normal Torch shape specialization). Inductor-managed graph
+warmup precedes replay; manually capturing a completely cold kernel is not
+a supported way to initiate tuning. See [effort controls](autotune_effort.md).
+
+Persistent runner scratch uses a separate CUDA memory pool rather than
+Inductor's output-tracked graph pool. This avoids untracked live allocations
+during `reduce-overhead` warmup. Scratch follows the existing bounded,
+stream-specific runner caches; `rtx.clear_runtime_caches()` also drops scratch
+pool ownership. Do not clear caches while a captured graph is still in use.
+Cold compiled forward/backward, two static shapes, stable graph counts, and
+reduce-overhead inference are tested on Torch 2.13.0+cu132 / RTX 5070 Ti.
 
 `autotune_cache_dir` selects the winner root. `tuning_policy` provides advanced
 policy control. Environment overrides include `RTX_AUTOTUNE`,

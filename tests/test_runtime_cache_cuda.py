@@ -30,10 +30,11 @@ for family in ("mxfp8", "nvfp4"):
         layer = cls(256, 128, device="cuda", autotune="balanced",
                     backend="materialized", autotune_cache_dir=root).eval()
         x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        compiled = torch.compile(layer, fullgraph=True)
         with torch.inference_mode():
-            first = layer(x)
+            first = compiled(x)
             calls = tuner.call_count
-            second = layer(x)
+            second = compiled(x)
         torch.cuda.synchronize()
         torch.testing.assert_close(first, second, rtol=0, atol=0)
         assert bool(torch.isfinite(second).all())

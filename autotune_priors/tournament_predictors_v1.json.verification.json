@@ -1,0 +1,84 @@
+{
+  "train_counts": {
+    "raw": 62446,
+    "ok": 60148,
+    "unstable": 1071,
+    "quarantined": 7566,
+    "correctness_error": 61,
+    "implementation_rejected": 2221,
+    "compile_error": 4,
+    "runtime_error": 12,
+    "latency_rows": 53786,
+    "attempt_rows": 54872
+  },
+  "evaluation_counts": {
+    "raw": 79664,
+    "ok": 79507,
+    "quarantined": 8438,
+    "unstable": 1313,
+    "correctness_error": 137,
+    "runtime_error": 20,
+    "latency_rows": 35730,
+    "attempt_rows": 71226
+  },
+  "heads": {
+    "residual": {
+      "rows": 35730,
+      "max_abs_error": 0.0,
+      "top8_sets_equal": 482,
+      "top8_contexts": 482,
+      "warnings": []
+    },
+    "mlp": {
+      "rows": 35730,
+      "max_abs_error": 2.6226043701171875e-06,
+      "top8_sets_equal": 482,
+      "top8_contexts": 482,
+      "warnings": [
+        "Got `batch_size` less than 1 or larger than sample size. It is going to be clipped",
+        "Stochastic Optimizer: Maximum iterations (40) reached and the optimization hasn't converged yet."
+      ]
+    }
+  },
+  "source_manifest": {
+    "train": {
+      "raw": 62446,
+      "ok": 60148,
+      "unstable": 1090,
+      "quarantined": 5261,
+      "correctness_error": 61,
+      "implementation_rejected": 2221,
+      "compile_error": 4,
+      "runtime_error": 12,
+      "aggregated": 53786
+    },
+    "test": {
+      "raw": 79664,
+      "ok": 79507,
+      "quarantined": 8264,
+      "unstable": 1330,
+      "correctness_error": 137,
+      "runtime_error": 20,
+      "aggregated": 35730
+    },
+    "train_paths": [
+      "combined_parallel_v2_sphera2-Dell-Pro-Max-Tower-T2-FCT2250_20260912T232403Z.zip",
+      "combined_parallel_v1_DESKTOP-8GVONEQ_20260912T231548Z.zip",
+      "autotune_datasets/combined_first_hit_v1_achiyas-pc"
+    ],
+    "test_paths": [
+      "prior_study_v1_sphera2-Dell-Pro-Max-Tower-T2-FCT2250_20260913T082219Z.zip",
+      "prior_study_v1_DESKTOP-8GVONEQ_20260913T082441Z.zip",
+      "autotune_datasets/prior_study_v1_achiyas-pc_20260913T082155Z"
+    ],
+    "protocols": "chronological and train-device-disjoint; no tuning on test",
+    "limits": [
+      "Observed successful candidate pools only; NOT off-policy evaluation of adaptive UCB",
+      "This prospective study was previously inspected: development evidence, not untouched qualification",
+      "Measurements without explicit stationarity flags remain eligible",
+      "MLP quarantine conservatively filters stored inactive schedules too",
+      "Replicated timings use configuration medians; no cold compile latency claim"
+    ]
+  },
+  "artifact_sha256": "83b37cdb5aef216daeb83c464de93bbd5c88e9201b8dd46bb29f299f5c4b297a"
+}

@@ -1,5 +1,5 @@
 """GLU adapter for the shared persistent bandit/cost-model/local-search engine."""
-from dataclasses import asdict
+from dataclasses import asdict,replace
 import statistics
 import time
 from pathlib import Path
@@ -167,13 +167,19 @@ def make_glu_adapter(x, weight, *, activation="silu", output_format="bf16",
 
 def tune_mxfp8_glu(x, weight, *, activation="silu", output_format="bf16",
                     output_dir="autotune_results/glu", max_trials=32,
-                    time_budget_s=120, seed=0, progress=print, backend="auto", seed_history=None):
+                    time_budget_s=120, seed=0, progress=print, backend="auto", seed_history=None,tuning_policy=None):
     """Run/resume a bounded bandit portfolio; return its persistent winner.
 
     Explicitly call before torch.compile, then pass ``result.config`` to GLU.
     All evaluations are saved by the standard TuningStore. This experimental
     family does not share cache entries with ordinary linear projections.
     """
+    tuning_started=time.monotonic()
+    from .effort import AutotunePolicy
+    if tuning_policy is not None:
+        if not isinstance(tuning_policy,AutotunePolicy):raise TypeError('tuning_policy must be AutotunePolicy')
+        tuning_policy=tuning_policy.for_pass()
+        max_trials,time_budget_s,seed=tuning_policy.max_trials,tuning_policy.max_seconds,tuning_policy.seed
     if backend=="auto":
         if max_trials < 2:
             raise ValueError("auto backend search needs at least two trials")
@@ -185,10 +191,19 @@ def tune_mxfp8_glu(x, weight, *, activation="silu", output_format="bf16",
                 x,weight,activation=activation,output_format=output_format,output_dir=output_dir,
                 max_trials=max_trials//2+(max_trials%2 if index else 0),
                 time_budget_s=remaining/(2-index),seed=seed,progress=progress,
-                backend=family,seed_history=seed_history))
+                backend=family,seed_history=seed_history,
+                tuning_policy=None if tuning_policy is None else replace(tuning_policy,
+                    max_trials=max_trials//2+(max_trials%2 if index else 0),
+                    max_seconds=remaining/(2-index),forward_trials=None)))
         return min(results,key=lambda result:result.median_ms)
     with torch.cuda.device(x.device):
-        adapter = make_glu_adapter(x, weight, activation=activation, output_format=output_format,backend=backend)
+        measurement = {} if tuning_policy is None else {
+            "warmup": tuning_policy.warmup,
+            "samples": tuning_policy.samples,
+            "calls_per_sample": tuning_policy.calls_per_sample,
+        }
+        adapter = make_glu_adapter(x, weight, activation=activation, output_format=output_format,
+                                   backend=backend, **measurement)
         if seed_history is not None:
             import json
             candidates=[]
@@ -215,7 +230,7 @@ def tune_mxfp8_glu(x, weight, *, activation="silu", output_format="bf16",
                                     use_pretrained=False, use_pairwise=False)
         store = ResidualTuningStore(Path(output_dir) / adapter.context.identifier,
                                     transfer_root=output_dir)
-        return make_hybrid_autotuner(adapter, store, policy, progress=progress).tune()
+        return make_hybrid_autotuner(adapter, store,tuning_policy or policy, progress=progress,started_at=tuning_started).tune()
 
 
 def main():

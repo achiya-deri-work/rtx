@@ -120,6 +120,25 @@ class PrecisionAPITests(unittest.TestCase):
         self.assertLessEqual(torch.cuda.memory_allocated(),before+4096)
 
     @unittest.skipUnless(torch.cuda.is_available(),"requires CUDA")
+    def test_autotune_candidate_capture_uses_fresh_leaves(self):
+        from rtx.autotune.mlp import make_mlp_adapter
+        for precision in ("mxfp8","bf16_gate"):
+            module=MXFP8MLP(128,256,precision=precision,device="cuda")
+            x=torch.randn(128,128,device="cuda",dtype=torch.bfloat16)*.2
+            adapter=make_mlp_adapter(x,module.gate_up_weight,module.down_weight,
+                precision=precision,warmup=2,samples=2,calls_per_sample=1)
+            base=adapter.initial_config
+            other=replace(base,down_backward=replace(base.down_backward,
+                execution_order="dw_first" if base.down_backward.execution_order=="dx_first" else "dx_first"))
+            self.assertNotEqual(base,other)
+            for config in (base,other,base):
+                self.assertIsNone(adapter.rejection_fn(config))
+                result=adapter.evaluator(config)
+                self.assertEqual(result.status,"ok",result.error)
+            self.assertTrue(adapter.evaluator(base).metadata["prepared_benchmark_reused"])
+            self.assertEqual(adapter.context.tags["capture_warmup"],"candidate_leaves_same_stream_v2")
+
+    @unittest.skipUnless(torch.cuda.is_available(),"requires CUDA")
     def test_tuning_space_policy_and_shape_reductions(self):
         from rtx.autotune.mlp import make_mlp_adapter
         module=MXFP8MLP(128,256,device="cuda")

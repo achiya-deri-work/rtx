@@ -42,6 +42,7 @@ from .formats.nvfp4 import (
     validate_nvfp4_tensor,
 )
 from .runtime import BoundedCache, load_kernel_symbol, runner_cache_limit
+from ._workspace import persistent_scratch
 from .types import (
     AutotuneMode,
     CanonicalAutotuneMode,
@@ -673,6 +674,7 @@ _DYNAMIC_X_RUNNERS: BoundedCache[tuple[object, ...], _DynamicXRunner] = BoundedC
 )
 
 
+@persistent_scratch
 def _make_dynamic_runner(
     problem: NVFP4Problem,
     config: NVFP4ForwardConfig,
@@ -716,6 +718,7 @@ def _make_dynamic_runner(
     )
 
 
+@persistent_scratch
 def _make_delayed_dynamic_runner(
     problem: NVFP4Problem,
     config: NVFP4ForwardConfig,
@@ -755,6 +758,7 @@ def _make_delayed_dynamic_runner(
     )
 
 
+@persistent_scratch
 def _make_jit_region_dynamic_runner(
     problem: NVFP4Problem,
     config: NVFP4ForwardConfig,
@@ -841,6 +845,7 @@ def _make_jit_region_dynamic_runner(
     )
 
 
+@persistent_scratch
 def _make_block_dynamic_runner(
     problem: NVFP4Problem,
     config: NVFP4ForwardConfig,
@@ -884,6 +889,7 @@ def _make_block_dynamic_runner(
     )
 
 
+@persistent_scratch
 def _make_dynamic_x_runner(
     problem: NVFP4Problem,
     config: NVFP4ForwardConfig,
@@ -963,7 +969,7 @@ def _packed_inference_config_key(
             )
         if selected is None and request.mode in ("balanced", "coordinate"):
             from .nvfp4_inference_autotune import tune_nvfp4_inference_state
-            from .autotune.runtime import balanced_hybrid_policy
+            from .autotune.runtime import balanced_effort_policy
 
             winner_key = runtime_winner_key(
                 family, problem, device=device, variant=variant
@@ -985,7 +991,7 @@ def _packed_inference_config_key(
                             request.policy
                             if request.policy is not None
                             or request.mode == "coordinate"
-                            else balanced_hybrid_policy()
+                            else balanced_effort_policy()
                         ),
                     )
         selected = selected or NVFP4FullyPrequantConfig()
@@ -1006,7 +1012,7 @@ def _packed_inference_config_key(
             )
         if selected is None and request.mode in ("balanced", "coordinate"):
             from .nvfp4_inference_autotune import tune_nvfp4_inference_state
-            from .autotune.runtime import balanced_hybrid_policy
+            from .autotune.runtime import balanced_effort_policy
 
             winner_key = runtime_winner_key(
                 family, problem, device=device, variant=variant
@@ -1028,7 +1034,7 @@ def _packed_inference_config_key(
                             request.policy
                             if request.policy is not None
                             or request.mode == "coordinate"
-                            else balanced_hybrid_policy()
+                            else balanced_effort_policy()
                         ),
                     )
         selected = selected or NVFP4WeightPrequantConfig()
@@ -1126,7 +1132,7 @@ def _materialized_dynamic_config_key(
         and family in ("nvfp4_dynamic_fwd", "nvfp4_jit_row_region_fwd")
     ):
         from .nvfp4_inference_autotune import tune_nvfp4_inference_state
-        from .autotune.runtime import balanced_hybrid_policy
+        from .autotune.runtime import balanced_effort_policy
 
         assert winner_key is not None
         with runtime_tuning_lock(winner_key, root=request.cache_dir):
@@ -1150,7 +1156,7 @@ def _materialized_dynamic_config_key(
                         request.policy
                         if request.policy is not None
                         or request.mode == "coordinate"
-                        else balanced_hybrid_policy()
+                        else balanced_effort_policy()
                     ),
                 )
     if selected is None and family == "nvfp4_jit_row_region_fwd":

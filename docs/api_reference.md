@@ -7,6 +7,40 @@ Configuration listings show locally declared fields; inherited fields follow the
 `rtx.__version__` is the package version. Stable below means wildcard-export membership,
 not a declaration that this development checkout is a released 1.0 build.
 
+## `rtx.AutotunePolicy`
+
+Explicit feature/compatibility export; provider `rtx.autotune.effort.AutotunePolicy`.
+
+[Source](../rtx/autotune/effort.py)
+
+Per-context cumulative trial cap and per-invocation wall-time allowance.
+
+```python
+class AutotunePolicy:
+    max_trials: int = 16
+    max_seconds: float = 30.0
+    pool_size: int = 128
+    candidate_mix: str = 'legacy'
+    structural_proposals: int = 512
+    retrieval_trials: int | None = None
+    exploration_trials: int = 1
+    prior_artifact: str | None = None
+    predictor_artifact: str | None = None
+    predictor_heads: tuple[str, ...] = ('residual', 'mlp')
+    allow_research_prior: bool = False
+    exploration: float = 0.15
+    confirmation_repeats: int = 1
+    seed: int = 20260914
+    warmup: int = 3
+    samples: int = 5
+    calls_per_sample: int = 3
+    forward_trials: int | None = None
+    backward_trials: int | None = None
+    def preset(cls, name, **overrides)
+    def for_pass(self, backward=False)
+    def coordinate(self, *, rtol=0.05, atol=0.5)
+```
+
 ## `rtx.MXTensor`
 
 Stable runtime export; provider `rtx.formats.MXTensor`.
@@ -244,7 +278,7 @@ class MXFP8MLPConfig:
     backward_overlap: bool = False
     gate_backend: str = 'onchip'
     cooperative_ctas_per_sm: float = 1.0
-    gate_prequant: MXFP8GLUPrequantConfig = field(default_factory=lambda: MXFP8GLUPrequantConfig(quant=MXFP8QuantConfig(quant_vec=8, load_bits=128, quant_store_bits=32), gemm=MXFP8GLUGemmConfig(tile_m=64, atom_layout_m=2, stages=1, persistent_waves=1, glu_epilogue='registers', glu_quant_vec=4)))
+    gate_prequant: MXFP8GLUPrequantConfig = field(default_factory=lambda: MXFP8GLUPrequantConfig(quant=MXFP8QuantConfig(quant_vec=8, load_bits=128, quant_store_bits=32), gemm=MXFP8GLUGemmConfig(tile_m=64, atom_layout_m=2, stages=2, persistent_waves=1, glu_epilogue='registers', glu_quant_vec=4)))
     recompute_backend: str = 'onchip'
     recompute: MXFP8GLUPrequantConfig = field(default_factory=lambda: MXFP8GLUPrequantConfig(quant=MXFP8QuantConfig(quant_vec=8, load_bits=128, quant_store_bits=32), gemm=MXFP8GLUGemmConfig(tile_m=64, atom_layout_m=2, stages=2, glu_epilogue='registers', glu_quant_vec=4)))
     down_backend: str = 'onchip'

@@ -43,7 +43,7 @@ class QualitySweepTests(unittest.TestCase):
         from rtx.configs.mxfp8 import MXFP8QuantConfig,MXFP8GemmConfig
         from rtx.kernels.mxfp8 import MXFP8Problem
         config=MXFP8PrequantConfig(quant=MXFP8QuantConfig(scale_layout="row_major"),
-            gemm=MXFP8GemmConfig(tile_m=64,atom_layout_m=2,stages=1))
+            gemm=MXFP8GemmConfig(tile_m=64,atom_layout_m=2,stages=2))
         problem=MXFP8Problem(129,256,128)
         self.assertIn("full M/N tiles",config.rejection(problem))
         direct=replace(config,gemm=replace(config.gemm,epilogue="direct",store_vec=1))

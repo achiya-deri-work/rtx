@@ -1039,6 +1039,10 @@ def tune_mxfp8_prequant(
     axes: Mapping[str, Iterable[dict[str, object]]] = PREQUANT_SEARCH_SPACE,
     progress: ProgressCallback | None = print,
 ) -> PrequantTuningResult:
+    from .autotune.effort import AutotunePolicy,tune_legacy_effort
+    if isinstance(policy,AutotunePolicy):
+        return tune_legacy_effort('prequant',x,weight,policy=policy,initial=initial,
+            axes=axes,cache_dir=cache_dir,progress=progress)
     selected_policy = _policy_for_prequant(policy)
     x_2d = x.reshape(-1, x.shape[-1])
     evaluator = MXFP8PrequantEvaluator(x_2d, weight, selected_policy)

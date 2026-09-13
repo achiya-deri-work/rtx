@@ -260,7 +260,7 @@ NVFP4_WEIGHT_PREQUANT_SEARCH_SPACE = {
     "x_reduction": _QUANT_REDUCTION,
     "x_launch": _QUANT_LAUNCH,
     "x_registers": _QUANT_REGISTERS,
-    "x_scale_reciprocal": _QUANT_RECIPROCAL,
+    "x_scale_reciprocal": ({"quant": {"scale_reciprocal": "direct"}},),
     "x_scale_compute": _QUANT_SCALE_COMPUTE,
     **_gemm_axes(),
 }
@@ -885,6 +885,8 @@ def tune_nvfp4_inference_state(
     layouts remain an implementation coordinate inside the dynamic family.
     """
 
+    import time
+    tuning_started=time.monotonic()
     from .autotune import (
         CalibratedPrequantEvaluator,
         DeviceFingerprint,
@@ -960,7 +962,9 @@ def tune_nvfp4_inference_state(
         device=fingerprint,
         regime="hot",
     )
-    if isinstance(policy, HybridTuningPolicy):
+    from .autotune.effort import AutotunePolicy
+    if isinstance(policy,AutotunePolicy):policy=policy.for_pass()
+    if isinstance(policy, (HybridTuningPolicy,AutotunePolicy)):
         hybrid = policy
     else:
         hybrid = HybridTuningPolicy(
@@ -984,7 +988,7 @@ def tune_nvfp4_inference_state(
         root / "runtime_sessions" / adapter.context.family / fingerprint.identifier / suffix
     )
     result = make_hybrid_autotuner(
-        adapter, store, hybrid, progress=progress
+        adapter, store, hybrid, progress=progress,started_at=tuning_started
     ).tune()
     key = runtime_winner_key(
         adapter.context.family,

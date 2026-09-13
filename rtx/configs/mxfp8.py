@@ -186,6 +186,12 @@ class MXFP8GemmConfig:
             return "tile_n must equal 64 * atom_layout_n"
         if self.tile_m == 64 and self.atom_layout_m != 2:
             return "64-row SFA fragments require atom_layout_m=2"
+        if (self.tile_m == 64 and self.stages == 1 and self.scale_role == "consumers"
+                and self.scale_layout == "row_major"):
+            return (
+                "64-row single-buffer consumer-scale GEMM is quarantined after intermittent "
+                "large-grid numerical failures; use stages>=2 or tile_m>=128"
+            )
         if self.tile_m == 256 and self.atom_layout_m != 8:
             return "256-row SFA fragments require atom_layout_m=8"
         if self.num_threads > 1024:

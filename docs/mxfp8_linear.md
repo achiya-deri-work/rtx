@@ -135,7 +135,7 @@ optimizer/weight-sharing guarantees, see [the model conversion guide](model_conv
   `balanced`.
 - `off` uses an explicit or portable configuration.
 - `cache` loads compatible verified winners and never benchmarks unexpectedly.
-- `balanced` checks the exact runtime cache first, explores at most 24 candidates
+- `balanced` checks the exact runtime cache first, explores at most 16 candidates
   or 30 seconds on a miss, confirms the winner, and persists it atomically.
   Repeated calls use the process-local selection without another lookup.
 - `online` is a compatibility alias for `balanced`.
@@ -145,12 +145,12 @@ optimizer/weight-sharing guarantees, see [the model conversion guide](model_conv
   winner storage.
 
 The balanced limits can be changed with `RTX_BALANCED_AUTOTUNE_TRIALS` and
-`RTX_BALANCED_AUTOTUNE_SECONDS`. Screening defaults to five adaptive samples;
+`RTX_BALANCED_AUTOTUNE_SECONDS`. Screening defaults to five samples;
 `RTX_BALANCED_AUTOTUNE_WARMUP`, `RTX_BALANCED_AUTOTUNE_SAMPLES`, and
 `RTX_BALANCED_AUTOTUNE_CALLS_PER_SAMPLE` expose the remaining first-hit cost.
-Set `RTX_AUTOTUNE_PRETRAINED_ARTIFACT` to a validated portable model bundle to
-seed the learned arms; without it, the same policy learns only from the current
-context and any resumable local journal.
+Use `tuning_policy=rtx.AutotunePolicy(...)` for explicit budgets or a compatible
+prior artifact. Research priors require explicit opt-in. The shared default
+learns from the current context and its resumable local journal.
 
 Exact winner selection is keyed by device/software identity, kernel revision,
 shape, operand state, and physical scale layouts. It remains opaque through

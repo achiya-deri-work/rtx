@@ -38,6 +38,7 @@ from .kernels.mxfp8 import (
     fwd_config_to_dict,
 )
 from .runtime import BoundedCache, load_kernel_symbol, runner_cache_limit
+from ._workspace import persistent_scratch
 from .types import AutotuneMode, CanonicalAutotuneMode, MXFP8Backend
 
 if TYPE_CHECKING:
@@ -793,6 +794,7 @@ def quantize_mxfp8(
     )
 
 
+@persistent_scratch
 def _build_prequant_runner(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -848,13 +850,10 @@ def _build_prequant_runner(
                         policy = request.policy
                         if request.mode == "balanced" and policy is None:
                             from .autotune.runtime import (
-                                balanced_coordinate_policy,
+                                balanced_effort_policy,
                             )
 
-                            policy = balanced_coordinate_policy(
-                                correctness_rtol=5e-2,
-                                correctness_atol=5e-1,
-                            )
+                            policy = balanced_effort_policy()
                         result = tune_mxfp8_prequant(
                             x,
                             weight,
@@ -1811,7 +1810,7 @@ def _resolve_packed_inference_config(
         runtime_winner_key,
         runtime_tuning_lock,
     )
-    from .autotune.runtime import balanced_hybrid_policy
+    from .autotune.runtime import balanced_effort_policy
     from .inference_autotune import (
         fully_prequant_config_from_dict,
         tune_mxfp8_inference_state,
@@ -1867,7 +1866,7 @@ def _resolve_packed_inference_config(
                         policy=(
                             tuning_policy
                             if tuning_policy is not None or mode == "coordinate"
-                            else balanced_hybrid_policy()
+                            else balanced_effort_policy()
                         ),
                     )
         assert isinstance(selected, MXFP8WeightPrequantConfig)
@@ -1933,7 +1932,7 @@ def _resolve_packed_inference_config(
                     policy=(
                         tuning_policy
                         if tuning_policy is not None or mode == "coordinate"
-                        else balanced_hybrid_policy()
+                        else balanced_effort_policy()
                     ),
                 )
     assert isinstance(selected, MXFP8FullyPrequantConfig)
@@ -2361,9 +2360,9 @@ def _resolve_fwd_config(
             return cached
         policy = tuning_policy
         if policy is None and mode == "balanced":
-            from .autotune.runtime import balanced_coordinate_policy
+            from .autotune.runtime import balanced_effort_policy
 
-            policy = balanced_coordinate_policy()
+            policy = balanced_effort_policy()
         elif policy is None:
             policy = CoordinateDescentPolicy(
                 time_budget_s=float(

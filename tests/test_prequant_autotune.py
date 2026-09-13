@@ -39,6 +39,16 @@ def _fingerprint() -> DeviceFingerprint:
 
 
 class PrequantAutotuneTests(unittest.TestCase):
+    def test_single_buffer_64_row_consumer_scale_quarantine(self):
+        from dataclasses import replace
+        from rtx.configs.mxfp8 import MXFP8GemmConfig
+        from rtx.kernels.mxfp8 import MXFP8Problem
+        c=MXFP8GemmConfig(tile_m=64,atom_layout_m=2,stages=1,epilogue="direct",store_vec=1)
+        problem=MXFP8Problem(6144,3072,1024)
+        self.assertIn("quarantined",c.rejection(problem))
+        self.assertIsNone(replace(c,stages=2).rejection(problem))
+        self.assertIsNone(replace(c,tile_m=128).rejection(problem))
+
     problem = MXFP8Problem(512, 1536, 1536)
 
     def test_config_round_trip_and_structural_layouts(self) -> None:

@@ -196,7 +196,7 @@ compiler-visible FX where specified.
 - `autotune="off"` uses supplied or portable configurations.
 - `autotune="cache"` loads an installed verified winner and otherwise uses a
   portable seed.
-- `autotune="balanced"` checks the exact cache first, explores at most 24
+- `autotune="balanced"` checks the exact cache first, explores at most 16
   candidates or 30 seconds on a miss, confirms the winner, saves it atomically,
   and reuses it for every subsequent call with the same context.
 - `autotune="online"` is a compatibility alias for `"balanced"`.
@@ -214,12 +214,10 @@ winners. Most users should leave them unset so runtime selection can account
 for GPU SKU, shape, cache regime, and kernel revision.
 
 Set `RTX_BALANCED_AUTOTUNE_TRIALS` or `RTX_BALANCED_AUTOTUNE_SECONDS` to change
-the bounded first-hit budget. The default 24-trial cutoff was selected from
-prospective 5070 Ti, laptop 5070, and 5090 campaigns: it reached a configuration
-within 2% of each context's eventual campaign best in 97.6%, 92.5%, and 95.7%
-of contexts respectively.
-`RTX_AUTOTUNE_PRETRAINED_ARTIFACT` may point at a separately validated portable
-cost-model bundle; the runtime never silently trains on copied campaign data.
+the bounded first-hit budget. The shared effort policy defaults to 16 trials;
+older 24-trial campaign results are not a guarantee for this smaller budget.
+Use `tuning_policy=rtx.AutotunePolicy(...)` to customize effort or explicitly
+supply a prior. The runtime never silently trains on copied campaign data.
 
 ## Training
 

@@ -138,6 +138,15 @@ class FrozenPrior:
             random.Random(seed).shuffle(pool);return pool
         bundle=self.bundle(adapter)
         if bundle is None:return pool
+        ids=[adapter.config_id(c) for c in pool];positions={cid:i for i,cid in enumerate(ids)}
+        retrieved=[]
+        for r in sorted(bundle['winners'],key=lambda r:shape_distance(r['features'],adapter.context.features())):
+            i=positions.get(r['config_id'])
+            if i is not None and i not in retrieved:retrieved.append(i)
+        # Short retrieval budgets need neither model deserialization nor
+        # candidate feature extraction/prediction.
+        if policy=='retrieval':
+            return [pool[i] for i in retrieved+[i for i in range(len(pool)) if i not in retrieved]]
         key=stable_id(bundle['contract'])
         if key not in self._models:
             self._models[key]=tuple(cls.from_state_dict(bundle[name]) if bundle.get(name) else None
@@ -148,18 +157,12 @@ class FrozenPrior:
         predicted,uncertainty=ranker.predict(features) if ranker else (np.ones(len(pool)),np.ones(len(pool)))
         probability=feasibility.predict(features)[0] if feasibility else np.ones(len(pool))
         preparation=cost.predict(features)[0] if cost else np.ones(len(pool))
-        ids=[adapter.config_id(c) for c in pool];positions={cid:i for i,cid in enumerate(ids)}
-        retrieved=[]
-        for r in sorted(bundle['winners'],key=lambda r:shape_distance(r['features'],adapter.context.features())):
-            i=positions.get(r['config_id'])
-            if i is not None and i not in retrieved:retrieved.append(i)
         # Penalties are deliberately bounded. Sparse failure evidence cannot
         # erase a promising configuration or overrule static legality.
         score=np.log(np.maximum(predicted,1e-12))+feasibility_penalty*(1-np.clip(probability,0,1))
         score+=preparation_penalty*np.clip(np.log(np.maximum(preparation,1e-9)/max(float(np.median(preparation)),1e-9)),-2,2)
         ranked=sorted(range(len(pool)),key=lambda i:(float(score[i]),ids[i]))
-        if policy=='retrieval':order=retrieved+[i for i in range(len(pool)) if i not in retrieved]
-        elif policy=='ranker':order=ranked
+        if policy=='ranker':order=ranked
         else:
             # 2 retrieval, 4 model, 2 diverse slots per block of eight.
             # Diversity uses feature-space distance; no prediction calibration

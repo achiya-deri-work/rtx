@@ -30,6 +30,46 @@ scaling and cache regime. Porting to a different operation requires defining its
 semantic contract too; do not treat attention visibility policies, for example,
 as interchangeable merely because their shapes match.
 
+## Composing a short-budget research policy
+
+The [three-device prospective results](prior_prospective_results_20260913.md)
+support investigating retrieval-first budgets and family-specific routing.
+`StagedPriorPolicy` and `FamilyPriorPolicy` provide this composition without
+embedding RTX family names into the generic prior implementation:
+
+```python
+from rtx.autotune.prior_policy import (
+    PriorStage, StagedPriorPolicy, FamilyPriorPolicy,
+)
+
+staged = StagedPriorPolicy((
+    PriorStage("retrieval", trials=4),
+    PriorStage("hybrid"),  # Retain every remaining candidate; no hard pruning.
+))
+policy = FamilyPriorPolicy(staged, routes={
+    "mxfp8_bwd": StagedPriorPolicy((PriorStage("retrieval"),)),
+    "nvfp4_jit_row_region_fwd": StagedPriorPolicy((PriorStage("retrieval"),)),
+})
+shortlist = policy.order(prior, adapter, legal_candidates, max_candidates=8)
+```
+
+This example is a **new research hypothesis**, not a qualified deployment
+recipe. Its routing rules were chosen after inspecting the study; evaluate it
+on fresh workloads before claiming an unbiased win. No runtime default changes.
+
+The caller still owns legality checks, numerical verification, confirmations,
+trial/time budgets, and measured-winner installation. Stages count unique
+proposals, not successful trials. Repeated IDs in the supplied pool are rejected.
+Without `max_candidates`, ordering retains the complete pool. A budget of four
+in the example never invokes the hybrid stage; retrieval itself skips model
+deserialization and per-candidate model feature extraction. The frozen artifact
+must still be loaded, so this is not a claim of zero first-hit setup cost.
+Unknown semantic contracts preserve caller ordering. Family routing does not
+bypass kernel revision, numerical-policy, or cache-regime compatibility.
+
+The existing four-hour launcher continues to compare the original five arms.
+It does not silently substitute this newly composed policy into a resumed study.
+
 ## Development evidence
 
 `autotune_reports/portable_prior_v1/evaluation.json` records all 24 bundle

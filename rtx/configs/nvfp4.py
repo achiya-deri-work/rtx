@@ -290,6 +290,12 @@ class NVFP4WeightPrequantConfig:
     l2_fetch_granularity: int | None = None
 
     def rejection(self, problem: NVFP4Problem) -> str | None:
+        # This path's public contract uses TorchAO tensor-current packing.
+        # Reassociating the outer/block reciprocal changes E2M1 tie rounding
+        # for non-power-of-two outer scales. Do not autotune numerical policy
+        # as if it were an interchangeable schedule.
+        if self.quant_x.scale_reciprocal != "direct":
+            return "activation reciprocal quarantined for tensor-current packed inference; use direct"
         reason = self.quant_x.rejection(problem.m, problem.k)
         if reason is not None:
             return f"activation quantizer: {reason}"

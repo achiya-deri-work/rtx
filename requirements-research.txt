@@ -1,0 +1,8 @@
+# Optional, isolated CPU model-tournament environment; not runtime dependencies.
+numpy==2.5.3
+scikit-learn==1.9.1
+pyarrow==25.0.1
+scipy==1.18.1
+xgboost-cpu==3.4.1
+catboost==1.2.10
+threadpoolctl>=3.6

@@ -15,6 +15,21 @@ and backward in MXFP8. No library-wide speedup or convergence guarantee is made.
    [inference, packing, and checkpoints](inference.md).
 5. [Tune, collect datasets, and deploy winners](autotuning.md).
 
+For bounded first-hit search, see [user-controlled tuning effort](autotune_effort.md)
+and the [empirical cost-model study](effort_ml_study_20260913.md).
+The [CPU model tournament](model_tournament.md) compares model families,
+hardware feature ablations, and transfer holdouts without collecting GPU data.
+The [portable predictor validation](portable_predictor_validation.md) covers
+export fidelity and opt-in, retrieval-backed first-hit UCB integration.
+The [prospective predictor study](predictor_prospective_study.md) compares real
+8/16/32-trial searches on unseen shapes with separate tuning and kernel timings.
+The [coverage repair work](autotune_coverage_repair.md) audits inactive-field
+quarantines and prepares broader, matched structural panels for the next study.
+The [mixed-pool qualification](mixed_pool_study.md) covers the experimental
+candidate mixture, 8/16/32/64-trial comparisons, and cross-device replay launcher.
+The [shape-stratified study](shape_stratified_study.md) expands this to 16
+held-out geometries, with category-balanced scheduling and ragged-shape probes.
+
 ## User reference
 
 | Topic | Guide |

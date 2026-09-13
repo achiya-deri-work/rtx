@@ -104,6 +104,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         confirmation: ConfirmationPolicy = ConfirmationPolicy(),
         progress: Callable[[str], None] | None = None,
         coverage_proposals: Sequence[Proposal[ConfigT]] = (),
+        started_at: float | None = None,
     ) -> None:
         if not strategies:
             raise ValueError("at least one search strategy is required")
@@ -122,6 +123,8 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         self.confirmation = confirmation
         self.progress = progress
         self.coverage_proposals = tuple(coverage_proposals)
+        self.started_at=started_at
+        self.pool_audit = None
 
     def _log(self, started: float, message: str) -> None:
         if self.progress is not None:
@@ -137,7 +140,12 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         return 0.002 + improvement
 
     def tune(self) -> ComposableTuningResult[ConfigT]:
-        started = time.monotonic()
+        from .store import tuning_session_lock
+        with tuning_session_lock(self.store, self.adapter.context):
+            return self._tune_locked()
+
+    def _tune_locked(self) -> ComposableTuningResult[ConfigT]:
+        started = time.monotonic() if self.started_at is None else self.started_at
         rng = random.Random(self.seed)
         restored: list[Observation[ConfigT]] = []
         if self.resume:
@@ -150,7 +158,14 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 ):
                     continue
                 try:
-                    restored.append(observation_from_dict(self.adapter, record))
+                    observation=observation_from_dict(self.adapter, record)
+                    rejection=self.adapter.rejection(observation.config)
+                    if rejection is not None:
+                        # Current legality wins over a previously timed cache
+                        # entry. Keep the historical trial count, but never
+                        # restore its latency as an eligible winner.
+                        observation.outcome=TrialOutcome(rejection[0],error=rejection[1])
+                    restored.append(observation)
                 except (KeyError, TypeError, ValueError):
                     continue
         history = SearchHistory(restored, self.adapter.context.identifier)
@@ -180,6 +195,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 "resumed_observations": len(restored),
                 "resumed_active_budget": resumed_active,
                 "max_trials_includes_resumed": self.max_trials_includes_resumed,
+                "candidate_pool": self.pool_audit,
             },
         )
         statistics = {name: ArmStatistics() for name in self.strategies}
@@ -388,6 +404,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         if (
             initial_id not in history.seen_ids | abandoned_ids
             and resumed_active + evaluated < self.budget.max_trials
+            and time.monotonic()-started<self.budget.time_budget_s
         ):
             initial = run(Proposal(self.adapter.initial_config, "initial"))
             if not initial.successful:
@@ -408,6 +425,9 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                     or time.monotonic() - started >= self.budget.time_budget_s):
                 break
             if self.adapter.config_id(proposal.config) in history.seen_ids:
+                continue
+            if self.adapter.rejection(proposal.config) is not None:
+                history.excluded_config_ids.add(self.adapter.config_id(proposal.config))
                 continue
             run(proposal)
             coverage_evaluated += 1
@@ -471,6 +491,16 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 if self.adapter.config_id(proposal.config)
                 not in history.seen_ids | abandoned_ids
             ]
+            legal=[]
+            for proposal in proposals:
+                rejection=self.adapter.rejection(proposal.config)
+                if rejection is None:legal.append(proposal)
+                else:
+                    cid=self.adapter.config_id(proposal.config)
+                    history.excluded_config_ids.add(cid)
+                    self.store.record_event(session_id,'static_rejected',
+                        {'config_id':cid,'reason':rejection[1],'strategy':arm_name})
+            proposals=legal
             if not proposals:
                 statistics[arm_name].proposal_empty += 1
                 empty_attempts += 1
@@ -485,6 +515,8 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 continue
             empty_attempts = 0
             proposal = proposals[0]
+            if time.monotonic()-started>=self.budget.time_budget_s:
+                break
             proposal.strategy = arm_name
             proposal.metadata = {
                 **proposal.metadata,
@@ -512,6 +544,12 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 "best_median_ms": best.score,
                 "evaluated_trials": evaluated,
                 "elapsed_s": elapsed,
+                "resumed_trials": resumed_active,
+                "stop_reason": ('trial_budget' if resumed_active+evaluated>=self.budget.max_trials
+                                else 'time_budget' if elapsed>=self.budget.time_budget_s else 'search_exhausted'),
+                "confirmation_evaluations":sum(len(o.metadata.get('confirmation',{}).get('outcomes',[]))
+                    for o in history.current if o.session_id==session_id),
+                "proposal_elapsed_s":sum(a.proposal_elapsed_s for a in statistics.values()),
             },
         )
         return ComposableTuningResult(

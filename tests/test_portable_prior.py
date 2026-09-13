@@ -50,6 +50,32 @@ class PortablePriorTests(unittest.TestCase):
         self.assertNotEqual(semantic_contract('toy',1,{'context.tags.scale_policy=block':1}),
                             semantic_contract('toy',1,{'context.tags.scale_policy=delayed':1}))
 
+    def test_retrieval_does_not_initialize_models(self):
+        a,rows,document=self.make_prior()
+        prior=FrozenPrior(document,research=True)
+        order=prior.order(a,[r.config for r in rows],policy='retrieval')
+        self.assertEqual(len(order),len(rows))
+        self.assertFalse(prior._models)
+
+    def test_staged_family_policy_is_lazy_and_retains_pool(self):
+        from rtx.autotune.prior_policy import PriorStage,StagedPriorPolicy,FamilyPriorPolicy
+        a,rows,document=self.make_prior();prior=FrozenPrior(document,research=True)
+        pool=[r.config for r in rows]
+        policy=StagedPriorPolicy((PriorStage('retrieval',4),PriorStage('hybrid')))
+        first=policy.order(prior,a,pool,max_candidates=4)
+        self.assertFalse(prior._models)
+        self.assertEqual(first,prior.order(a,pool,policy='retrieval')[:4])
+        full=policy.order(prior,a,pool)
+        self.assertEqual(full[:4],first);self.assertEqual(set(full),set(pool))
+        routed=FamilyPriorPolicy(policy,{a.context.family:StagedPriorPolicy((PriorStage('ordered'),))})
+        self.assertEqual(routed.order(prior,a,pool),pool)
+        with self.assertRaisesRegex(ValueError,'duplicate'):policy.order(prior,a,[*pool,pool[0]])
+        with self.assertRaises(ValueError):StagedPriorPolicy((PriorStage('retrieval',4),))
+        for n in (-1,1.5,True):
+            with self.assertRaises(ValueError):policy.order(prior,a,pool,max_candidates=n)
+        a.context=replace(a.context,kernel_revision=999);a.__post_init__()
+        self.assertEqual(policy.order(prior,a,pool,max_candidates=4),pool[:4])
+
     def test_prospective_summary_rejects_mismatched_pools(self):
         from rtx.autotune.prior_summary import summarize
         with tempfile.TemporaryDirectory() as tmp:

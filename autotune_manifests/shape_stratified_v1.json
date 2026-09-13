@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "shapes": [
+    {"category": "single_token", "m": 1, "n": 1280, "k": 896},
+    {"category": "small_m", "m": 32, "n": 768, "k": 640},
+    {"category": "underfilled_grid", "m": 128, "n": 1280, "k": 896},
+    {"category": "square", "m": 1152, "n": 1152, "k": 1152},
+    {"category": "expansion", "m": 2048, "n": 4608, "k": 1152},
+    {"category": "contraction", "m": 4096, "n": 640, "k": 2560},
+    {"category": "long_k", "m": 384, "n": 768, "k": 7168},
+    {"category": "long_m_dw_reduction", "m": 24576, "n": 896, "k": 896},
+    {"category": "narrow_output", "m": 8192, "n": 128, "k": 896},
+    {"category": "wide_output", "m": 4096, "n": 6144, "k": 1280},
+    {"category": "m_boundary_below", "m": 255, "n": 1280, "k": 896},
+    {"category": "m_boundary_above", "m": 257, "n": 1280, "k": 896},
+    {"category": "ragged_m", "m": 1023, "n": 1536, "k": 896},
+    {"category": "aligned32_not128", "m": 512, "n": 1504, "k": 928},
+    {"category": "odd_nk", "m": 513, "n": 1543, "k": 777},
+    {"category": "large_multiwave", "m": 6144, "n": 2304, "k": 1920}
+  ],
+  "families": ["mxfp8_prequant_fwd", "mxfp8_bwd", "nvfp4_dynamic_fwd", "nvfp4_delayed_fwd", "nvfp4_jit_row_region_fwd", "mlp_forward", "mlp_train", "glu"],
+  "treatments": ["existing", "mixed", "residual_mlp", "mixed_residual_mlp"],
+  "budgets": [8, 16, 32, 64],
+  "regime": "hot"
+}

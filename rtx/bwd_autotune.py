@@ -1383,6 +1383,10 @@ def tune_mxfp8_backward(
     axes: Mapping[str, Iterable[dict[str, object]]] = BWD_SEARCH_SPACE,
     progress: ProgressCallback | None = print,
 ) -> BwdTuningResult:
+    from .autotune.effort import AutotunePolicy,tune_legacy_effort
+    if isinstance(policy,AutotunePolicy):
+        return tune_legacy_effort('backward',x,weight,grad=grad_output,policy=policy,
+            initial=initial,axes=axes,cache_dir=cache_dir,progress=progress)
     selected_policy = _policy_for_bwd(policy)
     x_2d = x.reshape(-1, x.shape[-1])
     grad_2d = grad_output.reshape(-1, grad_output.shape[-1])

@@ -266,6 +266,9 @@ def clear_runtime_caches(*, synchronize: bool = True, device=None) -> dict[str, 
         clear = getattr(module, "_clear_runtime_caches", None)
         if clear is not None:
             released[module_name] = clear()
+    from ._workspace import clear_scratch_pools
+
+    clear_scratch_pools()
     return released
 
 

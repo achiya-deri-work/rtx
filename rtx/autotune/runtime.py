@@ -107,3 +107,21 @@ def balanced_hybrid_policy() -> HybridTuningPolicy:
 
 
 __all__ = ["balanced_coordinate_policy", "balanced_hybrid_policy"]
+
+
+def balanced_effort_policy():
+    """Shared first-input policy; legacy factories above remain explicit APIs.
+
+    Called by real-tensor dispatch, never by fake/meta execution. Family
+    evaluators retain their own numerical correctness thresholds.
+    """
+    from .effort import AutotunePolicy
+
+    return AutotunePolicy(
+        max_trials=int(os.getenv("RTX_BALANCED_AUTOTUNE_TRIALS", "16")),
+        max_seconds=_seconds(),
+        warmup=int(os.getenv("RTX_BALANCED_AUTOTUNE_WARMUP", "3")),
+        samples=int(os.getenv("RTX_BALANCED_AUTOTUNE_SAMPLES", "5")),
+        calls_per_sample=int(os.getenv("RTX_BALANCED_AUTOTUNE_CALLS_PER_SAMPLE", "5")),
+        seed=int(os.getenv("RTX_BALANCED_AUTOTUNE_SEED", "20260817")),
+    )

@@ -4,6 +4,7 @@ from ._version import __version__
 
 
 _LAZY_EXPORTS = {
+    "AutotunePolicy": ("autotune.effort", "AutotunePolicy"),
     # Stable public format and frontend API.
     "MXTensor": ("formats", "MXTensor"),
     "MXFP8Tensor": ("formats", "MXFP8Tensor"),

@@ -42,6 +42,15 @@ def _has_sm12x() -> bool:
 
 
 class NVFP4ConfigTests(unittest.TestCase):
+    def test_packed_weight_requires_contract_preserving_reciprocal(self) -> None:
+        from rtx.nvfp4_inference_autotune import NVFP4_WEIGHT_PREQUANT_SEARCH_SPACE
+        for mode in ("e4m3_lut", "rcp_approx"):
+            cfg=NVFP4WeightPrequantConfig(quant_x=NVFP4QuantConfig(scale_reciprocal=mode))
+            self.assertIn("reciprocal quarantined",cfg.rejection(NVFP4Problem(128,1536,1536)))
+        self.assertIsNone(NVFP4WeightPrequantConfig().rejection(NVFP4Problem(128,1536,1536)))
+        self.assertEqual(NVFP4_WEIGHT_PREQUANT_SEARCH_SPACE["x_scale_reciprocal"],
+                         ({"quant":{"scale_reciprocal":"direct"}},))
+
     def test_large_grid_unsafe_64_row_tiles_are_rejected(self) -> None:
         config = NVFP4GemmConfig(tile_m=64, atom_layout_m=2, stages=1)
         for shape in ((64, 128, 128), (32768, 1280, 1280)):

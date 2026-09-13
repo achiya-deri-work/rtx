@@ -93,8 +93,13 @@ def make_hybrid_autotuner(
     *,
     progress=None,
     shared_fit_state: SharedModelFitState | None = None,
+    started_at: float | None = None,
 ) -> AutotuneOrchestrator[ConfigT]:
     """Build GBT-guided global search followed by/bandited with local search."""
+
+    from .effort import AutotunePolicy,make_effort_autotuner
+    if isinstance(policy,AutotunePolicy):
+        return make_effort_autotuner(adapter,store,policy,progress=progress,started_at=started_at)
 
     random_search = RandomSearch[ConfigT]()
     if policy.portfolio == "random":

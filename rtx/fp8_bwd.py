@@ -20,6 +20,7 @@ from .kernels.mxfp8_bwd import (
     MXFP8BwdMatmulConfig,
 )
 from .runtime import BoundedCache, load_kernel_symbol, runner_cache_limit
+from ._workspace import persistent_scratch
 from .types import AutotuneMode
 
 
@@ -325,6 +326,7 @@ class _BwdRunner:
             self.dx(grad_output, weight, grad_x)
 
 
+@persistent_scratch
 def _build_matmul_runner(
     *,
     problem: MXFP8Problem,
@@ -518,6 +520,7 @@ def _build_matmul_runner(
     )
 
 
+@persistent_scratch
 def _build_bwd_runner(
     problem: MXFP8Problem,
     config: MXFP8BwdConfig,
@@ -774,13 +777,10 @@ def _resolve_bwd_context(
                         policy = request.policy
                         if policy is None and request.mode == "balanced":
                             from .autotune.runtime import (
-                                balanced_coordinate_policy,
+                                balanced_effort_policy,
                             )
 
-                            policy = balanced_coordinate_policy(
-                                correctness_rtol=7e-2,
-                                correctness_atol=1.0,
-                            )
+                            policy = balanced_effort_policy()
                         result = tune_mxfp8_backward(
                             grad_output,
                             x,
@@ -870,6 +870,7 @@ def _resolve_bwd_runner(
     return problem, runner, grad_output_c, x_c, weight_c
 
 
+@persistent_scratch
 def _build_partial_bwd_runner(
     problem: MXFP8Problem,
     config: MXFP8BwdConfig,
@@ -1700,13 +1701,10 @@ def mxfp8_linear_backward(
                         policy = tuning_policy
                         if policy is None and mode == "balanced":
                             from .autotune.runtime import (
-                                balanced_coordinate_policy,
+                                balanced_effort_policy,
                             )
 
-                            policy = balanced_coordinate_policy(
-                                correctness_rtol=7e-2,
-                                correctness_atol=1.0,
-                            )
+                            policy = balanced_effort_policy()
                         result = tune_mxfp8_backward(
                             grad_2d,
                             x_2d,

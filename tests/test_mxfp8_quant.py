@@ -424,7 +424,7 @@ class MXFP8QuantCudaTests(unittest.TestCase):
         )
         compile_mxfp8_gemm(
             problem,
-            MXFP8GemmConfig(tile_m=64, atom_layout_m=2, stages=1),
+            MXFP8GemmConfig(tile_m=64, atom_layout_m=2, stages=2),
         )(qx, qw, sx, sw, row_out)
 
         for tile_rows, scale_layout, gemm_layout, tile_m, atom_m in (

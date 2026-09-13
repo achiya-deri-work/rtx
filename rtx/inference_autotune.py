@@ -191,6 +191,8 @@ def tune_mxfp8_inference_state(
     progress=print,
 ):
     """Tune one packed inference state and publish its runtime winner."""
+    import time
+    tuning_started=time.monotonic()
 
     from .autotune import (
         CalibratedPrequantEvaluator,
@@ -294,7 +296,9 @@ def tune_mxfp8_inference_state(
     else:
         raise ValueError(f"unsupported inference state {state!r}")
 
-    if isinstance(policy, HybridTuningPolicy):
+    from .autotune.effort import AutotunePolicy
+    if isinstance(policy,AutotunePolicy):policy=policy.for_pass()
+    if isinstance(policy, (HybridTuningPolicy,AutotunePolicy)):
         hybrid = policy
     else:
         hybrid = HybridTuningPolicy(
@@ -316,7 +320,7 @@ def tune_mxfp8_inference_state(
         / f"m{problem.m}_n{problem.n}_k{problem.k}_{variant}"
     )
     result = make_hybrid_autotuner(
-        adapter, store, hybrid, progress=progress
+        adapter, store, hybrid, progress=progress,started_at=tuning_started
     ).tune()
     key = runtime_winner_key(
         adapter.context.family,

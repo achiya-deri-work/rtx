@@ -35,6 +35,28 @@ class TuningStore(Protocol, Generic[ConfigT]):
     def incomplete_candidates(self, context_id: str) -> Iterable[Mapping[str, object]]: ...
 
 
+@contextmanager
+def tuning_session_lock(store, context):
+    """Serialize a residual's same-context read/search/write transaction.
+
+    Per-append locks alone cannot prevent two callers spending the same
+    cumulative budget. Linux flock is released even if a worker is killed.
+    Different contexts and different residuals remain independent.
+    """
+    path = store.path
+    if path is None or fcntl is None:
+        yield
+        return
+    root = Path(path) / 'session_locks'
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / (context.identifier + '.lock')).open('a+b') as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 class JsonlTuningStore(Generic[ConfigT]):
     """One JSON object per line; every accepted measurement is immediately durable."""
 

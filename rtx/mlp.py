@@ -41,7 +41,7 @@ class MXFP8MLPConfig:
     cooperative_ctas_per_sm: float = 1.0
     gate_prequant: MXFP8GLUPrequantConfig = field(default_factory=lambda: MXFP8GLUPrequantConfig(
         quant=MXFP8QuantConfig(quant_vec=8,load_bits=128,quant_store_bits=32),
-        gemm=MXFP8GLUGemmConfig(tile_m=64,atom_layout_m=2,stages=1,persistent_waves=1,
+        gemm=MXFP8GLUGemmConfig(tile_m=64,atom_layout_m=2,stages=2,persistent_waves=1,
                               glu_epilogue="registers",glu_quant_vec=4)))
     recompute_backend: str = "onchip"
     recompute: MXFP8GLUPrequantConfig = field(default_factory=lambda: MXFP8GLUPrequantConfig(
