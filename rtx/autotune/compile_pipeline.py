@@ -90,9 +90,10 @@ def adopt_identity(path,expected,allow=False):
     atomic_json(path,expected)
 
 
-def run_workers(pending,manifest,manifest_path,root,milestone,device,deadline,workers):
+def run_workers(pending,manifest,manifest_path,root,milestone,device,deadline,workers,
+                worker_module="rtx.autotune.first_hit_study"):
     """Bounded process pool: coarse VRAM admission and one GPU execution token."""
-    pending=list(pending);active=[];failures=0
+    pending=list(pending);active=[];failures=0;heartbeat=time.monotonic()
     import torch
     budget=int(torch.cuda.get_device_properties(device).total_memory*.65) if torch.cuda.is_available() else 4*1024**3
     def reserve(task):
@@ -105,6 +106,14 @@ def run_workers(pending,manifest,manifest_path,root,milestone,device,deadline,wo
         try:process.wait(timeout=3)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid,signal.SIGKILL);process.wait()
+    def record(item,status,*,censored=False):
+        status=None if status is None else int(status)
+        with (root/'supervisor.jsonl').open('a') as stream:
+            stream.write(json.dumps(dict(task=item['task']['id'],milestone=milestone,
+                status=status,elapsed_s=time.monotonic()-item['started'],cpu_workers=workers,
+                started_epoch=item['started_epoch'],pid=int(item['process'].pid),
+                censored=censored))+'\n')
+            stream.flush();os.fsync(stream.fileno())
     try:
         while pending or active:
             if time.monotonic()>=deadline:return False
@@ -116,14 +125,14 @@ def run_workers(pending,manifest,manifest_path,root,milestone,device,deadline,wo
                 if active and memory+sum(item["memory"] for item in active)>budget:break
                 pending.pop(0)
                 log=root/f"worker-{index:03d}-{milestone:03d}.log"
-                command=[sys.executable,"-m","rtx.autotune.first_hit_study","worker",str(Path(manifest_path).resolve()),
+                command=[sys.executable,"-m",worker_module,"worker",str(Path(manifest_path).resolve()),
                          "--output",str(root.resolve()),"--index",str(index),"--milestone",str(milestone),"--device",device]
                 env={**os.environ,"OMP_NUM_THREADS":"1","MKL_NUM_THREADS":"1","TORCHINDUCTOR_COMPILE_THREADS":"1"}
                 stream=log.open("a")
                 process=subprocess.Popen(command,stdout=stream,stderr=subprocess.STDOUT,
                                          start_new_session=True,env=env)
                 active.append({"process":process,"stream":stream,"started":time.monotonic(),
-                               "task":task,"index":index,"memory":memory})
+                               "started_epoch":time.time(),"task":task,"index":index,"memory":memory})
                 print(f"START task={index} milestone={milestone} pid={process.pid} active={len(active)} log={log}",flush=True)
             events={}
             lease_log=root/"gpu_execution.jsonl"
@@ -146,13 +155,14 @@ def run_workers(pending,manifest,manifest_path,root,milestone,device,deadline,wo
                     stop(process);status=124
                 if status is None:continue
                 item["stream"].close();active.remove(item)
-                with (root/"supervisor.jsonl").open("a") as stream:
-                    stream.write(json.dumps({"task":item["task"]["id"],"milestone":milestone,
-                        "status":status,"elapsed_s":time.monotonic()-item["started"],"cpu_workers":workers})+"\n")
-                    stream.flush();os.fsync(stream.fileno())
+                record(item,status,censored=status==124)
                 print(f"DONE task={item['index']} milestone={milestone} status={status}",flush=True)
                 failures=failures+1 if status else 0
                 if failures>=3:raise RuntimeError("three consecutive workers failed; inspect worker logs")
+            if time.monotonic()-heartbeat>=10:
+                compiling=sum(events.get(item['process'].pid,{}).get('event')=='compile_started' for item in active)
+                print(f'HEARTBEAT active={len(active)} cute_compiling={compiling} pending={len(pending)} remaining={max(0,deadline-time.monotonic()):.1f}s',flush=True)
+                heartbeat=time.monotonic()
             if active:time.sleep(.1)
         return True
     finally:
@@ -162,3 +172,4 @@ def run_workers(pending,manifest,manifest_path,root,milestone,device,deadline,wo
                 except ProcessLookupError:pass
         for item in active:
             stop(item["process"]);item["stream"].close()
+            record(item,item['process'].returncode,censored=True)

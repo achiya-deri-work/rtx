@@ -39,11 +39,41 @@ through ranking. No model is trained on the first-hit path.
 
 ## Collect matched data on all three devices
 
+For the next frozen-prior comparison, see the
+[four-hour prospective prior study](portable_prior_study.md). The combined
+collector below remains the earlier general data-gathering workflow.
+
 For the combined **six-hour MLP + linear** campaign:
 
 ```bash
 bash benchmarks/launch_combined_collection.sh 6
 ```
+
+After collection, audit local directories and copied ZIPs together:
+
+```bash
+python -m benchmarks.analyze_combined_collection <local-output> <laptop.zip> <5090.zip> \
+  --output autotune_reports/combined_analysis
+python -m rtx.autotune.first_hit_study fit <local-output> <laptop.zip> <5090.zip> \
+  --split device --family mxfp8_recompute_mlp \
+  --output autotune_reports/combined_analysis/mlp_device_holdout
+```
+
+The audit writes CSV coverage and Parquet **selection manifests** linking back
+to original observation IDs, not copies of kernel payloads. The feasibility
+view retains failures and noisy successful measurements; the latency view and
+fitter exclude explicitly nonstationary successes. Missing stability metadata
+(currently MLP observations) is retained but is not a stability certification.
+Malformed JSONL and ZIP CRC failures abort this audit before ingestion.
+
+Omit `--family` to evaluate all families. Device holdout partitions preserve
+source hashes and semantic/measurement tags, but ignore machine IDs, Git
+provenance, and shard-manifest digests. Those bookkeeping values must not
+accidentally make cross-device comparisons impossible. Shape holdout is a
+separate evaluation (`--split shape`); device holdout can include the same
+shapes on training devices. Artifacts remain **deployment-disabled**: replay
+compares only observed successful candidates and does not measure first-hit
+compile cost, unseen-candidate performance, or future failure rates.
 
 The launcher creates `.venv` if absent, installs the pinned `requirements.txt`
 stack and the editable package, then checks runtime versions and dependency

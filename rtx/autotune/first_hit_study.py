@@ -222,9 +222,22 @@ def grouped_key(row, split):
         and any(part in k for part in ("multiprocessor_count","total_memory","major","minor"))))
 
 
-def fit(paths, output, split="shape", backend="builtin"):
+def benchmark_contract_features(features):
+    """Exclude collection provenance, not source identity or numerical policy.
+
+    Sharding changes manifest_digest; neither shard assignment, machine ID nor
+    a docs-only Git commit defines a distinct measurement contract. The actual
+    source_sha256 remains part of the partition.
+    """
+    provenance={"context.tags.git_commit","context.tags.git_dirty",
+                "context.tags.machine_id","context.tags.manifest_digest"}
+    return tuple(sorted((k,v) for k,v in features.items()
+        if k.startswith(("context.tags.","context.regime=")) and k.split("=",1)[0] not in provenance))
+
+
+def fit(paths, output, split="shape", backend="builtin", family=None):
     """Grouped offline replay. Never automatically qualifies a deployable model."""
-    from .pretrained import load_offline_observations,ContextRankingModel,_observation_documents
+    from .pretrained import load_offline_observations,ContextRankingModel,_observation_documents,_usable_for_latency
     from .cost_model import GradientBoostedCostModel
     observations,report=load_offline_observations(paths)
     report["anchors"]=audit_anchors(paths)
@@ -232,12 +245,13 @@ def fit(paths, output, split="shape", backend="builtin"):
         raise ValueError("mismatched cross-device portfolios")
     benchmark_keys={}
     for _,record in _observation_documents(paths):
-        benchmark_keys[record["context_id"]]=tuple(sorted((k,v) for k,v in record.get("features",{}).items()
-            if k.startswith(("context.tags.","context.regime="))))
+        benchmark_keys[record["context_id"]]=benchmark_contract_features(record.get("features",{}))
     contracts={}
     for document in anchor_documents(paths):
         contracts[stable_id(document["context"])]=document["contract"]
-    rows=[replace(r,features=model_features(r.features)) for r in observations if r.successful]
+    rows=[replace(r,features=model_features(r.features)) for r in observations
+          if r.successful and _usable_for_latency(r) and (family is None or r.family==family)]
+    report["fit_selection"]={"family":family,"stable_successful_rows":len(rows)}
     families=defaultdict(list)
     # Separate semantic modes and exact benchmark tags, not only revisions.
     for row in rows:
@@ -328,6 +342,7 @@ def main():
         if name=="fit":
             sub.add_argument("--split",choices=("shape","device"),default="shape")
             sub.add_argument("--backend",choices=("builtin","xgboost"),default="builtin")
+            sub.add_argument("--family",help="Evaluate only this kernel family")
     args=parser.parse_args()
     if args.command=="run":
         if not math.isfinite(args.hours) or args.hours<=0:parser.error("hours must be finite and positive")
@@ -338,7 +353,7 @@ def main():
     elif args.command=="worker":
         worker(json.loads(Path(args.manifest).read_text()),args.output,args.index,args.milestone,args.device)
     elif args.command=="export":export(args.paths,args.output)
-    else:fit(args.paths,args.output,args.split,args.backend)
+    else:fit(args.paths,args.output,args.split,args.backend,args.family)
 
 
 if __name__=="__main__":main()

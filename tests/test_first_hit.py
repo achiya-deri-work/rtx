@@ -16,6 +16,15 @@ from rtx.autotune.first_hit_study import study_tasks,grouped_key
 
 
 class FirstHitTests(unittest.TestCase):
+    def test_benchmark_partition_ignores_provenance_not_semantics(self):
+        from rtx.autotune.first_hit_study import benchmark_contract_features
+        a={"context.tags.machine_id=a":1,"context.tags.manifest_digest=x":1,
+           "context.tags.source_sha256=same":1,"context.tags.precision=fp4":1}
+        b={"context.tags.machine_id=b":1,"context.tags.manifest_digest=y":1,
+           "context.tags.source_sha256=same":1,"context.tags.precision=fp4":1}
+        self.assertEqual(benchmark_contract_features(a),benchmark_contract_features(b))
+        b["context.tags.scale_policy=block"]=1
+        self.assertNotEqual(benchmark_contract_features(a),benchmark_contract_features(b))
     def test_bounded_dedup_and_legality(self):
         a=adapter()
         self.assertEqual(bounded_candidates(a,[Config(),Config(),Config(a=3),Config(a=2)]),
@@ -76,11 +85,18 @@ class FirstHitTests(unittest.TestCase):
                 session=store.start_session(a.context,{})
                 for index in range(8):
                     store.record_observation(evaluate_proposal(a,Proposal(Config(a=index),"anchor"),session_id=session,sequence=index))
+                unstable=evaluate_proposal(a,Proposal(Config(a=99),"anchor"),session_id=session,sequence=8)
+                unstable=replace(unstable,outcome=replace(unstable.outcome,median_ms=1e-12,
+                    metadata={"sampling":{"collection":{"stationary":False}}}))
+                store.record_observation(unstable)
                 (root/str(m)/"anchor.json").write_text(json.dumps({"context":a.context.as_dict(),
                     "contract":contract(a.context),"manifest_id":"test","task":{"id":str(m)},"portfolio_id":"test"}))
             fit([root],root/"model")
             report=json.loads((root/"model/evaluation.json").read_text())
             self.assertEqual(len(report["metrics"]),8)
+            self.assertEqual(report["ingestion"]["fit_selection"]["stable_successful_rows"],16)
+            self.assertEqual(report["ingestion"]["latency_view"]["excluded_nonstationary_successes"],2)
+            self.assertTrue(all(r["candidates"]==8 for r in report["metrics"]))
             artifact=next((root/"model").glob("*-ranker.json"))
             with self.assertRaises(ValueError):FrozenRanker.load(artifact)
             ranker=FrozenRanker.load(artifact,allow_unqualified=True)
