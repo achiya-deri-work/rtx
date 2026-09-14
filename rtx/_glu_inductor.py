@@ -30,6 +30,9 @@ class _Launcher:
     def __init__(self,key):
         self.activation,self.output_format,config_key=key
         values=json.loads(config_key)
+        self.autotune_spec=values if values.get('_glu_autotune')==1 else None
+        if self.autotune_spec is not None:
+            values=values['initial']
         self.prequant=values.get("backend")=="prequant"
         self.config=(prequant_glu_config_from_dict if self.prequant else glu_config_from_dict)(values)
         self.runners=BoundedCache(8)
@@ -52,12 +55,16 @@ class _Launcher:
                     if torch.cuda.get_device_capability(x.device)[0]!=12:
                         raise RuntimeError("MXFP8 GLU requires SM12x")
                     with torch.cuda.device(x.device):
+                        config=self.config
+                        if self.autotune_spec is not None:
+                            from ._glu_autotune import resolve
+                            config=resolve(x,weight,self.activation,self.output_format,self.autotune_spec)
                         if self.prequant:
                             from .kernels.mxfp8_glu_prequant import build_prequant_glu_runner
-                            runner=build_prequant_glu_runner(x,weight,out,scales,self.config,self.activation,self.output_format,bind_inputs=False)
+                            runner=build_prequant_glu_runner(x,weight,out,scales,config,self.activation,self.output_format,bind_inputs=False)
                         else:
                             from .kernels.mxfp8_glu import compile_mxfp8_glu
-                            compiled=compile_mxfp8_glu(MXFP8Problem(m,2*h,k),self.config,self.activation,self.output_format)
+                            compiled=compile_mxfp8_glu(MXFP8Problem(m,2*h,k),config,self.activation,self.output_format)
                             def runner(x,w,out,scales):
                                 return compiled(x,w,out,scales,scales,scales,scales)
                     self.runners[key]=runner

@@ -21,6 +21,14 @@ def document():
 
 
 class PortablePredictorTests(unittest.TestCase):
+    def test_plain_trees_do_not_add_a_memory_baseline(self):
+        d=document()
+        d['models']['trees']=copy.deepcopy(d['models']['residual'])
+        p=PortablePredictor(d,research=True)
+        rows=[dict(family='coverage_test',revision=1,
+                   features={'config.a':v,'derived.memory_roofline_ms':100.}) for v in (0,1)]
+        np.testing.assert_allclose(p.predict(rows,'trees'),[0,-1])
+
     def test_parameters_and_opt_in(self):
         with self.assertRaises(ValueError):
             PortablePredictor(document())

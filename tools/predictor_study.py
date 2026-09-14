@@ -152,6 +152,11 @@ def build_adapter(task, timing, device):
     from rtx.autotune.hardware import static_device_profile
     from rtx.prequant_experiments import BenchmarkProtocol, ShapeSpec
     family, shape = task['family'], task['shape']
+    measurement_mode = task.get('backward_measurement_mode', 'host')
+    if measurement_mode not in ('host', 'cuda_graph'):
+        raise ValueError('backward_measurement_mode must be host or cuda_graph')
+    if measurement_mode != 'host' and family != 'mxfp8_bwd':
+        raise ValueError('graph backward measurement requires mxfp8_bwd')
     profile = static_device_profile(device)
     if family in ('glu', 'mlp_forward', 'mlp_train'):
         torch.manual_seed(task['seed'])
@@ -174,7 +179,9 @@ def build_adapter(task, timing, device):
         min_calls_per_sample=5, max_calls_per_sample=128,
         correctness_rtol=.07 if family=='mxfp8_bwd' else .05,
         correctness_atol=1. if family=='mxfp8_bwd' else .5)
-    job = DatasetJob(family, (spec,), regimes=('hot',), protocol=protocol)
+    mode_tags = ({'backward_measurement_mode': measurement_mode}
+                 if measurement_mode != 'host' else {})
+    job = DatasetJob(family, (spec,), regimes=('hot',), protocol=protocol, tags=mode_tags)
     campaign = SimpleNamespace(device=torch.device(device), hardware_profile=profile,
                                manifest=SimpleNamespace(seed=task['seed']))
     backend = _BACKENDS[family]

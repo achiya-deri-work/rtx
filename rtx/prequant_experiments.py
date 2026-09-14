@@ -913,19 +913,9 @@ class CandidateCorrectnessError(RuntimeError):
 
 def _reference_prequant_config(problem: MXFP8Problem) -> MXFP8PrequantConfig:
     """Choose a stable legal reference family, including for 64-row shapes."""
+    from .prequant_autotune import _legal_default_prequant_config
 
-    if DEFAULT_MXFP8_PREQUANT_CONFIG.rejection(problem) is None:
-        return DEFAULT_MXFP8_PREQUANT_CONFIG
-    for updates in PREQUANT_SEARCH_SPACE["layout_transport"]:
-        candidate = update_prequant_config(DEFAULT_MXFP8_PREQUANT_CONFIG, updates)
-        if (
-            candidate.gemm.scale_layout == "row_major"
-            and candidate.rejection(problem) is None
-        ):
-            return candidate
-    raise RuntimeError(
-        f"no legal prequant correctness-reference configuration for {problem}"
-    )
+    return _legal_default_prequant_config(problem)
 
 
 class PrequantBenchmarkHarness:

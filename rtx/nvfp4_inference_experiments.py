@@ -91,13 +91,16 @@ class NVFP4DynamicBenchmarkHarness(PrequantBenchmarkHarness):
             generator=generator,
         )
         self._inputs = self._make_input_ring()
+        self._expected = self._make_reference()
+
+    def _make_reference(self) -> torch.Tensor:
         reference = self._build_runner(NVFP4DynamicConfig())
         expected = torch.empty(
-            (shape.m, shape.n), device=self.device, dtype=torch.bfloat16
+            (self.shape.m, self.shape.n), device=self.device, dtype=torch.bfloat16
         )
         reference(self.x, self.weight, expected)
         torch.cuda.synchronize(self.device)
-        self._expected = expected.clone()
+        return expected.clone()
 
     def _build_runner(
         self, config: NVFP4DynamicConfig
@@ -247,21 +250,28 @@ class _DelayedBenchmarkRunner:
             self.next_weight_history,
             out,
         )
-        self.x_history, self.next_x_history = (
-            self.next_x_history,
-            self.x_history,
-        )
-        self.weight_history, self.next_weight_history = (
-            self.next_weight_history,
-            self.weight_history,
+        from .fp4 import _publish_delayed_history
+
+        _publish_delayed_history(
+            self.x_history, self.weight_history,
+            self.next_x_history, self.next_weight_history,
         )
 
 
 class NVFP4DelayedBenchmarkHarness(NVFP4DynamicBenchmarkHarness):
     """Measure compact delayed observation + native materialized GEMM."""
 
+    def __init__(self, *args, scale_policy=None, **kwargs) -> None:
+        from .nvfp4_inference_autotune import delayed_scale_variant
+
+        delayed_scale_variant(scale_policy)  # Validate before allocating CUDA state.
+        self.scale_policy = (
+            DEFAULT_NVFP4_SCALE_CONFIG if scale_policy is None else scale_policy
+        )
+        super().__init__(*args, **kwargs)
+
     def _build_runner(self, config: NVFP4DynamicConfig) -> object:
-        policy = DEFAULT_NVFP4_SCALE_CONFIG
+        policy = self.scale_policy
         history_len = policy.amax_history_len
         return _DelayedBenchmarkRunner(
             _make_delayed_dynamic_runner(
@@ -286,11 +296,10 @@ class NVFP4DelayedBenchmarkHarness(NVFP4DynamicBenchmarkHarness):
 class NVFP4JITRowRegionBenchmarkHarness(NVFP4DynamicBenchmarkHarness):
     """Measure current local outer-scale quantization plus native GEMM."""
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def _make_reference(self) -> torch.Tensor:
         # Region geometry is a numerical coordinate, so use BF16 GEMM as the
         # common correctness oracle rather than one arbitrary region policy.
-        self._expected = torch.matmul(
+        return torch.matmul(
             self.x.float(), self.weight.float().transpose(0, 1)
         ).to(torch.bfloat16)
 

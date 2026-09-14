@@ -9,6 +9,46 @@ from rtx.autotune.outcomes import TrialOutcome
 
 
 class EffortTests(unittest.TestCase):
+    def test_initial_neighborhood_is_fixed_and_resumable(self):
+        a=adapter(); store=InMemoryTuningStore()
+        p=AutotunePolicy(max_trials=4, initial_neighborhood_trials=2,
+                         local_anchor_tolerance=.01, confirmation_repeats=0)
+        tuner=make_effort_autotuner(a,store,p,candidates=[Config(b=2)])
+        expected=[q.config for q in tuner.coverage_proposals[:2]]
+        self.assertEqual(expected,[Config(a=1),Config(a=2)])
+        tuner.tune()
+        records=list(store.records(a.context))
+        self.assertEqual([r['strategy'] for r in records[:3]],
+                         ['initial','initial_neighborhood','initial_neighborhood'])
+        self.assertEqual(make_effort_autotuner(a,store,p).tune().evaluated_trials,0)
+        self.assertEqual(make_effort_autotuner(a,store,replace(p,max_trials=8)).tune().evaluated_trials,4)
+
+    def test_guard_validation(self):
+        for kw in ({'initial_neighborhood_trials':-1},
+                   {'initial_neighborhood_trials':True},
+                   {'local_anchor_tolerance':float('nan')},
+                   {'local_anchor_tolerance':1},
+                   {'max_trials':3,'initial_neighborhood_trials':2}):
+            with self.assertRaises(ValueError): AutotunePolicy(**kw)
+
+    def test_local_margin_keeps_initial_anchor_on_near_tie(self):
+        from types import SimpleNamespace
+        import random
+        from rtx.autotune.strategies import CoordinateLocalSearch
+        a=adapter()
+        def obs(c,score):
+            return SimpleNamespace(config=c,config_id=a.config_id(c),score=score)
+        initial=obs(Config(),1.)
+        challenger=obs(Config(b=2),.999)
+        history=SimpleNamespace(successful=[initial,challenger],
+                                seen_ids={initial.config_id,challenger.config_id})
+        guarded=CoordinateLocalSearch(anchor_tolerance=.01)
+        proposal=guarded.propose(a,history,random.Random(0),1)[0]
+        self.assertEqual(proposal.parent_config_id,initial.config_id)
+        challenger.score=.98
+        proposal=guarded.propose(a,history,random.Random(0),1)[0]
+        self.assertEqual(proposal.parent_config_id,challenger.config_id)
+
     def test_default_runtime_uses_shared_policy_and_environment_budget(self):
         from rtx.autotune.runtime import balanced_effort_policy
         with mock.patch.dict('os.environ', {}, clear=True):

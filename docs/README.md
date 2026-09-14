@@ -1,92 +1,51 @@
 # RTX Blackwell documentation
 
-Install **`rtx-blackwell`**, import **`rtx`**. This library supplies bias-free
-low-precision linear layers for RTX Blackwell and a reusable GPU autotuner.
-Torch-side dynamic parameters, activations, outputs and gradients are BF16.
-MXFP8 executes forward/backward GEMMs in MXFP8; NVFP4 executes forward in NVFP4
-and backward in MXFP8. No library-wide speedup or convergence guarantee is made.
+Install **rtx-blackwell**, import **rtx**. Bias-free MXFP8/NVFP4 linear layers
+for RTX Blackwell, with a reusable GPU autotuner. Dynamic Torch-side inputs,
+parameters, outputs and gradients are BF16; NVFP4 uses MXFP8 backward.
 
-## Start here
+## User manual
 
-1. [Install and verify the environment](installation.md).
-2. [Run a layer, convert a model, and compile it](quickstart.md).
-3. Choose [MXFP8Linear](mxfp8_linear.md) or [NVFP4Linear](nvfp4_linear.md).
-4. Read [training and numerical policy](training.md) or
-   [inference, packing, and checkpoints](inference.md).
-5. [Tune, collect datasets, and deploy winners](autotuning.md).
+Start with [installation](installation.md) and [quickstart](quickstart.md).
+The [API map](api.md) owns public names and shared frontend controls;
+the [generated reference](api_reference.md) owns exact signatures and defaults.
 
-For bounded first-hit search, see [user-controlled tuning effort](autotune_effort.md)
-and the [empirical cost-model study](effort_ml_study_20260913.md).
-The [CPU model tournament](model_tournament.md) compares model families,
-hardware feature ablations, and transfer holdouts without collecting GPU data.
-The [portable predictor validation](portable_predictor_validation.md) covers
-export fidelity and opt-in, retrieval-backed first-hit UCB integration.
-The [prospective predictor study](predictor_prospective_study.md) compares real
-8/16/32-trial searches on unseen shapes with separate tuning and kernel timings.
-The [coverage repair work](autotune_coverage_repair.md) audits inactive-field
-quarantines and prepares broader, matched structural panels for the next study.
-The [mixed-pool qualification](mixed_pool_study.md) covers the experimental
-candidate mixture, 8/16/32/64-trial comparisons, and cross-device replay launcher.
-The [shape-stratified study](shape_stratified_study.md) expands this to 16
-held-out geometries, with category-balanced scheduling and ragged-shape probes.
-
-## User reference
-
-| Topic | Guide |
+| Task | Canonical guide |
 |---|---|
-| Every top-level export and its purpose | [API index](api.md) |
-| Exact callable signatures and configuration defaults | [Generated API reference](api_reference.md) |
-| Selective training conversion and PTQ | [Model conversion](model_conversion.md) |
-| Formats, scale hierarchy, and backward reduction axes | [Numerical formats](formats.md) |
-| Compilation, CUDA graphs, streams, and caches | [Execution guide](execution.md) |
-| Checkpoint schemas and distributed limitations | [Runtime contract](runtime_contract.md) |
-| Errors, slow first calls, and debugging | [Troubleshooting](troubleshooting.md) |
-| Tests, contributions, and adding a kernel family | [Development guide](development.md) |
+| Use the linear layers | [MXFP8Linear](mxfp8_linear.md) · [NVFP4Linear](nvfp4_linear.md) |
+| Convert a model for training or PTQ | [Model conversion](model_conversion.md) |
+| Choose dynamic, packed-weight or fully packed inference | [Inference](inference.md) |
+| Understand precision | [Training](training.md) · [Formats](formats.md) |
+| Configure effort and cache reuse/refinement | [First-hit autotuning](first_hit_autotuning.md) |
+| Compile and use graphs, streams and caches | [Execution](execution.md) |
+| Collect datasets and deploy winners | [Autotuning operations](autotuning.md) |
+| Diagnose errors and limitations | [Troubleshooting](troubleshooting.md) · [Runtime contract](runtime_contract.md) |
 
-## Feature-branch APIs
+Linears replace **bias-free** nn.Linear under the documented dtype/device
+constraints, not every PyTorch/distributed configuration. Calling eval() does
+not pack weights. Operand state, numerical policy, backend and tuning effort
+are separate choices.
 
-These APIs are explicitly importable as `rtx.<name>` but are not part of the
-stable wildcard-export surface. They have separate qualification gates.
+## Feature APIs
 
-- [MXFP8GLU](mxfp8_glu.md): fused gate/up and SiLU/GELU/ReLU, BF16 or packed
-  MXFP8 output; **forward only**.
-- [MXFP8MLP](mxfp8_mlp.md): two-kernel forward, fully recomputed first-order
-  backward, weight conversion, explicit autotuning and policy persistence.
-- [MLP numerical stress results and known singleton failure](mxfp8_mlp_numerics.md).
-- [Bounded-input divergence and precision interventions](mxfp8_mlp_divergence.md).
-- [TorchAO-quantized MLP recipe parity and residual-stream error](mxfp8_mlp_recipe_parity.md).
-- [Selective gate and hidden precision experiments](mxfp8_mlp_selective_precision.md).
-- [Measured mixed-precision MLP schedules and compiler caveats](mxfp8_mlp_quality_runtime.md).
-- [SiLU/GELU multi-shape numerics and long-reduction tuning](mxfp8_mlp_multishape.md).
-- [Selective-precision API, ragged schedules, and decoder training](mxfp8_mlp_precision_api.md).
-- [MLP optimization evidence](mxfp8_mlp_optimization.md).
+- [MXFP8GLU](mxfp8_glu.md): paired projection and activation, BF16/MXFP8 output,
+  forward only.
+- [MXFP8MLP](mxfp8_mlp.md): packed hidden connection with recomputed backward.
 
-The optional packed-down MLP policy currently faults for M=K=H=O=1. The default
-policy passes this case. Do not interpret logical shape support as proof that
-every experimental schedule is safe.
+Both default to tuning off, with opt-in first-hit selection. They remain explicit
+imports, outside the stable wildcard surface. The optional packed-down MLP
+singleton failure is recorded in [numerical qualification](mxfp8_mlp_numerics.md).
 
-## Autotuner developers and experiment operators
+## Development and evidence
 
-- [Portable adapters, conditional spaces, bandits, and ask/tell](../rtx/autotune/README.md)
-- [Campaign manifest catalogue](../autotune_manifests/README.md)
-- [Benchmark and decoder-training commands](../benchmarks/README.md)
-- [Cross-SKU analysis](autotune_cross_sku_study.md) and
-  [evidence methodology](autotune_evidence_methodology.md)
-- [Historical kernel-tuning notebook](../AUTOTUNING.md)
+- [Development](development.md), [autotuner framework](../rtx/autotune/README.md),
+  [manifest catalogue](../autotune_manifests/README.md), [benchmarks](../benchmarks/README.md).
+- [Research and qualification index](research.md): experiments and historical
+  results, separate from current API instructions.
+- [Release checklist](release_checklist.md), [precision policy](../PRECISION_POLICY.md).
 
-## Scope and evidence
-
-Native execution targets SM120/SM121 on Linux, with the pinned CUDA 13.2 stack.
-SM110/Thor and datacenter Blackwell are not supported by these kernels.
-Importing the package does not require a GPU. CPU execution of native layers,
-FSDP/DTensor integration, and general dynamic-shape export are not promised.
-
-The [precision policy](../PRECISION_POLICY.md) defines numerical and benchmark
-terminology. The [release checklist](release_checklist.md) tracks release gates;
-dated reports describe evidence at that revision, not timeless performance.
-Optional [DINOv3 tests](dinov3_regression.md) need separately obtained source
-and weights. Those assets are not shipped by this project.
-
-The source package is Apache-2.0; see [LICENSE](../LICENSE). Third-party test
-assets keep their own licenses. The [SM120 hardware notes](../sm120_hardware.md)
-credit Tri Dao's Quack project.
+Native kernels target SM120/SM121 on Linux with the supported CUDA 13.2 stack.
+SM110/Thor and datacenter Blackwell are not supported. Import is CPU-safe;
+native execution is CUDA-only. Source: [Apache-2.0](../LICENSE).
+[SM120 notes](../sm120_hardware.md) credit Tri Dao's Quack project.
+Optional [DINOv3 tests](dinov3_regression.md) need separately obtained assets.

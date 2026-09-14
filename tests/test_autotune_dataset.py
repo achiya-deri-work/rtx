@@ -555,7 +555,7 @@ class DatasetTests(unittest.TestCase):
             with self.subTest(family=family):
                 job = jobs[family]
                 shape = job.shapes[0]
-                harness = SimpleNamespace(problem=shape.problem)
+                harness = SimpleNamespace(problem=shape.problem, measurement_mode="host")
                 adapter = dataset_module._BACKENDS[family].make_adapter(
                     campaign, job, shape, "hot", harness, {}
                 )

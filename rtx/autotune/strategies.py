@@ -142,6 +142,11 @@ class CoordinateLocalSearch(Generic[ConfigT]):
     beam_width: int = 2
     shuffle_coordinates: bool = False
     name: str = "coordinate_local"
+    anchor_tolerance: float = 0.0
+
+    def __post_init__(self):
+        if not math.isfinite(self.anchor_tolerance) or not 0 <= self.anchor_tolerance < 1:
+            raise ValueError('anchor_tolerance must be finite and in [0, 1)')
 
     def propose(
         self,
@@ -151,6 +156,15 @@ class CoordinateLocalSearch(Generic[ConfigT]):
         limit: int,
     ) -> list[Proposal[ConfigT]]:
         ranked = sorted(history.successful, key=lambda item: item.score)
+        if self.anchor_tolerance and ranked:
+            # Stable chronological anchor: a near tie must not redirect the
+            # local search. This is a policy margin, not a confidence interval;
+            # raw timings and final winner selection remain unchanged.
+            anchor = history.successful[0]
+            for item in history.successful[1:]:
+                if item.score < anchor.score * (1 - self.anchor_tolerance):
+                    anchor = item
+            ranked = [anchor] + [item for item in ranked if item.config_id != anchor.config_id]
         bases = ranked[: self.beam_width]
         if not bases:
             return [Proposal(adapter.initial_config, self.name)]

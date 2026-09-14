@@ -16,6 +16,9 @@ from .configs.glu import DEFAULT_GLU_CONFIG, MXFP8GLUPrequantConfig
 
 @torch.compiler.assume_constant_result
 def _config_key(config):
+    from ._glu_autotune import DeferredGLUConfig
+    if isinstance(config,DeferredGLUConfig):
+        return config.key
     # Include frontend lowering revision in the FX cache key: registering a new
     # lowering alone does not invalidate an old cached opaque wrapper.
     if not isinstance(config,(MXFP8FwdConfig,MXFP8GLUPrequantConfig)):
@@ -127,17 +130,24 @@ class MXFP8GLU(torch.nn.Module):
     or ``mxfp8``; ``packed_output=True`` returns the tensor-only MXFP8 pair.
     Both operands are dynamically quantized on every call, including replay.
 
-    Call ``autotune_(example_x, max_trials=..., time_budget_s=...)`` before
-    torch.compile/capture. It selects one config for the representative shape;
-    it does not launch searches from forward or claim that config is optimal
-    for other shapes. Reports remain in the standard residual dataset.
-    State dicts contain weights, not hardware-specific tuning decisions.
-    Loading weights into a newly constructed module requires retuning it.
+    Default ``autotune='off'`` uses the explicit config. Opt into
+    ``autotune='balanced'`` with an ``AutotunePolicy`` for real-input first-hit
+    search, including through fullgraph compilation. ``autotune='cache'``
+    only reads durable winners. Search stays in the backend selected by config
+    and uses it as the initial candidate. ``autotune_cache_dir`` controls the
+    shared revisioned winner/evidence location. Warm each required shape/stream
+    before CUDA graph capture. Hot calls use cached launchers, not searches.
+
+    ``autotune_(example_x, ...)`` remains the explicit cross-backend option;
+    it installs one config and disables implicit selection on this module.
+    State dicts contain weights, not hardware-specific tuning decisions;
+    reconstruct automatic-selection options separately when loading weights.
     """
 
     def __init__(self, in_features, hidden_features, *, activation="silu",
                  output_format="bf16", packed_output=False,
-                 config=MXFP8GLUPrequantConfig(), device=None, dtype=torch.bfloat16):
+                 config=MXFP8GLUPrequantConfig(), device=None, dtype=torch.bfloat16,
+                 autotune="off",tuning_policy=None,autotune_cache_dir=None):
         super().__init__()
         if type(in_features) is not int or type(hidden_features) is not int or min(in_features,hidden_features)<=0:
             raise ValueError("in_features and hidden_features must be positive integers")
@@ -154,6 +164,8 @@ class MXFP8GLU(torch.nn.Module):
         self.in_features, self.hidden_features = in_features, hidden_features
         self.activation, self.output_format = activation, output_format
         self.packed_output, self.config = packed_output, config
+        from ._glu_autotune import deferred_config
+        self._first_hit_config=deferred_config(config,autotune,tuning_policy,autotune_cache_dir)
         self.tuning_result = None
         self.weight = torch.nn.Parameter(torch.empty(2*hidden_features,in_features,device=device,dtype=dtype))
         self.reset_parameters()
@@ -162,10 +174,11 @@ class MXFP8GLU(torch.nn.Module):
         torch.nn.init.trunc_normal_(self.weight,mean=0.,std=.02,a=-.04,b=.04)
 
     def forward(self, x):
+        config=self.config if self._first_hit_config is None else self._first_hit_config
         if self.packed_output:
-            return mxfp8_glu_packed(x,self.weight,activation=self.activation,config=self.config)
+            return mxfp8_glu_packed(x,self.weight,activation=self.activation,config=config)
         return mxfp8_glu(x,self.weight,activation=self.activation,
-                        output_format=self.output_format,config=self.config)
+                        output_format=self.output_format,config=config)
 
     @torch.no_grad()
     def autotune_(self, example_x, **kwargs):
@@ -176,6 +189,7 @@ class MXFP8GLU(torch.nn.Module):
         result = tune_mxfp8_glu(example_x,self.weight,activation=self.activation,
                                 output_format=self.output_format,**kwargs)
         self.config, self.tuning_result = result.config, result
+        self._first_hit_config = None
         return self
 
     @classmethod

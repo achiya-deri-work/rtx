@@ -50,7 +50,7 @@ WeightMode = Literal["dynamic", "prequantized"]
 # This revision is part of every compiler-visible forward token. Increment it
 # whenever lowering/ABI behavior changes so AOTInductor cannot revive a stale
 # generated wrapper whose graph otherwise has identical tensor guards.
-MXFP8_FRONTEND_REVISION = 7
+MXFP8_FRONTEND_REVISION = 8
 
 
 def _normalize_mxfp8_backend(backend: MXFP8Backend) -> Literal[
@@ -794,6 +794,17 @@ def quantize_mxfp8(
     )
 
 
+def _prequant_source_alignment(*tensors: torch.Tensor) -> int:
+    """Metadata-only specialization for contiguous views with a storage offset."""
+    pointers = [tensor.data_ptr() for tensor in tensors]
+    alignment = 16
+    while alignment > 2 and any(pointer % alignment for pointer in pointers):
+        alignment //= 2
+    if any(pointer % alignment for pointer in pointers):
+        raise ValueError('BF16 quantization requires at least two-byte source alignment')
+    return alignment
+
+
 @persistent_scratch
 def _build_prequant_runner(
     x: torch.Tensor,
@@ -834,6 +845,7 @@ def _build_prequant_runner(
                 winner_key,
                 prequant_config_from_dict,
                 root=request.cache_dir,
+                tuning_policy=request.policy if request.mode == 'balanced' else None,
                 rejection=lambda candidate: candidate.rejection(problem),
             )
             if selected is not None:
@@ -844,6 +856,7 @@ def _build_prequant_runner(
                         winner_key,
                         prequant_config_from_dict,
                         root=request.cache_dir,
+                        tuning_policy=request.policy if request.mode == 'balanced' else None,
                         rejection=lambda candidate: candidate.rejection(problem),
                     )
                     if selected is None:
@@ -872,6 +885,7 @@ def _build_prequant_runner(
                             ).hexdigest()[:20],
                             root=request.cache_dir,
                             median_ms=result.median_ms,
+                            tuning_evidence=result.tuning_evidence,
                             metadata={"source": "runtime_tuner"},
                         )
             else:
@@ -909,6 +923,7 @@ def _build_prequant_runner(
         device=x.device,
     )
     weight_config = config.resolved_weight_quant()
+    source_alignment = _prequant_source_alignment(x, weight)
     weight_scale_layout = weight_config.scale_layout
     sx = _allocate_scales(
         x.shape[0], x.shape[1], config.quant.scale_layout, x.device
@@ -923,11 +938,14 @@ def _build_prequant_runner(
             problem.k,
             config.quant,
             weight_scale_layout=weight_scale_layout,
+            source_alignment=source_alignment,
         )
         quant_w = None
     else:
-        quant_x = compile_mxfp8_quant(problem.m, problem.k, config.quant)
-        quant_w = compile_mxfp8_quant(problem.n, problem.k, weight_config)
+        quant_x = compile_mxfp8_quant(problem.m, problem.k, config.quant,
+                                     source_alignment=source_alignment)
+        quant_w = compile_mxfp8_quant(problem.n, problem.k, weight_config,
+                                     source_alignment=source_alignment)
     gemm = compile_mxfp8_gemm(storage_problem, config.gemm)
     return _PrequantRunner(
         config.quant_launches,
@@ -958,6 +976,7 @@ def _launch_prequant_out(
         int(x_c.shape[1]),
         int(weight_c.shape[0]),
         config_key,
+        _prequant_source_alignment(x_c, weight_c),
     )
     runner = _PREQUANT_RUNNERS.get(runner_key)
     if runner is None:
@@ -975,7 +994,7 @@ class _InductorPrequantLauncher:
     def __init__(self, config_key: str) -> None:
         self.config_key = config_key
         self.runners: BoundedCache[
-            tuple[int | None, int, int, int, int], tuple
+            tuple[int | None, int, int, int, int, int], tuple
         ] = BoundedCache(runner_cache_limit("inductor_prequant", 8))
 
     def __call__(
@@ -992,6 +1011,7 @@ class _InductorPrequantLauncher:
             int(x.shape[0]),
             int(x.shape[1]),
             int(weight.shape[0]),
+            _prequant_source_alignment(x, weight),
         )
         runner = self.runners.get(key)
         if runner is None:
@@ -1800,6 +1820,7 @@ def _resolve_packed_inference_config(
         x_layout,
         weight_layout,
         mode,
+        repr(tuning_policy),
         None if cache_dir is None else str(Path(cache_dir).expanduser()),
     )
     cached_selection = _PACKED_INFERENCE_SELECTIONS.get(selection_key)
@@ -1829,6 +1850,7 @@ def _resolve_packed_inference_config(
             key,
             weight_prequant_config_from_dict,
             root=cache_dir,
+            tuning_policy=tuning_policy if mode == 'balanced' else None,
             rejection=lambda config: (
                 config.rejection(problem)
                 or (
@@ -1847,6 +1869,7 @@ def _resolve_packed_inference_config(
                     key,
                     weight_prequant_config_from_dict,
                     root=cache_dir,
+                    tuning_policy=tuning_policy if mode == 'balanced' else None,
                     rejection=lambda config: (
                         config.rejection(problem)
                         or (
@@ -1892,6 +1915,7 @@ def _resolve_packed_inference_config(
         key,
         fully_prequant_config_from_dict,
         root=cache_dir,
+        tuning_policy=tuning_policy if mode == 'balanced' else None,
         rejection=lambda config: (
             config.rejection(problem)
             or (
@@ -1911,6 +1935,7 @@ def _resolve_packed_inference_config(
                 key,
                 fully_prequant_config_from_dict,
                 root=cache_dir,
+                tuning_policy=tuning_policy if mode == 'balanced' else None,
                 rejection=lambda config: (
                     config.rejection(problem)
                     or (
@@ -2338,9 +2363,11 @@ def _resolve_fwd_config(
         winner_key,
         lambda value: fwd_config_from_dict(dict(value)),
         root=cache_dir,
+        tuning_policy=tuning_policy if mode == 'balanced' else None,
         rejection=lambda candidate: candidate.implementation_rejection(problem),
     )
-    if cached is None:
+    if cached is None and not (mode == 'balanced' and
+                               getattr(tuning_policy, 'cache_behavior', 'reuse') == 'refine'):
         cached = load_cached_mxfp8_fwd_config(
             problem, device=x.device, cache_dir=cache_dir
         )
@@ -2352,6 +2379,7 @@ def _resolve_fwd_config(
             winner_key,
             lambda value: fwd_config_from_dict(dict(value)),
             root=cache_dir,
+            tuning_policy=tuning_policy if mode == 'balanced' else None,
             rejection=lambda candidate: candidate.implementation_rejection(
                 problem
             ),
@@ -2380,6 +2408,7 @@ def _resolve_fwd_config(
             ).hexdigest()[:20],
             root=cache_dir,
             median_ms=result.median_ms,
+            tuning_evidence=result.tuning_evidence,
             metadata={"source": "runtime_tuner"},
         )
         return result.config

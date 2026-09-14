@@ -24,6 +24,8 @@ import uuid
 
 import torch
 
+from .autotune.measurement import runtime_timing_metadata
+
 from .autotune import (
     CoordinateDescentPolicy,
     DeviceFingerprint,
@@ -55,7 +57,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 22
+KERNEL_REVISION = 23
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -848,6 +850,7 @@ class BwdTuningResult:
     evaluated_trials: int
     reused_trials: int
     elapsed_s: float
+    tuning_evidence: dict[str, object] | None = None
 
 
 class BwdJsonTuningDatabase:
@@ -1032,7 +1035,11 @@ class MXFP8BwdEvaluator:
         x: torch.Tensor,
         weight: torch.Tensor,
         policy: CoordinateDescentPolicy,
+        *, measurement_mode: str = 'host',
     ) -> None:
+        if measurement_mode not in ('host','cuda_graph'):
+            raise ValueError('unsupported backward measurement mode')
+        self.measurement_mode = measurement_mode
         self.grad_output = grad_output.contiguous()
         self.x = x.contiguous()
         self.weight = weight.contiguous()
@@ -1047,8 +1054,9 @@ class MXFP8BwdEvaluator:
                 dw = self.grad_output.float().T @ self.x.float()
                 self._reference = (dx.to(torch.bfloat16), dw.to(torch.bfloat16))
             else:
+                from .fp8_bwd import _default_bwd_config
                 runner = _build_bwd_runner(
-                    self.problem, DEFAULT_MXFP8_BWD_CONFIG, self.x.device
+                    self.problem, _default_bwd_config(self.problem), self.x.device
                 )
                 dx = torch.empty_like(self.x)
                 dw = torch.empty_like(self.weight)
@@ -1073,6 +1081,8 @@ class MXFP8BwdEvaluator:
         try:
             runner(self.grad_output, self.x, self.weight, dx, dw)
             torch.cuda.synchronize(self.x.device)
+            if not bool(dx.isfinite().all()) or not bool(dw.isfinite().all()):
+                return TrialOutcome('correctness_error',compile_ms=compile_ms,error='nonfinite backward output')
             max_error: float | None = None
             if self.policy.correctness != "none":
                 ref_dx, ref_dw = self.reference()
@@ -1105,13 +1115,35 @@ class MXFP8BwdEvaluator:
             for _ in range(self.policy.warmup):
                 runner(self.grad_output, self.x, self.weight, dx, dw)
             torch.cuda.synchronize(self.x.device)
+            graph = None
+            capture_ms = 0.
+            if self.measurement_mode == 'cuda_graph':
+                capture_start = time.monotonic()
+                graph = torch.cuda.CUDAGraph()
+                # Capture a complete batch, including auxiliary-stream joins.
+                # Single-call replay in a Python loop is a different timing mode.
+                with torch.cuda.graph(graph):
+                    for _call in range(self.policy.calls_per_sample):
+                        runner(self.grad_output, self.x, self.weight, dx, dw)
+                graph.replay()
+                torch.cuda.synchronize(self.x.device)
+                capture_ms = (time.monotonic()-capture_start)*1000
+                if not bool(dx.isfinite().all()) or not bool(dw.isfinite().all()):
+                    return TrialOutcome('correctness_error',compile_ms=compile_ms,error='nonfinite graph backward output')
+                if self.policy.correctness != 'none' and not (
+                    torch.allclose(dx,ref_dx,rtol=self.policy.correctness_rtol,atol=self.policy.correctness_atol)
+                    and torch.allclose(dw,ref_dw,rtol=self.policy.correctness_rtol,atol=self.policy.correctness_atol)):
+                    return TrialOutcome('correctness_error',compile_ms=compile_ms,error='graph replay dX/dW differ from reference')
             timings: list[float] = []
             for _ in range(self.policy.samples):
                 begin = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 begin.record()
-                for _call in range(self.policy.calls_per_sample):
-                    runner(self.grad_output, self.x, self.weight, dx, dw)
+                if graph is not None:
+                    graph.replay()
+                else:
+                    for _call in range(self.policy.calls_per_sample):
+                        runner(self.grad_output, self.x, self.weight, dx, dw)
                 end.record()
                 end.synchronize()
                 timings.append(
@@ -1123,6 +1155,9 @@ class MXFP8BwdEvaluator:
                 timings_ms=timings,
                 compile_ms=compile_ms,
                 max_abs_error=max_error,
+                metadata={**runtime_timing_metadata(timings),
+                          'measurement_mode':self.measurement_mode,'graph_capture_ms':capture_ms,
+                          'calls_per_sample':self.policy.calls_per_sample},
             )
         except Exception as exc:
             return TrialOutcome(

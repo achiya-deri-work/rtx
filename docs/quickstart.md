@@ -71,7 +71,10 @@ compiled_mlp(x).float().square().mean().backward()
 
 This saves input/weight references, not hidden activations. It is not the
 forward-only `MXFP8GLU`. Read the [MLP contract and known blocker](mxfp8_mlp.md).
-Unlike linears, its `forward` never starts a first-hit search.
+Unlike linears, its default is `autotune="off"`. For opt-in per-shape first-hit
+selection, pass `autotune="balanced"`, `tuning_policy=rtx.AutotunePolicy.preset("quick")`,
+and `autotune_cache_dir=".rtx-cache"` to the constructor. Automatic selection
+currently requires MXFP8 precision; explicit tuning remains available.
 
 ## Runnable examples
 

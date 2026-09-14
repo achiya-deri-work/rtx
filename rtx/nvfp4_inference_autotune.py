@@ -23,8 +23,21 @@ from .prequant_autotune import PREQUANT_SEARCH_SPACE
 
 NVFP4_INFERENCE_KERNEL_REVISION = 5
 NVFP4_DYNAMIC_KERNEL_REVISION = 8
-NVFP4_DELAYED_KERNEL_REVISION = 3
+NVFP4_DELAYED_KERNEL_REVISION = 4
 NVFP4_JIT_ROW_REGION_KERNEL_REVISION = 10
+
+
+def delayed_scale_variant(scale_policy=None) -> str:
+    """Partition delayed evidence by its actual numerical/history policy."""
+    from .configs.nvfp4 import DEFAULT_NVFP4_SCALE_CONFIG, NVFP4ScaleConfig
+
+    selected = DEFAULT_NVFP4_SCALE_CONFIG if scale_policy is None else scale_policy
+    if not isinstance(selected, NVFP4ScaleConfig):
+        raise TypeError("scale_policy must be NVFP4ScaleConfig")
+    if selected == DEFAULT_NVFP4_SCALE_CONFIG:
+        return "default"
+    return (f"scale-{selected.tensor_scale_mode}_history-{selected.amax_history_len}"
+            f"-{selected.amax_history_algo}")
 
 
 def _gemm_axes() -> dict[str, tuple[dict[str, object], ...]]:
@@ -875,18 +888,25 @@ def tune_nvfp4_inference_state(
     device="cuda",
     cache_dir: Path | str | None = None,
     policy=None,
+    scale_policy=None,
     progress=print,
 ):
     """Tune one NVFP4 materialized operand state and publish its winner.
 
-    ``state`` is one of ``dynamic``, ``weight_prequantized``, or
-    ``fully_prequantized``. Packed public operands currently use the canonical
+    ``state`` is one of ``dynamic``, ``delayed``, ``jit_row_region``,
+    ``weight_prequantized``, or ``fully_prequantized``. ``scale_policy`` applies
+    only to delayed state and partitions both search evidence and runtime winners.
+    Packed public operands currently use the canonical
     row-major TorchAO-compatible representation; physical tensor-core scale
     layouts remain an implementation coordinate inside the dynamic family.
     """
 
     import time
     tuning_started=time.monotonic()
+    if state != "delayed" and scale_policy is not None:
+        raise ValueError("scale_policy is supported only for delayed tuning")
+    if state == "delayed":
+        delayed_scale_variant(scale_policy)  # Fail before CUDA/harness initialization.
     from .autotune import (
         CalibratedPrequantEvaluator,
         DeviceFingerprint,
@@ -899,9 +919,11 @@ def tune_nvfp4_inference_state(
         make_nvfp4_weight_prequant_adapter,
     )
     from .autotune.legacy import default_cache_dir
+    from .autotune.adapters import make_nvfp4_delayed_adapter
     from .autotune.winners import runtime_winner_key, save_runtime_winner
     from .nvfp4_inference_experiments import (
         NVFP4DynamicBenchmarkHarness,
+        NVFP4DelayedBenchmarkHarness,
         NVFP4JITRowRegionBenchmarkHarness,
         NVFP4FullyPrequantBenchmarkHarness,
         NVFP4WeightPrequantBenchmarkHarness,
@@ -929,7 +951,12 @@ def tune_nvfp4_inference_state(
         device=device,
         seed=20260811,
     )
-    if state == "dynamic":
+    if state == "delayed":
+        harness = NVFP4DelayedBenchmarkHarness(shape, scale_policy=scale_policy, **common)
+        adapter_factory = make_nvfp4_delayed_adapter
+        initial = DEFAULT_NVFP4_DYNAMIC_CONFIG
+        variant = delayed_scale_variant(scale_policy)
+    elif state == "dynamic":
         harness = NVFP4DynamicBenchmarkHarness(shape, **common)
         adapter_factory = make_nvfp4_dynamic_adapter
         initial = DEFAULT_NVFP4_DYNAMIC_CONFIG
@@ -961,7 +988,11 @@ def tune_nvfp4_inference_state(
         initial=initial,
         device=fingerprint,
         regime="hot",
+        **({"tags": {"delayed_scale_policy": asdict(harness.scale_policy)}}
+           if state == "delayed" and variant != "default" else {}),
     )
+    from .autotune.runtime_coordinates import runtime_schedule_adapter
+    adapter = runtime_schedule_adapter(adapter)
     from .autotune.effort import AutotunePolicy
     if isinstance(policy,AutotunePolicy):policy=policy.for_pass()
     if isinstance(policy, (HybridTuningPolicy,AutotunePolicy)):
@@ -984,9 +1015,10 @@ def tune_nvfp4_inference_state(
     suffix = f"m{problem.m}_n{problem.n}_k{problem.k}"
     if variant != "default":
         suffix += f"_{variant}"
-    store = JsonlTuningStore(
-        root / "runtime_sessions" / adapter.context.family / fingerprint.identifier / suffix
-    )
+    session_root = root / "runtime_sessions" / adapter.context.family / fingerprint.identifier / suffix
+    if isinstance(hybrid, AutotunePolicy) and hybrid.search_schedule == 'progressive':
+        session_root = session_root / hybrid.evidence_contract()
+    store = JsonlTuningStore(session_root)
     result = make_hybrid_autotuner(
         adapter, store, hybrid, progress=progress,started_at=tuning_started
     ).tune()
@@ -1002,6 +1034,7 @@ def tune_nvfp4_inference_state(
         config_id=adapter.config_id(result.config),
         root=root,
         median_ms=result.median_ms,
+        tuning_evidence=result.tuning_evidence,
         metadata={"context_id": result.context_id, "source": "runtime_tuner"},
     )
     return result.config

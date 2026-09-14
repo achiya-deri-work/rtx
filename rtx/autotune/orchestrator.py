@@ -125,6 +125,11 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         self.coverage_proposals = tuple(coverage_proposals)
         self.started_at=started_at
         self.pool_audit = None
+        self.checkpoint_key = None
+        self.finalist_rounds = 0
+        self.finalist_margin = 0.005
+        self.finalist_reserve_s = 0.
+        self.effort_contract = None
 
     def _log(self, started: float, message: str) -> None:
         if self.progress is not None:
@@ -146,6 +151,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
 
     def _tune_locked(self) -> ComposableTuningResult[ConfigT]:
         started = time.monotonic() if self.started_at is None else self.started_at
+        search_seconds = max(0., self.budget.time_budget_s - self.finalist_reserve_s)
         rng = random.Random(self.seed)
         restored: list[Observation[ConfigT]] = []
         if self.resume:
@@ -178,9 +184,10 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         abandoned_ids = {
             str(item.get("config_id", "")) for item in abandoned
         } - {""}
+        abandoned_ids -= {o.config_id for o in history.current}
         history.excluded_config_ids.update(abandoned_ids)
         resumed_active = (
-            len(history.current) if self.max_trials_includes_resumed else 0
+            len(history.current) + len(abandoned_ids) if self.max_trials_includes_resumed else 0
         )
         session_id = self.store.start_session(
             self.adapter.context,
@@ -206,6 +213,21 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 history,
                 self.adapter.context.features(),
             )
+        if self.checkpoint_key and history.current:
+            checkpoint = history.current[-1].metadata.get('search_checkpoint')
+            if checkpoint is not None:
+                if (checkpoint.get('key') != self.checkpoint_key or
+                        checkpoint.get('count') != len(history.current) or
+                        checkpoint.get('history_digest') != stable_id([
+                            (o.config_id, o.outcome.status) for o in history.current]) or
+                        set(checkpoint.get('statistics', {})) != set(statistics)):
+                    raise ValueError('progressive search checkpoint is incompatible with this policy/history')
+                def tuples(value):
+                    return tuple(tuples(v) for v in value) if isinstance(value, (list, tuple)) else value
+                rng.setstate(tuples(checkpoint['rng']))
+                history.excluded_config_ids.update(checkpoint.get('excluded_ids', []))
+                statistics = {name: ArmStatistics(**value)
+                              for name, value in checkpoint['statistics'].items()}
         evaluated = 0
         if abandoned:
             self.store.record_event(
@@ -356,31 +378,35 @@ class AutotuneOrchestrator(Generic[ConfigT]):
             confirm(observation, proposal, before)
             evaluated += 1
             history.observations.append(observation)
-            self.store.record_observation(observation)
-            self.store.record_event(
-                session_id,
-                "candidate_completed",
-                {
-                    "attempt_id": attempt_id,
-                    "sequence": observation.sequence,
-                    "context_id": observation.context_id,
-                    "config_id": observation.config_id,
-                    "observation_id": observation.observation_id,
-                    "status": observation.outcome.status,
-                },
-            )
             arm = statistics.get(proposal.strategy)
-            if arm is not None:
-                reward_fn = getattr(self.scheduler, "reward", self._reward)
-                reward = float(reward_fn(before, observation))
-                update = getattr(self.scheduler, "update", None)
-                if update is not None:
-                    update(statistics, proposal.strategy, reward, observation)
-                else:
-                    arm.pulls += 1
-                    arm.successes += int(observation.successful)
-                    arm.elapsed_s += observation_strategy_cost_s(observation)
-                    arm.reward_sum += reward
+            try:
+                if arm is not None:
+                    reward_fn = getattr(self.scheduler, "reward", self._reward)
+                    reward = float(reward_fn(before, observation))
+                    update = getattr(self.scheduler, "update", None)
+                    if update is not None:
+                        update(statistics, proposal.strategy, reward, observation)
+                    else:
+                        arm.pulls += 1
+                        arm.successes += int(observation.successful)
+                        arm.elapsed_s += observation_strategy_cost_s(observation)
+                        arm.reward_sum += reward
+            except Exception:
+                # A strategy/scheduler bug must not erase a completed GPU
+                # measurement. Recovery can rebuild state from this evidence.
+                self.store.record_observation(observation)
+                raise
+            if self.checkpoint_key:
+                observation.metadata['search_checkpoint'] = dict(
+                    key=self.checkpoint_key, count=len(history.current), rng=rng.getstate(),
+                    history_digest=stable_id([(o.config_id, o.outcome.status) for o in history.current]),
+                    excluded_ids=sorted(history.excluded_config_ids),
+                    statistics={name: arm.as_dict() for name, arm in statistics.items()})
+            self.store.record_observation(observation)
+            self.store.record_event(session_id, 'candidate_completed', dict(
+                attempt_id=attempt_id, sequence=observation.sequence,
+                context_id=observation.context_id, config_id=observation.config_id,
+                observation_id=observation.observation_id, status=observation.outcome.status))
             self._log(
                 started,
                 f"SAVE {proposal.strategy} {observation.config_id} "
@@ -404,7 +430,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         if (
             initial_id not in history.seen_ids | abandoned_ids
             and resumed_active + evaluated < self.budget.max_trials
-            and time.monotonic()-started<self.budget.time_budget_s
+            and time.monotonic()-started<search_seconds
         ):
             initial = run(Proposal(self.adapter.initial_config, "initial"))
             if not initial.successful:
@@ -422,7 +448,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         coverage_evaluated = 0
         for proposal in self.coverage_proposals:
             if (resumed_active + evaluated >= self.budget.max_trials
-                    or time.monotonic() - started >= self.budget.time_budget_s):
+                    or time.monotonic() - started >= search_seconds):
                 break
             if self.adapter.config_id(proposal.config) in history.seen_ids:
                 continue
@@ -435,7 +461,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         names = tuple(self.strategies)
         empty_attempts = 0
         while resumed_active + evaluated < self.budget.max_trials:
-            if time.monotonic() - started >= self.budget.time_budget_s:
+            if time.monotonic() - started >= search_seconds:
                 break
             trial_index = resumed_active + evaluated
             arm_name = self.scheduler.select(names, statistics, trial_index)
@@ -462,6 +488,12 @@ class AutotuneOrchestrator(Generic[ConfigT]):
             proposal_started = time.monotonic()
             try:
                 proposals = strategy.propose(self.adapter, history, rng, 1)
+                take_audit = getattr(strategy, 'take_audit', None)
+                if take_audit is not None:
+                    audit = take_audit()
+                    if audit is not None:
+                        self.store.record_event(session_id, 'strategy_candidate_ranking',
+                                                {'strategy': arm_name, 'trial': trial_index, **audit})
             except Exception as exc:
                 proposal_elapsed_s = time.monotonic() - proposal_started
                 statistics[arm_name].proposal_calls += 1
@@ -515,7 +547,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 continue
             empty_attempts = 0
             proposal = proposals[0]
-            if time.monotonic()-started>=self.budget.time_budget_s:
+            if time.monotonic()-started>=search_seconds:
                 break
             proposal.strategy = arm_name
             proposal.metadata = {
@@ -529,11 +561,21 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         if best is None:
             self.store.finish_session(session_id, {"status": "failed", "reason": "no successful trials"})
             raise RuntimeError("autotuning produced no successful configurations")
+        decision = None
+        search_elapsed = time.monotonic() - started
+        selected_score = best.score
+        if self.finalist_rounds:
+            from .paired_promotion import promote
+            decision = promote(self.adapter, self.store, history, session_id,
+                rounds=self.finalist_rounds, margin=self.finalist_margin,
+                deadline=started+self.budget.time_budget_s, seed=self.seed)
+            best = next(o for o in history.successful if o.config_id == decision['config_id'])
+            selected_score = decision['median_ms']
         elapsed = time.monotonic() - started
         status = (
             "budget_exhausted"
             if resumed_active + evaluated >= self.budget.max_trials
-            or elapsed >= self.budget.time_budget_s
+            or search_elapsed >= search_seconds
             else "complete"
         )
         self.store.finish_session(
@@ -541,11 +583,16 @@ class AutotuneOrchestrator(Generic[ConfigT]):
             {
                 "status": status,
                 "best_config_id": best.config_id,
-                "best_median_ms": best.score,
+                "best_median_ms": selected_score,
+                "winner_decision": decision,
+                "search_elapsed_s": search_elapsed,
+                "finalist_evaluations": (0 if decision is None or decision.get('reused') or
+                    decision.get('confirmation') is None else decision['confirmation']['evaluations']),
                 "evaluated_trials": evaluated,
                 "elapsed_s": elapsed,
                 "resumed_trials": resumed_active,
                 "stop_reason": ('trial_budget' if resumed_active+evaluated>=self.budget.max_trials
+                                else 'confirmation_reserve' if search_elapsed>=search_seconds and self.finalist_reserve_s
                                 else 'time_budget' if elapsed>=self.budget.time_budget_s else 'search_exhausted'),
                 "confirmation_evaluations":sum(len(o.metadata.get('confirmation',{}).get('outcomes',[]))
                     for o in history.current if o.session_id==session_id),
@@ -554,7 +601,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         )
         return ComposableTuningResult(
             config=best.config,
-            median_ms=best.score,
+            median_ms=selected_score,
             session_id=session_id,
             context_id=self.adapter.context.identifier,
             evaluated_trials=evaluated,
@@ -562,6 +609,15 @@ class AutotuneOrchestrator(Generic[ConfigT]):
             strategy_trials={**{name: arm.pulls for name, arm in statistics.items()},
                              **({"coverage": coverage_evaluated} if self.coverage_proposals else {})},
             store_path=None if self.store.path is None else str(self.store.path),
+            winner_decision=decision,
+            tuning_evidence=(None if self.effort_contract is None else dict(
+                schema=1, contract=self.effort_contract, attempted_trials=resumed_active+evaluated,
+                context_id=self.adapter.context.identifier, session_id=session_id,
+                backward_coordinate_revision=self.adapter.context.tags.get('runtime_backward_coordinate_revision'),
+                finalist_rounds=(len(decision['confirmation']['rounds']) if decision and
+                    decision.get('confirmation') and decision['confirmation']['status']=='complete' else 0),
+                finalist_margin=self.finalist_margin, winner_decision=decision,
+                promotion_revision=decision.get('promotion_revision') if decision else None)),
         )
 
 

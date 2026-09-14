@@ -101,7 +101,7 @@ class MXFP8MLPConfig:
 
 
 DEFAULT_MLP_CONFIG = MXFP8MLPConfig()
-MLP_CONFIG_REVISION = 8
+MLP_CONFIG_REVISION = 9
 
 
 @torch.compiler.assume_constant_result
@@ -325,9 +325,13 @@ def _setup_context(ctx,inputs,output):
     ctx.keys=_backward_keys(key,x.numel()//x.shape[-1],x.shape[-1],gate_up.shape[0]//2,down.shape[0])
 
 
-def _backward(ctx,grad_output):
+def _backward(ctx,grad_output,*,independent_outputs=False):
     from .glu import _glu_op
     from .fp8_bwd import _mxfp8_bwd_compiler_visible, _mxfp8_dx_compiler_visible, _mxfp8_dw_compiler_visible
+    if independent_outputs:
+        # Preserve the paired launch schedule but allocate disjoint gradient
+        # storages for the enclosing runtime-selected custom-op boundary.
+        from ._mlp_autotune import independent_bwd as _mxfp8_bwd_compiler_visible
     x,gate_up,down=ctx.saved_tensors
     need_x,need_gate,need_down=ctx.needs_input_grad[:3]
     m,k=x.numel()//x.shape[-1],x.shape[-1]
@@ -437,8 +441,23 @@ class MXFP8MLP(torch.nn.Module):
     ``hidden_features`` is the post-GLU width, not the packed 2H weight width.
     ``out_features`` defaults to ``in_features``. ``activation`` accepts silu,
     exact GELU, or ReLU. Backward is first-order STE with full recomputation.
-    Call ``autotune_`` explicitly before ``torch.compile(fullgraph=True)``;
-    forward never starts a search. See docs/mxfp8_mlp.md for qualification.
+    By default ``autotune='off'`` keeps explicit configuration; call
+    ``autotune_`` before compilation to install a shape policy. Experimental
+    ``autotune='balanced'`` selects on the first real input, using the shared
+    ``tuning_policy`` (AutotunePolicy) and durable ``autotune_cache_dir``.
+    ``'cache'`` reuses a compatible winner or the explicit initial config,
+    without searching. Automatic selection currently supports only mxfp8
+    precision. A grad-enabled call tunes full forward/backward, not just
+    forward. Configured shape overrides take precedence. Warm forward and
+    backward before CUDA graph capture. The selected plan is saved as CPU
+    metadata, not hidden activations. Paired backward launchers write disjoint
+    outputs without staging copies. Broad performance qualification is pending; see
+    docs/mlp_first_hit_plan_contract.md. Existing explicit execution is unchanged.
+    Automatic Inductor CUDA graphs leave host-plan metadata uncaptured but replay
+    the CUDA-only forward/backward bodies when requested by ``torch.compile``
+    (for example ``mode='reduce-overhead'``). Replay is not always faster; the
+    caller controls that option. Manual warmed capture uses compiled graph-free
+    bodies, primed during cold setup. No hidden activations are retained.
 
     Construct on CPU/meta for checkpoint loading, then move to an SM12x CUDA
     device before execution. Only BF16 execution is supported. ``eval()`` does
@@ -447,7 +466,8 @@ class MXFP8MLP(torch.nn.Module):
     new optimizer after conversion: parameters are new objects.
     """
     def __init__(self,in_features,hidden_features,out_features=None,*,activation="silu",
-                 config=DEFAULT_MLP_CONFIG,precision="mxfp8",device=None,dtype=torch.bfloat16):
+                 config=DEFAULT_MLP_CONFIG,precision="mxfp8",device=None,dtype=torch.bfloat16,
+                 autotune="off",tuning_policy=None,autotune_cache_dir=None):
         super().__init__()
         out_features=in_features if out_features is None else out_features
         if any(type(v) is not int or v<=0 for v in (in_features,hidden_features,out_features)):
@@ -463,6 +483,8 @@ class MXFP8MLP(torch.nn.Module):
         self.in_features,self.hidden_features,self.out_features=in_features,hidden_features,out_features
         self.activation,self.config=activation,config
         self.precision=precision
+        from ._mlp_autotune import deferred_spec
+        self._first_hit_spec=deferred_spec(config,precision,autotune,tuning_policy,autotune_cache_dir)
         self._shape_configs={}
         self.gate_up_weight=torch.nn.Parameter(torch.empty((2*hidden_features,in_features),device=device,dtype=dtype))
         self.down_weight=torch.nn.Parameter(torch.empty((out_features,hidden_features),device=device,dtype=dtype))
@@ -512,6 +534,10 @@ class MXFP8MLP(torch.nn.Module):
         return result.train(gate.training)
 
     def forward(self,x):
+        if self._first_hit_spec is not None and self._shape_key(x) not in self._shape_configs:
+            from ._mlp_autotune import selected_mlp
+            training=torch.is_grad_enabled() and (x.requires_grad or self.gate_up_weight.requires_grad or self.down_weight.requires_grad)
+            return selected_mlp(x,self.gate_up_weight,self.down_weight,self.activation,self._first_hit_spec,training)[0]
         config,precision=self._shape_configs.get(self._shape_key(x),(self.config,self.precision))
         return mxfp8_mlp(x,self.gate_up_weight,self.down_weight,activation=self.activation,
                          config=config,precision=precision)

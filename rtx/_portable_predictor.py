@@ -71,7 +71,7 @@ class PortablePredictor:
         self.models = {}
         n = len(self.feature_names)
         for head, families in document['models'].items():
-            if head not in ('mlp', 'residual'):
+            if head not in ('mlp', 'residual', 'trees'):
                 raise ValueError('unknown predictor head')
             self.models[head] = {}
             for family, model in families.items():

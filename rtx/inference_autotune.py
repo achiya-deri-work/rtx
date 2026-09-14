@@ -334,6 +334,7 @@ def tune_mxfp8_inference_state(
         config_id=adapter.config_id(result.config),
         root=root,
         median_ms=result.median_ms,
+        tuning_evidence=result.tuning_evidence,
         metadata={"context_id": result.context_id, "source": "runtime_tuner"},
     )
     return result.config

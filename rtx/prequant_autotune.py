@@ -25,6 +25,8 @@ import uuid
 
 import torch
 
+from .autotune.measurement import runtime_timing_metadata
+
 from .autotune import (
     CoordinateDescentPolicy,
     DeviceFingerprint,
@@ -426,6 +428,7 @@ class PrequantTuningResult:
     evaluated_trials: int
     reused_trials: int
     elapsed_s: float
+    tuning_evidence: dict[str, object] | None = None
 
 
 class PrequantJsonTuningDatabase:
@@ -663,7 +666,7 @@ class MXFP8PrequantEvaluator:
                 self._expected = _torch_mxfp8_reference(self.x, self.weight)
                 return self._expected
             runner = _build_prequant_runner(
-                self.x, self.weight, _intern_for_tuning(DEFAULT_MXFP8_PREQUANT_CONFIG)
+                self.x, self.weight, _intern_for_tuning(_legal_default_prequant_config(self.problem))
             )
             out = torch.empty(
                 (self.problem.m, self.problem.n),
@@ -739,6 +742,7 @@ class MXFP8PrequantEvaluator:
                 timings_ms=timings,
                 compile_ms=compile_ms,
                 max_abs_error=max_abs_error,
+                metadata=runtime_timing_metadata(timings),
             )
         except Exception as exc:
             return TrialOutcome(
@@ -1029,6 +1033,17 @@ def load_cached_mxfp8_prequant_config(
     return best[0]
 
 
+def _legal_default_prequant_config(problem: MXFP8Problem) -> MXFP8PrequantConfig:
+    """Use an existing legal baseline without changing quantization policy."""
+    if DEFAULT_MXFP8_PREQUANT_CONFIG.rejection(problem) is None:
+        return DEFAULT_MXFP8_PREQUANT_CONFIG
+    for updates in PREQUANT_SEARCH_SPACE['layout_transport']:
+        candidate = update_prequant_config(DEFAULT_MXFP8_PREQUANT_CONFIG, updates)
+        if candidate.gemm.scale_layout == 'row_major' and candidate.rejection(problem) is None:
+            return candidate
+    raise RuntimeError(f'no legal default prequant configuration for {problem}')
+
+
 def tune_mxfp8_prequant(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1039,6 +1054,10 @@ def tune_mxfp8_prequant(
     axes: Mapping[str, Iterable[dict[str, object]]] = PREQUANT_SEARCH_SPACE,
     progress: ProgressCallback | None = print,
 ) -> PrequantTuningResult:
+    if initial == DEFAULT_MXFP8_PREQUANT_CONFIG:
+        initial = _legal_default_prequant_config(
+            MXFP8Problem(x.numel() // x.shape[-1], weight.shape[0], x.shape[-1])
+        )
     from .autotune.effort import AutotunePolicy,tune_legacy_effort
     if isinstance(policy,AutotunePolicy):
         return tune_legacy_effort('prequant',x,weight,policy=policy,initial=initial,

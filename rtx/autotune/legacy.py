@@ -42,6 +42,7 @@ from ..kernels.mxfp8 import (
 )
 from ..runtime import load_kernel_symbol
 from .outcomes import TrialOutcome, TrialStatus
+from .measurement import runtime_timing_metadata
 
 
 def compile_mxfp8_fwd(*args, **kwargs):
@@ -173,6 +174,7 @@ class TuningResult:
     evaluated_trials: int
     reused_trials: int
     elapsed_s: float
+    tuning_evidence: dict[str, object] | None = None
 
 
 class JsonTuningDatabase:
@@ -933,6 +935,7 @@ class MXFP8ForwardEvaluator:
             timings_ms=timings,
             compile_ms=compile_ms,
             max_abs_error=max_abs_error,
+            metadata=runtime_timing_metadata(timings),
         )
 
 

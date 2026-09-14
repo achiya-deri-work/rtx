@@ -122,6 +122,7 @@ def save_runtime_winner(
     root: Path | str | None = None,
     median_ms: float | None = None,
     metadata: Mapping[str, object] | None = None,
+    tuning_evidence: Mapping[str, object] | None = None,
 ) -> Path:
     base = default_cache_dir() if root is None else Path(root).expanduser()
     path = base / key.relative_path
@@ -141,7 +142,7 @@ def save_runtime_winner(
         "config_id": config_id,
         "config": dict(config),
         "median_ms": median_ms,
-        "metadata": dict(metadata or {}),
+        "metadata": {**dict(metadata or {}), **({'tuning_evidence':dict(tuning_evidence)} if tuning_evidence is not None else {})},
     }
     temporary: str | None = None
     try:
@@ -207,6 +208,8 @@ def load_runtime_winner(
     *,
     root: Path | str | None = None,
     rejection: Callable[[ConfigT], str | None] | None = None,
+    tuning_policy=None,
+    backward: bool = False,
 ) -> ConfigT | None:
     base = default_cache_dir() if root is None else Path(root).expanduser()
     path = base / key.relative_path
@@ -215,6 +218,8 @@ def load_runtime_winner(
     except FileNotFoundError:
         return None
     except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, dict):
         return None
     expected_problem = {
         "m": key.problem.m,
@@ -238,6 +243,32 @@ def load_runtime_winner(
         return None
     if rejection is not None and rejection(config) is not None:
         return None
+    metadata = document.get('metadata', {})
+    evidence = metadata.get('tuning_evidence', {}) if isinstance(metadata, dict) else {}
+    from .paired_promotion import PROMOTION_REVISION
+    # Reject previously confirmed winners under the unsafe confirmation ABI,
+    # including reuse mode. Raw search evidence remains compatible/reusable.
+    if (isinstance(evidence, dict) and evidence.get('finalist_rounds') and
+            evidence.get('promotion_revision') != PROMOTION_REVISION):
+        return None
+    if getattr(tuning_policy, 'cache_behavior', 'reuse') == 'refine':
+        policy=tuning_policy.for_pass(backward)
+        metadata=document.get('metadata', {})
+        evidence=metadata.get('tuning_evidence', {}) if isinstance(metadata, dict) else {}
+        if key.family == 'mxfp8_bwd':
+            from .runtime_coordinates import BWD_COORDINATE_REVISION
+            if not isinstance(evidence, dict) or evidence.get('backward_coordinate_revision') != BWD_COORDINATE_REVISION:
+                return None
+        if (not isinstance(evidence, dict) or evidence.get('schema') != 1 or
+                evidence.get('contract') != policy.evidence_contract() or
+                type(evidence.get('attempted_trials')) is not int or
+                evidence['attempted_trials'] < policy.max_trials):
+            return None
+        if policy.finalist_rounds and (type(evidence.get('finalist_rounds')) is not int or
+                                      evidence['finalist_rounds'] < policy.finalist_rounds or
+                                      evidence.get('promotion_revision') != PROMOTION_REVISION or
+                                      evidence.get('finalist_margin') != policy.finalist_margin):
+            return None
     return config
 
 
@@ -268,6 +299,13 @@ def list_runtime_winners(
                 }
             )
             continue
+        if not isinstance(document, dict):
+            rows.append({
+                "path": str(path),
+                "valid": False,
+                "error": "runtime winner document must be a JSON object",
+            })
+            continue
         family = str(document.get("family", ""))
         device_id = str(document.get("device_id", ""))
         if family_filter is not None and family not in family_filter:
@@ -282,6 +320,7 @@ def list_runtime_winners(
         )
         rows.append(
             {
+                **document,
                 "path": str(path),
                 "valid": compatible,
                 "compatibility": (
@@ -291,7 +330,6 @@ def list_runtime_winners(
                     if schema_version == 1
                     else "incompatible_schema"
                 ),
-                **document,
             }
         )
     return rows

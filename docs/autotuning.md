@@ -57,11 +57,17 @@ includes the kernel revision. Preserve their source datasets for analysis.
 
 ## GLU/MLP distinction
 
-Feature-branch modules use explicit `module.autotune_(example_x, ...)` before
-compile/capture. MLP searches whole forward or forward+recomputed-backward
-time, then installs one `.config`. It does not automatically tune each new
-shape or use the linear runtime-winner installer. Persist its JSON policy
-separately from weights and revalidate it on other workloads/devices.
+Feature-branch modules default to tuning off, but accept the same
+`autotune="balanced"`, `tuning_policy`, and `autotune_cache_dir` constructor
+controls for opt-in first-hit selection. GLU tunes forward only within its
+configured backend. Automatic MLP selection requires MXFP8 precision and
+selects a forward-owned recomputation plan; it is not independent per-GEMM
+linear winner installation. See [frontend controls](api.md#shared-frontend-controls).
+
+Explicit `module.autotune_(example_x, ...)` is still available before
+compile/capture. MLP can search whole forward or forward+recomputed-backward
+time and install a shape policy. Keep exported policies separate from weights
+and revalidate them on other workloads/devices.
 
 ## Run a campaign
 

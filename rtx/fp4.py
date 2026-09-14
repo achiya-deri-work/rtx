@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from contextlib import nullcontext
 import hashlib
 import json
 import math
@@ -54,7 +55,7 @@ if TYPE_CHECKING:
     from .kernels.mxfp8_bwd import MXFP8BwdConfig
 
 WeightMode = Literal["dynamic", "prequantized"]
-NVFP4_FRONTEND_REVISION = 7
+NVFP4_FRONTEND_REVISION = 10
 DEFAULT_NVFP4_X_SCALE_REGION_ROWS = 5
 DEFAULT_NVFP4_WEIGHT_SCALE_REGION_ROWS = 4
 
@@ -965,6 +966,7 @@ def _packed_inference_config_key(
                 runtime_winner_key(family, problem, device=device, variant=variant),
                 fully_prequant_config_from_dict,
                 root=request.cache_dir,
+                tuning_policy=request.policy if request.mode == 'balanced' else None,
                 rejection=lambda value: value.rejection(problem),
             )
         if selected is None and request.mode in ("balanced", "coordinate"):
@@ -979,6 +981,7 @@ def _packed_inference_config_key(
                     winner_key,
                     fully_prequant_config_from_dict,
                     root=request.cache_dir,
+                    tuning_policy=request.policy if request.mode == 'balanced' else None,
                     rejection=lambda value: value.rejection(problem),
                 )
                 if selected is None:
@@ -1008,6 +1011,7 @@ def _packed_inference_config_key(
                 runtime_winner_key(family, problem, device=device, variant=variant),
                 weight_prequant_config_from_dict,
                 root=request.cache_dir,
+                tuning_policy=request.policy if request.mode == 'balanced' else None,
                 rejection=lambda value: value.rejection(problem),
             )
         if selected is None and request.mode in ("balanced", "coordinate"):
@@ -1022,6 +1026,7 @@ def _packed_inference_config_key(
                     winner_key,
                     weight_prequant_config_from_dict,
                     root=request.cache_dir,
+                    tuning_policy=request.policy if request.mode == 'balanced' else None,
                     rejection=lambda value: value.rejection(problem),
                 )
                 if selected is None:
@@ -1075,10 +1080,19 @@ def _materialized_dynamic_config_key(
     family: str = "nvfp4_dynamic_fwd",
     x_scale_region_rows: int = 0,
     weight_scale_region_rows: int = 0,
+    delayed_forward_config_key: str | None = None,
 ) -> str:
     """Resolve a verified joint quantize+GEMM winner for dynamic operands."""
 
     request = _AUTOTUNE_REQUESTS[request_key]
+    scale_policy = None
+    variant = "default"
+    if family == "nvfp4_delayed_fwd":
+        from .nvfp4_inference_autotune import delayed_scale_variant
+
+        if delayed_forward_config_key is not None:
+            scale_policy = _resolve_forward_config(delayed_forward_config_key).policy
+        variant = delayed_scale_variant(scale_policy)
     selection_key = (
         family,
         device.index,
@@ -1088,6 +1102,7 @@ def _materialized_dynamic_config_key(
         request_key,
         x_scale_region_rows,
         weight_scale_region_rows,
+        variant,
     )
     selected_key = _DYNAMIC_CONFIG_SELECTIONS.get(selection_key)
     if selected_key is not None:
@@ -1110,26 +1125,30 @@ def _materialized_dynamic_config_key(
     winner_key = None
     selected = request.dynamic
     if selected is None and request.mode != "off":
-        winner_key = runtime_winner_key(family, problem, device=device)
+        winner_key = runtime_winner_key(family, problem, device=device, variant=variant)
         selected = load_runtime_winner(
             winner_key,
             dynamic_config_from_dict,
             root=request.cache_dir,
+            tuning_policy=request.policy if request.mode == 'balanced' else None,
             rejection=reject_runtime_dynamic,
         )
-        if selected is None and family == "nvfp4_delayed_fwd":
+        if (selected is None and family == "nvfp4_delayed_fwd" and variant == "default" and
+                not (request.mode == 'balanced' and
+                     getattr(request.policy, 'cache_behavior', 'reuse') == 'refine')):
             selected = load_runtime_winner(
                 runtime_winner_key(
                     "nvfp4_dynamic_fwd", problem, device=device
                 ),
                 dynamic_config_from_dict,
                 root=request.cache_dir,
+                tuning_policy=request.policy if request.mode == 'balanced' else None,
                 rejection=lambda value: value.rejection(problem),
             )
     if (
         selected is None
         and request.mode in ("balanced", "coordinate")
-        and family in ("nvfp4_dynamic_fwd", "nvfp4_jit_row_region_fwd")
+        and family in ("nvfp4_dynamic_fwd", "nvfp4_jit_row_region_fwd", "nvfp4_delayed_fwd")
     ):
         from .nvfp4_inference_autotune import tune_nvfp4_inference_state
         from .autotune.runtime import balanced_effort_policy
@@ -1140,6 +1159,7 @@ def _materialized_dynamic_config_key(
                 winner_key,
                 dynamic_config_from_dict,
                 root=request.cache_dir,
+                tuning_policy=request.policy if request.mode == 'balanced' else None,
                 rejection=reject_runtime_dynamic,
             )
             if selected is None:
@@ -1148,10 +1168,12 @@ def _materialized_dynamic_config_key(
                     state=(
                         "jit_row_region"
                         if family == "nvfp4_jit_row_region_fwd"
+                        else "delayed" if family == "nvfp4_delayed_fwd"
                         else "dynamic"
                     ),
                     device=device,
                     cache_dir=request.cache_dir,
+                    scale_policy=scale_policy,
                     policy=(
                         request.policy
                         if request.policy is not None
@@ -1223,6 +1245,7 @@ def _materialized_dynamic_config_key_from_dims(
     family: str = "nvfp4_dynamic_fwd",
     x_scale_region_rows: int = 0,
     weight_scale_region_rows: int = 0,
+    delayed_forward_config_key: str | None = None,
 ) -> str:
     return _materialized_dynamic_config_key(
         NVFP4Problem(int(m), int(n), int(k)),
@@ -1231,6 +1254,7 @@ def _materialized_dynamic_config_key_from_dims(
         family,
         x_scale_region_rows,
         weight_scale_region_rows,
+        delayed_forward_config_key,
     )
 
 
@@ -1418,6 +1442,26 @@ def _launch_nvfp4_forward_delayed(
     return out, next_x_amax_state, next_weight_amax_state
 
 
+def _publish_delayed_history(x_history, weight_history, next_x, next_weight):
+    """Publish completed telemetry on-stream without eager Torch operations.
+
+    Quantization must finish before modifying its source history. Keeping the
+    source addresses stable makes every CUDA graph replay consume its immediate
+    predecessor's state. Explicit out-of-place operator users do not call this.
+    """
+    from cuda.bindings import runtime
+
+    stream = int(torch._C._cuda_getCurrentRawStream(x_history.device.index))
+    for destination, source in ((x_history, next_x), (weight_history, next_weight)):
+        result = runtime.cudaMemcpyAsync(
+            int(destination.data_ptr()), int(source.data_ptr()), int(destination.nbytes),
+            runtime.cudaMemcpyKind.cudaMemcpyDeviceToDevice, stream,
+        )
+        status = result[0] if isinstance(result, tuple) else result
+        if status != runtime.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"delayed history cudaMemcpyAsync failed with {status}")
+
+
 def _launch_nvfp4_forward_delayed_out(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1427,6 +1471,27 @@ def _launch_nvfp4_forward_delayed_out(
     next_weight_amax_state: torch.Tensor,
     forward_config_key: str,
     materialized_config_key: str = "",
+    bootstrap_history: bool = False,
+) -> torch.Tensor:
+    from ._delayed_state import DELAYED_HISTORY_EXECUTION
+    states=(x_amax_state,weight_amax_state,next_x_amax_state,next_weight_amax_state)
+    guard=(DELAYED_HISTORY_EXECUTION.submission(states,torch.cuda.current_stream(x.device))
+           if bootstrap_history else nullcontext())
+    with guard:
+        return _submit_nvfp4_forward_delayed_out(x,weight,*states,forward_config_key,
+            materialized_config_key,bootstrap_history)
+
+
+def _submit_nvfp4_forward_delayed_out(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_amax_state: torch.Tensor,
+    weight_amax_state: torch.Tensor,
+    next_x_amax_state: torch.Tensor,
+    next_weight_amax_state: torch.Tensor,
+    forward_config_key: str,
+    materialized_config_key: str = "",
+    bootstrap_history: bool = False,
 ) -> torch.Tensor:
     _check_nvfp4_inputs(x, weight)
     _check_sm12x(x.device)
@@ -1467,6 +1532,14 @@ def _launch_nvfp4_forward_delayed_out(
     if next_weight_amax_state.data_ptr() == weight_amax_state.data_ptr():
         raise ValueError("delayed weight amax generations must not alias")
     stream = torch.cuda.current_stream(x.device)
+    if bootstrap_history:
+        from ._delayed_state import DELAYED_HISTORY_BOOTSTRAP
+        DELAYED_HISTORY_BOOTSTRAP.prepare(
+            x_c, weight_c, x_amax_state, weight_amax_state,
+            next_x_amax_state, next_weight_amax_state,
+            stream_id=stream.cuda_stream,
+            policy_key=(forward_config_key, materialized_config_key),
+        )
     cache_key = (
         x.device.index,
         stream.cuda_stream,
@@ -1492,6 +1565,9 @@ def _launch_nvfp4_forward_delayed_out(
         next_weight_amax_state,
         out,
     )
+    if bootstrap_history:
+        _publish_delayed_history(x_amax_state, weight_amax_state,
+                                 next_x_amax_state, next_weight_amax_state)
     out._base_inputs = (
         x_c,
         weight_c,
@@ -1936,7 +2012,7 @@ torch.library.register_autograd(
 
 @torch.library.custom_op(
     "rtx::nvfp4_linear_train_delayed",
-    mutates_args=("next_x_amax_state", "next_weight_amax_state"),
+    mutates_args=("x_amax_state", "weight_amax_state", "next_x_amax_state", "next_weight_amax_state"),
     device_types="cuda",
 )
 def _nvfp4_linear_train_delayed_op(
@@ -1949,6 +2025,7 @@ def _nvfp4_linear_train_delayed_op(
     forward_config_key: str,
     materialized_config_key: str,
     backward_config_key: str,
+    bootstrap_history: bool = False,
 ) -> torch.Tensor:
     return _launch_nvfp4_forward_delayed_out(
         x,
@@ -1959,6 +2036,7 @@ def _nvfp4_linear_train_delayed_op(
         next_weight_amax_state,
         forward_config_key,
         materialized_config_key,
+        bootstrap_history,
     )
 
 
@@ -1973,6 +2051,7 @@ def _nvfp4_linear_train_delayed_fake(
     forward_config_key: str,
     materialized_config_key: str,
     backward_config_key: str,
+    bootstrap_history: bool = False,
 ) -> torch.Tensor:
     return torch.empty(
         (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
@@ -1983,15 +2062,34 @@ class _InductorNVFP4DelayedLauncher:
     """Shape-bound delayed launcher used directly by generated wrappers."""
 
     def __init__(
-        self, forward_config_key: str, materialized_config_key: str
+        self, forward_config_key: str, materialized_config_key: str, bootstrap_history: bool = False
     ) -> None:
         self.forward_config_key = forward_config_key
         self.materialized_config_key = materialized_config_key
+        self.bootstrap_history = bootstrap_history
         self.runners: BoundedCache[tuple[object, ...], object] = (
             BoundedCache(runner_cache_limit("inductor_delayed", 8, namespace="NVFP4"))
         )
 
     def __call__(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        x_amax_state: torch.Tensor,
+        weight_amax_state: torch.Tensor,
+        next_x_amax_state: torch.Tensor,
+        next_weight_amax_state: torch.Tensor,
+        *,
+        out: torch.Tensor,
+    ) -> None:
+        from ._delayed_state import DELAYED_HISTORY_EXECUTION
+        states=(x_amax_state,weight_amax_state,next_x_amax_state,next_weight_amax_state)
+        guard=(DELAYED_HISTORY_EXECUTION.submission(states,torch.cuda.current_stream(x.device))
+               if self.bootstrap_history else nullcontext())
+        with guard:
+            self._submit(x,weight,*states,out=out)
+
+    def _submit(
         self,
         x: torch.Tensor,
         weight: torch.Tensor,
@@ -2011,6 +2109,14 @@ class _InductorNVFP4DelayedLauncher:
         config = _resolve_forward_config(self.materialized_config_key)
         public = _resolve_forward_config(self.forward_config_key)
         policy = public.policy or DEFAULT_NVFP4_SCALE_CONFIG
+        if self.bootstrap_history:
+            from ._delayed_state import DELAYED_HISTORY_BOOTSTRAP
+            DELAYED_HISTORY_BOOTSTRAP.prepare(
+                x, weight, x_amax_state, weight_amax_state,
+                next_x_amax_state, next_weight_amax_state,
+                stream_id=stream_id,
+                policy_key=(self.forward_config_key, self.materialized_config_key),
+            )
         key = (
             "materialized",
             x.device.index,
@@ -2038,10 +2144,13 @@ class _InductorNVFP4DelayedLauncher:
             next_weight_amax_state,
             out,
         )
+        if self.bootstrap_history:
+            _publish_delayed_history(x_amax_state, weight_amax_state,
+                                     next_x_amax_state, next_weight_amax_state)
 
 
-class _InductorNVFP4DelayedRegistry(dict[tuple[str, str], object]):
-    def __missing__(self, config_key: tuple[str, str]) -> object:
+class _InductorNVFP4DelayedRegistry(dict[tuple[object, ...], object]):
+    def __missing__(self, config_key: tuple[object, ...]) -> object:
         with _CONFIG_LOCK:
             launcher = self.get(config_key)
             if launcher is None:
@@ -2575,6 +2684,7 @@ def _register_delayed_inductor_lowering() -> None:
         forward_config_key,
         materialized_config_key,
         backward_config_key,
+        bootstrap_history=False,
     ):
         inputs = [
             ir.ExternKernel.require_contiguous(ir.ExternKernel.realize_input(value))
@@ -2591,7 +2701,7 @@ def _register_delayed_inductor_lowering() -> None:
         n = weight.get_size()[0]
         name = (
             "torch._rtx_nvfp4_delayed_launchers"
-            f"[{(forward_config_key, materialized_config_key)!r}]"
+            f"[{(forward_config_key, materialized_config_key, bootstrap_history)!r}]"
         )
         return ir.TensorBox.create(
             ir.ExternKernelOut(
@@ -2659,9 +2769,11 @@ class _NVFP4DelayedAutograd(torch.autograd.Function):
         forward_config_key: str,
         materialized_config_key: str,
         backward_config_key: str,
+        bootstrap_history: bool = False,
     ) -> torch.Tensor:
         ctx.save_for_backward(x, weight)
         ctx.backward_config_key = backward_config_key
+        ctx.bootstrap_argument_count = len(ctx.needs_input_grad)
         return _nvfp4_linear_train_delayed_op(
             x,
             weight,
@@ -2672,11 +2784,13 @@ class _NVFP4DelayedAutograd(torch.autograd.Function):
             forward_config_key,
             materialized_config_key,
             backward_config_key,
+            bootstrap_history,
         )
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        return _nvfp4_delayed_backward(ctx, grad_output)
+        result = _nvfp4_delayed_backward(ctx, grad_output)
+        return result + (None,) * (ctx.bootstrap_argument_count - len(result))
 
 
 def nvfp4_linear(
@@ -3142,28 +3256,30 @@ class NVFP4Linear(nn.Module):
                 )
             )
             self.reset_parameters()
+            history_values = (
+                _delayed_history_values_from_key(self._forward_config_key)
+                if self.scaling == "delayed" else 0
+            )
             self.register_buffer(
                 "_x_amax_state",
-                torch.empty(0, dtype=torch.float32, device=device),
+                torch.empty(history_values, dtype=torch.float32, device=device),
                 persistent=False,
             )
             self.register_buffer(
                 "_weight_amax_state",
-                torch.empty(0, dtype=torch.float32, device=device),
+                torch.empty(history_values, dtype=torch.float32, device=device),
                 persistent=False,
             )
             self.register_buffer(
                 "_next_x_amax_state",
-                torch.empty(0, dtype=torch.float32, device=device),
+                torch.empty(history_values, dtype=torch.float32, device=device),
                 persistent=False,
             )
             self.register_buffer(
                 "_next_weight_amax_state",
-                torch.empty(0, dtype=torch.float32, device=device),
+                torch.empty(history_values, dtype=torch.float32, device=device),
                 persistent=False,
             )
-            self._delayed_initialized = False
-            self._delayed_problem: tuple[object, ...] | None = None
         else:
             validate_nvfp4_tensor(packed_weight)
             if nvfp4_matrix_shape(packed_weight) != (
@@ -3278,15 +3394,50 @@ class NVFP4Linear(nn.Module):
         if self.weight_mode != "dynamic":
             return
         self._x_amax_state = torch.empty(
-            0,
+            _delayed_history_values_from_key(self._forward_config_key)
+            if self.scaling == "delayed" else 0,
             dtype=torch.float32,
             device=self._x_amax_state.device,
         )
         self._weight_amax_state = torch.empty_like(self._x_amax_state)
         self._next_x_amax_state = torch.empty_like(self._x_amax_state)
         self._next_weight_amax_state = torch.empty_like(self._x_amax_state)
-        self._delayed_initialized = False
-        self._delayed_problem = None
+
+    def __deepcopy__(self, memo):
+        import copy
+        from ._delayed_state import DELAYED_HISTORY_BOOTSTRAP
+
+        result = type(self).__new__(type(self))
+        memo[id(self)] = result
+        result.__setstate__(copy.deepcopy(self.__getstate__(), memo))
+        if self.weight_mode == 'dynamic' and self.scaling == 'delayed':
+            names = ('_x_amax_state', '_weight_amax_state',
+                     '_next_x_amax_state', '_next_weight_amax_state')
+            DELAYED_HISTORY_BOOTSTRAP.inherit_copy(
+                tuple(getattr(self, name) for name in names),
+                tuple(getattr(result, name) for name in names),
+            )
+        return result
+
+    @property
+    def _delayed_problem(self):
+        # Diagnostic compatibility only. No traced forward reads this metadata.
+        from ._delayed_state import DELAYED_HISTORY_BOOTSTRAP
+        if self.weight_mode != "dynamic":
+            return None
+        signature = DELAYED_HISTORY_BOOTSTRAP.state_signature(
+            self._x_amax_state, self._weight_amax_state,
+            self._next_x_amax_state, self._next_weight_amax_state,
+        )
+        if signature is None:
+            return None
+        x_shape, w_shape, stream_id, keys, _length = signature
+        return (self.weight.device.type, self.weight.device.index,
+                stream_id, x_shape[0], w_shape[0], x_shape[1], keys[1])
+
+    @property
+    def _delayed_initialized(self):
+        return self._delayed_problem is not None
 
     @property
     def packed_weight(self) -> NVFP4Tensor | None:
@@ -3466,38 +3617,8 @@ class NVFP4Linear(nn.Module):
                 x_2d.device,
                 self._materialized_request_key,
                 "nvfp4_delayed_fwd",
+                delayed_forward_config_key=self._forward_config_key,
             )
-            delayed_problem = (
-                x_2d.device.type,
-                x_2d.device.index,
-                torch.cuda.current_stream(x_2d.device).cuda_stream,
-                int(x_2d.shape[0]),
-                int(self.weight.shape[0]),
-                int(x_2d.shape[1]),
-                materialized_key,
-            )
-            if (
-                not self._delayed_initialized
-                or self._delayed_problem != delayed_problem
-            ):
-                with torch.no_grad():
-                    state_values = _delayed_history_values_from_key(
-                        self._forward_config_key
-                    )
-                    self._x_amax_state = _delayed_amax_state(
-                        x_2d, state_values
-                    )
-                    self._weight_amax_state = _delayed_amax_state(
-                        self.weight, state_values
-                    )
-                    self._next_x_amax_state = torch.empty_like(
-                        self._x_amax_state
-                    )
-                    self._next_weight_amax_state = torch.empty_like(
-                        self._weight_amax_state
-                    )
-                self._delayed_initialized = True
-                self._delayed_problem = delayed_problem
             needs_grad = torch.is_grad_enabled() and (
                 x_2d.requires_grad or self.weight.requires_grad
             )
@@ -3512,6 +3633,7 @@ class NVFP4Linear(nn.Module):
                     self._forward_config_key,
                     materialized_key,
                     self._backward_config_key,
+                    True,
                 )
             else:
                 # Delayed scaling is a forward numerical/performance policy,
@@ -3529,15 +3651,10 @@ class NVFP4Linear(nn.Module):
                     self._forward_config_key,
                     materialized_key,
                     self._backward_config_key,
+                    True,
                 )
-            self._x_amax_state, self._next_x_amax_state = (
-                self._next_x_amax_state,
-                self._x_amax_state,
-            )
-            self._weight_amax_state, self._next_weight_amax_state = (
-                self._next_weight_amax_state,
-                self._weight_amax_state,
-            )
+            # The launcher publishes history into these stable addresses;
+            # Python pointer swaps do not execute during CUDA graph replay.
             return out.reshape(*leading_shape, self.out_features)
         return _nvfp4_dynamic_linear_with_keys(
             x,

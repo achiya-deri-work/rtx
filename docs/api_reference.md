@@ -9,7 +9,7 @@ not a declaration that this development checkout is a released 1.0 build.
 
 ## `rtx.AutotunePolicy`
 
-Explicit feature/compatibility export; provider `rtx.autotune.effort.AutotunePolicy`.
+Stable runtime export; provider `rtx.autotune.effort.AutotunePolicy`.
 
 [Source](../rtx/autotune/effort.py)
 
@@ -18,26 +18,37 @@ Per-context cumulative trial cap and per-invocation wall-time allowance.
 ```python
 class AutotunePolicy:
     max_trials: int = 16
+    search_schedule: str = 'legacy'
+    cache_behavior: str = 'reuse'
     max_seconds: float = 30.0
     pool_size: int = 128
     candidate_mix: str = 'legacy'
     structural_proposals: int = 512
     retrieval_trials: int | None = None
+    ranked_opening_trials: int = 0
     exploration_trials: int = 1
+    baseline_trials: int = 0
+    initial_neighborhood_trials: int = 0
+    local_anchor_tolerance: float = 0.0
     prior_artifact: str | None = None
     predictor_artifact: str | None = None
     predictor_heads: tuple[str, ...] = ('residual', 'mlp')
     allow_research_prior: bool = False
     exploration: float = 0.15
     confirmation_repeats: int = 1
+    finalist_rounds: int = 0
+    finalist_margin: float = 0.005
+    finalist_reserve_fraction: float = 0.2
     seed: int = 20260914
     warmup: int = 3
     samples: int = 5
     calls_per_sample: int = 3
+    backward_measurement_mode: str = 'host'
     forward_trials: int | None = None
     backward_trials: int | None = None
     def preset(cls, name, **overrides)
     def for_pass(self, backward=False)
+    def evidence_contract(self)
     def coordinate(self, *, rtol=0.05, atol=0.5)
 ```
 
@@ -232,7 +243,7 @@ Experimental bias-free gate/up module; **backward is not implemented**.
 
 ```python
 class MXFP8GLU(torch.nn.Module):
-    def __init__(self, in_features, hidden_features, *, activation='silu', output_format='bf16', packed_output=False, config=MXFP8GLUPrequantConfig(), device=None, dtype=torch.bfloat16)
+    def __init__(self, in_features, hidden_features, *, activation='silu', output_format='bf16', packed_output=False, config=MXFP8GLUPrequantConfig(), device=None, dtype=torch.bfloat16, autotune='off', tuning_policy=None, autotune_cache_dir=None)
     def reset_parameters(self)
     def forward(self, x)
     def autotune_(self, example_x, **kwargs)
@@ -250,7 +261,7 @@ Bias-free GLU MLP with full recomputation and no saved hidden activations.
 
 ```python
 class MXFP8MLP(torch.nn.Module):
-    def __init__(self, in_features, hidden_features, out_features=None, *, activation='silu', config=DEFAULT_MLP_CONFIG, precision='mxfp8', device=None, dtype=torch.bfloat16)
+    def __init__(self, in_features, hidden_features, out_features=None, *, activation='silu', config=DEFAULT_MLP_CONFIG, precision='mxfp8', device=None, dtype=torch.bfloat16, autotune='off', tuning_policy=None, autotune_cache_dir=None)
     def reset_parameters(self)
     def from_linears(cls, gate, up, down, *, activation='silu', config=DEFAULT_MLP_CONFIG, precision='mxfp8')
     def forward(self, x)
@@ -1067,6 +1078,7 @@ class BwdTuningResult:
     evaluated_trials: int
     reused_trials: int
     elapsed_s: float
+    tuning_evidence: dict[str, object] | None = None
 ```
 
 ## `rtx.load_cached_mxfp8_bwd_config`
@@ -1128,6 +1140,7 @@ class PrequantTuningResult:
     evaluated_trials: int
     reused_trials: int
     elapsed_s: float
+    tuning_evidence: dict[str, object] | None = None
 ```
 
 ## `rtx.load_cached_mxfp8_prequant_config`
@@ -1171,5 +1184,5 @@ Explicit feature/compatibility export; provider `rtx.nvfp4_inference_autotune.tu
 Tune one NVFP4 materialized operand state and publish its winner.
 
 ```python
-tune_nvfp4_inference_state(problem, *, state: str, device='cuda', cache_dir: Path | str | None=None, policy=None, progress=print)
+tune_nvfp4_inference_state(problem, *, state: str, device='cuda', cache_dir: Path | str | None=None, policy=None, scale_policy=None, progress=print)
 ```

@@ -34,6 +34,7 @@ from cutlass.experimental.primitives import nvvm_wrapper as nvvm
 
 from ..configs.mxfp8 import MXFP8GemmConfig
 from .mxfp8 import MXFP8Problem
+from ._layout_contracts import preserve_tma_singletons
 from .mxfp8_fwd import (
     SF_VEC_SIZE,
     _make_ldmatrix_atom,
@@ -2093,13 +2094,13 @@ def compile_mxfp8_gemm(
     )
     qx = cute.runtime.make_fake_tensor(
         Float8E4M3FN,
-        (problem.m, problem.k),
+        preserve_tma_singletons((problem.m, problem.k)),
         stride=(problem.k, 1),
         assumed_align=16,
     )
     qw = cute.runtime.make_fake_tensor(
         Float8E4M3FN,
-        (problem.n, problem.k),
+        preserve_tma_singletons((problem.n, problem.k)),
         stride=(problem.k, 1),
         assumed_align=16,
     )

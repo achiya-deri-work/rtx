@@ -17,6 +17,7 @@ from cutlass.cute.nvgpu import warp
 
 from ..configs.nvfp4 import NVFP4GemmConfig, NVFP4Problem, NVFP4_SF_VEC_SIZE
 from .mxfp8_gemm import MXFP8GemmKernel
+from ._layout_contracts import preserve_tma_singletons
 
 
 class NVFP4GemmKernel(MXFP8GemmKernel):
@@ -397,13 +398,13 @@ def compile_nvfp4_gemm(
     kernel = NVFP4GemmKernel(problem, config)
     qx = cute.runtime.make_fake_tensor(
         Float4E2M1FN,
-        (problem.m, problem.k),
+        preserve_tma_singletons((problem.m, problem.k)),
         stride=(problem.k, 1),
         assumed_align=16,
     )
     qw = cute.runtime.make_fake_tensor(
         Float4E2M1FN,
-        (problem.n, problem.k),
+        preserve_tma_singletons((problem.n, problem.k)),
         stride=(problem.k, 1),
         assumed_align=16,
     )
@@ -448,13 +449,13 @@ def compile_nvfp4_block_gemm(
     kernel = NVFP4BlockGemmKernel(problem, config)
     qx = cute.runtime.make_fake_tensor(
         Float4E2M1FN,
-        (problem.m, problem.k),
+        preserve_tma_singletons((problem.m, problem.k)),
         stride=(problem.k, 1),
         assumed_align=16,
     )
     qw = cute.runtime.make_fake_tensor(
         Float4E2M1FN,
-        (problem.n, problem.k),
+        preserve_tma_singletons((problem.n, problem.k)),
         stride=(problem.k, 1),
         assumed_align=16,
     )
@@ -500,13 +501,13 @@ def compile_nvfp4_jit_region_gemm(
     )
     qx = cute.runtime.make_fake_tensor(
         Float4E2M1FN,
-        (problem.m, problem.k),
+        preserve_tma_singletons((problem.m, problem.k)),
         stride=(problem.k, 1),
         assumed_align=16,
     )
     qw = cute.runtime.make_fake_tensor(
         Float4E2M1FN,
-        (problem.n, problem.k),
+        preserve_tma_singletons((problem.n, problem.k)),
         stride=(problem.k, 1),
         assumed_align=16,
     )

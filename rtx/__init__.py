@@ -105,6 +105,7 @@ _LAZY_EXPORTS = {
 # Historical tuner symbols remain directly addressable for compatibility, but
 # new integrations should import them from ``rtx.autotune``.
 _STABLE_EXPORTS = (
+    "AutotunePolicy",
     "MXTensor", "MXFP8Tensor", "NVFP4Tensor", "LinearOperandState",
     "LinearExecutionDecision", "AutotuneMode", "LinearBackend",
     "MXFP8Backend", "NVFP4Backend", "NVFP4ScalingMode", "MXFP8Linear", "NVFP4Linear",

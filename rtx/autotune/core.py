@@ -345,6 +345,8 @@ class ComposableTuningResult(Generic[ConfigT]):
     elapsed_s: float
     strategy_trials: dict[str, int]
     store_path: str | None
+    winner_decision: dict[str, object] | None = None
+    tuning_evidence: dict[str, object] | None = None
 
 
 def evaluate_proposal(

@@ -167,7 +167,8 @@ def make_glu_adapter(x, weight, *, activation="silu", output_format="bf16",
 
 def tune_mxfp8_glu(x, weight, *, activation="silu", output_format="bf16",
                     output_dir="autotune_results/glu", max_trials=32,
-                    time_budget_s=120, seed=0, progress=print, backend="auto", seed_history=None,tuning_policy=None):
+                    time_budget_s=120, seed=0, progress=print, backend="auto", seed_history=None,tuning_policy=None,
+                    initial=None):
     """Run/resume a bounded bandit portfolio; return its persistent winner.
 
     Explicitly call before torch.compile, then pass ``result.config`` to GLU.
@@ -181,6 +182,8 @@ def tune_mxfp8_glu(x, weight, *, activation="silu", output_format="bf16",
         tuning_policy=tuning_policy.for_pass()
         max_trials,time_budget_s,seed=tuning_policy.max_trials,tuning_policy.max_seconds,tuning_policy.seed
     if backend=="auto":
+        if initial is not None:
+            raise ValueError('an explicit initial GLU config requires an explicit backend')
         if max_trials < 2:
             raise ValueError("auto backend search needs at least two trials")
         started=time.monotonic()
@@ -204,6 +207,10 @@ def tune_mxfp8_glu(x, weight, *, activation="silu", output_format="bf16",
         }
         adapter = make_glu_adapter(x, weight, activation=activation, output_format=output_format,
                                    backend=backend, **measurement)
+        if initial is not None:
+            if type(initial) is not type(adapter.initial_config) or adapter.rejection(initial) is not None:
+                raise ValueError('initial GLU config is incompatible with the problem/backend')
+            adapter.initial_config=initial
         if seed_history is not None:
             import json
             candidates=[]
@@ -228,7 +235,14 @@ def tune_mxfp8_glu(x, weight, *, activation="silu", output_format="bf16",
                                     time_budget_s=time_budget_s, seed=seed,
                                     confirmation_repeats=2, confirm_initial=True,
                                     use_pretrained=False, use_pairwise=False)
-        store = ResidualTuningStore(Path(output_dir) / adapter.context.identifier,
+        if tuning_policy is not None and tuning_policy.search_schedule == 'progressive':
+            from .runtime_coordinates import runtime_schedule_adapter
+            adapter=runtime_schedule_adapter(adapter)
+        store_root=Path(output_dir)/adapter.context.identifier
+        if tuning_policy is not None:
+            from .effort import effort_residual_root
+            store_root=effort_residual_root(store_root,tuning_policy)
+        store = ResidualTuningStore(store_root,
                                     transfer_root=output_dir)
         return make_hybrid_autotuner(adapter, store,tuning_policy or policy, progress=progress,started_at=tuning_started).tune()
 

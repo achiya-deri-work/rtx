@@ -22,7 +22,11 @@ def mixed_pool(adapter, *, limit=128, seed=1729, retrieved=(), seeds=(),
         min(limit, structural_proposals), structural_proposals, seed))
     structural, audit = select_portfolio(adapter, raw, limit)
     local = adapter.sample(random.Random(seed), limit, [adapter.initial_config])
-    sources = [('seed', [adapter.initial_config, *seeds], 1),
+    # Explicit caller anchors are not ordinary local-fill candidates. Keep
+    # them before retrieval/structural quotas; a full pool previously silently
+    # discarded every seed after the initial configuration.
+    seeds = list(seeds)
+    sources = [('seed', [adapter.initial_config, *seeds], min(limit, 1 + len(seeds))),
                ('retrieval', list(retrieved), limit // 4),
                ('structural', structural, max(1, limit // 4)),
                ('local', list(local), limit)]

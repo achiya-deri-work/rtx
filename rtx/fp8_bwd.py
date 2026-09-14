@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import os
@@ -80,7 +80,7 @@ def compile_mxfp8_backward_quad_quant(*args, **kwargs):
 if TYPE_CHECKING:
     from .autotune import CoordinateDescentPolicy
 
-BWD_FRONTEND_REVISION = 3
+BWD_FRONTEND_REVISION = 4
 
 
 def _zero_tensor_async(tensor: torch.Tensor) -> None:
@@ -594,6 +594,42 @@ class _BwdAutotuneRequest:
     cache_dir: str | None
 
 
+def _bwd_measurement_variant(policy):
+    mode = getattr(policy, 'backward_measurement_mode', 'host')
+    return 'default' if mode in ('host','auto') else f'measurement_{mode}_v1'
+
+
+_MEASUREMENT_REQUEST_PREFIX = 'bwd-measurement-v1:'
+
+
+def _compiled_bwd_measurement_key(config_key):
+    """Resolve auto at lowering; embed enough data for disk-cache reuse."""
+    request = _AUTOTUNE_REQUESTS.get(config_key)
+    if request is None or getattr(request.policy,'backward_measurement_mode','host') != 'auto':
+        return config_key
+    from torch._inductor import config as inductor_config
+    policy = replace(request.policy, backward_measurement_mode=(
+        'cuda_graph' if inductor_config.triton.cudagraphs else 'host'))
+    return _MEASUREMENT_REQUEST_PREFIX + json.dumps(dict(mode=request.mode,
+        policy=asdict(policy),cache_dir=request.cache_dir),sort_keys=True,separators=(',',':'))
+
+
+def _bwd_request_from_key(config_key):
+    request = _AUTOTUNE_REQUESTS.get(config_key)
+    if request is None and config_key.startswith(_MEASUREMENT_REQUEST_PREFIX):
+        from .autotune.effort import AutotunePolicy
+        payload = json.loads(config_key[len(_MEASUREMENT_REQUEST_PREFIX):])
+        values = payload['policy']
+        values['predictor_heads'] = tuple(values['predictor_heads'])
+        policy = AutotunePolicy(**values)
+        if policy.backward_measurement_mode not in ('host','cuda_graph'):
+            raise ValueError('compiled backward request must have a resolved measurement mode')
+        request = _BwdAutotuneRequest(payload['mode'],policy,payload['cache_dir'])
+        with _LOCK:
+            _AUTOTUNE_REQUESTS[config_key] = request
+    return request
+
+
 @torch.compiler.assume_constant_result
 def _intern_bwd_config(config: MXFP8BwdConfig) -> str:
     config = config.normalized()
@@ -724,7 +760,7 @@ def _resolve_bwd_context(
     torch.Tensor,
 ]:
     problem = _check_bwd_inputs(grad_output, x, weight)
-    request = _AUTOTUNE_REQUESTS.get(config_key)
+    request = _bwd_request_from_key(config_key)
     if request is not None:
         selection_key = (
             config_key,
@@ -749,17 +785,21 @@ def _resolve_bwd_context(
             )
 
             winner_key = runtime_winner_key(
-                "mxfp8_bwd", problem, device=x.device
+                "mxfp8_bwd", problem, device=x.device,
+                variant=_bwd_measurement_variant(request.policy),
             )
             selected = load_runtime_winner(
                 winner_key,
                 bwd_config_from_dict,
                 root=request.cache_dir,
+                tuning_policy=request.policy if request.mode == 'balanced' else None, backward=True,
                 rejection=lambda candidate: candidate.implementation_rejection(
                     problem
                 ),
             )
-            if selected is None:
+            if selected is None and not (request.mode == 'balanced' and
+                                         (getattr(request.policy, 'cache_behavior', 'reuse') == 'refine'
+                                          or _bwd_measurement_variant(request.policy) != 'default')):
                 selected = load_cached_mxfp8_bwd_config(
                     problem, device=x.device, cache_dir=request.cache_dir
                 )
@@ -769,6 +809,7 @@ def _resolve_bwd_context(
                         winner_key,
                         bwd_config_from_dict,
                         root=request.cache_dir,
+                        tuning_policy=request.policy if request.mode == 'balanced' else None, backward=True,
                         rejection=lambda candidate: (
                             candidate.implementation_rejection(problem)
                         ),
@@ -799,6 +840,7 @@ def _resolve_bwd_context(
                             ).hexdigest()[:20],
                             root=request.cache_dir,
                             median_ms=result.median_ms,
+                            tuning_evidence=result.tuning_evidence,
                             metadata={"source": "runtime_tuner"},
                         )
             selected_key = _intern_bwd_config(
@@ -1409,6 +1451,7 @@ def _register_bwd_inductor_lowerings() -> None:
         type_promotion_kind=None,
     )
     def lower_bwd_packed(grad_output, x, weight, config_key):
+        config_key = _compiled_bwd_measurement_key(config_key)
         inputs = [
             ir.ExternKernel.require_contiguous(
                 ir.ExternKernel.realize_input(value)
@@ -1669,17 +1712,21 @@ def mxfp8_linear_backward(
             )
 
             winner_key = runtime_winner_key(
-                "mxfp8_bwd", problem, device=x.device
+                "mxfp8_bwd", problem, device=x.device,
+                variant=_bwd_measurement_variant(tuning_policy),
             )
             cached = load_runtime_winner(
                 winner_key,
                 bwd_config_from_dict,
                 root=autotune_cache_dir,
+                tuning_policy=tuning_policy if mode == 'balanced' else None, backward=True,
                 rejection=lambda candidate: candidate.implementation_rejection(
                     problem
                 ),
             )
-            if cached is None:
+            if cached is None and not (mode == 'balanced' and
+                                       (getattr(tuning_policy, 'cache_behavior', 'reuse') == 'refine'
+                                        or _bwd_measurement_variant(tuning_policy) != 'default')):
                 cached = load_cached_mxfp8_bwd_config(
                     problem,
                     device=x.device,
@@ -1693,6 +1740,7 @@ def mxfp8_linear_backward(
                         winner_key,
                         bwd_config_from_dict,
                         root=autotune_cache_dir,
+                        tuning_policy=tuning_policy if mode == 'balanced' else None, backward=True,
                         rejection=lambda candidate: (
                             candidate.implementation_rejection(problem)
                         ),
@@ -1723,6 +1771,7 @@ def mxfp8_linear_backward(
                             ).hexdigest()[:20],
                             root=autotune_cache_dir,
                             median_ms=result.median_ms,
+                            tuning_evidence=result.tuning_evidence,
                             metadata={"source": "runtime_tuner"},
                         )
             else:

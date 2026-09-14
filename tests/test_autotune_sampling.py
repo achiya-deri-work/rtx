@@ -7,6 +7,30 @@ from tests.test_autotune_coverage import adapter, Config
 
 
 class MixedSamplingTests(unittest.TestCase):
+    def test_explicit_seeds_are_not_lost_to_pool_fill(self):
+        a = adapter()
+        seeds = [Config(2, 2), Config(1, 2)]
+        pool, audit = mixed_pool(a, limit=4, seeds=seeds,
+                                retrieved=[Config(0, 1), Config(0, 2)])
+        self.assertEqual(pool[:3], [a.initial_config, *seeds])
+        self.assertEqual(audit['counts']['seed'], 3)
+
+    def test_baseline_reservation_is_bounded_and_resumable(self):
+        a = adapter()
+        store = InMemoryTuningStore()
+        policy = AutotunePolicy(candidate_mix='mixed', max_trials=8,
+                                baseline_trials=2, confirmation_repeats=0)
+        tuner = make_effort_autotuner(a, store, policy)
+        self.assertEqual(tuner.scheduler.minimum_pulls,
+                         {'structural': 1, 'coordinate_local': 2})
+        result = tuner.tune()
+        self.assertEqual(result.evaluated_trials, 8)
+        self.assertGreaterEqual(result.strategy_trials['coordinate_local'], 2)
+        self.assertEqual(make_effort_autotuner(a, store, policy).tune().evaluated_trials, 0)
+        for value in (-1, True, 8):
+            with self.assertRaises(ValueError):
+                AutotunePolicy(max_trials=8, baseline_trials=value)
+
     def test_retrieval_cannot_starve_structural(self):
         a = adapter()
         retrieval = [Config(i, j) for i in range(4) for j in range(3)] * 30

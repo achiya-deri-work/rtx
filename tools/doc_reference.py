@@ -85,13 +85,17 @@ def render():
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check",action="store_true")
+    mode=parser.add_mutually_exclusive_group()
+    mode.add_argument("--check",action="store_true")
+    mode.add_argument("--write",action="store_true",help="Regenerate docs/api_reference.md")
     args=parser.parse_args()
     expected=render()
     if args.check:
         if (ROOT/"docs/api_reference.md").read_text()!=expected:
             raise SystemExit("API reference is stale; regenerate with tools/doc_reference.py")
         print("API reference matches source")
+    elif args.write:
+        (ROOT/"docs/api_reference.md").write_text(expected)
     else:
         print(expected,end="")
 

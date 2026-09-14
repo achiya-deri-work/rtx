@@ -15,6 +15,10 @@ from .recipes import HybridTuningPolicy,make_hybrid_autotuner
 from .store import ResidualTuningStore
 from .glu import GLU_SEARCH_SPACE
 from ..mlp import DEFAULT_MLP_CONFIG,MLP_CONFIG_REVISION,_parse,_validate,mxfp8_mlp
+
+# Explicit candidate arguments preserve training autograd during nested runtime
+# selection. Do not combine these observations with closure-input revision 34.
+MLP_AUTOTUNE_REVISION = 35
 from ..configs.glu import normalize_glu_config,glu_rejection
 from ..kernels.mxfp8 import FWD_SEARCH_SPACE,MXFP8Problem,normalize_fwd_config
 
@@ -339,8 +343,8 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
             stream.wait_stream(torch.cuda.current_stream(x.device))
             with torch.cuda.stream(stream):
                 capture_inputs=tuple(t.detach().requires_grad_() for t in (x,gu,down))
-            def forward():
-                return mxfp8_mlp(*capture_inputs,activation=activation,config=c,precision=precision)
+            def forward(*values):
+                return mxfp8_mlp(*values,activation=activation,config=c,precision=precision)
             # Both policies measure the same compiler/capture contract. Retire
             # only this candidate closure, not unrelated model compilations.
             torch._dynamo.reset_code(forward.__code__)
@@ -348,8 +352,8 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
             def run():
                 if phase=="forward":
                     with torch.no_grad():
-                        return (forward_fn(),)
-                y=forward_fn()
+                        return (forward_fn(*capture_inputs),)
+                y=forward_fn(*capture_inputs)
                 return (y,*torch.autograd.grad(y,capture_inputs,dy))
             # Compilation, correctness, warmup, and capture must all exercise
             # these candidate-local leaves on the same stream.
@@ -357,11 +361,20 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
                 actual=run()
             stream.synchronize()
             errors=[]
-            for a,b in zip(actual,expected):
-                error=((a.detach().float()-b.float()).norm()/b.float().norm().clamp_min(1e-20)).item()
+            numerics={}
+            for name,a,b in zip(('output','dx','dgate_up','ddown'),actual,expected):
+                difference=a.detach().float()-b.float()
+                error=(difference.norm()/b.float().norm().clamp_min(1e-20)).item()
                 errors.append(error)
-                if not a.isfinite().all() or error>(.003 if precision=="bf16_gate" else .025):
-                    return TrialOutcome("correctness_error",error=f"relative L2 {errors}")
+                numerics[name]=dict(relative_l2=error,
+                    max_abs=float(difference.abs().max()),
+                    rms_error=float(difference.square().mean().sqrt()),
+                    reference_rms=float(b.float().square().mean().sqrt()),
+                    finite=bool(a.isfinite().all()))
+            if any(not v['finite'] or v['relative_l2']>(.003 if precision=="bf16_gate" else .025)
+                   for v in numerics.values()):
+                return TrialOutcome("correctness_error",error=f"relative L2 {errors}",
+                                    metadata={'numerics':numerics,'relative_l2':errors})
             compile_ms=(time.monotonic()-started)*1000
             stage="runtime"
             del actual
@@ -382,7 +395,7 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
 
     hardware=_mlp_hardware(str(x.device))
     return DiscreteKernelAdapter(
-        context=KernelContext("mxfp8_recompute_mlp",33,{"m":m,"k":k,"h":h,"o":o,"activation":activation,"phase":phase,
+        context=KernelContext("mxfp8_recompute_mlp",MLP_AUTOTUNE_REVISION,{"m":m,"k":k,"h":h,"o":o,"activation":activation,"phase":phase,
                                                       "precision":precision,"silu_math":initial.gate_up.glu_silu_math},
                               device=hardware,
                               tags={"warmup":warmup,"samples":samples,"calls_per_sample":calls_per_sample,
@@ -438,7 +451,14 @@ def tune_mxfp8_mlp(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT_M
             raise RuntimeError("tune before CUDA graph capture")
         adapter=make_mlp_adapter(x,gu,down,activation=activation,phase=phase,initial=initial,precision=precision,
                                  warmup=warmup,samples=samples,calls_per_sample=calls_per_sample)
-        store=ResidualTuningStore(Path(output_dir)/adapter.context.identifier,transfer_root=output_dir)
+        if tuning_policy is not None and tuning_policy.search_schedule == 'progressive':
+            from .runtime_coordinates import runtime_schedule_adapter
+            adapter=runtime_schedule_adapter(adapter)
+        store_root=Path(output_dir)/adapter.context.identifier
+        if tuning_policy is not None:
+            from .effort import effort_residual_root
+            store_root=effort_residual_root(store_root,tuning_policy)
+        store=ResidualTuningStore(store_root,transfer_root=output_dir)
         seeds=mlp_structural_seeds(adapter,precision,phase)
         if tuning_policy is not None:
             return make_effort_autotuner(adapter,store,tuning_policy,progress=progress,candidates=[*portfolio,*seeds],started_at=tuning_started).tune()

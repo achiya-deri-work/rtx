@@ -241,6 +241,11 @@ class DatasetJob:
             raise ValueError("regimes must contain hot and/or rotate")
         if self.promote <= 0:
             raise ValueError("promote must be positive")
+        mode = self.tags.get("backward_measurement_mode", "host")
+        if mode not in ("host", "cuda_graph"):
+            raise ValueError("dataset backward_measurement_mode must be host or cuda_graph")
+        if mode != "host" and self.family != "mxfp8_bwd":
+            raise ValueError("backward_measurement_mode only applies to mxfp8_bwd")
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "DatasetJob":
@@ -935,6 +940,7 @@ def _bwd_harness(
         regime=regime,
         device=campaign.device,
         seed=_backend_seed(campaign, job, shape, regime),
+        measurement_mode=job.tags.get("backward_measurement_mode", "host"),
     )
 
 
@@ -1080,6 +1086,12 @@ def _bwd_adapter(
     evaluator = CalibratedBwdEvaluator(
         harness, samples=job.protocol.samples, seed=campaign.manifest.seed
     )
+    mode = harness.measurement_mode
+    if mode != job.tags.get("backward_measurement_mode", "host"):
+        raise ValueError("backward harness measurement mode disagrees with dataset job")
+    if mode != "host":
+        tags = {**tags, "backward_measurement_mode": mode,
+                "backward_measurement_revision": 1}
     return make_mxfp8_bwd_adapter(
         shape.problem,
         evaluator,

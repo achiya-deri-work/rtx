@@ -91,10 +91,38 @@ are inference-only; keep your BF16 source checkpoint for future training.
 ## Autotune
 
 Linear defaults use bounded balanced first-hit search: exact cache lookup,
-then up to 24 trials / 30 seconds of search budget on a miss, with confirmation
+then up to 16 trials / 30 seconds of search budget on a miss, with confirmation
 and persistent winners. These budgets do not interrupt an in-flight compiler.
 `autotune="cache"` forbids searches; `"off"` selects explicit/portable settings.
 Compilation is still lazy in both modes.
+
+For explicit per-shape investment, supply a tuning policy. Its presets are
+`quick` / `balanced` / `thorough` / `extensive` (8 / 16 / 32 / 64 trial caps):
+
+```python
+policy = rtx.AutotunePolicy.preset(
+    "balanced",
+    search_schedule="progressive",
+    cache_behavior="refine",
+    finalist_rounds=2,
+)
+layer = rtx.MXFP8Linear(
+    768, 3072, device="cuda", autotune="balanced", tuning_policy=policy,
+    autotune_cache_dir=".rtx-cache",
+)
+compiled_layer = torch.compile(layer, fullgraph=True, dynamic=False)
+y = compiled_layer(x)  # A new shape may tune; compatible later calls reuse it.
+```
+
+The same policy API applies to `NVFP4Linear`. `refine` allows a compatible
+lower-effort cache entry to gain more trials; `reuse` accepts the existing
+winner without extending its search. Progressive search and paired finalist
+confirmation above are explicit options, not current defaults. Time limits are
+soft admission deadlines and can stop search before the trial cap. Warm each
+required forward/backward shape before explicit CUDA graph capture. Effort
+levels express investment, not a guarantee of near-optimal speed; learned
+priors remain research opt-ins. Start with the [first-hit setup and evidence](docs/first_hit_autotuning.md), or see the [effort guide](docs/autotune_effort.md)
+for cache compatibility, qualification boundaries, and per-pass budgets.
 
 The reusable `rtx.autotune` framework includes conditional spaces, staged
 validation, random/model/local search, bandit allocation, durable residual
@@ -110,7 +138,10 @@ journals, resumable campaigns, ask/tell workers, and CSV/Parquet exports.
   fully recomputed first-order backward. Supports `from_linears`, explicit
   `autotune_`, and revisioned JSON policies. [Guide](docs/mxfp8_mlp.md).
 
-Unlike linears, GLU/MLP tuning is explicit, not automatic per new shape.
+GLU/MLP default to tuning off. Opt into per-shape first-hit tuning with
+`autotune="balanced"`, `tuning_policy=rtx.AutotunePolicy(...)`, and
+`autotune_cache_dir=...`, or use explicit `autotune_` before compile/capture.
+Automatic MLP selection currently requires MXFP8 precision; GLU remains forward-only.
 These feature APIs are not in the stable wildcard-export surface.
 **Known blocker:** the optional packed-down MLP schedule faults on
 M=K=H=O=1; the conservative default passes. Read the

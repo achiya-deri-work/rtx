@@ -456,6 +456,12 @@ class NVFP4ConfigTests(unittest.TestCase):
 
 @unittest.skipUnless(_has_sm12x(), "requires an SM120/SM121 CUDA GPU")
 class NVFP4CudaTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Independent tests vary modes/shapes against one forward code object.
+        # Keep their specializations separate; never reset within a test's
+        # repeated calls or history transitions.
+        torch.compiler.reset()
+
     def test_partial_warp_shuffle_quantization_matches_redux(self) -> None:
         from rtx.nvfp4_inference_experiments import NVFP4DelayedBenchmarkHarness
         from rtx.prequant_experiments import BenchmarkProtocol, ShapeSpec
@@ -1461,7 +1467,9 @@ class NVFP4CudaTests(unittest.TestCase):
         self.assertTrue(all(bool(torch.isfinite(out).all()) for out in outputs))
         layer.load_state_dict(layer.state_dict())
         self.assertFalse(layer._delayed_initialized)
-        self.assertEqual(layer._x_amax_state.numel(), 0)
+        # Reset preserves compiler-visible buffer shapes but invalidates the
+        # storage identity, so the next real call bootstraps current amax.
+        self.assertEqual(layer._x_amax_state.numel(), 16)
 
     def test_delayed_training_is_fullgraph_compileable(self) -> None:
         torch.manual_seed(1904)

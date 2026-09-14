@@ -22,8 +22,35 @@ The conversion policies are `MXFP8TrainingConfig`, `NVFP4TrainingConfig`,
 [conversion](model_conversion.md). Functional NVFP4 does **not** accept delayed
 history; delayed mode belongs to `NVFP4Linear`.
 
+## Shared frontend controls
+
+| Control | Meaning |
+|---|---|
+| `autotune` | Search, reuse cache, or use explicit/portable settings |
+| `tuning_policy=rtx.AutotunePolicy(...)` | Effort, search, confirmation and cache refinement |
+| `autotune_cache_dir` | Durable tuning storage, separate from model checkpoints |
+| `config` and family-specific configs | Explicit implementation schedules, advanced and shape-dependent |
+
+| Frontend | Default | First-hit boundary |
+|---|---|---|
+| `MXFP8Linear`, `NVFP4Linear` | Environment override, otherwise balanced | Forward/backward and operand states have separate contexts |
+| `MXFP8GLU` | Off | Opt-in balanced; forward only, configured backend |
+| `MXFP8MLP` | Off | Opt-in balanced; automatic selection requires MXFP8 precision |
+
+Use [first-hit autotuning](first_hit_autotuning.md) for the example and effort
+ladder. `reuse`/`refine` are `cache_behavior` policy values, not `autotune`
+modes. `quick`/`thorough`/`extensive` are policy presets, not module modes.
+Explicit `autotune_` belongs before compilation/capture; opt-in first-hit
+selection works through compilation. Warm required paths before manual capture.
+
+For linears, operand state (dynamic/packed), numerical scaling policy and
+backend are independent axes. NVFP4 dynamic scaling defaults to
+`jit_row_region`, with explicit `delayed`, `block`, and `current` options.
+See family guides for packed-operand and explicit-configuration restrictions.
+
 ## Types, configuration and introspection
 
+- `AutotunePolicy`: shared effort, search, confirmation and cache-refinement controls.
 - `MXTensor` / `MXFP8Tensor`, `NVFP4Tensor`: TorchAO-backed payload/scale types.
 - `LinearOperandState`: dynamic, weight-prequantized, fully-prequantized state.
 - `LinearExecutionDecision`: result of linear `.explain(x)`.

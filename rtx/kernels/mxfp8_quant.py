@@ -52,6 +52,8 @@ def _native_scale_tile_rows(scale_layout: str) -> int:
 class MXFP8QuantKernel:
     """Warp-grouped, grid-stride dynamic MXFP8 quantization kernel."""
 
+    source_alignment = 16
+
     def __init__(self, rows: int, k: int, config: MXFP8QuantConfig):
         rejection = config.rejection(rows, k)
         if rejection is not None:
@@ -181,6 +183,11 @@ class MXFP8QuantKernel:
                 naturally_aligned = (
                     src.layout((row, global_k_base)) * (BFloat16.width // 8)
                 ) % load_bytes == 0
+                if cutlass.const_expr(self.source_alignment < load_bytes):
+                    naturally_aligned = (
+                        (src_row.iterator + src_row.layout(global_k_base)).toint()
+                        % load_bytes == 0
+                    )
                 if (
                     global_k_base + values_per_load <= self.k
                     and naturally_aligned
@@ -1103,6 +1110,11 @@ class MXFP8OrientedDualQuantKernel(MXFP8TransposedQuantKernel):
                 "transposed_tile_rows must be divisible by num_warps * quant_vec"
             )
         blocks_per_row = k // SF_VEC_SIZE
+        for rows, orientation, operand_config in (
+            (a_rows, a_orientation, config), (b_rows, b_orientation, b_config)
+        ):
+            if orientation == "row" and rows * blocks_per_row % operand_config.quant_vec:
+                raise ValueError("oriented row quantization requires complete warp scale groups")
         self.a_warp_tasks = a_rows * blocks_per_row // config.quant_vec
         self.b_warp_tasks = b_rows * blocks_per_row // b_config.quant_vec
         self.a_task_groups = (
@@ -1252,9 +1264,11 @@ class MXFP8OrientedDualQuantKernel(MXFP8TransposedQuantKernel):
             threads_per_scale = 32 // cfg.quant_vec
             scale_in_warp = lane_idx // threads_per_scale
             lane_in_scale = lane_idx % threads_per_scale
-            first_block = warp_task * cfg.quant_vec
-            row = first_block // blocks_per_row
-            scale_block = first_block % blocks_per_row + scale_in_warp
+            # A warp may straddle rows (e.g. K=640, quant_vec=8).
+            # Include the lane's scale before decoding the logical row.
+            linear_block = warp_task * cfg.quant_vec + scale_in_warp
+            row = linear_block // blocks_per_row
+            scale_block = linear_block % blocks_per_row
             k_base = (
                 scale_block * SF_VEC_SIZE + lane_in_scale * cfg.quant_vec
             )
@@ -1778,11 +1792,14 @@ def compile_mxfp8_quant(
     rows: int,
     k: int,
     config: MXFP8QuantConfig = MXFP8QuantConfig(),
-    *, interleave_rows: bool = False,
+    *, interleave_rows: bool = False, source_alignment: int = 16,
 ):
     """Compile and cache a shape/config-specialized TVM-FFI launcher."""
 
     kernel = MXFP8QuantKernel(rows, k, config)
+    if source_alignment not in (2, 4, 8, 16):
+        raise ValueError('source_alignment must be 2, 4, 8 or 16 bytes')
+    kernel.source_alignment = source_alignment
     if interleave_rows and rows % 2:
         raise ValueError("paired quantization requires an even row count")
     kernel.glu_interleave = interleave_rows
@@ -1790,7 +1807,7 @@ def compile_mxfp8_quant(
         BFloat16,
         (rows, k),
         stride=(k, 1),
-        assumed_align=16,
+        assumed_align=source_alignment,
     )
     storage_k = (k + SF_VEC_SIZE - 1) // SF_VEC_SIZE * SF_VEC_SIZE
     quantized = cute.runtime.make_fake_tensor(
@@ -1839,13 +1856,16 @@ def compile_mxfp8_dual_quant(
     k: int,
     config: MXFP8QuantConfig = MXFP8QuantConfig(),
     weight_scale_layout: str | None = None,
-    *, interleave_weight: bool = False,
+    *, interleave_weight: bool = False, source_alignment: int = 16,
 ):
     """Compile one launcher that dynamically quantizes X and W together."""
 
     kernel = MXFP8DualQuantKernel(
         x_rows, weight_rows, k, config, weight_scale_layout
     )
+    if source_alignment not in (2, 4, 8, 16):
+        raise ValueError('source_alignment must be 2, 4, 8 or 16 bytes')
+    kernel.source_alignment = source_alignment
     if interleave_weight and weight_rows % 2:
         raise ValueError("paired quantization requires an even row count")
     kernel.glu_interleave = interleave_weight
@@ -1855,7 +1875,7 @@ def compile_mxfp8_dual_quant(
             dtype,
             (rows, columns),
             stride=(columns, 1),
-            assumed_align=16,
+            assumed_align=source_alignment if dtype == BFloat16 else 16,
         )
 
     x = fake(BFloat16, x_rows, k)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import time
 from typing import Callable, Mapping
@@ -41,6 +41,8 @@ class _PreparedBwdCandidate:
     max_abs_error: float
     max_relative_l2_error: float
     compiled_resources: Mapping[str, object]
+    graphs: dict[tuple[int, int], object] = field(default_factory=dict)
+    graph_capture_ms: float = 0.0
 
 
 class BwdBenchmarkHarness:
@@ -54,7 +56,11 @@ class BwdBenchmarkHarness:
         regime: CacheRegime = "hot",
         device: torch.device | str = "cuda",
         seed: int = 0,
+        measurement_mode: str = "host",
     ) -> None:
+        if measurement_mode not in ("host", "cuda_graph"):
+            raise ValueError("measurement_mode must be host or cuda_graph")
+        self.measurement_mode = measurement_mode
         self.shape = shape
         self.problem = shape.problem
         self.protocol = protocol
@@ -145,6 +151,15 @@ class BwdBenchmarkHarness:
             grad_weight,
         )
         torch.cuda.synchronize(self.device)
+        max_abs_error, max_relative_l2_error = self._validate_outputs(grad_x, grad_weight)
+        return _PreparedBwdCandidate(
+            config, runner, grad_x, grad_weight, compile_ms,
+            max_abs_error, max_relative_l2_error, compiled_resource_metadata(runner),
+        )
+
+    def _validate_outputs(self, grad_x, grad_weight) -> tuple[float, float]:
+        if not bool(torch.isfinite(grad_x).all()) or not bool(torch.isfinite(grad_weight).all()):
+            raise BwdCandidateCorrectnessError("nonfinite backward output")
         reference_x, reference_weight = self._reference
         max_abs_error = max(
             float((grad_x.float() - reference_x.float()).abs().max()),
@@ -164,34 +179,43 @@ class BwdBenchmarkHarness:
         ):
             raise BwdCandidateCorrectnessError(
                 "candidate differs from FP32 reference "
-                f"(relative L2 {max_relative_l2_error}, max abs {max_abs_error})"
+                f"(relative L2 {max_relative_l2_error}, max abs {max_abs_error}; "
+                f"dX relative L2 {relative_x}, dW relative L2 {relative_weight})"
             )
-        return _PreparedBwdCandidate(
-            config,
-            runner,
-            grad_x,
-            grad_weight,
-            compile_ms,
-            max_abs_error,
-            max_relative_l2_error,
-            compiled_resource_metadata(runner),
-        )
+        return max_abs_error, max_relative_l2_error
+
+    def _run_batch(self, prepared, calls: int, offset: int) -> None:
+        for call in range(calls):
+            grad_output, x, weight = self._inputs[(offset + call) % len(self._inputs)]
+            prepared.runner(grad_output, x, weight, prepared.grad_x, prepared.grad_weight)
+
+    def _batch_graph(self, prepared, calls: int, offset: int):
+        key = (calls, offset % len(self._inputs))
+        if key not in prepared.graphs:
+            # Capture and validation are never inside the event timing interval.
+            started = time.monotonic()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self._run_batch(prepared, calls, offset)
+            graph.replay()
+            torch.cuda.synchronize(self.device)
+            prepared.graph_capture_ms += (time.monotonic() - started) * 1000
+            self._validate_outputs(prepared.grad_x, prepared.grad_weight)
+            prepared.graphs[key] = graph
+        return prepared.graphs[key]
 
     def _time_batch(
         self, prepared: _PreparedBwdCandidate, calls: int, offset: int = 0
     ) -> float:
+        graph = (self._batch_graph(prepared, calls, offset)
+                 if self.measurement_mode == "cuda_graph" else None)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        for call in range(calls):
-            grad_output, x, weight = self._inputs[(offset + call) % len(self._inputs)]
-            prepared.runner(
-                grad_output,
-                x,
-                weight,
-                prepared.grad_x,
-                prepared.grad_weight,
-            )
+        if graph is None:
+            self._run_batch(prepared, calls, offset)
+        else:
+            graph.replay()
         end.record()
         end.synchronize()
         return float(start.elapsed_time(end)) / calls
@@ -358,6 +382,10 @@ class BwdBenchmarkHarness:
         return {
             "status": "ok",
             "compile_ms": prepared.compile_ms,
+            "measurement_mode": self.measurement_mode,
+            "graph_capture_ms": prepared.graph_capture_ms,
+            "graph_count": len(prepared.graphs),
+            "component_measurement_mode": "host" if components else None,
             "max_abs_error": prepared.max_abs_error,
             "max_relative_l2_error": prepared.max_relative_l2_error,
             "compiled_resources": prepared.compiled_resources,
@@ -457,6 +485,9 @@ class BwdBenchmarkHarness:
         return {
             "status": "ok",
             "decision": decision,
+            "measurement_mode": self.measurement_mode,
+            "incumbent_graph_capture_ms": a.graph_capture_ms,
+            "challenger_graph_capture_ms": b.graph_capture_ms,
             "practical_threshold": threshold,
             "incumbent_timings_ms": a_times,
             "challenger_timings_ms": b_times,
