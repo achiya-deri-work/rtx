@@ -18,7 +18,7 @@ from .configs import (
 from .prequant_autotune import PREQUANT_SEARCH_SPACE
 
 
-INFERENCE_KERNEL_REVISION = 7
+INFERENCE_KERNEL_REVISION = 8
 
 _WEIGHT_ACTIVE_AXES = (
     "layout_transport",

@@ -51,7 +51,7 @@ except ImportError:  # pragma: no cover - Linux/CUDA is the supported target.
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_prequant_e2e"
-KERNEL_REVISION = 9
+KERNEL_REVISION = 10
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -176,8 +176,8 @@ PREQUANT_SEARCH_SPACE: dict[str, tuple[dict[str, object], ...]] = {
                 "atom_layout_n": atom_n,
             }
         }
-        for tile_m, atom_m in ((64, 2), (128, 2), (128, 4), (128, 8), (256, 8))
-        for tile_n, atom_n in ((128, 2), (256, 4))
+        for tile_m, atom_m in ((64, 2), (128, 2), (128, 4), (128, 8), (256, 8), (384, 8), (512, 8))
+        for tile_n, atom_n in ((64, 2), (128, 2), (256, 4))
         for tile_k in (128,)
     ),
     "gemm_stages": tuple(

@@ -4,6 +4,15 @@ from ..kernels.mxfp8 import MXFP8Problem, MXFP8FwdConfig, normalize_fwd_config
 from .mxfp8 import MXFP8GemmConfig, MXFP8QuantConfig
 
 
+def prequant_recompute_rejection(config):
+    """Quarantine an observed nondeterministic derivative schedule, not all GEMMs."""
+    if (config.tile_m == 128 and config.tile_n == 64 and config.stages == 1
+            and config.scale_role == "consumers" and config.scale_layout == "row_major"):
+        return ("128x64 single-buffer consumer-scale recompute is quarantined after "
+                "same-input gradient nondeterminism; use stages>=2 until repaired")
+    return None
+
+
 def cooperative_glu_rejection(problem,config):
     """Conservative rendezvous qualification boundary for cooperative GLU.
 
@@ -60,7 +69,7 @@ class MXFP8GLUPrequantConfig:
         if self.gemm.scale_rounding != "infinity" or self.quant.scale_rounding != "infinity" or self.resolved_weight_quant().scale_rounding != "infinity":
             return "GLU uses round-to-infinity scales"
         g = self.gemm
-        if g.glu_hidden_decode not in ("fp32","bf16x2"):
+        if g.glu_hidden_decode not in ("fp32","fp32_packed","bf16x2"):
             return "invalid hidden reconstruction arithmetic"
         if g.glu_silu_math not in ("division","shared_reciprocal","approx_reciprocal"):
             return "invalid SiLU arithmetic policy"
@@ -114,10 +123,13 @@ class MXFP8GLUConfig(MXFP8FwdConfig):
 
 
 def normalize_glu_config(base=None, /, **updates):
+    if "weight_reuse_tile" in updates:
+        updates.update(glu_scratch="reuse_operands", glu_epilogue="registers",
+                       glu_quant_epilogue="exchange", glu_store="direct", glu_store_stages=1)
     if "glu_tile" in updates:
         tile_m,tile_n,atom_m = updates.pop("glu_tile")
         updates.update(tile_m=tile_m,tile_n=tile_n,atom_layout_m=atom_m,
-                       atom_layout_n=tile_n//64,mxfp8_stages=1,glu_scratch="reuse_operands",
+                       atom_layout_n=max(2,tile_n//64),mxfp8_stages=1,glu_scratch="reuse_operands",
                        glu_epilogue="registers",glu_quant_epilogue="exchange",
                        cooperative_warps=0,load_engine="scalar",schedule="cooperative",
                        persistent=False,persistent_waves=1,reuse="none",cluster_reuse="none",cluster_size=1)
@@ -175,6 +187,8 @@ def glu_rejection(problem: MXFP8Problem, config: MXFP8FwdConfig, output_format="
         return "fragment-register quantization requires the paired register epilogue"
     if quant_epilogue == "fragment_registers" and config.tile_n != 128:
         return "fragment-register quantization currently requires tile_n=128"
+    if config.tile_n == 64 and config.glu_store == "tma":
+        return "64-column GLU currently requires direct output stores"
     store = getattr(config,"glu_store","direct")
     stages = getattr(config,"glu_store_stages",1)
     if store not in ("direct","tma") or stages not in (1,2,3,4):

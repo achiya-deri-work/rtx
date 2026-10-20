@@ -13,12 +13,56 @@ from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version as package_version
 from functools import lru_cache
 import os
-from threading import RLock
+from threading import RLock, local
+from contextlib import contextmanager
 from typing import Generic, TypeVar
 
 
 KeyT = TypeVar("KeyT")
 ValueT = TypeVar("ValueT")
+
+_resource_scope = local()
+_resource_scope_lock = RLock()
+_active_resource_scopes = {}
+
+
+@contextmanager
+def retain_runtime_resources():
+    """Pin cached resources accessed while building a CUDA graph.
+
+    Graph nodes retain addresses, not Python runner ownership. Cache eviction
+    must not free the scratch allocations behind those addresses.
+    """
+    previous = getattr(_resource_scope, "owners", None)
+    owners = {}
+    _resource_scope.owners = owners
+    with _resource_scope_lock:
+        _active_resource_scopes[id(owners)] = owners
+    # A captured allocation also depends on its private allocator pool lifetime.
+    from ._workspace import retain_scratch_pools
+    try:
+        retain_scratch_pools(owners)
+        yield owners
+    finally:
+        with _resource_scope_lock:
+            _active_resource_scopes.pop(id(owners), None)
+        _resource_scope.owners = previous
+        if previous is not None:
+            previous.update(owners)
+
+
+def _retain_resource(value):
+    owners = getattr(_resource_scope, "owners", None)
+    if owners is not None:
+        owners[id(value)] = value
+    elif _active_resource_scopes:
+        # Autograd launches can run on a different Python thread from the
+        # caller-owned capture scope. Pin into every active scope rather than
+        # losing those resources at the first cache eviction. Concurrent scopes
+        # conservatively retain each other's worker resources until release.
+        with _resource_scope_lock:
+            for target in _active_resource_scopes.values():
+                target[id(value)] = value
 
 
 _CUTE_TARGETS = {
@@ -141,15 +185,31 @@ class BoundedCache(MutableMapping[KeyT, ValueT], Generic[KeyT, ValueT]):
     invocation but is not retained afterwards.
     """
 
-    def __init__(self, max_entries: int) -> None:
-        if max_entries < 0:
+    def __init__(self, max_entries: int | None, *, max_bytes: int | None = None, sizeof=None) -> None:
+        if max_entries is not None and (type(max_entries) is not int or max_entries < 0):
             raise ValueError("cache size cannot be negative")
-        self.max_entries = int(max_entries)
+        if max_entries is None and max_bytes is None:
+            raise ValueError("a cache requires an entry or byte limit")
+        self.max_entries = max_entries
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
+            raise ValueError("max_bytes must be a nonnegative integer or None")
+        if max_bytes is not None and sizeof is None:
+            raise ValueError("a byte budget requires an explicit sizeof callback")
+        self.max_bytes = max_bytes
+        self._sizeof = sizeof
+        self._sizes = {}
+        self.resident_bytes = 0
+        self.peak_resident_bytes = 0
+        self.oversized = 0
         self._values: OrderedDict[KeyT, ValueT] = OrderedDict()
         self._lock = RLock()
         self.hits = 0
         self.misses = 0
         self.evictions = 0
+        self.insertions = 0
+        self.entry_limit_evictions = 0
+        self.byte_limit_evictions = 0
+        self.recent_evicted_keys = []
 
     def __getitem__(self, key: KeyT) -> ValueT:
         with self._lock:
@@ -160,6 +220,7 @@ class BoundedCache(MutableMapping[KeyT, ValueT], Generic[KeyT, ValueT]):
                 raise
             self._values[key] = value
             self.hits += 1
+            _retain_resource(value)
             return value
 
     def get(self, key: KeyT, default=None):
@@ -169,19 +230,39 @@ class BoundedCache(MutableMapping[KeyT, ValueT], Generic[KeyT, ValueT]):
             return default
 
     def __setitem__(self, key: KeyT, value: ValueT) -> None:
+        size = 0 if self._sizeof is None else self._sizeof(value)
+        if type(size) is not int or size < 0:
+            raise ValueError("sizeof must return a nonnegative integer")
+        _retain_resource(value)
         with self._lock:
+            self.insertions += 1
             self._values.pop(key, None)
-            if self.max_entries == 0:
+            self.resident_bytes -= self._sizes.pop(key, 0)
+            oversized = self.max_bytes is not None and size > self.max_bytes
+            if self.max_entries == 0 or oversized:
                 self.evictions += 1
+                self.oversized += int(oversized)
+                self.entry_limit_evictions += int(self.max_entries == 0)
+                self.byte_limit_evictions += int(oversized)
+                self.recent_evicted_keys = (self.recent_evicted_keys + [repr(key)])[-16:]
                 return
             self._values[key] = value
-            while len(self._values) > self.max_entries:
-                self._values.popitem(last=False)
+            self._sizes[key] = size
+            self.resident_bytes += size
+            while ((self.max_entries is not None and len(self._values) > self.max_entries) or
+                   (self.max_bytes is not None and self.resident_bytes > self.max_bytes)):
+                self.entry_limit_evictions += int(self.max_entries is not None and len(self._values) > self.max_entries)
+                self.byte_limit_evictions += int(self.max_bytes is not None and self.resident_bytes > self.max_bytes)
+                old_key, _ = self._values.popitem(last=False)
+                self.recent_evicted_keys = (self.recent_evicted_keys + [repr(old_key)])[-16:]
+                self.resident_bytes -= self._sizes.pop(old_key)
                 self.evictions += 1
+            self.peak_resident_bytes = max(self.peak_resident_bytes, self.resident_bytes)
 
     def __delitem__(self, key: KeyT) -> None:
         with self._lock:
             del self._values[key]
+            self.resident_bytes -= self._sizes.pop(key)
 
     def __iter__(self) -> Iterator[KeyT]:
         with self._lock:
@@ -194,8 +275,10 @@ class BoundedCache(MutableMapping[KeyT, ValueT], Generic[KeyT, ValueT]):
     def clear(self) -> None:
         with self._lock:
             self._values.clear()
+            self._sizes.clear()
+            self.resident_bytes = 0
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, int | None]:
         with self._lock:
             return {
                 "entries": len(self._values),
@@ -203,7 +286,60 @@ class BoundedCache(MutableMapping[KeyT, ValueT], Generic[KeyT, ValueT]):
                 "hits": self.hits,
                 "misses": self.misses,
                 "evictions": self.evictions,
+                "insertions": self.insertions,
+                "entry_limit_evictions": self.entry_limit_evictions,
+                "byte_limit_evictions": self.byte_limit_evictions,
+                "resident_bytes": self.resident_bytes,
+                "peak_resident_bytes": self.peak_resident_bytes,
+                "max_bytes": self.max_bytes,
+                "oversized": self.oversized,
+                "bytes_accounted": self._sizeof is not None,
             }
+
+
+def tensor_storage_bytes(value) -> int:
+    """Count tensor storage in explicit dataclass/container scratch owners.
+
+    Aliased views count once per owner. Opaque executables/closures are not
+    traversed: callers must use explicit owners, not infer arbitrary reachability.
+    This measures owned storage, not allocator reserve or graph-pool memory.
+    """
+    from dataclasses import fields, is_dataclass
+    import torch
+    seen, storages = set(), {}
+    def visit(item):
+        if id(item) in seen:
+            return
+        seen.add(id(item))
+        if isinstance(item, torch.Tensor):
+            storage = item.untyped_storage()
+            storages[(str(item.device), storage.data_ptr())] = storage.nbytes()
+        elif is_dataclass(item) and not isinstance(item, type):
+            for field in fields(item):
+                visit(getattr(item, field.name))
+        elif isinstance(item, dict):
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, (tuple, list)):
+            for child in item:
+                visit(child)
+    visit(value)
+    return sum(storages.values())
+
+
+def runner_cache_byte_limit(kind: str, *, namespace: str = "MXFP8") -> int | None:
+    """Optional per-cache byte cap; unset retains the legacy entry limit."""
+    name = f"RTX_{namespace}_{kind.upper()}_CACHE_BYTES"
+    raw = os.getenv(name, os.getenv(f"RTX_{namespace}_RUNNER_CACHE_BYTES"))
+    if raw is None:
+        return None
+    try:
+        size = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a nonnegative integer") from exc
+    if size < 0:
+        raise ValueError(f"{name} cannot be negative")
+    return size
 
 
 def runner_cache_limit(
@@ -247,29 +383,51 @@ def load_kernel_symbol(module: str, symbol: str, *, family: str = "sm120"):
     return getattr(import_module(f".kernels.{module}", __package__), symbol)
 
 
-def clear_runtime_caches(*, synchronize: bool = True, device=None) -> dict[str, object]:
+def clear_runtime_caches(*, synchronize: bool = True, device=None,
+                         preserve_compiled: bool = False) -> dict[str, object]:
     """Release cached launch workspaces retained by the Python frontends.
 
     Synchronization is the safe default because CuTe/TVM-FFI launches are
     asynchronous. Advanced callers may disable it only after establishing
-    their own stream/device completion boundary.
+    their own stream/device completion boundary. Cleanup is process-wide, not
+    filtered by ``device``; synchronize every visible device before eviction.
+    ``preserve_compiled`` retains cheap selections and compiled MLP helpers.
     """
 
     if synchronize:
         import torch
 
         if torch.cuda.is_available():
-            torch.cuda.synchronize(device)
+            for index in range(torch.cuda.device_count()):
+                torch.cuda.synchronize(index)
     released: dict[str, object] = {}
     for module_name in ("fp8", "fp8_bwd", "fp4", "glu", "mlp"):
         module = import_module(f".{module_name}", __package__)
         clear = getattr(module, "_clear_runtime_caches", None)
         if clear is not None:
-            released[module_name] = clear()
+            released[module_name] = clear(preserve_compiled=preserve_compiled)
     from ._workspace import clear_scratch_pools
 
     clear_scratch_pools()
     return released
+
+
+def runtime_cache_stats() -> dict[str, dict[str, object]]:
+    """Read loaded frontend LRU counters without importing kernels or clearing.
+
+    Unaccounted caches report bytes_accounted=False; their zero byte counter is
+    not evidence that their contents own no GPU memory. Graph pins and allocator
+    pools are outside these per-cache snapshots.
+    """
+    import sys
+    result = {}
+    for name in ('fp8', 'fp8_bwd', 'fp4', 'glu', 'mlp', '_mlp_autotune'):
+        module = sys.modules.get(f'rtx.{name}')
+        if module is not None:
+            for key, value in tuple(vars(module).items()):
+                if isinstance(value, BoundedCache):
+                    result[f'{name}.{key}'] = value.stats()
+    return result
 
 
 __all__ = [
@@ -277,5 +435,7 @@ __all__ = [
     "clear_runtime_caches",
     "load_kernel_symbol",
     "runner_cache_limit",
+    "runner_cache_byte_limit",
+    "runtime_cache_stats",
     "validate_runtime_environment",
 ]

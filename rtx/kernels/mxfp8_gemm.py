@@ -71,6 +71,7 @@ class MXFP8GemmKernel:
             )
         self.ab_dtype = Float8E4M3FN
         self.glu = False
+        self.single_stage_recompute_handoff = False
         self.cooperative_quant = False
         self.glu_tma_store = False
         self.glu_store_stages = 1
@@ -281,9 +282,12 @@ class MXFP8GemmKernel:
             self.sfa_layout = blockscaled_utils.sm120_make_smem_layout_sfa(
                 self.tiled_mma, padded_tile, self.sf_vec_size, cfg.stages
             )
-        self.sfb_layout = blockscaled_utils.sm120_make_smem_layout_sfb(
-            self.tiled_mma, padded_tile, self.sf_vec_size, cfg.stages
-        )
+        if cfg.tile_n == 64:
+            self.sfb_layout = _make_sm120_sfa_layout_64(
+                self.tiled_mma, cfg.tile_k, self.sf_vec_size, cfg.stages)
+        else:
+            self.sfb_layout = blockscaled_utils.sm120_make_smem_layout_sfb(
+                self.tiled_mma, padded_tile, self.sf_vec_size, cfg.stages)
         self.out_layout = cute.tile_to_shape(
             cute.nvgpu.warpgroup.make_smem_layout_atom(
                 cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128,
@@ -1596,8 +1600,20 @@ class MXFP8GemmKernel:
                         # not let a fast warp recycle this scale stage while a
                         # slower peer is still loading its final fragments.
                         self.scale_barrier.arrive_and_wait()
+                    # Generic-proxy shared loads must finish before the TMA
+                    # producer may reuse this slot through the async proxy.
+                    # A named barrier/warp rendezvous alone is insufficient:
+                    # concurrent, differently shaped GEMMs exposed changing
+                    # FP32 split partials with identical quantized operands.
+                    cute.arch.fence_view_async_shared()
                     tma_pipeline.consumer_release(consumer_state)
                     consumer_state.advance()
+
+                if cutlass.const_expr(self.single_stage_recompute_handoff and cfg.stages == 1 and cfg.scale_role == "consumers"):
+                    # A single physical slot is shared by the TMA producer and
+                    # consumer-owned scale writes. Keep every thread on the
+                    # same K iteration before either side recycles that slot.
+                    cute.arch.sync_threads()
 
             if cutlass.const_expr(self.split_reduction > 1):
                 if warp_idx == cfg.num_mma_warps:

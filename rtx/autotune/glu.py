@@ -19,7 +19,7 @@ from ..kernels.mxfp8 import (
     fwd_config_id, fwd_config_to_dict, fwd_config_from_dict,
 )
 
-GLU_KERNEL_REVISION = 6
+GLU_KERNEL_REVISION = 8
 # Inherit all projection coordinates, including compound TMA/role/reuse moves.
 # GLU has its own output schedule rather than pretending a plain GEMM store
 # writes the same tensor. Unsupported transport combinations remain rejected.
@@ -34,8 +34,8 @@ GLU_SEARCH_SPACE["glu_scratch_swizzle"] = ("none","xor_16b")
 GLU_SEARCH_SPACE["glu_silu_math"] = ("division","shared_reciprocal","approx_reciprocal")
 GLU_SEARCH_SPACE["glu_quant_epilogue"] = ("exchange", "fragment_registers")
 GLU_SEARCH_SPACE["glu_tile"] = tuple(
-    (m,n,am) for m in (32,64,128,256) for n in (128,256)
-    for am in ((2,4,8) if m==128 else (8,) if m==256 else (2,)))
+    (m,n,am) for m in (32,64,128,256,384,512) for n in (64,128,256)
+    for am in ((2,4,8) if m==128 else (8,) if m>=256 else (2,)))
 
 
 def _reference(x, weight, activation):

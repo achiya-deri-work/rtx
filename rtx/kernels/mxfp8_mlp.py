@@ -69,8 +69,117 @@ class GLURecomputeDerivative(MXFP8GLUKernel):
     """Recompute FP32 projections, differentiate GLU, store only BF16 dGate/dUp."""
 
     @cute.jit
+    def _backward_quant_pair(self,value0,value1,inv,math:cutlass.Constexpr):
+        """Pack already-BF16 operands in standalone-quantizer byte order."""
+        if cutlass.const_expr(math=='bf16x2'):
+            bits0=Int32(BFloat16(value0).bitcast(Uint16))
+            bits1=Int32(BFloat16(value1).bitcast(Uint16))
+            inv_bits=Int32(BFloat16(inv).bitcast(Uint16))
+            scaled=nvvm.mul_bf16x2(bits0|(bits1<<16),inv_bits|(inv_bits<<16))
+            return nvvm.inline_ptx_hl(
+                "cvt.rn.satfinite.e4m3x2.bf16x2 {$w0}, {$r0};",
+                write_only_types=[Int16],read_only_args=[scaled])
+        else:
+            return nvvm.inline_ptx_hl(
+                "cvt.rn.satfinite.e4m3x2.f32 {$w0}, {$r0}, {$r1};",
+                write_only_types=[Int16],read_only_args=[value1*inv,value0*inv])
+
+    @cute.jit
+    def _hidden_quant_epilogue(self,scratch,quantized,scales,block_m,block_n,tidx):
+        """Forward-rounded hidden -> independent leading-axis block quantization.
+
+        Registers bridge two disjoint uses of the same shared allocation. No
+        BF16 hidden tensor is written to GMEM by this path.
+        """
+        cfg=self.config
+        width=cfg.tile_n//2
+        iterations=cute.ceil_div(cfg.tile_m*width,cfg.num_threads*cfg.glu_quant_vec)
+        rounded_values=cute.make_rmem_tensor((iterations*cfg.glu_quant_vec,),BFloat16)
+        rounded_values.fill(BFloat16(0))
+        for i in cutlass.range_constexpr(iterations):
+            index=(tidx+i*cfg.num_threads)*cfg.glu_quant_vec
+            row,col=index//width,index%width
+            gr,gc=block_m*cfg.tile_m+row,block_n*width+col
+            values=cute.make_rmem_tensor((cfg.glu_quant_vec,),Float32)
+            maximum=Float32(0)
+            for v in cutlass.range_constexpr(cfg.glu_quant_vec):
+                value=Float32(0)
+                if row<cfg.tile_m and gr<self.problem.m and gc+v<self.problem.n//2:
+                    value=scratch[row,col+v]
+                values[v]=value
+                maximum=cute.arch.fmax(maximum,cute.abs(value),nan=True)
+            amax=self._warp_amax(maximum,32//cfg.glu_quant_vec,cute.arch.lane_idx())
+            scale,inv=self._scale_from_amax(amax)
+            for pair in cutlass.range_constexpr((cfg.glu_quant_vec+1)//2):
+                v0=2*pair
+                v1=cutlass.min(v0+1,cfg.glu_quant_vec-1)
+                packed=nvvm.inline_ptx_hl(
+                    "cvt.rn.satfinite.e4m3x2.f32 {$w0}, {$r0}, {$r1};",
+                    write_only_types=[Int16],read_only_args=[values[v1]*inv,values[v0]*inv])
+                for half in cutlass.range_constexpr(min(2,cfg.glu_quant_vec)):
+                    rounded=Uint8(packed>>(8*half)).bitcast(Float8E4M3FN)
+                    rounded_values[i*cfg.glu_quant_vec+v0+half]=BFloat16(Float32(rounded)*Float32(scale))
+        # All FP32 products have been consumed before reinterpreting storage.
+        cute.arch.sync_threads()
+        hidden=cute.make_tensor(cute.recast_ptr(scratch.iterator,dtype=BFloat16),
+            cute.make_layout((width,cfg.tile_m+1),stride=(cfg.tile_m+1,1)))
+        for i in cutlass.range_constexpr(iterations):
+            index=(tidx+i*cfg.num_threads)*cfg.glu_quant_vec
+            row,col=index//width,index%width
+            if row<cfg.tile_m:
+                for v in cutlass.range_constexpr(cfg.glu_quant_vec):
+                    hidden[col+v,row]=rounded_values[i*cfg.glu_quant_vec+v]
+        cute.arch.sync_threads()
+        storage_m=((self.problem.m+31)//32)*32
+        for group in cutlass.range(cute.ceil_div(width*cfg.tile_m,4*cfg.num_threads),unroll=1):
+            idx=(tidx+group*cfg.num_threads)*4
+            hr,mr=idx//cfg.tile_m,idx%cfg.tile_m
+            gh,gm=block_n*width+hr,block_m*cfg.tile_m+mr
+            vals=cute.make_rmem_tensor((4,),Float32)
+            maximum=Float32(0)
+            maximum_bits=Int32(0)
+            for v in cutlass.range_constexpr(4):
+                value=Float32(0)
+                if hr<width and gh<self.problem.n//2 and gm+v<self.problem.m:
+                    value=Float32(hidden[hr,mr+v])
+                vals[v]=value
+                if cutlass.const_expr(self.hidden_quant_policy[1]=='bf16_bits'):
+                    maximum_bits=cutlass.max(maximum_bits,Int32(BFloat16(value).bitcast(Uint16))&Int32(0x7fff))
+                else:
+                    maximum=cute.arch.fmax(maximum,cute.abs(value),nan=True)
+            if cutlass.const_expr(self.hidden_quant_policy[1]=='bf16_bits'):
+                maximum=Float32(Uint16(maximum_bits).bitcast(BFloat16))
+            amax=self._warp_amax(maximum,8,cute.arch.lane_idx())
+            scale,inv=self._scale_from_amax(amax)
+            word=Uint32(0)
+            for pair in cutlass.range_constexpr(2):
+                packed=self._backward_quant_pair(vals[2*pair],vals[2*pair+1],inv,self.hidden_quant_policy[0])
+                word|=Uint32(packed.bitcast(Uint16))<<(16*pair)
+            if hr<width and gh<self.problem.n//2 and gm<storage_m:
+                ptr=cute.recast_ptr(quantized.iterator+gh*storage_m+gm,dtype=Uint32)
+                ptr[0]=word
+                if cute.arch.lane_idx()%8==0:
+                    scales[gh,gm//32]=scale
+        cute.arch.sync_threads()
+
+    @cute.jit
     def _glu_epilogue(self,storage,accumulators,coordinates,out,grad_h,
                       block_m,block_n,tidx,tma_out,tma_out_tensor,out_layout,work_slot):
+        if cutlass.const_expr(self.emit_hidden_quant):
+            hidden_quant,hidden_scales=grad_h[1],grad_h[2]
+            grad_h=grad_h[0]
+        if cutlass.const_expr(self.emit_gradient_quant):
+            gradient_quant,gradient_scales=grad_h[1],grad_h[2]
+            grad_h=grad_h[0]
+        if cutlass.const_expr(self.emit_hidden):
+            if cutlass.const_expr(self.separate_hidden):
+                hidden_out=grad_h[1]
+                grad_h=grad_h[0]
+            else:
+                hidden_out=cute.make_tensor(
+                    out.iterator+((2*self.problem.m+7)//8)*8*(self.problem.n//2),
+                    cute.make_layout((self.problem.m,self.problem.n//2),
+                                     stride=(self.problem.n//2,1)))
         if cutlass.const_expr(self.emit_hidden and not self.warp_quant):
             scratch=self._scratch(storage,self.config.tile_n//2)
             if cutlass.const_expr(self.config.glu_grad_load == "shared"):
@@ -166,6 +275,42 @@ class GLURecomputeDerivative(MXFP8GLUKernel):
                         out[out_row,gc]=grad_scratch[lr,lc]
                         if gc+1<self.problem.n//2:
                             out[out_row,gc+1]=grad_scratch[lr,lc+1]
+            if cutlass.const_expr(self.emit_gradient_quant):
+                # Quantize the *rounded BF16* derivatives, before these bytes
+                # are reused for hidden reconstruction. Each eight-lane group
+                # owns one contiguous 32-value scale block in one branch.
+                for group in cutlass.range(cute.ceil_div(cfg.tile_m*cfg.tile_n,4*cfg.num_threads),unroll=1):
+                    idx=(tidx+group*cfg.num_threads)*4
+                    lr,lc=idx//cfg.tile_n,idx%cfg.tile_n
+                    gr=block_m*cfg.tile_m+lr
+                    gc=block_n*cfg.tile_n//2+lc%(cfg.tile_n//2)
+                    out_row=2*gr+lc//(cfg.tile_n//2)
+                    vals=cute.make_rmem_tensor((4,),Float32)
+                    maximum=Float32(0)
+                    maximum_bits=Int32(0)
+                    for v in cutlass.range_constexpr(4):
+                        value=Float32(0)
+                        if lr<cfg.tile_m and gr<self.problem.m and gc+v<self.problem.n//2:
+                            value=Float32(grad_scratch[lr,lc+v])
+                        vals[v]=value
+                        if cutlass.const_expr(self.gradient_quant_policy[1]=='bf16_bits'):
+                            maximum_bits=cutlass.max(maximum_bits,Int32(BFloat16(value).bitcast(Uint16))&Int32(0x7fff))
+                        else:
+                            magnitude=(value.bitcast(Int32)&Int32(0x7fffffff)).bitcast(Float32)
+                            maximum=cute.arch.fmax(maximum,magnitude,nan=True)
+                    if cutlass.const_expr(self.gradient_quant_policy[1]=='bf16_bits'):
+                        maximum=Float32(Uint16(maximum_bits).bitcast(BFloat16))
+                    maximum=self._warp_amax(maximum,8,cute.arch.lane_idx())
+                    scale,inv=self._scale_from_amax(maximum)
+                    word=Uint32(0)
+                    for pair in cutlass.range_constexpr(2):
+                        packed=self._backward_quant_pair(vals[2*pair],vals[2*pair+1],inv,self.gradient_quant_policy[0])
+                        word|=Uint32(packed.bitcast(Uint16))<<(16*pair)
+                    if lr<cfg.tile_m and gr<self.problem.m and gc<self.problem.n//2:
+                        ptr=cute.recast_ptr(gradient_quant.iterator+out_row*(self.problem.n//2)+gc,dtype=Uint32)
+                        ptr[0]=word
+                        if cute.arch.lane_idx()%8==0:
+                            gradient_scales[out_row,gc//32]=scale
             cute.arch.sync_threads()
             if tidx<cfg.num_mma_warps*32:
                 for i in cutlass.range_constexpr(cute.size(products)):
@@ -177,9 +322,11 @@ class GLURecomputeDerivative(MXFP8GLUKernel):
                 for i in cutlass.range_constexpr(cute.size(products)):
                     row,col=coordinates[2*i][0],coordinates[2*i][1]//2
                     if row < self.problem.m and col < self.problem.n//2:
-                        out[((2*self.problem.m+7)//8)*8+row,col]=BFloat16(Float32(quantized[i])*decoded_scales[i])
+                        hidden_out[row,col]=BFloat16(Float32(quantized[i])*decoded_scales[i])
         cute.arch.sync_threads()
-        if cutlass.const_expr(self.emit_hidden and not self.warp_quant):
+        if cutlass.const_expr(self.emit_hidden_quant):
+            self._hidden_quant_epilogue(scratch,hidden_quant,hidden_scales,block_m,block_n,tidx)
+        if cutlass.const_expr(self.emit_hidden and not self.warp_quant and not self.emit_hidden_quant):
             cfg=self.config
             for i in range(cute.ceil_div(cfg.tile_m*(cfg.tile_n//2),cfg.num_threads*cfg.glu_quant_vec)):
                 index=(tidx+i*cfg.num_threads)*cfg.glu_quant_vec
@@ -205,26 +352,35 @@ class GLURecomputeDerivative(MXFP8GLUKernel):
                         write_only_types=[Int16],
                         read_only_args=[values[v1]*inv,values[v0]*inv],
                     )
-                    if cutlass.const_expr(cfg.glu_hidden_decode=="bf16x2" and cfg.glu_quant_vec>1):
-                        decoded=nvvm.inline_ptx_hl("cvt.rn.bf16x2.e4m3x2 {$w0}, {$r0};",
-                                                  write_only_types=[Int32],read_only_args=[packed])
-                        scale_bits=Uint32(BFloat16(Float32(scale)).bitcast(Uint16))
-                        decoded=Uint32(nvvm.mul_bf16x2(decoded,Int32(scale_bits|(scale_bits<<16))))
-                        out_row=((2*self.problem.m+7)//8)*8+gr
+                    if cutlass.const_expr(cfg.glu_hidden_decode in ("fp32_packed","bf16x2") and cfg.glu_quant_vec>1):
+                        if cutlass.const_expr(cfg.glu_hidden_decode=="fp32_packed"):
+                            # Preserve FP32 decoding/scaling; pack only the final
+                            # BF16 conversion/store. Low half is the first value.
+                            low=Float32(Uint8(packed).bitcast(Float8E4M3FN))*Float32(scale)
+                            high=Float32(Uint8(packed>>8).bitcast(Float8E4M3FN))*Float32(scale)
+                            decoded=Uint32(nvvm.inline_ptx_hl(
+                                "cvt.rn.bf16x2.f32 {$w0}, {$r0}, {$r1};",
+                                write_only_types=[Int32],read_only_args=[high,low]))
+                        else:
+                            decoded=nvvm.inline_ptx_hl("cvt.rn.bf16x2.e4m3x2 {$w0}, {$r0};",
+                                                      write_only_types=[Int32],read_only_args=[packed])
+                            scale_bits=Uint32(BFloat16(Float32(scale)).bitcast(Uint16))
+                            decoded=Uint32(nvvm.mul_bf16x2(decoded,Int32(scale_bits|(scale_bits<<16))))
+                        out_row=gr
                         if row<cfg.tile_m and gr<self.problem.m and gc+v0<self.problem.n//2:
                             if gc+v1<self.problem.n//2 and (out_row*(self.problem.n//2)+gc+v0)%2==0:
-                                ptr=cute.recast_ptr(out.iterator+out_row*(self.problem.n//2)+gc+v0,dtype=Uint32)
+                                ptr=cute.recast_ptr(hidden_out.iterator+out_row*(self.problem.n//2)+gc+v0,dtype=Uint32)
                                 ptr[0]=decoded
                             else:
-                                out[out_row,gc+v0]=Uint16(decoded).bitcast(BFloat16)
+                                hidden_out[out_row,gc+v0]=Uint16(decoded).bitcast(BFloat16)
                                 if gc+v1<self.problem.n//2:
-                                    out[out_row,gc+v1]=Uint16(decoded>>16).bitcast(BFloat16)
+                                    hidden_out[out_row,gc+v1]=Uint16(decoded>>16).bitcast(BFloat16)
                     else:
                         for half in cutlass.range_constexpr(min(2,cfg.glu_quant_vec)):
                             v=v0+half
                             if row<cfg.tile_m and gr<self.problem.m and gc+v<self.problem.n//2:
                                 rounded=Uint8(packed>>(8*half)).bitcast(Float8E4M3FN)
-                                out[((2*self.problem.m+7)//8)*8+gr,gc+v]=BFloat16(Float32(rounded)*Float32(scale))
+                                hidden_out[gr,gc+v]=BFloat16(Float32(rounded)*Float32(scale))
             cute.arch.sync_threads()
 
 
@@ -234,6 +390,9 @@ def compile_glu_derivative(problem,config,activation,emit_hidden=False):
         raise ValueError("recompute derivative currently requires direct output stores")
     kernel = GLURecomputeDerivative(problem,config,activation,"bf16")
     kernel.emit_hidden=emit_hidden
+    kernel.emit_gradient_quant=False
+    kernel.emit_hidden_quant=False
+    kernel.separate_hidden=False
     kernel.glu_scratch_elems = config.tile_m*config.tile_n//2 if emit_hidden else 0
     if kernel.warp_quant:
         kernel.glu_scratch_elems=config.tile_m*config.tile_n*config.atom_layout_n//64 if emit_hidden else 0
@@ -252,17 +411,42 @@ def compile_glu_derivative(problem,config,activation,emit_hidden=False):
 
 
 class PrequantGLURecomputeDerivative(MXFP8PrequantGLUKernel):
+    _backward_quant_pair = GLURecomputeDerivative._backward_quant_pair
     _glu_epilogue = GLURecomputeDerivative._glu_epilogue
+    _hidden_quant_epilogue = GLURecomputeDerivative._hidden_quant_epilogue
 
 
 @lru_cache(maxsize=128)
-def compile_prequant_glu_derivative(problem,config,activation,emit_hidden=False):
+def compile_prequant_glu_derivative(problem,config,activation,emit_hidden=False,separate_hidden=False,
+                                   emit_gradient_quant=False,emit_hidden_quant=False,
+                                   gradient_quant_policy=('fp32','fp32'),hidden_quant_policy=('fp32','fp32')):
+    for policy in (gradient_quant_policy,hidden_quant_policy):
+        if len(policy)!=2 or policy[0] not in ('fp32','bf16x2') or policy[1] not in ('fp32','bf16_bits'):
+            raise ValueError('unsupported backward quantization policy')
+    if emit_hidden_quant and (not emit_hidden or not separate_hidden or config.tile_m%32 or config.tile_n%64
+                              or config.glu_hidden_decode not in ('fp32','fp32_packed')):
+        raise ValueError('hidden quantization requires separate joint recomputation, 32-aligned row/branch tiles and FP32 hidden decode')
+    if emit_gradient_quant and (not emit_hidden or config.glu_grad_store!='exchange'
+                                or problem.n%64 or config.tile_n%64):
+        raise ValueError('gradient quantization requires joint exchange recompute and complete 32-value branch blocks')
+    if separate_hidden and not emit_hidden:
+        raise ValueError('separate hidden storage requires joint recomputation')
+    from ..configs.glu import prequant_recompute_rejection
+    rejection = prequant_recompute_rejection(config)
+    if rejection:
+        raise ValueError(rejection)
     if config.glu_epilogue != "registers" or config.glu_store != "direct":
         raise ValueError("prequant derivative requires the direct paired-register epilogue")
     if config.scale_layout != "row_major":
         raise ValueError("prequant derivative currently requires row-major scales")
     kernel=PrequantGLURecomputeDerivative(problem,config,activation,"bf16")
+    kernel.single_stage_recompute_handoff=True
     kernel.emit_hidden=emit_hidden
+    kernel.emit_gradient_quant=emit_gradient_quant
+    kernel.emit_hidden_quant=emit_hidden_quant
+    kernel.gradient_quant_policy=gradient_quant_policy
+    kernel.hidden_quant_policy=hidden_quant_policy
+    kernel.separate_hidden=separate_hidden
     kernel.glu_scratch_elems=config.tile_m*config.tile_n//2 if emit_hidden else 0
     def fake(dtype,rows,cols):
         return cute.runtime.make_fake_tensor(dtype,(rows,cols),stride=(cols,1),assumed_align=16)
@@ -273,6 +457,14 @@ def compile_prequant_glu_derivative(problem,config,activation,emit_hidden=False)
     h=problem.n//2
     out=fake(BFloat16,((2*problem.m+7)//8)*8+problem.m,h) if emit_hidden else fake(BFloat16,problem.m,problem.n)
     dh=fake(BFloat16,problem.m,h)
+    if separate_hidden:
+        out=fake(BFloat16,2*problem.m,h)
+        dh=(dh,fake(BFloat16,problem.m,h))
+    if emit_gradient_quant:
+        dh=(dh,fake(Float8E4M3FN,2*problem.m,h),fake(Float8E8M0FNU,2*problem.m,h//32))
+    if emit_hidden_quant:
+        storage_m=(problem.m+31)//32*32
+        dh=(dh,fake(Float8E4M3FN,h,storage_m),fake(Float8E8M0FNU,h,storage_m//32))
     stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile(kernel,x,w,sx,sw,out,dh,stream,
                         options="--enable-tvm-ffi --opt-level 3 "

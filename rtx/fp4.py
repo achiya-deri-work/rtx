@@ -3765,7 +3765,7 @@ class NVFP4Linear(nn.Module):
         )
 
 
-def _clear_runtime_caches() -> dict[str, object]:
+def _clear_runtime_caches(*, preserve_compiled=False) -> dict[str, object]:
     before = {
         "materialized_dynamic": _DYNAMIC_RUNNERS.stats(),
         "delayed_dynamic": _DELAYED_DYNAMIC_RUNNERS.stats(),
@@ -3778,8 +3778,9 @@ def _clear_runtime_caches() -> dict[str, object]:
     _JIT_REGION_DYNAMIC_RUNNERS.clear()
     _BLOCK_DYNAMIC_RUNNERS.clear()
     _DYNAMIC_X_RUNNERS.clear()
-    _INFERENCE_CONFIG_SELECTIONS.clear()
-    _DYNAMIC_CONFIG_SELECTIONS.clear()
+    if not preserve_compiled:
+        _INFERENCE_CONFIG_SELECTIONS.clear()
+        _DYNAMIC_CONFIG_SELECTIONS.clear()
     return before
 
 

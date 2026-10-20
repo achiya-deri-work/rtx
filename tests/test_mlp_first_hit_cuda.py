@@ -13,10 +13,57 @@ from tests.test_mxfp8_mlp import reference
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+def test_runtime_execution_mix_isolates_disk_winners(tmp_path):
+    from rtx._mlp_autotune import SELECTIONS
+    import rtx.autotune.mlp as tuning
+    torch.manual_seed(942)
+    policy=rtx.AutotunePolicy(max_trials=1,max_seconds=60,warmup=1,samples=3,
+        calls_per_sample=1,confirmation_repeats=0,finalist_rounds=0)
+    mixes=[rtx.MLPExecutionMix(inference_forwards=n) for n in (1,2)]
+    layers=[rtx.MXFP8MLP(128,128,device='cuda',autotune='balanced',
+        tuning_policy=policy,autotune_cache_dir=tmp_path,training_mix=m) for m in mixes]
+    layers[1].load_state_dict(layers[0].state_dict())
+    x=(torch.randn(128,128,device='cuda',dtype=torch.bfloat16)*.1).requires_grad_()
+    dy=torch.randn_like(x)*.1
+    functions=[torch.compile(layer,fullgraph=True,dynamic=False,
+        options={'triton.cudagraphs':False}) for layer in layers]
+    def run(i):
+        y=functions[i](x)
+        return y,*torch.autograd.grad(y,(x,*layers[i].parameters()),dy)
+    original=tuning.tune_mxfp8_mlp
+    observed=[]
+    def tune(*args,**kwargs):
+        observed.append(kwargs['execution_mix'])
+        return original(*args,**kwargs)
+    with patch.object(tuning,'tune_mxfp8_mlp',side_effect=tune):
+        actual=[run(i) for i in range(2)]
+    assert observed==mixes
+    expected_y,expected_grads=reference(x,layers[0].gate_up_weight,layers[0].down_weight,dy,'silu')
+    for values in actual:
+        for a,b in zip(values,(expected_y,*expected_grads)):
+            assert a.isfinite().all()
+            assert (a.float()-b.float()).norm()/b.float().norm().clamp_min(1e-12)<.025
+    journals={str(p):p.read_bytes() for p in tmp_path.rglob('observations.jsonl')}
+    assert len(journals)==2
+    SELECTIONS.clear()
+    with patch.object(tuning,'tune_mxfp8_mlp',side_effect=AssertionError('disk winner retuned')):
+        for i in range(2):
+            for a,b in zip(run(i),actual[i]):
+                torch.testing.assert_close(a,b,rtol=0,atol=0)
+    assert journals=={str(p):p.read_bytes() for p in tmp_path.rglob('observations.jsonl')}
+
+
 @pytest.mark.parametrize("mode", ["cache", "balanced"])
-def test_compiled_mlp_selection_and_refinement(tmp_path, mode):
+def test_compiled_mlp_selection_and_refinement(tmp_path, mode, monkeypatch):
     from rtx._mlp_autotune import SELECTIONS, BACKWARDS
     from torch._inductor.compile_fx import compile_fx
+    import rtx.autotune.mlp as tuning
+    tune_calls=[]
+    original_tune=tuning.tune_mxfp8_mlp
+    def record_tune(*args,**kwargs):
+        tune_calls.append(kwargs.copy())
+        return original_tune(*args,**kwargs)
+    monkeypatch.setattr(tuning,'tune_mxfp8_mlp',record_tune)
     torch.manual_seed(932)
     policy = rtx.AutotunePolicy(max_trials=8, max_seconds=90, search_schedule="progressive",
         cache_behavior="refine", finalist_rounds=2, confirmation_repeats=0,
@@ -89,6 +136,11 @@ def test_compiled_mlp_selection_and_refinement(tmp_path, mode):
         fn=torch.compile(layer,fullgraph=True,dynamic=False)
         run()
         assert sum(len(v.splitlines()) for v in journals().values())==16
+        assert len(journals())==1
+        assert len(tune_calls)==2
+        assert tune_calls[0]['initial']==tune_calls[1]['initial']
+        if tune_calls[1]['qualification_incumbent'] is not None:
+            assert tune_calls[1]['qualification_incumbent'] in tune_calls[1]['portfolio']
 
 
 @pytest.mark.parametrize("mask", [(True,False,False),(False,True,False),(False,False,True)])

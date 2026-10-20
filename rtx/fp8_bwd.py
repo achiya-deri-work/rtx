@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from threading import RLock
@@ -19,7 +20,8 @@ from .kernels.mxfp8_bwd import (
     MXFP8BwdConfig,
     MXFP8BwdMatmulConfig,
 )
-from .runtime import BoundedCache, load_kernel_symbol, runner_cache_limit
+from .runtime import (BoundedCache, load_kernel_symbol, runner_cache_limit,
+                      runner_cache_byte_limit, tensor_storage_bytes)
 from ._workspace import persistent_scratch
 from .types import AutotuneMode
 
@@ -103,18 +105,32 @@ def _allocate_scales(
     scale_layout: str,
     device: torch.device,
 ) -> torch.Tensor:
+    return torch.empty(_scale_shape(rows,k,scale_layout),
+                       dtype=torch.float8_e8m0fnu,device=device)
+
+
+def _scale_shape(rows, k, scale_layout):
     if scale_layout == "row_major":
-        return torch.empty(
-            rows, k // 32, dtype=torch.float8_e8m0fnu, device=device
-        )
+        return (rows, k // 32)
     tile_rows = 64 if scale_layout == "mma64" else 128
-    return torch.empty(
-        rows // tile_rows,
-        k // 128,
-        512,
-        dtype=torch.float8_e8m0fnu,
-        device=device,
-    )
+    return (rows // tile_rows, k // 128, 512)
+
+
+def _serial_operand_views(dx_problem, dw_problem, dx_config, dw_config, device):
+    """Cold allocation only. Each role aliases across sequential GEMMs, never
+    within a GEMM. Both runners own views of the same storage for graph pins.
+    """
+    def shapes(p,c):
+        return ((p.m,p.k),(p.n,p.k),
+                _scale_shape(p.m,p.k,c.quant_a.scale_layout),
+                _scale_shape(p.n,p.k,c.resolved_quant_b().scale_layout))
+    left,right=[],[]
+    for i,(a,b) in enumerate(zip(shapes(dx_problem,dx_config),shapes(dw_problem,dw_config))):
+        dtype=torch.float8_e4m3fn if i<2 else torch.float8_e8m0fnu
+        storage=torch.empty(max(math.prod(a),math.prod(b)),dtype=dtype,device=device)
+        left.append(storage[:math.prod(a)].view(a))
+        right.append(storage[:math.prod(b)].view(b))
+    return tuple(left),tuple(right)
 
 
 @dataclass(slots=True)
@@ -333,6 +349,7 @@ def _build_matmul_runner(
     config: MXFP8BwdMatmulConfig,
     device: torch.device,
     compile_quantizer: bool = True,
+    operands: tuple[torch.Tensor, ...] | None = None,
 ) -> _MatmulRunner | _FusedMatmulRunner | _SplitFusedMatmulRunner | _AtomicSplitFusedMatmulRunner:
     if config.backend == "fused":
         if config.reduction == "split_fp32_workspace":
@@ -412,15 +429,14 @@ def _build_matmul_runner(
         )
     a_shape = (problem.m, problem.k)
     b_shape = (problem.n, problem.k)
-    quantized_a = torch.empty(a_shape, dtype=torch.float8_e4m3fn, device=device)
-    quantized_b = torch.empty(b_shape, dtype=torch.float8_e4m3fn, device=device)
     quant_b_config = config.resolved_quant_b()
-    scales_a = _allocate_scales(
-        problem.m, problem.k, config.quant_a.scale_layout, device
-    )
-    scales_b = _allocate_scales(
-        problem.n, problem.k, quant_b_config.scale_layout, device
-    )
+    if operands is None:
+        quantized_a = torch.empty(a_shape, dtype=torch.float8_e4m3fn, device=device)
+        quantized_b = torch.empty(b_shape, dtype=torch.float8_e4m3fn, device=device)
+        scales_a = _allocate_scales(problem.m,problem.k,config.quant_a.scale_layout,device)
+        scales_b = _allocate_scales(problem.n,problem.k,quant_b_config.scale_layout,device)
+    else:
+        quantized_a,quantized_b,scales_a,scales_b = operands
     if not compile_quantizer:
         quant_a_launcher = None
         quant_b_launcher = None
@@ -530,17 +546,24 @@ def _build_bwd_runner(
     if reason is not None:
         raise RuntimeError(f"MXFP8 backward cannot run this configuration: {reason}")
     use_quad = config.quant_schedule in ("quad", "shared_g_quad")
+    dx_operands = dw_operands = None
+    if config.operand_storage in ('serial_reuse', 'serial_reuse_partials'):
+        dx_operands,dw_operands = _serial_operand_views(
+            MXFP8Problem(problem.m,problem.k,problem.n),
+            MXFP8Problem(problem.n,problem.k,problem.m),config.dx,config.dw,device)
     dx = _build_matmul_runner(
         problem=MXFP8Problem(problem.m, problem.k, problem.n),
         config=config.dx,
         device=device,
         compile_quantizer=not use_quad,
+        operands=dx_operands,
     )
     dw = _build_matmul_runner(
         problem=MXFP8Problem(problem.n, problem.k, problem.m),
         config=config.dw,
         device=device,
         compile_quantizer=not use_quad,
+        operands=dw_operands,
     )
     quad_quant = None
     if use_quad:
@@ -575,7 +598,8 @@ _CONFIGS: dict[str, MXFP8BwdConfig] = {}
 _AUTOTUNE_REQUESTS: dict[str, "_BwdAutotuneRequest"] = {}
 _AUTOTUNE_SELECTIONS: dict[tuple[object, ...], str] = {}
 _RUNNERS: BoundedCache[tuple[object, ...], _BwdRunner] = BoundedCache(
-    runner_cache_limit("backward", 8)
+    runner_cache_limit("backward", 8), max_bytes=runner_cache_byte_limit("backward"),
+    sizeof=tensor_storage_bytes,
 )
 _MATMUL_RUNNERS: BoundedCache[
     tuple[object, ...],
@@ -583,7 +607,9 @@ _MATMUL_RUNNERS: BoundedCache[
     | _FusedMatmulRunner
     | _SplitFusedMatmulRunner
     | _AtomicSplitFusedMatmulRunner,
-] = BoundedCache(runner_cache_limit("backward_matmul", 8))
+] = BoundedCache(runner_cache_limit("backward_matmul", 8),
+                 max_bytes=runner_cache_byte_limit("backward_matmul"),
+                 sizeof=tensor_storage_bytes)
 _LOCK = RLock()
 
 
@@ -633,7 +659,10 @@ def _bwd_request_from_key(config_key):
 @torch.compiler.assume_constant_result
 def _intern_bwd_config(config: MXFP8BwdConfig) -> str:
     config = config.normalized()
-    payload = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
+    value = asdict(config)
+    if value['operand_storage'] == 'separate':
+        del value['operand_storage']
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
     key = f"bwd-v{BWD_FRONTEND_REVISION}:{payload}"
     with _LOCK:
         _CONFIGS[key] = config
@@ -890,12 +919,15 @@ def _resolve_bwd_runner(
     torch.Tensor,
     torch.Tensor,
 ]:
-    problem, config_key, config, grad_output_c, x_c, weight_c = (
-        _resolve_bwd_context(grad_output, x, weight, config_key)
-    )
-    stream = torch.cuda.current_stream(x.device)
+    return _bwd_runner_from_context(_resolve_bwd_context(grad_output, x, weight, config_key))
+
+
+def _bwd_runner_from_context(context):
+    """One validated context, shared stream-keyed ownership for paired callers."""
+    problem, config_key, config, grad_output_c, x_c, weight_c = context
+    stream = torch.cuda.current_stream(x_c.device)
     runner_key = (
-        x.device.index,
+        x_c.device.index,
         int(stream.cuda_stream),
         problem.m,
         problem.n,
@@ -907,7 +939,7 @@ def _resolve_bwd_runner(
         with _LOCK:
             runner = _RUNNERS.get(runner_key)
             if runner is None:
-                runner = _build_bwd_runner(problem, config, x.device)
+                runner = _build_bwd_runner(problem, config, x_c.device)
                 _RUNNERS[runner_key] = runner
     return problem, runner, grad_output_c, x_c, weight_c
 
@@ -960,13 +992,24 @@ def _resolve_partial_bwd_runner(
     torch.Tensor,
     torch.Tensor,
 ]:
-    problem, config_key, config, grad_output_c, x_c, weight_c = (
-        _resolve_bwd_context(grad_output, x, weight, config_key)
-    )
-    stream = torch.cuda.current_stream(x.device)
+    return _partial_bwd_runner_from_context(
+        _resolve_bwd_context(grad_output, x, weight, config_key), gradient)
+
+
+def _partial_bwd_runner_from_context(context, gradient):
+    """Private lookup for an already validated context; retains no new tensors."""
+    problem, config_key, config, grad_output_c, x_c, weight_c = context
+    if gradient not in ('dx', 'dw'):
+        raise ValueError(f'unknown backward gradient {gradient!r}')
+    if config.operand_storage == 'serial_reuse_partials':
+        # Explicit opt-in: unlike serial_reuse, construct/retain both legs.
+        # Stream identity, byte limits and graph pins belong to _RUNNERS.
+        _, runner, grad_output_c, x_c, weight_c = _bwd_runner_from_context(context)
+        return getattr(runner, gradient), grad_output_c, x_c, weight_c
+    stream = torch.cuda.current_stream(x_c.device)
     runner_key = (
         gradient,
-        x.device.index,
+        x_c.device.index,
         int(stream.cuda_stream),
         problem.m,
         problem.n,
@@ -979,7 +1022,7 @@ def _resolve_partial_bwd_runner(
             runner = _MATMUL_RUNNERS.get(runner_key)
             if runner is None:
                 runner = _build_partial_bwd_runner(
-                    problem, config, x.device, gradient
+                    problem, config, x_c.device, gradient
                 )
                 _MATMUL_RUNNERS[runner_key] = runner
     return runner, grad_output_c, x_c, weight_c
@@ -1045,14 +1088,15 @@ def _launch_dw_out(
     runner(grad_output_c, x_c, grad_weight)
 
 
-def _clear_runtime_caches() -> dict[str, object]:
+def _clear_runtime_caches(*, preserve_compiled=False) -> dict[str, object]:
     before = {
         "backward": _RUNNERS.stats(),
         "backward_matmul": _MATMUL_RUNNERS.stats(),
     }
     _RUNNERS.clear()
     _MATMUL_RUNNERS.clear()
-    _AUTOTUNE_SELECTIONS.clear()
+    if not preserve_compiled:
+        _AUTOTUNE_SELECTIONS.clear()
     return before
 
 

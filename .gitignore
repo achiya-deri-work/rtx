@@ -16,9 +16,17 @@ autotune_reports/
 training_data/
 training_results/
 copied_datasets/
+research_data/
 hardware_calibration*.json
 *.log
 
 # Local DINOv3 regression checkout and checkpoints.  The upstream source and
 # its separately licensed assets are deliberately not distributed by RTX.
 fp8dinov3/
+
+# Local application feedback and chronological qualification notebooks.
+# Public API/workflow documentation remains tracked.
+/rtx-maintainer-feedback-*/
+/docs/afrl_*_202609*.md
+/docs/mlp_*_202609*.md
+/docs/mlp_deployment_goal_status.md

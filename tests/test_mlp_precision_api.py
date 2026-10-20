@@ -136,7 +136,7 @@ class PrecisionAPITests(unittest.TestCase):
                 result=adapter.evaluator(config)
                 self.assertEqual(result.status,"ok",result.error)
             self.assertTrue(adapter.evaluator(base).metadata["prepared_benchmark_reused"])
-            self.assertEqual(adapter.context.tags["capture_warmup"],"candidate_leaves_same_stream_v2")
+            self.assertEqual(adapter.context.tags["capture_warmup"],"candidate_leaves_evaluator_stream_v3")
 
     @unittest.skipUnless(torch.cuda.is_available(),"requires CUDA")
     def test_tuning_space_policy_and_shape_reductions(self):

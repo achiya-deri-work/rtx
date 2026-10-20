@@ -1,16 +1,65 @@
 # MLP first-hit execution-plan handoff
 
-Status: connected to an experimental opt-in MLP launcher and compiled backward.
+Status: connected to an experimental opt-in MLP launcher and kernel-only backward.
 Existing explicit MLP execution remains unchanged. This is not yet a
 performance-qualified replacement for explicit tuning.
 
-Current integration: private selected-op revision 3 and plan-spec revision 7
-route the caller's `torch.compile` CUDA graph option to CUDA-only nested replay.
-The host metadata boundary stays outside capture. Existing Inductor v2 artifacts
+Current integration: private selected-op revision 4, replay-op revision 3 and
+plan-spec revision 8 route the caller's `torch.compile` CUDA graph option to
+cached **CUDA launch graphs**, without internal `torch.compile` calls.
+The host metadata boundary stays outside capture. Old Inductor artifacts
 cannot bypass the new routing; durable kernel winners keep their numerical
 revision because the kernel/config contract did not change. No cache deletion is
 required. `autotune='off'` and ordinary compiler defaults remain unchanged.
 The dated experiment sections below preserve the progression and former limits.
+
+Each replay entry is keyed by policy, activation, device, tensor shapes/strides/
+dtypes, caller stream and (for backward) gradient mask. The forward/backward
+caches each hold at most 32 entries. Cold setup warms the kernel sequence and
+captures once; repeated invocations only stage operands, replay and publish
+independent outputs. New input/weight values are copied every call; weights
+are never silently frozen. Private replay adds memory and device copies, so
+it is not guaranteed faster than host feeding for compute-bound shapes.
+
+Graph-owned resources retain their scratch runners even if lower-level caches
+evict them. `clear_runtime_caches()` synchronizes by default and clears private
+MLP graphs too. It must still not be used while an external captured graph owns
+those runtime resources. The existing post-search cleanup remains in place.
+
+Manual outer capture records the already-warmed kernel sequence directly,
+without staging or launching a nested graph. Warm on the capture stream first.
+Without requested replay, the selected backward invokes kernels directly;
+there is no hidden compiler in either path. User-side `torch.compile` remains
+responsible for the surrounding model. Explicit-config MLPs and linears continue
+to use the user's outer compiler/capture rather than private per-layer compilers.
+
+Current local validation: 21 integration tests plus five kernel-only replay
+tests passed on RTX 5070 Ti / Torch 2.13.0+cu132. These cover changed operands,
+SiLU/GELU, ragged/aligned shapes, partial/full gradients, overlapping backward,
+multiple live outputs, external capture, scratch eviction, stable live memory,
+and a guard that forbids internal `torch.compile`. Historical timings below
+describe the previous nested-compiler implementation, not this replacement.
+The same five kernel-only tests plus nine automatic/lifetime CUDA tests also
+pass on Torch 2.12.1+cu132 (14 tests, 56.02 seconds) on this device.
+
+Kernel-only replay measurements on the same GPU, using fresh processes,
+identical **untuned default configs**, 20 CUDA-event samples × 10 calls after
+warmup (no optimizer):
+
+| M/K/H/O | Direct host-fed fwd+bwd | Private launch graph | Outer CUDA graph |
+|---|---:|---:|---:|
+| 64/128/256/64 | 336.1 µs | 343.5 µs | 323.9 µs |
+| 512/768/1536/768 | 670.0 µs | 706.9 µs | 665.0 µs |
+
+These are not speedups over the previous compiled implementation or tuned
+BF16 comparisons. Private staging regresses these compute-heavy defaults;
+outer capture avoids its copies. A narrow Nsight API trace of ten replayed
+fwd+bwd calls records 20 graph launches, no individual host kernel launches,
+and 110 device-to-device copies. Capture/compilation is absent from that range.
+Kernel-node timing was not enabled in this trace, so it establishes the launch
+contract, not per-kernel utilization. Reproduce timings with
+`tools/benchmark_mlp_kernel_replay.py --mode direct|replay|outer --shape M,K,H,O
+--output NEW.json` (one mode/process at a time).
 
 Use `torch.compile(..., mode="reduce-overhead", fullgraph=True, dynamic=False)`
 to request automatic replay. It is a choice, not a universal performance win.

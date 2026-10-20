@@ -57,7 +57,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 23
+KERNEL_REVISION = 25
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -126,6 +126,31 @@ def _shared_g_quad_variants() -> tuple[dict[str, object], ...]:
                         },
                     }
                 )
+    return tuple(variants)
+
+
+def _shared_g_row_major_variants():
+    """Compound entry from ragged per-matmul/serial-storage schedules.
+
+    Native-layout variants remain unchanged. Explicit separate storage avoids
+    aliasing four simultaneously live operands; row-major scales admit ragged
+    M. Both scale owners are exposed; producer movement also supports one stage.
+    """
+    variants = []
+    for original in _shared_g_quad_variants():
+        if original['dx']['quant_a']['native_scale_store'] != 'scalar':
+            continue
+        value = {'quant_schedule': 'shared_g_quad', 'operand_storage': 'separate'}
+        for leg in ('dx', 'dw'):
+            source = original[leg]
+            value[leg] = dict(backend='decomposed', quant_launches='dual',
+                quant_a={**source['quant_a'], 'scale_layout': 'row_major'},
+                quant_b={**source['quant_b'], 'scale_layout': 'row_major'},
+                gemm={'scale_layout': 'row_major', 'scale_role': 'producer'})
+        variants.append(value)
+        variants.append({**value, **{
+            leg: {**value[leg], 'gemm': {'scale_layout': 'row_major', 'scale_role': 'consumers'}}
+            for leg in ('dx', 'dw')}})
     return tuple(variants)
 
 
@@ -607,11 +632,14 @@ BWD_SEARCH_SPACE: dict[str, tuple[dict[str, object], ...]] = {
     "stream_schedule": tuple(
         {"stream_schedule": value} for value in ("single", "dual_stream")
     ),
+    "operand_storage": tuple({'operand_storage': value}
+                             for value in ('separate', 'serial_reuse', 'serial_reuse_partials')),
     "quant_schedule": tuple(
         {"quant_schedule": value}
         for value in ("per_matmul", "quad", "shared_g_quad")
     ),
     "shared_g_quad": _shared_g_quad_variants(),
+    "shared_g_row_major": _shared_g_row_major_variants(),
     "shared_g_vector": _shared_g_schedule_variants(_quant_vector_variants()),
     "shared_g_arithmetic": _shared_g_schedule_variants(
         _quant_arithmetic_variants()
@@ -732,7 +760,11 @@ def _matmul_from_dict(value: Mapping[str, object]) -> MXFP8BwdMatmulConfig:
 
 
 def bwd_config_to_dict(config: MXFP8BwdConfig) -> dict[str, object]:
-    return asdict(config.normalized())
+    value = asdict(config.normalized())
+    # Keep existing default identities compatible with archived configurations.
+    if value['operand_storage'] == 'separate':
+        del value['operand_storage']
+    return value
 
 
 def bwd_config_from_dict(value: Mapping[str, object]) -> MXFP8BwdConfig:
@@ -742,6 +774,7 @@ def bwd_config_from_dict(value: Mapping[str, object]) -> MXFP8BwdConfig:
         execution_order=str(value.get("execution_order", "dx_first")),
         stream_schedule=str(value.get("stream_schedule", "single")),
         quant_schedule=str(value.get("quant_schedule", "per_matmul")),
+        operand_storage=str(value.get('operand_storage', 'separate')),
     ).normalized()
 
 
@@ -819,6 +852,7 @@ def update_bwd_config(
         execution_order=str(updates.get("execution_order", config.execution_order)),
         stream_schedule=str(updates.get("stream_schedule", config.stream_schedule)),
         quant_schedule=str(updates.get("quant_schedule", config.quant_schedule)),
+        operand_storage=str(updates.get('operand_storage', config.operand_storage)),
     ).normalized()
 
 

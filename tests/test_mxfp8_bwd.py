@@ -941,6 +941,23 @@ class TestMXFP8BwdCuda(unittest.TestCase):
                 )
                 self._assert_backward_close(config, grad_output, x, weight)
 
+    def test_shared_g_row_major_ragged_reduction(self) -> None:
+        torch.manual_seed(135)
+        n,k = 128,128
+        weight = torch.randn(n,k,device='cuda',dtype=torch.bfloat16)
+        initial = replace(DEFAULT_MXFP8_BWD_CONFIG,
+            dx=replace(DEFAULT_MXFP8_BWD_CONFIG.dx,
+                gemm=replace(DEFAULT_MXFP8_BWD_CONFIG.dx.gemm, epilogue='direct', store_vec=1)))
+        for value in BWD_SEARCH_SPACE['shared_g_row_major']:
+            config = update_bwd_config(initial, value)
+            q = config.dx.quant_a
+            m = 3*q.transposed_tile_rows
+            x = torch.randn(m,k,device='cuda',dtype=torch.bfloat16)
+            grad_output = torch.randn(m,n,device='cuda',dtype=torch.bfloat16)
+            with self.subTest(tile=q.transposed_tile_rows, engine=q.transposed_load_engine):
+                self.assertIsNone(config.implementation_rejection(MXFP8Problem(m,n,k)))
+                self._assert_backward_close(config, grad_output, x, weight)
+
     def test_shared_g_quad_never_reads_the_duplicate_transpose_argument(self) -> None:
         torch.manual_seed(134)
         rows = 128

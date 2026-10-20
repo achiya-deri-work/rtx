@@ -27,7 +27,7 @@ class CompositeEffortNamespaceTests(unittest.TestCase):
                 paths=[];a=adapter()
                 def factory(adapt,store,*args,**kwargs):
                     paths.append(store.path)
-                    return SimpleNamespace(tune=lambda:None)
+                    return SimpleNamespace(tune=lambda:SimpleNamespace(config=adapt.initial_config))
                 with patch('torch.cuda.device',side_effect=lambda *_:nullcontext()), \
                      patch('torch.cuda.is_current_stream_capturing',return_value=False), \
                      patch(f'rtx.autotune.{family}.make_{family}_adapter',return_value=a), \

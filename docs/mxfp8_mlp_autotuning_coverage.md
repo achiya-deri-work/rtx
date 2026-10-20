@@ -8,6 +8,38 @@ this is not an aggressive-Inductor-options comparison.
 
 ## Why the search changed
 
+### Tall/narrow weight reuse
+
+MXFP8 now supports N=64 CTA tiles with two N MMA atoms and a logically
+64-column SFB view retaining the physical 128-column scale strides. This is
+not weight padding to a 128-column computation. The search includes
+`64/128/256/384/512 × 64`, alongside existing wider tiles. The 256-row and
+taller choices use eight M atoms. Thus `256×64` uses a `32×32` per-warp
+accumulator tile; total register usage also includes operands, scales and
+quantization temporaries, and must not be inferred from accumulator size alone.
+
+`weight_reuse_tile=(M, load_engine, BF16_stages, raster_group)` is a coupled
+coordinate: it selects N=64, the matching warp layout, one MXFP8 buffer,
+M-major traversal, and compatible transport settings. Engines are scalar,
+cp.async and TMA; staged engines expose 1–4 BF16 buffers and raster groups
+1/2/4/8. Resource/implementation checks reject illegal combinations.
+GLU additionally selects direct register epilogues and reuses operand scratch.
+Independent coordinates remain available for refinement. The MLP opening pool
+includes three narrow coupled schedules; it does not force one as the default.
+Backward inherits these fused coordinates independently for dX and dW, and
+prequantized GEMM geometry includes N=64 with its existing persistence controls.
+
+Qualification on RTX 5070 Ti / Torch 2.13.0+cu132 covers scalar narrow tiles,
+128×64 cp.async, 128×64 and 256×64 TMA, prequantized GEMM with multiple buffers
+and same-weight persistence, and compiled MLP forward/backward with ragged
+tails. **N=64 cp.async with M≥256 is quarantined following numerical failures.**
+N=64 GLU TMA output stores and NVFP4 N=64 are not enabled. Passing correctness
+does not establish a performance winner: no default config or precision changed.
+
+Reproduce with `pytest -q tests/test_narrow_cta.py` on a supported CUDA host.
+
+### Backend exploration
+
 Earlier 48-trial studies exposed a large space but left all four backward
 GEMMs decomposed, 128-by-128, and unsplit. Declaring a coordinate does not
 demonstrate that it was explored. Two important barriers were quad-quantization
@@ -26,6 +58,15 @@ observed identities. Interrupted candidate attempts retain the existing
 orchestrator recovery behavior.
 
 ## Scope
+
+Training search exposes `recompute_gemm.pipeline`, a coupled move over
+1–4 GEMM stages and `consumers`/`producer` scale ownership. Existing individual
+coordinates remain available. Coupling allows a legal destination to be tested
+without visiting an illegal intermediate; all normal legality checks still
+apply, including the one-stage consumer quarantine. This is not a precision
+choice or a forced one-stage default. Measured benefits are shape-dependent;
+use [replacement-level qualification](mlp_replacement_comparison.md) on the
+intended workload. Local research measurements are not distributed.
 
 Search includes the existing gate, down, recompute and four backward-leg
 schedules: backend, geometry, staging, quantization, scale transport, register
@@ -105,3 +146,37 @@ The stronger measurements are the appropriate handoff numbers; the lower
 search observations should not be presented as guaranteed steady-state times.
 Validation also passed 35 CPU orchestration/documentation tests and 13 CUDA
 frontend/compiled-autograd tests on Torch 2.13.0+cu132.
+## FP32 hidden reconstruction stores
+
+Prequantized recomputation exposes `recompute_gemm.glu_hidden_decode` with
+`fp32` (default), `fp32_packed`, and the existing `bf16x2` path. `fp32_packed`
+decodes each E4M3 value and multiplies its scale in FP32, then converts two
+distinct results to BF16 and writes an aligned 32-bit word. Ragged or unaligned
+pairs use scalar stores; quantization vector width 1 retains the scalar path.
+It does not use BF16 scale multiplication or change the MXFP8 rounding recipe.
+This option is currently supported for prequantized recomputation, not the
+on-chip `gate_up` configuration. It remains a search choice, not a default.
+
+## Shared-gradient quantization entry
+
+`gate_backward.shared_g_row_major` and `down_backward.shared_g_row_major`
+inherit the backward tuner's compound row-major shared-G family. Each move
+selects separate operand storage, a common square quantizer tile (32/64/128),
+register or async-copy loading, and producer- or consumer-owned row-major scale staging.
+This permits entry from serial-reuse schedules without an illegal overlapping
+storage lifetime. Native-layout shared-G moves remain available unchanged.
+The inherited GEMM epilogue and other legality constraints still apply:
+row-major scales remove the native 128-row restriction, not the quantizer's
+full-SMEM-tile reduction requirement. For example, M11712 admits 32/64 tiles,
+not 128. This is search coverage, not a preference for shared quantization.
+
+## Fused recompute gradient output
+
+`gradient_quantization` selects separate or recompute-epilogue row quantization.
+`gradient_quantization_path` crosses the structural legality boundary by
+selecting joint prequant exchange recompute, separate outputs, no overlap,
+serial dX-first execution and materialized row-major dX. It preserves arithmetic
+and scale rounding; incompatible numerical policies still reject. All original
+axes remain available. The new path borrows existing stream-owned FP8 scratch
+and is active only when both X and gate-weight gradients are requested.
+See [API constraints and tradeoffs](mxfp8_mlp.md#recompute-gradient-quantization-opt-in).

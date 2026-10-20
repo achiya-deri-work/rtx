@@ -408,12 +408,19 @@ class MXFP8LinearFwdKernel:
                 self.sf_vec_size,
                 cfg.mxfp8_stages,
             )
-        self.sfb_smem_layout = blockscaled_utils.sm120_make_smem_layout_sfb(
-            self.tiled_mma,
-            scale_layout_tile,
-            self.sf_vec_size,
-            cfg.mxfp8_stages,
-        )
+        if cfg.tile_n == 64:
+            # SFA and SFB share the same physical 128-row scale encoding.
+            # Keep those strides, but partition only the 64 logical B rows.
+            self.sfb_smem_layout = _make_sm120_sfa_layout_64(
+                self.tiled_mma, cfg.tile_k, self.sf_vec_size, cfg.mxfp8_stages,
+            )
+        else:
+            self.sfb_smem_layout = blockscaled_utils.sm120_make_smem_layout_sfb(
+                self.tiled_mma,
+                scale_layout_tile,
+                self.sf_vec_size,
+                cfg.mxfp8_stages,
+            )
         # TMA follows the contiguous basis of each GMEM tensor.  A metadata-only
         # transpose has stride (1, rows), so its staging tile must be MN-major;
         # using a K-major staging atom would reinterpret rather than transpose
@@ -2521,6 +2528,9 @@ class MXFP8LinearFwdKernel:
                             < self.num_mma_warps + cfg.quantizer_warps
                         )
                     if is_tma_consumer:
+                        # Order generic BF16 shared reads before the async TMA
+                        # producer is allowed to recycle this input slot.
+                        cute.arch.fence_view_async_shared()
                         tma_pipeline.consumer_release(tma_consumer_state)
                         tma_consumer_state.advance()
     

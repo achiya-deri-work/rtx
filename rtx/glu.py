@@ -221,7 +221,7 @@ from ._glu_inductor import register as _register_inductor
 _register_inductor()
 
 
-def _clear_runtime_caches():
+def _clear_runtime_caches(*, preserve_compiled=False):
     from ._glu_inductor import LAUNCHERS
     count=0
     for launcher in LAUNCHERS.values():

@@ -1,5 +1,50 @@
 # Autotuning: runtime selection to portable datasets
 
+## Local evidence consolidation
+
+Use one **logical collection**, not one enormous mutable file. The CPU-only
+storage command writes checksummed Parquet shards and a source/line occurrence
+index. It deduplicates exact record bytes only: repeated measurements,
+conflicting observation IDs, errors, malformed rows and raw metadata remain.
+It never averages timings or marks observations safe for training.
+
+```bash
+python -m tools.research.storage build --output research_data/collection_v1 \
+  --sources autotune_datasets copied_datasets autotune_reports autotune_results
+python -m tools.research.storage verify --output research_data/collection_v1
+```
+
+Root ZIP bundles may also be passed as sources. Read `records/*.parquet` for
+unique payloads and join `occurrences/*.parquet` on `record_hash` for source
+locations. `manifest.json` defines source IDs and checksums. `payload` retains
+the original JSONL record bytes. This is a lossless storage layer, not the
+curated training view; preserve study split/quarantine sidecars as well.
+
+Inactive original trees can be packed independently:
+
+```bash
+python -m tools.research.storage archive --sources copied_datasets \
+  --output research_data/archives/copied_datasets.zip
+```
+
+The archive is fully read back and compared by SHA-256. Optional `--retire`
+removes the checked originals only after verification; **do not use it on an
+active campaign**. Restore by extracting the archive into the original source
+parent. Resume old campaigns only after restoration. Keep receipts, original
+ZIP bundles and metadata, and never retire model checkpoints as part of this
+operation. The archive and collection are ignored by Git.
+
+To retire a tree whose archive already exists, without recompressing it:
+
+```bash
+python -m tools.research.storage retire --sources copied_datasets \
+  --output research_data/archives/copied_datasets.zip
+```
+
+This rechecks the archive and every original file before removing anything.
+The separate `.retired.json` receipt records retirement; the archive's original
+`.receipt.json` records the initial verified snapshot.
+
 ## First-hit linear tuning
 
 | Mode | Behavior |
@@ -150,3 +195,8 @@ it is a transport boundary, not a managed cluster service. The
 [extension reference](../rtx/autotune/README.md) includes a full example and
 durable local runner. New projects must provide their own independent numerical
 oracle and workload-specific resource/measurement logic.
+# MLP deployment qualification
+
+See [MLP deployment-mode qualification](mlp_deployment_qualification.md) for
+execution-mode-aware first-hit selection, paired promotion, logging, extra
+qualification costs, and current validation limits.

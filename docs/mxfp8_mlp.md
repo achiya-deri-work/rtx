@@ -1,9 +1,9 @@
 # Recomputed MXFP8 GLU MLP
 
-This feature implements the strict two-device-kernel forward requested for
-the GLU branch. **Qualification is in progress; this is not yet a production
-performance recommendation.** A conventional separate quantize-then-GLU
-forward is not silently substituted: it would violate the two-kernel contract.
+The native on-chip configuration implements a two-device-kernel forward.
+Autotuning also explores execution families with separate operand quantization;
+two launches are not a universal contract. **Qualification is in progress;
+this is not yet a production performance recommendation.**
 
 ## Public contract
 
@@ -11,6 +11,23 @@ See [coverage-first MLP autotuning](mxfp8_mlp_autotuning_coverage.md) for search
 controls, benchmark contracts and how to audit what was actually explored.
 For first-use effort, cache controls and the current qualification boundaries, see
 [first-hit autotuning](first_hit_autotuning.md).
+
+### CUDA graph ownership
+
+RTX does not internally call `torch.compile` to stitch selected MLP kernels.
+Compile the surrounding model yourself. With `triton.cudagraphs=True`, the
+first-hit MLP captures a cached kernel-only forward sequence and a separate
+backward sequence after warmup. The CPU selection-plan handoff stays outside
+capture. Private replay stages changing inputs/weights and copies outputs into
+independent storage; this costs memory and bandwidth but prevents stale values
+and overwritten live outputs. It is not universally faster.
+
+During a warmed manual outer CUDA capture, RTX records the kernel launches
+directly: no nested replay and no private staging copies. Capture/warmup must
+use the same stream and required forward/backward signatures. Explicit-config
+MLPs and linears participate in the outer compiler's graph as before. See the
+[execution-plan contract](mlp_first_hit_plan_contract.md) for ownership,
+cache limits, qualification and historical measurements.
 
 ```python
 import torch
@@ -87,7 +104,7 @@ use `torch.inference_mode()` when no backward is needed.
 
 ### Explicit numerical policies and shape dispatch
 
-`precision="mxfp8"` remains the default native fused path. `precision="bf16_gate"`
+`precision="mxfp8"` remains the default numerical recipe. `precision="bf16_gate"`
 uses a BF16 gate forward GEMM, MXFP8 up/down, and combined MXFP8 gate/up
 backward. Activation/product are FP32, with BF16 projection/hidden boundaries.
 This quality recipe materializes transient BF16 tensors; it is **not** the
@@ -137,6 +154,23 @@ The optional `down_backend="producer_quantized"` quantizes down weights once
 inside kernel 1 and uses the packed GEMM in kernel 2. It allocates transient
 packed down weights/scales, refreshed every invocation. It does not cache
 weights across optimizer updates.
+
+Experimental `gate_backend="prequant"` uses separately quantized X and gate/up
+weights, followed by packed GEMM with the on-chip GLU/MXFP8-output epilogue.
+`gate_prequant` controls quantization and GEMM scheduling. This currently
+supports `down_backend="onchip"` or `"prequant"`. It adds quantization launches and transient
+packed operands but avoids repeatedly quantizing the same inputs per GEMM tile.
+It retains the MXFP8 hidden boundary and existing backward recipe; weights are
+requantized on every invocation. It is an autotuner choice, not a default
+replacement or a guarantee of improvement on small shapes.
+
+Experimental `down_backend="prequant"` quantizes the BF16 down weight once per
+invocation in a separate kernel, then consumes the packed MXFP8 hidden directly
+with a packed GEMM. `down_quant` and `down_gemm` control this path. It supports
+native on-chip and prequantized gate execution, including logical tails. It
+requires row-major, infinity-rounded scales. It adds a launch and transient
+packed weights/scales, trading these costs against repeated tile-local weight
+quantization. Weights are never reused across invocations or optimizer updates.
 
 Experimental `gate_backend="cooperative_prequant"` instead quantizes X, gate/up
 weights, and down weights once across a cooperatively launched grid. A grid
@@ -241,3 +275,79 @@ See [historical measurements and qualification](mxfp8_mlp_history.md).
 ## Qualification and remaining release gates
 
 See [historical measurements and qualification](mxfp8_mlp_history.md).
+# Joint recomputation output storage
+
+`MXFP8MLPConfig.joint_output_storage` accepts `"packed"` (default) or
+`"separate"`. It applies only when `recompute_backend="prequant"` and
+`backward_recompute="joint"`; it is inactive for on-chip and two-pass
+recomputation. Both choices use the same quantization/numerical recipe.
+
+```python
+from dataclasses import replace
+config = replace(config, recompute_backend="prequant",
+                 backward_recompute="joint", joint_output_storage="separate")
+```
+
+Separate output buffers let serial selected backward release reconstructed
+hidden after down-weight backward without retaining it through gate backward.
+Overlapping backward must retain its inputs through the stream join. This is
+not a promise of lower steady-state memory or faster execution: on the recorded
+5070 Ti M11712/K256/H768/O256 case, separate storage lowers cold peak by
+17.69 MiB but increases warm mix peak by 0.31 MiB, with neutral paired latency.
+The training autotuner exposes `joint_output_storage`; forward schedule identity
+ignores it, and packed configuration serialization remains backward-compatible.
+Use [replacement-level qualification](mlp_replacement_comparison.md) to measure
+the tradeoff on your workload. Local research artifacts are not distributed.
+
+## Recompute gradient quantization (opt-in)
+
+`MXFP8MLPConfig.hidden_quantization` is also `"separate"` by default.
+`"recompute"` additionally emits the reconstructed hidden operand directly into
+down-dW's existing FP8 buffers, avoiding its BF16 global output and separate
+quantizer. It requires `gradient_quantization="recompute"`, all three gradients,
+M divisible by 32, FP32 or FP32-packed hidden decode, and a decomposed down-dW
+with separate row-major quantizers and matching scale rounding. Supported
+`(quant_math, quant_amax)` pairs are `("fp32", "fp32")` and
+`("bf16x2", "bf16_bits")`; the resolved policy is preserved, not substituted.
+Partial
+gradient requests retain the existing paths. Forward rounding and independent
+leading-axis down-dW scales are preserved; this is not forward-scale reuse.
+
+The autotuner exposes `hidden_quantization` and a compound
+`hidden_quantization_path` move to couple the required layouts and launches.
+It does not silently change quantizer arithmetic; incompatible policies are
+rejected. This optional path needs shape-specific complete latency and memory
+qualification; fewer intermediates alone do not guarantee lower peak memory.
+
+`MXFP8MLPConfig.gradient_quantization` is `"separate"` by default. The optional
+`"recompute"` path emits row-quantized FP8 gate gradients and E8M0 scales from
+the recompute epilogue directly into existing dX runner scratch, skipping its
+standalone quantizer. It still rounds derivatives to BF16 first. Gate-weight
+dW retains those BF16 values and independent leading-axis quantization.
+
+Requirements: joint prequantized recompute, exchange gradient stores, separate
+hidden storage, H divisible by 32, no backward overlap, serial dX-first and
+per-matmul execution. Gate dX must use separate row-major quantization with
+either supported policy pair above,
+with scale rounding matching recompute. Ordinary shape/transport legality
+still applies. Both X and gate-weight gradients must be requested to activate
+it; partial requests retain the original paths. Public compiled and selected
+execution are supported, without new hidden CUDA graphs or eager tensor math.
+Both backward operand policies specialize the fused compilation cache key.
+Activation/gating and forward hidden rounding remain unchanged; BF16x2 applies
+only after derivative/hidden operands have already been rounded to BF16.
+
+The autotuner exposes `gradient_quantization` and a compound
+`gradient_quantization_path` move selecting structural prerequisites without
+changing quantizer arithmetic. Training identity includes the choice; forward
+identity ignores it. Default serialization remains compatible. Opt into an
+explicit compatible configuration with
+`replace(config, gradient_quantization="recompute")`; incompatible training
+configurations fail rather than silently changing their schedule.
+
+This is not a new default. At M11712/256/768/256, the recorded selected-direct
+comparison gains about 1.2% F+B, with unchanged warm peak/residency but
+16.85 MiB higher cold peak. The compiler-visible combined operator can retain
+temporaries longer than the selected launcher: these memory numbers are not
+a guarantee for every execution mode. Requalify startup and the complete
+workload before deployment using [replacement-level qualification](mlp_replacement_comparison.md).

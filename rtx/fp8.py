@@ -2254,7 +2254,7 @@ def _backward_config_key(
     )
 
 
-def _clear_runtime_caches() -> dict[str, object]:
+def _clear_runtime_caches(*, preserve_compiled=False) -> dict[str, object]:
     """Internal half of :func:`rtx.clear_runtime_caches`."""
 
     before = {
@@ -2317,9 +2317,10 @@ def _clear_runtime_caches() -> dict[str, object]:
     for launcher in _INDUCTOR_FULLY_PREQUANT_LAUNCHERS.values():
         if isinstance(launcher, _InductorFullyPrequantLauncher):
             launcher.runners.clear()
-    _PACKED_INFERENCE_SELECTIONS.clear()
-    _PREQUANT_AUTOTUNE_SELECTIONS.clear()
-    _FWD_AUTOTUNE_SELECTIONS.clear()
+    if not preserve_compiled:
+        _PACKED_INFERENCE_SELECTIONS.clear()
+        _PREQUANT_AUTOTUNE_SELECTIONS.clear()
+        _FWD_AUTOTUNE_SELECTIONS.clear()
     return before
 
 

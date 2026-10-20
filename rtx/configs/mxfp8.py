@@ -178,11 +178,13 @@ class MXFP8GemmConfig:
             problem.validate()
         except ValueError as exc:
             return str(exc)
-        if (self.tile_m != 64 and self.tile_m % 128) or self.tile_n % 128:
-            return "SM120 block-scale tiles require M=64 or M/N divisible by 128"
+        if (self.tile_m != 64 and self.tile_m % 128) or (self.tile_n != 64 and self.tile_n % 128):
+            return "SM120 block-scale tiles require M=64 or M divisible by 128, N=64 or divisible by 128"
+        if self.tile_n == 64 and (self.native_operand_bits != 8 or self.atom_layout_n != 2):
+            return "64-column GEMM requires MXFP8 and two N atoms"
         if self.tile_k % self.native_mma_k:
             return f"tile K must be divisible by {self.native_mma_k}"
-        if self.tile_n != 64 * self.atom_layout_n:
+        if self.tile_n != 64 * self.atom_layout_n and not (self.tile_n == 64 and self.atom_layout_n == 2):
             return "tile_n must equal 64 * atom_layout_n"
         if self.tile_m == 64 and self.atom_layout_m != 2:
             return "64-row SFA fragments require atom_layout_m=2"
@@ -192,8 +194,8 @@ class MXFP8GemmConfig:
                 "64-row single-buffer consumer-scale GEMM is quarantined after intermittent "
                 "large-grid numerical failures; use stages>=2 or tile_m>=128"
             )
-        if self.tile_m == 256 and self.atom_layout_m != 8:
-            return "256-row SFA fragments require atom_layout_m=8"
+        if self.tile_m in (256,384,512) and self.atom_layout_m != 8:
+            return "tall SFA fragments require atom_layout_m=8"
         if self.num_threads > 1024:
             return "CUDA limits one CTA to 1024 threads"
         if self.stages not in (1, 2, 3, 4):

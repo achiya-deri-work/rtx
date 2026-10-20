@@ -237,7 +237,9 @@ class MXFP8BwdMatmulConfig:
             return "unknown reduction strategy"
         if self.split_reduction not in (1, 2, 4, 8, 16, 32):
             return "split_reduction must be 1, 2, 4, 8, 16, or 32"
-        if self.reduction_tile not in (0, 128, 256, 512, 1024, 2048, 4096):
+        # Packed GEMM accepts any nonnegative tile-K multiple; restricting
+        # chunks to powers of two makes many long ragged reductions unreachable.
+        if type(self.reduction_tile) is not int or self.reduction_tile < 0:
             return "unsupported reduction tile"
         if self.workspace_epilogue not in (
             "none",
@@ -357,13 +359,20 @@ def _default_dw_config() -> MXFP8BwdMatmulConfig:
 
 @dataclass(frozen=True, slots=True)
 class MXFP8BwdConfig:
-    """Full backward for ``Y[M,N] = X[M,K] @ W[N,K].T``."""
+    """Full backward for ``Y[M,N] = X[M,K] @ W[N,K].T``.
+
+    ``serial_reuse_partials`` explicitly retains a paired serial arena even
+    for partial requests. It can save memory when both legs are used, but
+    allocates the unused leg for single-gradient workloads. Ownership and
+    eviction are charged to the paired cache, not the partial cache.
+    """
 
     dx: MXFP8BwdMatmulConfig = field(default_factory=_default_dx_config)
     dw: MXFP8BwdMatmulConfig = field(default_factory=_default_dw_config)
     execution_order: str = "dx_first"
     stream_schedule: str = "single"
     quant_schedule: str = "per_matmul"
+    operand_storage: str = "separate"
 
     def normalized(self) -> "MXFP8BwdConfig":
         return replace(self, dx=self.dx.normalized(), dw=self.dw.normalized())
@@ -379,6 +388,14 @@ class MXFP8BwdConfig:
             return "stream_schedule must be single, dual_stream, or graph"
         if self.quant_schedule not in ("per_matmul", "quad", "shared_g_quad"):
             return "quant_schedule must be per_matmul, quad, or shared_g_quad"
+        if self.operand_storage not in ('separate', 'serial_reuse', 'serial_reuse_partials'):
+            return 'operand_storage must be separate, serial_reuse or serial_reuse_partials'
+        if self.operand_storage in ('serial_reuse', 'serial_reuse_partials') and (
+            self.stream_schedule != 'single' or self.quant_schedule != 'per_matmul'
+            or self.execution_order not in ('dx_first', 'dw_first')
+            or self.dx.backend != 'decomposed' or self.dw.backend != 'decomposed'
+        ):
+            return 'serial operand reuse requires serial per-matmul decomposed dX/dW'
         if (self.dx.a_orientation, self.dx.b_orientation) != ("row", "transpose"):
             return "dX requires logical layouts A=row and B=transpose"
         if (self.dw.a_orientation, self.dw.b_orientation) != (

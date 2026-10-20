@@ -60,7 +60,13 @@ def compile_prequant_glu(problem, config, activation="silu", output_format="bf16
 
 
 def build_prequant_glu_runner(x,weight,out,scales,config,activation,output_format,*,bind_inputs=True,
-                             derivative=False,emit_hidden=False):
+                             derivative=False,emit_hidden=False,separate_hidden=False,
+                             emit_gradient_quant=False,emit_hidden_quant=False,
+                             gradient_quant_policy=('fp32','fp32'),hidden_quant_policy=('fp32','fp32')):
+    if (emit_gradient_quant or emit_hidden_quant) and not derivative:
+        raise ValueError('output quantization requires derivative recomputation')
+    if separate_hidden and not (derivative and emit_hidden):
+        raise ValueError('separate hidden storage requires joint derivative recomputation')
     import torch
     from .mxfp8 import MXFP8Problem
     from .mxfp8_quant import compile_mxfp8_quant, compile_mxfp8_dual_quant
@@ -85,7 +91,8 @@ def build_prequant_glu_runner(x,weight,out,scales,config,activation,output_forma
         quant_w = compile_mxfp8_quant(n,k,wconfig,interleave_rows=True)
     if derivative:
         from .mxfp8_mlp import compile_prequant_glu_derivative
-        gemm = compile_prequant_glu_derivative(MXFP8Problem(m,n,storage_k),config.gemm,activation,emit_hidden)
+        gemm = compile_prequant_glu_derivative(MXFP8Problem(m,n,storage_k),config.gemm,activation,emit_hidden,separate_hidden,emit_gradient_quant,emit_hidden_quant,
+                                             gradient_quant_policy,hidden_quant_policy)
     else:
         gemm = compile_prequant_glu(MXFP8Problem(m,n,storage_k),config.gemm,activation,output_format)
     def run(runtime_x,runtime_weight,runtime_out,runtime_scales):

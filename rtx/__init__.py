@@ -4,7 +4,11 @@ from ._version import __version__
 
 
 _LAZY_EXPORTS = {
+    "WorkspacePolicy": ("workspace", "WorkspacePolicy"),
+    "configure_workspace": ("workspace", "configure_workspace"),
+    "workspace_report": ("workspace", "workspace_report"),
     "AutotunePolicy": ("autotune.effort", "AutotunePolicy"),
+    "MLPExecutionMix": ("autotune.execution_mix", "MLPExecutionMix"),
     # Stable public format and frontend API.
     "MXTensor": ("formats", "MXTensor"),
     "MXFP8Tensor": ("formats", "MXFP8Tensor"),
@@ -33,6 +37,9 @@ _LAZY_EXPORTS = {
     "MXFP8GLU": ("glu", "MXFP8GLU"),
     "MXFP8MLP": ("mlp", "MXFP8MLP"),
     "MXFP8MLPConfig": ("mlp", "MXFP8MLPConfig"),
+    "MLPCandidate": ("deployment", "MLPCandidate"),
+    "bind_qualified_mlp_plans_": ("deployment", "bind_qualified_mlp_plans_"),
+    "require_qualified_mlp_cache_": ("deployment", "require_qualified_mlp_cache_"),
     "mxfp8_mlp": ("mlp", "mxfp8_mlp"),
     "MXFP8GLUConfig": ("configs.glu", "MXFP8GLUConfig"),
     "MXFP8GLUGemmConfig": ("configs.glu", "MXFP8GLUGemmConfig"),
@@ -105,7 +112,9 @@ _LAZY_EXPORTS = {
 # Historical tuner symbols remain directly addressable for compatibility, but
 # new integrations should import them from ``rtx.autotune``.
 _STABLE_EXPORTS = (
+    "WorkspacePolicy", "configure_workspace", "workspace_report",
     "AutotunePolicy",
+    "MLPExecutionMix",
     "MXTensor", "MXFP8Tensor", "NVFP4Tensor", "LinearOperandState",
     "LinearExecutionDecision", "AutotuneMode", "LinearBackend",
     "MXFP8Backend", "NVFP4Backend", "NVFP4ScalingMode", "MXFP8Linear", "NVFP4Linear",

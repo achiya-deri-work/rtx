@@ -296,11 +296,11 @@ class NVFP4ConfigTests(unittest.TestCase):
         ):
             with self.subTest(family=family):
                 expected_revision = {
-                    "nvfp4_dynamic_fwd": 8,
-                    "nvfp4_delayed_fwd": 3,
-                    "nvfp4_jit_row_region_fwd": 10,
-                    "nvfp4_weight_prequant_fwd": 5,
-                    "nvfp4_fully_prequant_fwd": 5,
+                    "nvfp4_dynamic_fwd": 9,
+                    "nvfp4_delayed_fwd": 5,
+                    "nvfp4_jit_row_region_fwd": 11,
+                    "nvfp4_weight_prequant_fwd": 6,
+                    "nvfp4_fully_prequant_fwd": 6,
                 }[family]
                 self.assertEqual(
                     _current_revision(family),

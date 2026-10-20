@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 import torch
 
@@ -293,7 +294,7 @@ class MXFP8QuantCudaTests(unittest.TestCase):
             MXFP8GemmConfig(
                 tile_m=64,
                 atom_layout_m=2,
-                stages=1,
+                stages=2,
                 epilogue="tma",
                 epilogue_stages=2,
                 store_vec=4,
@@ -301,6 +302,10 @@ class MXFP8QuantCudaTests(unittest.TestCase):
                 tile_locality="same_a",
             ),
         )
+        # The one-stage consumer-scale variant remains quarantined; the proxy
+        # fence does not by itself qualify every previously rejected schedule.
+        with self.assertRaisesRegex(ValueError, 'quarantined'):
+            compile_mxfp8_gemm(problem, replace(variants[-1], stages=1))
         for config in variants:
             with self.subTest(config=config):
                 actual = torch.full_like(expected, float("nan"))

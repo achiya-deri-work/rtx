@@ -1,4 +1,4 @@
-"""Recomputed MXFP8 GLU MLP: two device kernels forward, no saved hidden state.
+"""Recomputed MXFP8 GLU MLP with selectable execution families, no saved hidden state.
 
 Experimental qualification is tracked in docs/mxfp8_mlp.md. This module owns
 first-order autograd; the forward-only GLU API remains unchanged.
@@ -23,6 +23,25 @@ class MXFP8MLPConfig:
     ``None`` backward policies select the existing shape-aware MXFP8 defaults.
     ``down_backend`` chooses on-chip or producer-quantized down weights.
     ``recompute`` independently configures the optional packed backward GEMM.
+    ``joint_output_storage='separate'`` gives prequantized joint recomputation
+    independently owned derivative/hidden buffers. It can reduce startup peak;
+    it is not guaranteed to reduce steady-state peak or latency. ``'packed'``
+    remains default. This field is inactive for on-chip or two-pass recompute.
+    ``gradient_quantization='recompute'`` is an opt-in joint prequant exchange
+    path: emit the BF16-rounded gate gradient directly into the dX runner's
+    existing FP8 scratch. Requires separate hidden storage, no backward overlap,
+    H divisible by 32, and serial dX-first row-major quantization with either
+    (FP32, FP32 amax) or (BF16x2, BF16-bits amax). dW keeps
+    independent transpose-axis quantization. Used when both X and gate-weight
+    gradients are requested; partial requests use the original paths. Cold peak
+    may increase even when warmed residency does not. Default is ``'separate'``.
+    ``hidden_quantization='recompute'`` additionally emits independently
+    leading-axis-quantized hidden values into down-dW scratch, skipping the
+    BF16 hidden output. Requires the gradient-recompute path, M divisible by
+    32, FP32 hidden decode and matching separate row-major down-dW quantizers.
+    It is used only when all gradients are requested; partial masks retain
+    the existing paths. Default remains ``'separate'``; qualify complete memory
+    and latency costs for the deployment shape before adopting either option.
     ``gate_up.glu_silu_math`` is the SiLU numerical policy for every forward
     and recompute backend; subordinate prequant configurations cannot change it.
     The cooperative forward adds a counter-initialization CUDA memset and is
@@ -36,6 +55,9 @@ class MXFP8MLPConfig:
     gate_backward: MXFP8BwdConfig | None = None
     down_backward: MXFP8BwdConfig | None = None
     backward_recompute: str = "joint"
+    joint_output_storage: str = "packed"
+    gradient_quantization: str = "separate"
+    hidden_quantization: str = "separate"
     backward_overlap: bool = False
     gate_backend: str = "onchip"
     cooperative_ctas_per_sm: float = 1.0
@@ -62,10 +84,16 @@ class MXFP8MLPConfig:
             raise TypeError("backward policies must be MXFP8BwdConfig or None")
         if self.backward_recompute not in ("joint","two_pass"):
             raise ValueError("backward_recompute must be joint or two_pass")
+        if self.joint_output_storage not in ("packed","separate"):
+            raise ValueError('joint_output_storage must be packed or separate')
+        if self.gradient_quantization not in ('separate','recompute'):
+            raise ValueError('gradient_quantization must be separate or recompute')
+        if self.hidden_quantization not in ('separate','recompute'):
+            raise ValueError('hidden_quantization must be separate or recompute')
         if not isinstance(self.backward_overlap,bool):
             raise TypeError("backward_overlap must be a bool")
-        if self.gate_backend not in ("onchip","cooperative_prequant"):
-            raise ValueError("gate_backend must be onchip or cooperative_prequant")
+        if self.gate_backend not in ("onchip","cooperative_prequant","prequant"):
+            raise ValueError("gate_backend must be onchip, cooperative_prequant, or prequant")
         if self.cooperative_ctas_per_sm not in (.25,.5,1.,2.):
             raise ValueError("cooperative_ctas_per_sm must be .25, .5, 1 or 2")
         if not isinstance(self.gate_prequant,MXFP8GLUPrequantConfig):
@@ -74,14 +102,24 @@ class MXFP8MLPConfig:
             raise ValueError("recompute_backend must be onchip or prequant")
         if not isinstance(self.recompute,MXFP8GLUPrequantConfig):
             raise TypeError("recompute must be MXFP8GLUPrequantConfig")
-        if self.down_backend not in ("onchip","producer_quantized"):
-            raise ValueError("down_backend must be onchip or producer_quantized")
+        if self.down_backend not in ("onchip","producer_quantized","prequant"):
+            raise ValueError("down_backend must be onchip, producer_quantized, or prequant")
         if not isinstance(self.down_quant,MXFP8QuantConfig) or not isinstance(self.down_gemm,MXFP8GemmConfig):
             raise TypeError("down_quant/down_gemm must be quantizer/GEMM configurations")
 
     def to_dict(self):
         """Return a revisioned JSON-serializable policy, without tensor state."""
-        return {"revision":MLP_CONFIG_REVISION,**asdict(self)}
+        value=asdict(self)
+        if self.joint_output_storage=='packed':
+            value.pop('joint_output_storage')
+        if self.gradient_quantization=='separate':
+            value.pop('gradient_quantization')
+        if self.hidden_quantization=='separate':
+            value.pop('hidden_quantization')
+        for name in ('gate_backward','down_backward'):
+            if value[name] is not None and value[name].get('operand_storage')=='separate':
+                del value[name]['operand_storage']
+        return {"revision":MLP_CONFIG_REVISION,**value}
 
     @classmethod
     def from_dict(cls,values):
@@ -108,7 +146,7 @@ MLP_CONFIG_REVISION = 9
 def _config_key(config):
     if not isinstance(config,MXFP8MLPConfig):
         raise TypeError("config must be MXFP8MLPConfig")
-    return json.dumps({"revision":MLP_CONFIG_REVISION,**asdict(config)},sort_keys=True)
+    return json.dumps(config.to_dict(),sort_keys=True)
 
 
 @lru_cache(maxsize=128)
@@ -129,6 +167,9 @@ def _parse(key):
         down_backward=None if v["down_backward"] is None else bwd_config_from_dict(v["down_backward"]),
         down_backend=v.get("down_backend","onchip"),
         backward_overlap=v.get("backward_overlap",False),
+        joint_output_storage=v.get('joint_output_storage','packed'),
+        gradient_quantization=v.get('gradient_quantization','separate'),
+        hidden_quantization=v.get('hidden_quantization','separate'),
         gate_backend=v.get("gate_backend","onchip"),
         cooperative_ctas_per_sm=v.get("cooperative_ctas_per_sm",1.),
         gate_prequant=prequant_glu_config_from_dict(v["gate_prequant"]) if "gate_prequant" in v else MXFP8MLPConfig().gate_prequant,
@@ -157,6 +198,24 @@ def _mlp_op(x:torch.Tensor,gate_up:torch.Tensor,down:torch.Tensor,
     return y
 
 
+def _run_prequant_down(q,scales,down,y,c):
+    """Quantize current down weights once; consume the already packed hidden."""
+    from .kernels.mxfp8_quant import compile_mxfp8_quant
+    from .kernels.mxfp8_gemm import compile_mxfp8_gemm
+    if (c.down_quant.scale_layout!='row_major' or c.down_gemm.scale_layout!='row_major'
+            or c.down_quant.scale_rounding!='infinity'):
+        raise ValueError('prequant down requires row-major infinity-rounded scales')
+    o,h=down.shape
+    width=q.shape[1]
+    reason=c.down_quant.rejection(o,h) or c.down_gemm.rejection(MXFP8Problem(q.shape[0],o,width))
+    if reason:
+        raise ValueError(reason)
+    qw=torch.empty((o,width),device=down.device,dtype=torch.float8_e4m3fn)
+    sw=torch.empty((o,width//32),device=down.device,dtype=torch.float8_e8m0fnu)
+    compile_mxfp8_quant(o,h,c.down_quant)(down,qw,sw)
+    compile_mxfp8_gemm(MXFP8Problem(q.shape[0],o,width),c.down_gemm)(q,qw,scales,sw,y)
+
+
 def _run_forward(x,gate_up,down,activation,c,y):
     _validate(x,gate_up,down,activation)
     from .runtime import validate_runtime_environment
@@ -172,7 +231,21 @@ def _run_forward(x,gate_up,down,activation,c,y):
     s=torch.empty((m,width//32),dtype=torch.uint8,device=x.device)
     with torch.cuda.device(x.device):
         sf=s.view(torch.float8_e8m0fnu)
-        if c.gate_backend == "cooperative_prequant":
+        if c.gate_backend == "prequant":
+            from .kernels.mxfp8_glu_prequant import build_prequant_glu_runner
+            if c.down_backend not in ("onchip","prequant"):
+                raise ValueError("prequant gate requires onchip or prequant down backend")
+            gate_config=replace(c.gate_prequant,gemm=replace(c.gate_prequant.gemm,
+                                glu_silu_math=c.gate_up.glu_silu_math))
+            first=build_prequant_glu_runner(x.view(m,k),gate_up,q,s,gate_config,
+                                           activation,"mxfp8",bind_inputs=False)
+            first(x.view(m,k),gate_up,q,s)
+            if c.down_backend=='prequant':
+                _run_prequant_down(q,sf,down,y.view(m,o),c)
+            else:
+                second=compile_mixed_down(MXFP8Problem(m,o,h),c.down)
+                second(q,down,y.view(m,o),sf,sf,sf,sf)
+        elif c.gate_backend == "cooperative_prequant":
             from .configs.glu import cooperative_glu_rejection
             reason=cooperative_glu_rejection(MXFP8Problem(m,2*h,k),c.gate_prequant.gemm)
             if reason:
@@ -218,9 +291,12 @@ def _run_forward(x,gate_up,down,activation,c,y):
             second(q,qw,sf,sw,y.view(m,o))
         else:
             first=compile_mxfp8_glu(MXFP8Problem(m,2*h,k),c.gate_up,activation,"mxfp8")
-            second=compile_mixed_down(MXFP8Problem(m,o,h),c.down)
             first(x.view(m,k),gate_up,q,s,s,s,s)
-            second(q,down,y.view(m,o),sf,sf,sf,sf)
+            if c.down_backend=='prequant':
+                _run_prequant_down(q,sf,down,y.view(m,o),c)
+            else:
+                second=compile_mixed_down(MXFP8Problem(m,o,h),c.down)
+                second(q,down,y.view(m,o),sf,sf,sf,sf)
 
 
 @_mlp_op.register_fake
@@ -246,6 +322,11 @@ def _dequant_fake(data,scales,hidden):
 @torch.library.custom_op("rtx::mxfp8_mlp_derivative",mutates_args=(),device_types="cuda")
 def _derivative_op(x:torch.Tensor,weight:torch.Tensor,grad_h:torch.Tensor,
                    activation:str,config_key:str)->torch.Tensor:
+    return _derivative_launch(x,weight,grad_h,activation,config_key)
+
+
+def _derivative_launch(x,weight,grad_h,activation,config_key):
+    """Allocate/launch internally without nesting another dispatcher boundary."""
     policy=_parse(config_key)
     joint=policy.backward_recompute=="joint"
     shape=(((2*x.shape[0]+7)//8)*8+x.shape[0],weight.shape[0]//2) if joint else (x.shape[0],weight.shape[0])
@@ -254,15 +335,37 @@ def _derivative_op(x:torch.Tensor,weight:torch.Tensor,grad_h:torch.Tensor,
     return out
 
 
-def _run_derivative(x,weight,grad_h,activation,policy,out):
+def _run_derivative(x,weight,grad_h,activation,policy,out,hidden_out=None,gradient_out=None,hidden_quant_out=None,
+                    hidden_quant_policy=None):
     with torch.cuda.device(x.device):
         if policy.recompute_backend == "prequant":
             from .kernels.mxfp8_glu_prequant import build_prequant_glu_runner
             recompute=replace(policy.recompute,gemm=replace(policy.recompute.gemm,glu_silu_math=policy.gate_up.glu_silu_math))
-            runner=build_prequant_glu_runner(x,weight,out,grad_h,recompute,
+            aux=grad_h if hidden_out is None else (grad_h,hidden_out)
+            if gradient_out is not None:
+                aux=(aux,*gradient_out)
+            if hidden_quant_out is not None:
+                aux=(aux,*hidden_quant_out)
+            gradient_policy=('fp32','fp32')
+            hidden_policy=('fp32','fp32')
+            if gradient_out is not None or hidden_quant_out is not None:
+                from .fp8_bwd import _default_bwd_config
+                if gradient_out is not None:
+                    gate=policy.gate_backward or _default_bwd_config(MXFP8Problem(x.shape[0],weight.shape[0],x.shape[1]))
+                    qa=gate.dx.quant_a
+                    gradient_policy=(qa.quant_math,qa.quant_amax)
+                if hidden_quant_out is not None:
+                    if hidden_quant_policy is None:
+                        raise ValueError('hidden quantization requires its resolved down dW policy')
+                    hidden_policy=hidden_quant_policy
+            runner=build_prequant_glu_runner(x,weight,out,aux,recompute,
                         activation,"mxfp8",bind_inputs=False,derivative=True,
-                        emit_hidden=policy.backward_recompute=="joint")
-            runner(x,weight,out,grad_h)
+                        emit_hidden=policy.backward_recompute=="joint",
+                        separate_hidden=hidden_out is not None,
+                        emit_gradient_quant=gradient_out is not None,
+                        emit_hidden_quant=hidden_quant_out is not None,
+                        gradient_quant_policy=gradient_policy,hidden_quant_policy=hidden_policy)
+            runner(x,weight,out,aux)
         else:
             from .kernels.mxfp8_mlp import compile_glu_derivative
             c=replace(policy.gate_up,glu_store="direct",glu_store_stages=1)
@@ -275,6 +378,163 @@ def _run_derivative(x,weight,grad_h,activation,policy,out):
 def _derivative_fake(x,weight,grad_h,activation,config_key):
     shape=(((2*x.shape[0]+7)//8)*8+x.shape[0],weight.shape[0]//2) if _parse(config_key).backward_recompute=="joint" else (x.shape[0],weight.shape[0])
     return x.new_empty(shape)
+
+
+def _separate_derivative_launch(x,weight,grad_h,activation,config_key):
+    policy=_parse(config_key)
+    if policy.recompute_backend!='prequant' or policy.backward_recompute!='joint':
+        raise ValueError('separate derivative outputs require prequant joint recomputation')
+    m,h=x.shape[0],weight.shape[0]//2
+    dp=x.new_empty((2*m,h))
+    hidden=x.new_empty((m,h))
+    _run_derivative(x,weight,grad_h,activation,policy,dp,hidden)
+    return dp,hidden
+
+
+@torch.library.custom_op('rtx::mxfp8_mlp_separate_derivative',mutates_args=(),device_types='cuda')
+def _separate_derivative_op(x:torch.Tensor,weight:torch.Tensor,grad_h:torch.Tensor,
+                            activation:str,config_key:str)->tuple[torch.Tensor,torch.Tensor]:
+    return _separate_derivative_launch(x,weight,grad_h,activation,config_key)
+
+
+@_separate_derivative_op.register_fake
+def _separate_derivative_fake(x,weight,grad_h,activation,config_key):
+    return x.new_empty((2*x.shape[0],weight.shape[0]//2)),x.new_empty((x.shape[0],weight.shape[0]//2))
+
+
+def _gradient_quant_rejection(policy,m,k,h):
+    if policy.gradient_quantization=='separate':
+        return None
+    if (policy.recompute_backend!='prequant' or policy.backward_recompute!='joint'
+            or policy.backward_overlap or policy.joint_output_storage!='separate'
+            or policy.recompute.gemm.glu_grad_store!='exchange' or h%32):
+        return 'recompute gradient quantization requires separate joint prequant exchange storage, H divisible by 32, and no backward overlap'
+    from .fp8_bwd import _default_bwd_config
+    gate=policy.gate_backward or _default_bwd_config(MXFP8Problem(m,2*h,k))
+    qa=gate.dx.quant_a
+    if (gate.quant_schedule!='per_matmul' or gate.stream_schedule!='single'
+            or gate.execution_order!='dx_first' or gate.dx.backend!='decomposed'
+            or gate.dx.quant_launches!='separate' or qa.scale_layout!='row_major'
+            or (qa.quant_math,qa.quant_amax) not in (('fp32','fp32'),('bf16x2','bf16_bits'))
+            or qa.scale_rounding!=policy.recompute.gemm.scale_rounding):
+        return 'recompute gradient quantization requires serial dX-first separate row-major dX quantization with a supported (fp32/fp32 or bf16x2/bf16_bits) policy and matching rounding'
+    return None
+
+
+def _prepare_recomputed_gate_bwd(x,weight,grad_h,activation,config_key,gate_key):
+    from .fp8_bwd import _resolve_bwd_runner,_MatmulRunner
+    policy=_parse(config_key)
+    m,k=x.shape;h=weight.shape[0]//2
+    reason=_gradient_quant_rejection(policy,m,k,h)
+    if reason:raise ValueError(reason)
+    dp=x.new_empty((2*m,h))
+    hidden=x.new_empty((m,h))
+    # Borrow the stream-keyed runner's existing dX operand buffers. No extra
+    # persistent FP8 allocation or externally visible scratch output is added.
+    _,runner,dp2,xc,wc=_resolve_bwd_runner(dp.view(m,2*h),x,weight,gate_key)
+    assert isinstance(runner.dx,_MatmulRunner) and runner.dx.quant_b is not None
+    qa=runner.dx.quantized_a.view(2*m,h)
+    sa=runner.dx.scales_a.view(2*m,h//32)
+    _run_derivative(xc,wc,grad_h,activation,policy,dp,hidden,(qa,sa))
+    return runner,dp2,xc,wc,hidden
+
+
+def _consume_recomputed_gate_bwd(prepared):
+    runner,dp2,xc,wc,hidden=prepared
+    dx=torch.empty_like(xc);dw=torch.empty_like(wc)
+    runner.dx.quant_b(wc,runner.dx.quantized_b,runner.dx.scales_b)
+    runner.dx.matmul(dx)
+    # dW still independently quantizes BF16 dP along the leading reduction
+    # dimension. Serial operand reuse may overwrite dX scratch only now.
+    runner.dw(dp2,xc,dw)
+    return dx,dw,hidden
+
+
+def _hidden_quant_rejection(policy,m,k,h,o):
+    if policy.hidden_quantization=='separate':return None
+    if policy.gradient_quantization!='recompute':
+        return 'hidden recompute quantization requires recompute gradient quantization'
+    reason=_gradient_quant_rejection(policy,m,k,h)
+    if reason:return reason
+    from .fp8_bwd import _default_bwd_config
+    dc=policy.down_backward or _default_bwd_config(MXFP8Problem(m,o,h))
+    qb=dc.dw.resolved_quant_b()
+    if (m%32 or dc.dw.backend!='decomposed' or dc.dw.quant_launches!='separate'
+            or qb.scale_layout!='row_major' or (qb.quant_math,qb.quant_amax) not in (('fp32','fp32'),('bf16x2','bf16_bits'))
+            or qb.scale_rounding!=policy.recompute.gemm.scale_rounding
+            or policy.recompute.gemm.glu_hidden_decode not in ('fp32','fp32_packed')):
+        return 'hidden recompute quantization requires aligned separate row-major down dW with a supported (fp32/fp32 or bf16x2/bf16_bits) policy and matching rounding'
+    return None
+
+
+def _prepare_recomputed_all_bwd(x,weight,grad_h,dy,down,activation,config_key,gate_key,down_key):
+    """Internal all-gradient proposal; no BF16 hidden allocation or retention."""
+    from .fp8_bwd import _resolve_bwd_runner,_partial_bwd_runner_from_context,_MatmulRunner,_resolve_bwd_context
+    policy=_parse(config_key)
+    m,k=x.shape;h=weight.shape[0]//2
+    if policy.gradient_quantization!='recompute':
+        raise ValueError('all-gradient recompute requires recompute gradient quantization')
+    reason=_gradient_quant_rejection(policy,m,k,h)
+    if reason:raise ValueError(reason)
+    down_context=_resolve_bwd_context(dy,grad_h,down,down_key)
+    dc=down_context[2]
+    qb=dc.dw.resolved_quant_b()
+    if (m%32 or dc.dw.backend!='decomposed' or dc.dw.quant_launches!='separate'
+            or qb.scale_layout!='row_major'
+            or (qb.quant_math,qb.quant_amax) not in (('fp32','fp32'),('bf16x2','bf16_bits'))
+            or qb.scale_rounding!=policy.recompute.gemm.scale_rounding
+            or policy.recompute.gemm.glu_hidden_decode not in ('fp32','fp32_packed')):
+        raise ValueError('hidden recompute quantization requires aligned separate row-major down dW with a supported (fp32/fp32 or bf16x2/bf16_bits) policy and matching rounding')
+    # grad_h supplies shape metadata only to the down runner resolver. Never
+    # retain it in the prepared state or pass it to the hidden quantizer.
+    down_runner,dyc,_,downc=_partial_bwd_runner_from_context(down_context,'dw')
+    dp=x.new_empty((2*m,h))
+    _,gate,dp2,xc,wc=_resolve_bwd_runner(dp.view(m,2*h),x,weight,gate_key)
+    assert isinstance(gate.dx,_MatmulRunner) and isinstance(down_runner,_MatmulRunner)
+    _run_derivative(xc,wc,grad_h,activation,policy,dp,grad_h,
+        (gate.dx.quantized_a.view(2*m,h),gate.dx.scales_a.view(2*m,h//32)),
+        (down_runner.quantized_b,down_runner.scales_b),
+        hidden_quant_policy=(qb.quant_math,qb.quant_amax))
+    return (gate,dp2,xc,wc,None),down_runner,dyc,downc
+
+
+def _consume_recomputed_all_bwd(prepared):
+    gate,runner,dy,down=prepared
+    dx,dgate,_=_consume_recomputed_gate_bwd(gate)
+    ddown=torch.empty_like(down)
+    runner.quant_a(dy,runner.quantized_a,runner.scales_a)
+    runner.matmul(ddown)
+    return dx,dgate,ddown
+
+
+@torch.library.custom_op('rtx::mxfp8_mlp_recomputed_all_bwd',mutates_args=(),device_types='cuda')
+def _recomputed_all_bwd_op(x:torch.Tensor,weight:torch.Tensor,grad_h:torch.Tensor,
+        dy:torch.Tensor,down:torch.Tensor,activation:str,config_key:str,gate_key:str,down_key:str
+        )->tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
+    return _consume_recomputed_all_bwd(_prepare_recomputed_all_bwd(
+        x,weight,grad_h,dy,down,activation,config_key,gate_key,down_key))
+
+
+@_recomputed_all_bwd_op.register_fake
+def _recomputed_all_bwd_fake(x,weight,grad_h,dy,down,activation,config_key,gate_key,down_key):
+    return x.new_empty(x.shape),weight.new_empty(weight.shape),down.new_empty(down.shape)
+
+
+def _recomputed_gate_bwd_launch(x,weight,grad_h,activation,config_key,gate_key):
+    return _consume_recomputed_gate_bwd(
+        _prepare_recomputed_gate_bwd(x,weight,grad_h,activation,config_key,gate_key))
+
+
+@torch.library.custom_op('rtx::mxfp8_mlp_recomputed_gate_bwd',mutates_args=(),device_types='cuda')
+def _recomputed_gate_bwd_op(x:torch.Tensor,weight:torch.Tensor,grad_h:torch.Tensor,
+                           activation:str,config_key:str,gate_key:str
+                           )->tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
+    return _recomputed_gate_bwd_launch(x,weight,grad_h,activation,config_key,gate_key)
+
+
+@_recomputed_gate_bwd_op.register_fake
+def _recomputed_gate_bwd_fake(x,weight,grad_h,activation,config_key,gate_key):
+    return x.new_empty(x.shape),weight.new_empty(weight.shape),grad_h.new_empty(grad_h.shape)
 
 
 @lru_cache(maxsize=32)
@@ -297,6 +557,9 @@ def _parallel_backward_op(dp:torch.Tensor,x:torch.Tensor,gu:torch.Tensor,dy:torc
         with torch.cuda.stream(parallel):
             _launch_dw_out(dy,hidden,down,down_key,dd)
         _launch_bwd_out(dp,x,gu,gate_key,dx,dg)
+        # Both branches consume caller-produced inputs; join before exposing
+        # their outputs. Shared-memory proxy fences in the GEMM/TMA consumers
+        # protect operand-slot reuse while these kernels execute concurrently.
         caller.wait_stream(parallel)
     return dx,dg,dd
 
@@ -331,7 +594,11 @@ def _backward(ctx,grad_output,*,independent_outputs=False):
     if independent_outputs:
         # Preserve the paired launch schedule but allocate disjoint gradient
         # storages for the enclosing runtime-selected custom-op boundary.
-        from ._mlp_autotune import independent_bwd as _mxfp8_bwd_compiler_visible
+        from ._mlp_autotune import (
+            _independent_bwd_launch as _mxfp8_bwd_compiler_visible,
+            independent_dx as _mxfp8_dx_compiler_visible,
+            independent_dw as _mxfp8_dw_compiler_visible,
+        )
     x,gate_up,down=ctx.saved_tensors
     need_x,need_gate,need_down=ctx.needs_input_grad[:3]
     m,k=x.numel()//x.shape[-1],x.shape[-1]
@@ -347,25 +614,68 @@ def _backward(ctx,grad_output,*,independent_outputs=False):
     else:
         q,s=_glu_op(x2,gate_up,ctx.activation,"mxfp8",glu_key)
         hidden=_dequant_op(q,s,h)
+        del q,s
     dh=ddown=None
     if need_x or need_gate:
         if need_down and not joint:
             dh,ddown=_mxfp8_bwd_compiler_visible(dy,hidden,down,down_key)
+        elif joint and independent_outputs:
+            # The private selected backward owns this fresh shape placeholder;
+            # dX reads only dY and W. Fill it rather than allocating a second
+            # MxH BF16 buffer. The general dispatcher ABI remains non-aliasing.
+            dh=_mxfp8_dx_compiler_visible(dy,hidden,down,down_key,shape_only=True)
         else:
             dh=_mxfp8_dx_compiler_visible(dy,hidden,down,down_key)
     elif need_down:
         ddown=_mxfp8_dw_compiler_visible(dy,hidden,down,down_key)
     dx=dgate=None
     if need_x or need_gate:
-        dp=_derivative_op(x2,gate_up,dh,ctx.activation,ctx.key)
+        # Down backward has consumed the two-pass hidden (or the joint shape
+        # placeholder). dH owns its own necessary reference until recompute.
+        del hidden
+        policy=_parse(ctx.key)
+        if policy.hidden_quantization=='recompute' and need_x and need_gate and need_down:
+            if independent_outputs:
+                prepared=_prepare_recomputed_all_bwd(x2,gate_up,dh,dy,down,ctx.activation,ctx.key,gate_key,down_key)
+                del dh
+                dx,dgate,ddown=_consume_recomputed_all_bwd(prepared)
+                del prepared
+            else:
+                dx,dgate,ddown=_recomputed_all_bwd_op(x2,gate_up,dh,dy,down,ctx.activation,ctx.key,gate_key,down_key)
+                del dh
+            return dx.view_as(x),dgate,ddown,None,None
+        if policy.gradient_quantization=='recompute' and need_x and need_gate:
+            if independent_outputs:
+                prepared=_prepare_recomputed_gate_bwd(x2,gate_up,dh,ctx.activation,ctx.key,gate_key)
+                del dh
+                dx,dgate,hidden=_consume_recomputed_gate_bwd(prepared)
+                del prepared
+            else:
+                dx,dgate,hidden=_recomputed_gate_bwd_op(x2,gate_up,dh,ctx.activation,ctx.key,gate_key)
+                del dh
+            if need_down:
+                ddown=_mxfp8_dw_compiler_visible(dy,hidden,down,down_key)
+            return dx.view_as(x),dgate,ddown,None,None
+        separate=ctx.joint and policy.recompute_backend=='prequant' and policy.joint_output_storage=='separate'
+        if separate:
+            derivative=_separate_derivative_launch if independent_outputs else _separate_derivative_op
+            dp,hidden=derivative(x2,gate_up,dh,ctx.activation,ctx.key)
+        else:
+            derivative = _derivative_launch if independent_outputs else _derivative_op
+            dp=derivative(x2,gate_up,dh,ctx.activation,ctx.key)
+        # The derivative is dH's last consumer. Same-stream allocator ordering
+        # protects its queued read; do not retain it through the remaining GEMMs.
+        del dh
         if ctx.joint:
-            hidden=dp[((2*m+7)//8)*8:]
+            if not separate:
+                hidden=dp[((2*m+7)//8)*8:]
             dp=dp[:2*m].view(m,2*h)
             if ctx.overlap and need_x and need_gate and need_down:
                 dx,dgate,ddown=_parallel_backward_op(dp,x2,gate_up,dy,hidden,down,gate_key,down_key)
                 return dx.view_as(x),dgate,ddown,None,None
             if need_down:
                 ddown=_mxfp8_dw_compiler_visible(dy,hidden,down,down_key)
+            del hidden
         if need_x and need_gate:
             dx,dgate=_mxfp8_bwd_compiler_visible(dp,x2,gate_up,gate_key)
         elif need_x:
@@ -408,11 +718,32 @@ def mxfp8_mlp(x,gate_up_weight,down_weight,*,activation="silu",config=DEFAULT_ML
     return _mlp_op(x,gate_up_weight,down_weight,activation,_config_key(config))
 
 
-def _clear_runtime_caches():
+def _clear_runtime_caches(*, preserve_compiled=False):
     """Release compiled helper references without retaining model tensors."""
     import sys
     from ._mlp_inductor import LAUNCHERS
     before={"launchers":len(LAUNCHERS),"configs":_parse.cache_info().currsize}
+    selected = sys.modules.get("rtx._mlp_autotune")
+    if selected is not None:
+        before['spec_metadata'] = selected._spec_mode_and_fixed_key.cache_info().currsize
+        if not preserve_compiled:
+            selected._spec_mode_and_fixed_key.cache_clear()
+            selected._bound_plan.cache_clear()
+        for name in ("FORWARDS", "BACKWARDS", "SELECTIONS"):
+            cache = getattr(selected, name)
+            before[name] = cache.stats()
+            if preserve_compiled and name == "SELECTIONS":
+                continue
+            if preserve_compiled and name == "BACKWARDS":
+                # Non-replay closures contain only metadata; replay closures
+                # own captured inputs, scratch and graphs.
+                for identity in tuple(cache):
+                    if identity[-2]:
+                        del cache[identity]
+            else:
+                cache.clear()
+    if preserve_compiled:
+        return before
     LAUNCHERS.clear()
     _parse.cache_clear()
     _overlap_stream.cache_clear()
@@ -445,19 +776,28 @@ class MXFP8MLP(torch.nn.Module):
     ``autotune_`` before compilation to install a shape policy. Experimental
     ``autotune='balanced'`` selects on the first real input, using the shared
     ``tuning_policy`` (AutotunePolicy) and durable ``autotune_cache_dir``.
+    ``training_mix`` and ``inference_mix`` optionally accept MLPExecutionMix
+    workload counts for first-hit timing, with separate cache identities.
+    They change only the tuning objective, never the number of public calls or
+    numerical policy. They require autotune="cache" or "balanced". Omitted
+    mixes preserve one training pair / one inference forward objectives.
     ``'cache'`` reuses a compatible winner or the explicit initial config,
     without searching. Automatic selection currently supports only mxfp8
     precision. A grad-enabled call tunes full forward/backward, not just
     forward. Configured shape overrides take precedence. Warm forward and
     backward before CUDA graph capture. The selected plan is saved as CPU
     metadata, not hidden activations. Paired backward launchers write disjoint
-    outputs without staging copies. Broad performance qualification is pending; see
+    outputs. Private CUDA replay stages inputs and copies outputs to preserve
+    functional ownership. Broad performance qualification is pending; see
     docs/mlp_first_hit_plan_contract.md. Existing explicit execution is unchanged.
     Automatic Inductor CUDA graphs leave host-plan metadata uncaptured but replay
     the CUDA-only forward/backward bodies when requested by ``torch.compile``
     (for example ``mode='reduce-overhead'``). Replay is not always faster; the
-    caller controls that option. Manual warmed capture uses compiled graph-free
-    bodies, primed during cold setup. No hidden activations are retained.
+    caller controls that option. These are cached CUDA launch graphs, not nested
+    ``torch.compile`` functions. Manual warmed capture records the kernels
+    directly, without private replay or staging. A cache entry owns static
+    input/output buffers and scratch; no forward hidden activation is saved for
+    backward. Cold setup executes warmup and capture; warm replay does neither.
 
     Construct on CPU/meta for checkpoint loading, then move to an SM12x CUDA
     device before execution. Only BF16 execution is supported. ``eval()`` does
@@ -467,7 +807,8 @@ class MXFP8MLP(torch.nn.Module):
     """
     def __init__(self,in_features,hidden_features,out_features=None,*,activation="silu",
                  config=DEFAULT_MLP_CONFIG,precision="mxfp8",device=None,dtype=torch.bfloat16,
-                 autotune="off",tuning_policy=None,autotune_cache_dir=None):
+                 autotune="off",tuning_policy=None,autotune_cache_dir=None,
+                 training_mix=None,inference_mix=None):
         super().__init__()
         out_features=in_features if out_features is None else out_features
         if any(type(v) is not int or v<=0 for v in (in_features,hidden_features,out_features)):
@@ -484,8 +825,10 @@ class MXFP8MLP(torch.nn.Module):
         self.activation,self.config=activation,config
         self.precision=precision
         from ._mlp_autotune import deferred_spec
-        self._first_hit_spec=deferred_spec(config,precision,autotune,tuning_policy,autotune_cache_dir)
+        self._first_hit_spec=deferred_spec(config,precision,autotune,tuning_policy,autotune_cache_dir,
+                                           training_mix=training_mix,inference_mix=inference_mix)
         self._shape_configs={}
+        self._bound_plans=False
         self.gate_up_weight=torch.nn.Parameter(torch.empty((2*hidden_features,in_features),device=device,dtype=dtype))
         self.down_weight=torch.nn.Parameter(torch.empty((out_features,hidden_features),device=device,dtype=dtype))
         self.reset_parameters()
@@ -534,6 +877,8 @@ class MXFP8MLP(torch.nn.Module):
         return result.train(gate.training)
 
     def forward(self,x):
+        if self._bound_plans and (self._shape_configs or self.precision != 'mxfp8'):
+            raise RuntimeError('manual shape/precision overrides cannot bypass bound MLP plans')
         if self._first_hit_spec is not None and self._shape_key(x) not in self._shape_configs:
             from ._mlp_autotune import selected_mlp
             training=torch.is_grad_enabled() and (x.requires_grad or self.gate_up_weight.requires_grad or self.down_weight.requires_grad)
@@ -556,6 +901,8 @@ class MXFP8MLP(torch.nn.Module):
         """
         if torch.compiler.is_compiling():
             raise RuntimeError("configure_shape_ must run before torch.compile")
+        if self._bound_plans:
+            raise RuntimeError('manual shape overrides cannot bypass bound MLP plans; rebind explicitly')
         if example_x.device.type=="cuda":
             with torch.cuda.device(example_x.device):
                 if torch.cuda.is_current_stream_capturing():
@@ -577,6 +924,14 @@ class MXFP8MLP(torch.nn.Module):
 
     def policy_for(self,example_x):
         """Return the effective ``(config, precision)`` without searching or mutating."""
+        if self._bound_plans:
+            from ._mlp_autotune import _bound_plan
+            training = torch.is_grad_enabled() and (example_x.requires_grad or
+                self.gate_up_weight.requires_grad or self.down_weight.requires_grad)
+            key = _bound_plan(self._first_hit_spec, tuple(example_x.shape),
+                tuple(self.gate_up_weight.shape), tuple(self.down_weight.shape),
+                str(example_x.device), str(example_x.dtype), self.activation, training, False)
+            return _parse(key), 'mxfp8'
         return self._shape_configs.get(self._shape_key(example_x),(self.config,self.precision))
 
     def autotune_(self,example_x,**kwargs):
@@ -591,6 +946,8 @@ class MXFP8MLP(torch.nn.Module):
         """
         if torch.compiler.is_compiling():
             raise RuntimeError("autotune_ must run before torch.compile")
+        if self._bound_plans:
+            raise RuntimeError('autotune_ cannot replace bound MLP plans; qualify and rebind explicitly')
         _validate(example_x,self.gate_up_weight,self.down_weight,self.activation)
         with torch.cuda.device(example_x.device):
             if torch.cuda.is_current_stream_capturing():
@@ -600,6 +957,43 @@ class MXFP8MLP(torch.nn.Module):
         self.tuning_result=tune_mxfp8_mlp(example_x,self.gate_up_weight,self.down_weight,
                                          activation=self.activation,initial=initial,precision=precision,**kwargs)
         self.configure_shape_(example_x,config=self.tuning_result.config,precision=precision)
+        return self
+
+    def export_tuning_spec(self, path=None):
+        """Return a detached JSON-compatible exact first-hit specification.
+
+        Optionally write it to a NEW file for disposable preflight. Requires
+        an explicit cache directory and automatic MXFP8 tuning configuration.
+        Does not initialize CUDA, tune, or claim shape coverage. Shape-specific
+        manual overrides cannot be represented and are rejected. Export before
+        compilation; callers own file permissions and transport of cache paths.
+        """
+        if torch.compiler.is_compiling():
+            raise RuntimeError('export_tuning_spec must run outside torch.compile')
+        if self._first_hit_spec is None or self._shape_configs:
+            raise ValueError('export requires automatic tuning without manual shape overrides')
+        import json
+        from pathlib import Path
+        spec = json.loads(self._first_hit_spec)
+        if not spec.get('cache_dir'):
+            raise ValueError('export requires an explicit autotune_cache_dir')
+        if path is not None:
+            with Path(path).open('x') as stream:
+                json.dump(spec, stream, indent=2, sort_keys=True)
+        return spec
+
+    def require_cached_(self):
+        """Disable live tuning/fallback; require a disk winner on each new context.
+
+        Call BEFORE compiling/capturing (recompile existing callers afterward).
+        This is strict miss enforcement, not coverage verification or winner
+        qualification. Training/inference, execution mix and replay contracts
+        remain distinct. Parameters and durable winner files are unchanged.
+        """
+        import json
+        spec = self.export_tuning_spec()
+        spec.update(mode='cache', cache_miss='error')
+        self._first_hit_spec = json.dumps(spec, sort_keys=True)
         return self
 
     def extra_repr(self):

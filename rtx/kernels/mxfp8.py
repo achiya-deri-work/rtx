@@ -212,8 +212,14 @@ class MXFP8FwdConfig:
             problem.validate()
         except ValueError as exc:
             return str(exc)
-        if (self.tile_m not in (32,64) and self.tile_m % 128) or self.tile_n % 128:
-            return "SM120 block-scale tiles require M=32/64 or M/N divisible by 128"
+        if (self.tile_m not in (32,64) and self.tile_m % 128) or (self.tile_n != 64 and self.tile_n % 128):
+            return "SM120 block-scale tiles require M=32/64 or M divisible by 128, N=64 or divisible by 128"
+        if self.native_operand_bits != 8 and self.tile_n == 64:
+            return "64-column tiles currently implement MXFP8 only"
+        if self.tile_n == 64 and self.atom_layout_n != 2:
+            return "64-column SFB copy partitions require two N atoms"
+        if self.tile_n == 64 and self.tile_m >= 256 and self.load_engine == "cpasync":
+            return "tall N=64 cp.async staging is quarantined after numerical failures"
         if self.native_operand_bits != 8 and self.tile_m == 32:
             return "32-row tiles currently implement MXFP8 only"
         if self.tile_k % 128:
@@ -227,14 +233,15 @@ class MXFP8FwdConfig:
         if self.num_threads > 1024:
             return "CUDA limits one CTA to at most 1024 threads"
         # The SM120 warp-level block-scale fragment mapping has a fixed N
-        # quantum.  M=128 supports 2/4/8-way warp layouts, while the 256 tile
-        # requires eight M atoms so every SFA fragment has a matching copy
+        # quantum. N=64 uses two N atoms and a logically clipped SFB layout.
+        # M=128 supports 2/4/8-way warp layouts, while the taller tiles
+        # require eight M atoms so every SFA fragment has a matching copy
         # partition.  These constraints are verified by compilation and exact
         # device tests below rather than inferred from nominal tile divisibility.
-        if self.tile_n != 64 * self.atom_layout_n:
+        if self.tile_n != 64 * self.atom_layout_n and not (self.tile_n == 64 and self.atom_layout_n == 2):
             return "SM120 SFB fragments require tile_n == 64 * atom_layout_n"
-        if self.tile_m == 256 and self.atom_layout_m != 8:
-            return "the 256-row SFA fragment requires atom_layout_m == 8"
+        if self.tile_m in (256,384,512) and self.atom_layout_m != 8:
+            return "the tall SFA fragment requires atom_layout_m == 8"
         if self.tile_m in (32,64) and self.atom_layout_m != 2:
             return "the 32/64-row SFA fragment requires atom_layout_m == 2"
         if self.quantizer_warps not in (1, 2, 4, 8, 16):
@@ -614,18 +621,18 @@ class MXFP8FwdConfig:
 
 
 DEFAULT_MXFP8_FWD_CONFIG = MXFP8FwdConfig()
-MXFP8_FWD_KERNEL_REVISION = 24
+MXFP8_FWD_KERNEL_REVISION = 25
 
 
 # Block coordinates supplement, rather than replace, their primitive fields.
 # They let coordinate descent cross a slower intermediate configuration and
 # directly enter small-SMEM/deep-pipeline or small-RMEM/many-warp basins.
 SMEM_RMEM_TILE_COORDINATES: tuple[tuple[int, int, int, int, int], ...] = tuple(
-    (smem_m, smem_n, smem_k, rmem_m, 64)
+    (smem_m, smem_n, smem_k, rmem_m, 32 if smem_n == 64 else 64)
     for smem_m, smem_n, smem_k in product(
-        (64, 128, 256), (128, 256), (128, 256)
+        (64, 128, 256, 384, 512), (64, 128, 256), (128, 256)
     )
-    for rmem_m in (16, 32, 64)
+    for rmem_m in (16, 32, 48, 64)
     if smem_m % rmem_m == 0
 )
 
@@ -725,8 +732,15 @@ FWD_SEARCH_SPACE: dict[str, tuple[object, ...]] = {
     "bf16_pipeline": BF16_PIPELINE_COORDINATES,
     "cpasync_ldmatrix_pipeline": CPASYNC_LDMATRIX_PIPELINE_COORDINATES,
     "persistent_tma_pipeline": PERSISTENT_TMA_PIPELINE_COORDINATES,
-    "tile_m": (32, 64, 128, 256),
-    "tile_n": (128, 256),
+    "tile_m": (32, 64, 128, 256, 384, 512),
+    "tile_n": (64, 128, 256),
+    "weight_reuse_tile": tuple(
+        (m, engine, stages, group)
+        for m in (64, 128, 256, 384, 512)
+        for engine in ("scalar", "cpasync", "tma")
+        for stages in ((1,) if engine == "scalar" else (1, 2, 3, 4))
+        for group in (1, 2, 4, 8)
+    ),
     "tile_k": (128, 256),
     "atom_layout_m": (2, 4, 8),
     "atom_layout_n": (1, 2, 4),
@@ -777,6 +791,7 @@ FWD_COORDINATE_ORDER: tuple[str, ...] = (
     # requiring every slower one-field intermediate to win.
     "smem_rmem_tile",
     "cta_reuse_tile",
+    "weight_reuse_tile",
     "cluster_reuse_tile",
     "cpasync_cluster_reuse_tile",
     "bf16_pipeline",
@@ -838,6 +853,7 @@ def normalize_fwd_config(
     values = asdict(base or DEFAULT_MXFP8_FWD_CONFIG)
     updates = dict(updates)
     compound_names = {
+        "weight_reuse_tile",
         "smem_rmem_tile",
         "cta_reuse_tile",
         "cluster_reuse_tile",
@@ -849,6 +865,22 @@ def normalize_fwd_config(
     unknown = set(updates).difference(values).difference(compound_names)
     if unknown:
         raise ValueError(f"unknown MXFP8 forward coordinates: {sorted(unknown)}")
+
+    narrow = updates.pop("weight_reuse_tile", None)
+    if narrow is not None:
+        rows, engine, stages, group = narrow
+        updates.update(tile_m=rows, tile_n=64, tile_k=128,
+            atom_layout_m=2 if rows == 64 else 4 if rows == 128 else 8,
+            atom_layout_n=2, load_engine=engine,
+            schedule="warp_specialized" if engine == "tma" else "cooperative",
+            bf16_tile_k=128 if engine == "scalar" else 32, bf16_stages=stages, mxfp8_stages=1,
+            bf16_swizzle="128b" if engine == "scalar" else "none",
+            quant_vec=4 if engine == "scalar" else 8,
+            quant_load_bits=16 if engine == "scalar" else 128,
+            cooperative_warps=0, persistent=False, persistent_waves=1,
+            reuse="none", cluster_reuse="none", cluster_size=1,
+            raster="m", grid_swizzle=group, maxrregcount=128,
+            epilogue="direct", epilogue_stages=1)
 
     smem_rmem_tile = updates.pop("smem_rmem_tile", None)
     if smem_rmem_tile is not None:
@@ -1043,9 +1075,11 @@ def normalize_fwd_config(
             64: 2,
             128: 4,
             256: 8,
+            384: 8,
+            512: 8,
         }[int(values["tile_m"])]
     if "tile_n" in updates and "atom_layout_n" not in updates:
-        values["atom_layout_n"] = int(values["tile_n"]) // 64
+        values["atom_layout_n"] = max(2, int(values["tile_n"]) // 64)
     mma_warps = int(values["atom_layout_m"]) * int(values["atom_layout_n"])
     schedule = values["schedule"]
     producer_warps = 0 if schedule == "cooperative" else 1
