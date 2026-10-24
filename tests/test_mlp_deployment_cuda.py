@@ -1,9 +1,11 @@
 """Real execution surfaces: correctness, prepared reuse, and live memory."""
 import gc
+import json
 import pytest
 import torch
 
 from rtx.autotune.mlp import make_mlp_adapter
+from tests.cache_memory_checks import wait_for_cuda_allocation_cleanup
 
 
 pytestmark=pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA required')
@@ -41,7 +43,13 @@ def test_deployment_mode(mode,phase,shape,execution_mix=None,recompute='joint'):
         # its prepared executable alive; do not evict caches between samples.
         gc.collect()
         torch.cuda.synchronize()
-        allocations.append(torch.cuda.memory_allocated())
+        allocated=torch.cuda.memory_allocated()
+        if allocations and allocated > allocations[0]:
+            samples=wait_for_cuda_allocation_cleanup(allocations[0],observed=allocated)
+            print('MEMORY_SETTLE '+json.dumps(dict(mode=mode,phase=phase,shape=shape,
+                  expected=allocations[0],samples=samples)),flush=True)
+            allocated=samples[-1]
+        allocations.append(allocated)
     assert len(set(allocations))==1,allocations
     del adapter
     rtx.clear_runtime_caches()

@@ -157,7 +157,15 @@ class InterruptedCacheCudaTests(unittest.TestCase):
                 self.assertNotIn(winner['config_id'], lost)
                 evidence = winner['metadata']['tuning_evidence']
                 self.assertEqual(evidence['attempted_trials'], 8)
-                self.assertEqual(evidence['finalist_rounds'], 2)
+                decision = evidence['winner_decision']
+                if decision['reason'] == 'only_candidate':
+                    # Promotion v3 excludes unstable search observations.
+                    # One eligible candidate needs no paired comparison.
+                    self.assertIsNone(decision['confirmation'])
+                    self.assertEqual(evidence['finalist_rounds'], 0)
+                else:
+                    self.assertEqual(decision['confirmation']['status'], 'complete')
+                    self.assertEqual(evidence['finalist_rounds'], 2)
                 print('RECOVERY ' + json.dumps(dict(family=family, completed=7,
                       abandoned=list(lost), winner=winner['config_id'])), flush=True)
                 print(resumed.stdout, flush=True)

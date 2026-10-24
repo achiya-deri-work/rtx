@@ -28,8 +28,48 @@ host timing on WSL is therefore no longer a release gate. Its strict test
 remains available through `-m timing_environment`; no timing thresholds or
 past results were changed. Forced-noise GPU safety tests remain in default
 qualification and passed on both 5060 Torch stacks. The fallback implementation
-is unchanged since those recorded runs. This approval does not resolve the
-separate, unreproduced 22,016-byte allocation observation below.
+is unchanged since those recorded runs. The separate allocation observation was
+subsequently localized and qualified as described in the final focused follow-up.
+
+### Final focused follow-up (2026-10-25)
+
+The uninstrumented 5060 integration run at `9e0fa6f` reproduced a 22,016-byte
+increase in the mixed selected-direct deployment test and a stale recovery-test
+assertion requiring two finalist rounds even with only one eligible candidate.
+The run was stopped after retaining its events/log; it is **not** a passing full
+suite. Artifacts: `final_integration_9e0fa6f_5060/`.
+
+A same-adapter mixed-workload probe identified allocations of 13,824 and 8,192
+bytes (requested 13,580 and 7,954), matching the two BF16 weight-gradient shapes.
+A subsequent 160-evaluation probe observed a 23,552-byte transient increase,
+including an input-gradient-sized block. Idle host cleanup returned to the exact
+33,604,608-byte baseline in the first polling iteration (0.128 seconds including
+collection), with no new evaluation, kernel launch or cache eviction. Final
+growth was zero. This establishes transient cleanup, not its exact internal
+ownership mechanism. Artifacts: `rtx-ragged-mixed-5060.jsonl` and
+`rtx-ragged-idle-settlement-5060.jsonl`.
+
+The test-only cleanup observer uses a one-second polling deadline, preserves raw
+samples and retains the original exact-bound assertion. It neither clears
+caches nor changes production execution. Six CPU protocol cases verify stable,
+transient and persistent-growth behavior, including rejection of invalid policy.
+Recovery tests now accept zero paired rounds only for the explicit
+`only_candidate` decision; multi-candidate confirmation remains required.
+
+Focused results, without another full-suite restart:
+
+- 5060 Torch 2.12.1: deployment and interrupted-recovery files, **32 passed and
+  four subtests**, 102.42 seconds (`rtx-settlement-followup-5060.xml`).
+- 5090, each supported Torch stack: selected-direct deployment cases,
+  **seven passed** each (`settlement_5090_{212,213}.xml`).
+- 5090 Torch 2.13: interrupted recovery, **two passed and four subtests**
+  (`recovery_single_finalist_213.xml`).
+
+These focused results supersede the unresolved allocation/recovery status in
+the chronological notes below. The only runtime change since `2c1d9e0` is
+promotion revision 3, separately qualified below. No new kernel change or
+universal memory-safety certification is claimed. The current summary is
+[Main-branch qualification](main_qualification_status.md).
 
 **Qualification has the limitations recorded below.** Both laptops became available again;
 the resumed results below supersede their earlier availability status. No

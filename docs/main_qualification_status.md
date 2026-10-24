@@ -29,18 +29,34 @@ optimal performance. Explicit offline tuning still fails without eligible
 timings. The strict singleton clock test is opt-in through
 `pytest -m timing_environment`; correctness/fallback/cache tests remain mandatory.
 
-## Remaining integration gate
+## Focused integration follow-up
 
-A historical 5060 full-suite test observed a 22,016-byte live-allocation increase.
-It has not reproduced in 120 same-adapter evaluations across three environments,
+A 5060 full-suite test observed a 22,016-byte live-allocation increase.
+It did not reproduce in 120 same-adapter evaluations across three environments,
 the traced 30-test deployment file plus four extra repetitions, or the untraced
 30-test deployment file. Those checks retained the original memory assertions.
 No root cause or kernel leak fix is claimed.
 
-One final uninstrumented library-suite run is active on the 5060 at frozen
-commit `9e0fa6f`, with the approved singleton timing exclusion. Its result is
-required before closing this integration gate. No duplicate full suite is
-running on the other devices.
+The uninstrumented integration run at `9e0fa6f` reproduced the same increase
+in `test_repeated_forward_mix[selected_direct]`: three samples of 67,394,560
+bytes followed by 67,416,576 bytes. The original plain-training case passed.
+The run also exposed a stale interrupted-recovery assertion demanding two
+finalist rounds when only one timing-eligible candidate remains. The broad
+run was stopped after preserving failure events; it is not a passing suite.
+Focused diagnosis localized the transient allocations to gradient-sized blocks.
+In a 160-evaluation mixed-workload probe, an increase returned to the exact
+baseline during idle cleanup, without another model call or cache eviction.
+This is evidence of delayed cleanup, not persistent growth; it does not identify
+the precise internal owner or establish a kernel leak fix.
+
+The deployment test now observes bounded idle cleanup (one-second polling
+deadline), records raw samples and preserves its exact allocation bound.
+Persistent growth still fails. Six CPU protocol cases cover these guarantees.
+The corrected singleton-finalist assertion and deployment checks pass together
+on the 5060: **32 tests and four subtests**. Selected-direct deployment checks
+also pass on both 5090 Torch stacks (seven each); the local interrupted-recovery
+file passes two tests and four subtests. These focused results close the observed
+failures; the stopped broad run is not retroactively reported as green.
 
 ## Evidence and release boundary
 

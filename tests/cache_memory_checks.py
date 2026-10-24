@@ -1,8 +1,28 @@
 """Synchronized post-warmup live-allocation evidence, not a timing harness."""
 import gc
 import json
+import time
 
 import torch
+
+
+def wait_for_cuda_allocation_cleanup(expected, *, observed, timeout_s=1.0, poll_s=.005):
+    """Observe bounded idle cleanup without executing work or clearing caches.
+
+    Observed gradient-sized allocations can outlive CUDA synchronization and
+    disappear during idle host cleanup. Retain every sample; the caller must
+    still enforce its original allocation bound on the final sample.
+    """
+    if timeout_s < 0 or poll_s <= 0:
+        raise ValueError('cleanup timeout must be nonnegative and poll interval positive')
+    samples=[observed]
+    deadline=time.monotonic()+timeout_s
+    while samples[-1] > expected and time.monotonic() < deadline:
+        time.sleep(poll_s)
+        gc.collect()
+        torch.cuda.synchronize()
+        samples.append(torch.cuda.memory_allocated())
+    return samples
 
 
 def assert_stable_cuda_memory(case, step, *, label, iterations=20):
