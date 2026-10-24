@@ -31,11 +31,18 @@ x=torch.randn(128,128,device='cuda',dtype=torch.bfloat16)*.1
 calls=0
 evaluator_type=MXFP8PrequantEvaluator if family=='mxfp8' else CalibratedPrequantEvaluator
 original=evaluator_type.__call__
-def evaluate(self,config):
+def evaluate(self,config,**kwargs):
     global calls
-    outcome=original(self,config)
+    outcome=original(self,config,**kwargs)
+    if kwargs.get('validate_only'):
+        return outcome
+    if mode.endswith('-noisy') and outcome.successful:
+        # Inject eligibility only, preserving real CUDA correctness and raw
+        # measurements. This is recovery coverage, not performance evidence.
+        outcome.metadata={**outcome.metadata,'sampling':{'collection':{'stationary':False}},
+                          'test_forced_ineligible':True}
     calls+=1
-    if mode=='interrupt' and calls==4:
+    if mode.startswith('interrupt') and calls==4:
         assert outcome.status=='ok','crash boundary requires a successfully measured CUDA candidate'
         torch.cuda.synchronize()
         print('KILL_READY',flush=True)
@@ -68,11 +75,18 @@ with torch.inference_mode(),patch.object(evaluator_type,'__call__',evaluate):
 @unittest.skipUnless(torch.cuda.is_available() and sys.platform == 'linux', 'CUDA/Linux required')
 class InterruptedCacheCudaTests(unittest.TestCase):
     def test_killed_evaluation_consumes_budget_and_resumes(self):
+        self._check_recovery(force_noise=False)
+
+    def test_killed_noisy_evaluation_resumes_without_installing_winner(self):
+        self._check_recovery(force_noise=True)
+
+    def _check_recovery(self, *, force_noise):
+        suffix='-noisy' if force_noise else ''
         for family in ('mxfp8', 'nvfp4'):
             with self.subTest(family=family), tempfile.TemporaryDirectory() as root:
                 with tempfile.TemporaryFile(mode='w+') as errors:
                     child = subprocess.Popen([sys.executable, '-u', '-c', WORKER,
-                        root, family, 'interrupt'], stdin=subprocess.PIPE,
+                        root, family, 'interrupt'+suffix], stdin=subprocess.PIPE,
                         stdout=subprocess.PIPE, stderr=errors, text=True, bufsize=1)
                     try:
                         deadline = time.monotonic() + 120
@@ -104,7 +118,7 @@ class InterruptedCacheCudaTests(unittest.TestCase):
                             child.kill()
                         child.communicate(timeout=20)
                 resumed = subprocess.run([sys.executable, '-u', '-c', WORKER,
-                    root, family, 'resume'], capture_output=True, text=True, timeout=150)
+                    root, family, 'resume'+suffix], capture_output=True, text=True, timeout=150)
                 self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
                 after = paths[0].read_bytes()
                 self.assertTrue(after.startswith(before_bytes), 'completed evidence was rewritten')
@@ -126,6 +140,18 @@ class InterruptedCacheCudaTests(unittest.TestCase):
                 self.assertEqual(len(lost), 1)
                 self.assertTrue(lost.isdisjoint(row['config_id'] for row in rows))
                 winners = list(Path(root).glob('runtime_winners/**/*.json'))
+                eligible=[row for row in rows if TrialOutcome.from_dict(row['outcome']).timing_eligible]
+                if force_noise:
+                    self.assertFalse(eligible)
+                if not eligible:
+                    self.assertFalse(winners, 'ineligible timings must not install a winner')
+                    self.assertIn('without installing a winner', resumed.stderr)
+                    self.assertTrue(any(TrialOutcome.from_dict(row['outcome']).successful for row in rows))
+                    print('RECOVERY '+json.dumps(dict(family=family,completed=7,
+                          abandoned=list(lost),winner=None,checked_fallback=True,
+                          forced_noise=force_noise)),flush=True)
+                    print(resumed.stdout,flush=True)
+                    continue
                 self.assertEqual(len(winners), 1)
                 winner = json.loads(winners[0].read_text())
                 self.assertNotIn(winner['config_id'], lost)
