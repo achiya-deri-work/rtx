@@ -48,12 +48,17 @@ winners merely to make a cache test pass.
   policies had NLL increases 0.29210–0.32481 and mean cosines
   0.91315–0.93414. Passing the broader NVFP4 gates is not BF16-equivalent
   quality; Four Over Six was the best NVFP4 policy on this particular check.
+  The eight-policy 12-step training check subsequently completed successfully
+  (`training_exit=0`); this is integration coverage, not long convergence.
 - Test-only commits `ad8636a` and `b7d2e75` distinguish rejected noisy timings
   from valid durable winners for interrupted and packed refinement. They retain
   numerical/budget checks and explicitly test forced-noise non-persistence.
   Both supported local Torch stacks passed the focused checks. These changes
   do **not** establish reliable laptop first-hit winner availability, nor fix
   the separate progressive cross-process failures.
+  The focused 5060 Torch 2.12.1 follow-up also passed five tests and four
+  subtests in 83.71 seconds, including forced-noise cases
+  (`rtx-focused-contracts.xml`).
 - Allocation tracing on both local 5090 stacks passed all 16 additional
   ragged deployment repetitions after 379 preceding linear/MLP tests per
   stack. This does not reproduce or explain the 5060's allocation increase;
@@ -70,6 +75,13 @@ winners merely to make a cache test pass.
   stationarity gate. This implicates submission overhead/variability, but
   does not establish a reliable measurement remedy or justify silently
   substituting graph timings for host-deployment timings.
+- The narrow 5060 Nsight Systems capture supports the submission-overhead
+  diagnosis: 4,608 CUDA kernel launch calls averaged 10.275 us, versus
+  approximately 2.505 us for the GEMM and 0.761 us for dual quantization.
+  These are profiler diagnostics, not ordinary performance numbers; the
+  default trace does not provide complete per-kernel graph-replay attribution.
+  Raw trace and CSV summaries are `rtx-5060-jitter-focused-trace.nsys-rep`
+  and `rtx-5060-jitter-focused-stats_*.csv`.
 
 Redundant full-suite reruns and queued chains were stopped at the user's
 request. Follow-up is restricted to the observed failures; already completed
