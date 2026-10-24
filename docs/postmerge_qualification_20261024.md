@@ -46,8 +46,33 @@ validation is not weakened. Resuming the actual failed journals at 16 and 32
 trials now passes on both Torch stacks, with exactly 16/32 observations and one
 compiled graph. A fresh-process 32-trial reuse adds no observations and invokes
 no tuner. The targeted MLP first-hit/graph/gradient and progressive-search
-regression suites pass 15 tests on each supported Torch stack. Ragged-shape
-budget progression and laptop qualification remain in progress.
+regression suites pass 15 tests on each supported Torch stack. The ragged
+`511,384,576,384` budget progression and fresh-process reuse also pass both
+stacks. Laptop qualification remains in progress.
+
+## Linear first-hit budget sweep
+
+All 54 compiled inference probes passed: three families (MXFP8 materialized,
+NVFP4 block, NVFP4 JIT-region), three M,N,K shapes (`256,768,768`,
+`2048,768,1536`, `511,576,384`), three progressive budgets (8/16/32), and
+both supported Torch stacks on separate RTX 5090s. Each probe checks finite
+outputs against a BF16-cast FP32 reference, trial accounting, warm reuse and
+CUDA-graph capture/replay. Error gates remain NRMS <0.07 for MXFP8 and <0.20
+for NVFP4. This is inference coverage, not backward qualification.
+
+Median first-call times across the nine family/shape cells were 3.98/4.69/6.65
+seconds for Torch 2.13 and 4.35/4.75/6.91 seconds for Torch 2.12.1 at
+8/16/32 trials respectively. The later budgets resume previous observations;
+their times are additional refinement costs, not independent cold-start totals.
+Compiler disk caches were not cleared, and process startup is excluded.
+
+Most replay timings were approximately flat with additional effort. One
+Torch 2.13 ragged MXFP8 cell changed from 10.24 to 8.18 microseconds (about
+1.25x), while most cells changed by less than 2%. These are unpaired
+cross-process measurements, not proof of monotonic speedup or global optimality.
+The two stacks sometimes selected different schedules with materially different
+latencies; that does not isolate a Torch-version effect. No research winner
+was installed into the user's default runtime cache.
 
 ## Cross-device and installation status
 
@@ -55,8 +80,30 @@ Isolated source snapshots on the RTX 5060 and 5070 laptops are running release
 qualification. Initial attempts had missing test dependencies and an import-path
 setup error; those are failed attempts, not kernel passes. The corrected runner
 explicitly imports its own checkout, and Pillow is now a declared test dependency.
+Both initial Ettin model/short-training subprocesses passed, but their parent
+qualification runs did not. The 5060's subsequent partial suite was deliberately
+stopped to include the runtime refinement fix. The 5070 WSL instance restarted
+externally during its partial suite; the cause is not established. Those partial
+logs remain intact. Full suites restarted at `7ec987e` with four compiler workers
+by default (caller-overridable), avoiding excessive parallel compiler memory use.
+Fresh final local suites on both Torch stacks are also running against this code.
+The restarted laptop suites have reported early failures; complete traces are
+pending suite completion. They are not qualified, and release remains blocked
+until those failures are understood and resolved.
 
 The built wheel imports MXFP8Linear, NVFP4Linear and MXFP8MLP outside the source
 tree and passes runtime version validation. That check reused the qualified
 environment's dependency directory; it is not a fresh network dependency solve.
-No release tag or package upload has been made.
+Both dependency requirement files are additionally being installed into genuinely
+fresh virtual environments. The Torch 2.13 fresh install has passed `pip check`,
+runtime version validation and public frontend imports outside the checkout;
+its CLI help and all 58 public exports also load. Torch 2.12.1 installation is
+still in progress. The `c728aae` wheel/sdist pass build and twine checks;
+archive inspection found no ignored source artifacts (136 wheel / 622 sdist
+entries). No release tag or package upload has been made.
+
+Subsequent qualification runs record failures immediately in
+`test-events.jsonl`, including collection failures and tracebacks. The optional
+pytest plugin refuses existing output files and fsyncs failure/final records.
+Its passing/failing-probe and overwrite-protection tests pass on both stacks.
+This does not change any numerical or runtime gate.
