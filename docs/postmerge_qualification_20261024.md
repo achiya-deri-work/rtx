@@ -200,3 +200,18 @@ the 5090. Longer windows did not consistently improve laptop stability, so an
 experimental automatic long-window retry was discarded, not shipped. These
 small studies describe measurement reliability, not kernel speedup or SKU-wide
 performance. The original timing thresholds and measurement mode remain intact.
+
+At `2c1d9e0`, the 5060 passes all three targeted noisy-history fallback tests
+and three subtests on each supported Torch stack. This includes packed MXFP8
+W, packed X/W, fused forward, backward current-input validation and the
+dimension-based NVFP4 harness fallback. The corresponding XML artifacts are
+`autotune_reports/postmerge_20261024/fallback_2c1d9e0_{213,212}.xml`.
+These passes establish checked fallback behavior, not stationary timing or
+persistent-winner qualification.
+
+Process-only timing experiments on the 5060 accepted 11/36 windows with
+Python garbage collection disabled and 10/36 with CPU affinity restricted to
+core 0. Neither established a reliable fix relative to the original 8/36.
+No library GC, CPU-affinity, timing-threshold or measurement-mode change was
+made. The 5070 laptop is unavailable by user confirmation; its unfinished
+qualification remains explicitly outstanding.
