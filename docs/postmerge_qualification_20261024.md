@@ -124,6 +124,36 @@ Torch 2.12.1 stack (one test, five subtests, 55.70 seconds;
 against the previous implementation: all three failed there and pass with
 the correction.
 
+Further revision-3 coverage:
+
+- The 5060 progressive **training** refinement/reuse test passed through
+  8/16/32/64 trials and the final lower-budget cache read. The separately
+  selected singleton host-measurement test still failed with
+  `NoEligibleTimingError`; the combined result is one pass and one failure,
+  not a green bundle (`rtx-promotion-v3-training-5060.xml`).
+- On the 5070 Torch 2.12.1 stack, the production matrix passed 49/49 and the
+  compiled progressive inference/cache test passed with five subtests
+  (`rtx-promotion-v3-5070-production212.json`,
+  `rtx-promotion-v3-5070-cache212.xml`). This is additional-stack coverage,
+  not a rerun of the full suite.
+
+### Focused ragged-allocation investigation
+
+Forty consecutive evaluations of the **same** prepared ragged training
+adapter passed on each local 5090 Torch stack and on the 5060 Torch 2.12.1
+stack: 120 evaluations total, zero live-allocation growth or spread, and
+all numerical checks passed. No runtime cache was evicted between samples.
+The protocol collected Python cycles then synchronized CUDA, recording
+allocation snapshots only at baseline or on a changed sample.
+
+The original 22,016-byte increase matches the allocator-rounded combined
+sizes of the two weight gradients for `(M,K,H,O)=(17,35,97,41)`:
+13,824 + 8,192 bytes. This suggests an output-lifetime investigation but
+does not establish ownership or root cause. No kernel leak fix is claimed;
+the earlier full-suite observation remains unlocalized. Artifacts are
+`diagnose_ragged_retention.py`, `ragged_retention_5090_{212,213}.jsonl` and
+`rtx-ragged-retention-5060.jsonl`.
+
 ### Completed 5070 first-hit study
 
 All 12 compiled training checks passed: three shapes at cumulative budgets
