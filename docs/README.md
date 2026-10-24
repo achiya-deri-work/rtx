@@ -45,8 +45,10 @@ singleton failure is recorded in [numerical qualification](mxfp8_mlp_numerics.md
 - [Research and qualification index](research.md): experiments and historical
   results, separate from current API instructions.
 - [Release checklist](release_checklist.md), [precision policy](../PRECISION_POLICY.md).
-- [MXFP8/GLU merge qualification](mxfp8_glu_merge_qualification.md): current
-  scheduling transfer and cross-stack validation status.
+- [Current main qualification](main_qualification_status.md): completed evidence,
+  approved fallback policy, and remaining integration gate.
+- [MXFP8/GLU merge qualification](mxfp8_glu_merge_qualification.md): scheduling
+  transfer and earlier cross-stack validation history.
 
 Native kernels target SM120/SM121 on Linux with the supported CUDA 13.2 stack.
 SM110/Thor and datacenter Blackwell are not supported. Import is CPU-safe;
