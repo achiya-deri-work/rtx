@@ -153,6 +153,7 @@ class EffortCacheTests(unittest.TestCase):
         self.assertIsNone(selected.implementation_rejection(evaluator.problem))
 
     def test_reuse_refinement_budget_and_confirmation(self):
+        from rtx.autotune.paired_promotion import PROMOTION_REVISION
         key=RuntimeWinnerKey('test',MXFP8Problem(128,128,128),'hot','test',1)
         p=AutotunePolicy(max_trials=8,cache_behavior='refine')
         with tempfile.TemporaryDirectory() as root:
@@ -164,7 +165,7 @@ class EffortCacheTests(unittest.TestCase):
             self.assertIsNotNone(load(replace(p,cache_behavior='reuse')))
             self.assertIsNone(load(p))
             evidence=dict(schema=1,contract=p.evidence_contract(),attempted_trials=8,
-                          finalist_rounds=4,finalist_margin=.005,promotion_revision=2)
+                          finalist_rounds=4,finalist_margin=.005,promotion_revision=PROMOTION_REVISION)
             save(evidence)
             self.assertIsNotNone(load(p))
             self.assertIsNone(load(replace(p,max_trials=16)))
@@ -173,6 +174,10 @@ class EffortCacheTests(unittest.TestCase):
             self.assertIsNone(load(replace(p,seed=1)))
             self.assertIsNone(load(replace(p,samples=9)))
             self.assertEqual(p.evidence_contract(),replace(p,max_seconds=100,max_trials=16).evidence_contract())
+            evidence['promotion_revision']=2
+            save(evidence)
+            self.assertIsNone(load(p))
+            self.assertIsNone(load(replace(p,cache_behavior='reuse')))
             evidence.pop('promotion_revision')
             save(evidence)
             self.assertIsNone(load(p))

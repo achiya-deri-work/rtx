@@ -98,6 +98,26 @@ must not be read as the current status above.
 
 ## Qualification history and corrections
 
+### Finalist eligibility correction (promotion revision 3)
+
+Review of the noisy-cache failures found an inconsistency: search used
+`TrialOutcome.timing_eligible`, but finalist promotion used numerical success
+alone. A search-rejected timing could therefore re-enter as the initial
+incumbent or as a finalist, despite an eligible measured alternative.
+Promotion now applies the same timing-eligibility predicate as search.
+This does not relax thresholds, retry until a favorable measurement appears,
+or persist an unmeasured fallback. It does not solve a run where every timing
+is unstable.
+
+Promotion revision 3 invalidates older finalist-confirmed runtime winners in
+both reuse and refine modes; raw trial journals remain available. Kernels and
+numerical policies are unchanged. Focused CPU validation passed 28 tests and
+14 subtests, including noisy initial candidates, a single eligible candidate,
+all-noisy rejection and revision-2 cache invalidation. The compiled real-GPU
+progressive inference/cross-process reuse test passed on both local 5090 Torch
+stacks (`promotion_v3_{212,213}.xml`). The ongoing 5070 first-hit study uses its
+unchanged revision-2 checkout and must not be presented as revision-3 coverage.
+
 The following supersedes the earlier campaign status recorded below. It is
 not a claim that every release gate is closed.
 

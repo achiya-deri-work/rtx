@@ -7,7 +7,7 @@ import statistics
 from .confirmation import confirm_finalists
 from .core import stable_id
 
-PROMOTION_REVISION = 2
+PROMOTION_REVISION = 3
 
 
 def decision_events(store, context_id, kind='winner_decision'):
@@ -44,8 +44,12 @@ def promote(adapter, store, history, session_id, *, rounds, margin, deadline=Non
     contract = stable_id(dict(schema=PROMOTION_REVISION, rounds=rounds, margin=margin, seed=seed))
     failed = {event['config_id'] for event in decision_events(store, adapter.context.identifier,
               'winner_confirmation') if event.get('outcome', {}).get('status') != 'ok'}
+    # Feasibility is not latency evidence. In particular, a noisy initial
+    # schedule must not become the incumbent after search found a measured
+    # alternative. Keep the same eligibility contract as SearchHistory.best.
     eligible = {o.config_id:o for o in history.successful
-                if o.config_id not in failed and adapter.rejection(o.config) is None}
+                if o.outcome.timing_eligible and o.config_id not in failed
+                and adapter.rejection(o.config) is None}
     if not eligible:
         raise RuntimeError('no legal successful candidate for promotion')
     previous = list(decision_events(store, adapter.context.identifier))

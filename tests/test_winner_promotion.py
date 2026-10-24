@@ -4,7 +4,7 @@ import unittest
 from rtx.autotune.core import Proposal, SearchHistory, evaluate_proposal
 from rtx.autotune.outcomes import TrialOutcome
 from rtx.autotune.store import JsonlTuningStore
-from rtx.autotune.paired_promotion import promote
+from rtx.autotune.paired_promotion import PROMOTION_REVISION, promote
 from tests.test_autotune_coverage import adapter, Config
 
 
@@ -54,6 +54,37 @@ class WinnerPromotionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             d=promote(a,JsonlTuningStore(root),h,'s',rounds=4,margin=.01)
             self.assertEqual(d['config_id'],a.config_id(Config()))
+
+    def test_unstable_search_seed_cannot_become_incumbent(self):
+        a,h=self.setup_history()
+        h.current[0].outcome.metadata={'sampling':{'collection':{'stationary':False}}}
+        evaluated=[]
+        def evaluate(c):
+            evaluated.append(c)
+            return TrialOutcome('ok',median_ms=1.)
+        a.evaluator=evaluate
+        with tempfile.TemporaryDirectory() as root:
+            d=promote(a,JsonlTuningStore(root),h,'s',rounds=2,margin=.01)
+        self.assertNotIn(Config(),evaluated)
+        self.assertEqual(d['config_id'],a.config_id(Config(a=1)))
+
+    def test_only_stable_search_candidate_survives_deadline(self):
+        a,h=self.setup_history()
+        for observation in h.current[:2]:
+            observation.outcome.metadata={'sampling':{'collection':{'stationary':False}}}
+        a.evaluator=lambda c:self.fail('one eligible candidate requires no race')
+        with tempfile.TemporaryDirectory() as root:
+            d=promote(a,JsonlTuningStore(root),h,'s',rounds=2,margin=.01,deadline=0.)
+        self.assertEqual(d['config_id'],a.config_id(Config(a=2)))
+        self.assertEqual(d['reason'],'only_candidate')
+
+    def test_all_noisy_search_history_cannot_be_promoted(self):
+        a,h=self.setup_history()
+        for observation in h.current:
+            observation.outcome.metadata={'sampling':{'collection':{'stationary':False}}}
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(RuntimeError,'no legal successful candidate'):
+                promote(a,JsonlTuningStore(root),h,'s',rounds=2,margin=.01)
 
     def test_failed_fastest_candidate_cannot_win(self):
         a,h=self.setup_history()
@@ -116,7 +147,7 @@ class WinnerPromotionTests(unittest.TestCase):
             store.record_event('old','winner_decision',old)
             fresh=promote(a,store,h,'s2',rounds=4,margin=.01)
             self.assertFalse(fresh['reused'])
-            self.assertEqual(fresh['promotion_revision'],2)
+            self.assertEqual(fresh['promotion_revision'],PROMOTION_REVISION)
 
 
 if __name__=='__main__': unittest.main()
