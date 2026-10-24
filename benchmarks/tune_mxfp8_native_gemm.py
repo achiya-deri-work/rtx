@@ -21,6 +21,7 @@ from rtx.kernels.mxfp8_quant import (
 
 
 COORDINATES: tuple[tuple[str, tuple[dict[str, object], ...]], ...] = (
+    ("k_tile_unroll", tuple({"k_tile_unroll": v} for v in (1, 2, 3, 4, 6, 8, 12))),
     (
         "pipeline_geometry",
         tuple(

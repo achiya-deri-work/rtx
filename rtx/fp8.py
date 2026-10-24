@@ -358,6 +358,7 @@ class _PrequantAutotuneRequest:
     policy: object | None
     cache_dir: str | None
     initial: MXFP8PrequantConfig
+    select_preparation: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,6 +423,7 @@ def _intern_prequant_autotune_request(
     policy: object | None,
     cache_dir: Path | str | None,
     initial: MXFP8PrequantConfig,
+    select_preparation: bool = False,
 ) -> str:
     policy_value = None if policy is None else asdict(policy)
     payload = {
@@ -429,6 +431,7 @@ def _intern_prequant_autotune_request(
         "policy": policy_value,
         "cache_dir": None if cache_dir is None else str(Path(cache_dir).expanduser()),
         "initial": asdict(initial),
+        "select_preparation": select_preparation,
     }
     digest = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     key = (
@@ -441,6 +444,7 @@ def _intern_prequant_autotune_request(
             policy=policy,
             cache_dir=payload["cache_dir"],
             initial=initial,
+            select_preparation=select_preparation,
         )
     return key
 
@@ -816,6 +820,12 @@ def _build_prequant_runner(
     )
     request = _PREQUANT_AUTOTUNE_REQUESTS.get(config_key)
     if request is not None:
+        from .autotune.preparation import preparation_selection_enabled
+        if (request.select_preparation and request.mode == "balanced"
+                and preparation_selection_enabled(request.policy)):
+            from .autotune.preparation_runtime import select_forward_runner
+
+            return select_forward_runner(x, weight, request)
         selection_key = (
             config_key,
             x.device.index,
@@ -867,7 +877,8 @@ def _build_prequant_runner(
                             )
 
                             policy = balanced_effort_policy()
-                        result = tune_mxfp8_prequant(
+                        from .autotune.runtime import run_runtime_tuner
+                        result = run_runtime_tuner(tune_mxfp8_prequant,
                             x,
                             weight,
                             policy=policy,
@@ -2163,6 +2174,7 @@ def mxfp8_linear(
                 tuning_policy,
                 autotune_cache_dir,
                 selected_prequant,
+                select_preparation=backend == "auto" and config is None,
             )
         if torch.is_grad_enabled() and (
             x_2d.requires_grad or weight.requires_grad
@@ -2493,6 +2505,7 @@ class MXFP8Linear(nn.Module):
                 tuning_policy,
                 autotune_cache_dir,
                 selected_prequant,
+                select_preparation=self.backend == "auto" and self.config is None and packed_weight is None,
             )
         from .fp8_bwd import _intern_bwd_config
 

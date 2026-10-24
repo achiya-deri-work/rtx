@@ -45,6 +45,7 @@ TRAINING_MODES = (
     "bf16",
     "mxfp8",
     "nvfp4_delayed",
+    "nvfp4_current",
     "nvfp4_jit_row_region",
     "nvfp4_block",
 )
@@ -315,6 +316,8 @@ def _linear_policy(training_mode: str) -> tuple[str, str]:
         return "mxfp8", "block"
     if training_mode == "nvfp4_delayed":
         return "nvfp4", "delayed"
+    if training_mode == "nvfp4_current":
+        return "nvfp4", "current"
     if training_mode == "nvfp4_jit_row_region":
         return "nvfp4", "jit_row_region"
     if training_mode == "nvfp4_block":

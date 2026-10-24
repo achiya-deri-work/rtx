@@ -18,7 +18,7 @@ git rev-parse HEAD > "$report_dir/commit.txt"
 git diff --stat > "$report_dir/worktree.txt"
 echo "START tests: $report_dir/tests.log"
 test_status=0
-timeout 1800s "$runtime_python" -m unittest discover -s tests -v \
+timeout 3600s "$runtime_python" -m pytest -q --junitxml="$report_dir/tests.xml" \
     > "$report_dir/tests.log" 2>&1 || test_status=$?
 # A separate process prevents a failed CUDA context contaminating this matrix.
 echo "START production matrix (tests exit=$test_status): $report_dir/production.log"
@@ -26,7 +26,19 @@ matrix_status=0
 timeout 600s "$runtime_python" benchmarks/validate_production.py \
     --output "$report_dir/production.json" \
     > "$report_dir/production.log" 2>&1 || matrix_status=$?
-printf 'tests_exit=%s\nmatrix_exit=%s\n' "$test_status" "$matrix_status" \
+echo "START Ettin prospective inference: $report_dir/ettin.log"
+model_status=0
+timeout 900s "$runtime_python" -m benchmarks.ettin_regression \
+    --compile --corpus wikitext --paragraph-offset 128 --paragraphs 128 \
+    --max-length 511 --seeds 4801 --require-quality \
+    --output "$report_dir/ettin.jsonl" > "$report_dir/ettin.log" 2>&1 || model_status=$?
+echo "START Ettin short training: $report_dir/ettin_training.log"
+training_status=0
+timeout 900s "$runtime_python" -m benchmarks.train_ettin_qualification \
+    --compile --steps 12 --output "$report_dir/ettin_training.jsonl" \
+    > "$report_dir/ettin_training.log" 2>&1 || training_status=$?
+printf 'tests_exit=%s\nmatrix_exit=%s\nmodel_exit=%s\ntraining_exit=%s\n' \
+    "$test_status" "$matrix_status" "$model_status" "$training_status" \
     | tee "$report_dir/status.txt"
 echo "DONE evidence=$report_dir"
-[[ "$test_status" -eq 0 && "$matrix_status" -eq 0 ]]
+[[ "$test_status" -eq 0 && "$matrix_status" -eq 0 && "$model_status" -eq 0 && "$training_status" -eq 0 ]]

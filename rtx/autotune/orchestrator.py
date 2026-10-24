@@ -33,6 +33,18 @@ from .store import TuningStore
 from .strategies import SearchStrategy
 
 
+class NoEligibleTimingError(RuntimeError):
+    """No latency winner; optionally retain an independently checked seed.
+
+    Offline tuning still fails. A runtime caller may execute the checked seed
+    without promoting the unstable observations to a persistent winner.
+    """
+
+    def __init__(self, fallback_config=None):
+        super().__init__("autotuning produced no successful configurations with eligible timings")
+        self.fallback_config = fallback_config
+
+
 @dataclass(frozen=True, slots=True)
 class ConfirmationPolicy:
     """Repeat promising measurements before they can become incumbents."""
@@ -137,7 +149,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
 
     @staticmethod
     def _reward(before: float, observation: Observation[ConfigT]) -> float:
-        if not observation.successful:
+        if not observation.outcome.timing_eligible:
             return -0.01
         if not math.isfinite(before):
             return 0.05
@@ -175,6 +187,11 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 except (KeyError, TypeError, ValueError):
                     continue
         history = SearchHistory(restored, self.adapter.context.identifier)
+        by_config = {}
+        for item in history.current:
+            by_config.setdefault(item.config_id, []).append(item)
+        history.retryable_config_ids.update(cid for cid,items in by_config.items()
+            if all(item.successful and not item.outcome.timing_eligible for item in items))
         incomplete = getattr(self.store, "incomplete_candidates", None)
         abandoned = (
             []
@@ -321,6 +338,12 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                     ),
                     metadata=dict(screen.metadata),
                 )
+                if any("sampling" in item.metadata for item in outcomes):
+                    from .measurement import runtime_timing_metadata
+                    quality = runtime_timing_metadata(timings)
+                    if any(not item.timing_eligible for item in outcomes):
+                        quality["sampling"]["collection"]["stationary"] = False
+                    observation.outcome.metadata.update(quality)
             confirmation_elapsed = time.monotonic() - confirmation_started
             observation.elapsed_s += confirmation_elapsed
             observation.finished_at = utc_now()
@@ -378,6 +401,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
             confirm(observation, proposal, before)
             evaluated += 1
             history.observations.append(observation)
+            history.retryable_config_ids.discard(observation.config_id)
             arm = statistics.get(proposal.strategy)
             try:
                 if arm is not None:
@@ -412,6 +436,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 f"SAVE {proposal.strategy} {observation.config_id} "
                 f"{observation.outcome.status}"
                 + ("" if observation.outcome.median_ms is None else f" {observation.score * 1000:.3f}us")
+                + (" timing_ineligible" if observation.outcome.successful and not observation.outcome.timing_eligible else "")
                 + (
                     ""
                     if observation.outcome.error is None
@@ -560,7 +585,12 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         best = history.best
         if best is None:
             self.store.finish_session(session_id, {"status": "failed", "reason": "no successful trials"})
-            raise RuntimeError("autotuning produced no successful configurations")
+            initial_id = self.adapter.config_id(self.adapter.initial_config)
+            checked_seed = next((item for item in history.successful
+                if item.config_id == initial_id and item.session_id == session_id
+                and item.outcome.max_abs_error is not None
+                and math.isfinite(item.outcome.max_abs_error)), None)
+            raise NoEligibleTimingError(None if checked_seed is None else checked_seed.config)
         decision = None
         search_elapsed = time.monotonic() - started
         selected_score = best.score

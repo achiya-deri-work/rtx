@@ -110,7 +110,14 @@ class InterruptedCacheCudaTests(unittest.TestCase):
                 self.assertTrue(after.startswith(before_bytes), 'completed evidence was rewritten')
                 rows = [json.loads(line) for line in after.splitlines()]
                 self.assertEqual(len(rows), 7)
-                self.assertEqual(len({row['config_id'] for row in rows}), 7)
+                from rtx.autotune.outcomes import TrialOutcome
+                seen={}
+                for row in rows:
+                    for old in seen.get(row['config_id'], []):
+                        outcome=TrialOutcome.from_dict(old['outcome'])
+                        self.assertTrue(outcome.successful and not outcome.timing_eligible)
+                        self.assertNotEqual(old['session_id'],row['session_id'])
+                    seen.setdefault(row['config_id'],[]).append(row)
                 events = [json.loads(line) for p in Path(root).rglob('events.jsonl')
                           for line in p.read_text().splitlines()]
                 recovered = [e for e in events if e['kind'] == 'abandoned_candidates_recovered']

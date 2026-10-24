@@ -42,8 +42,9 @@ Issues = "https://github.com/achiya-deri-work/rtx/issues"
 Documentation = "https://github.com/achiya-deri-work/rtx/tree/main/docs"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "build>=1.2", "twine>=5"]
+dev = ["pytest>=8", "build>=1.2", "twine>=5", "joblib>=1.4,<2", "scikit-learn>=1.5,<2"]
 vision = ["torchvision>=0.27,<=0.28"]
+model-test = ["transformers==4.57.6", "safetensors>=0.4,<1"]
 
 [project.scripts]
 rtx-autotune = "rtx.autotune.dataset:main"
@@ -61,3 +62,5 @@ rtx = ["py.typed", "autotune/artifacts/**/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not dinov3_research'"
+markers = ["dinov3_research: optional historical DINO model-quality study; run explicitly with -m dinov3_research"]

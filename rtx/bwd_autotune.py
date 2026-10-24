@@ -24,7 +24,7 @@ import uuid
 
 import torch
 
-from .autotune.measurement import runtime_timing_metadata
+from .autotune.measurement import runtime_timing_metadata, measure_cuda_batches
 
 from .autotune import (
     CoordinateDescentPolicy,
@@ -57,7 +57,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 25
+KERNEL_REVISION = 26
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -272,6 +272,9 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
         ),
         f"{prefix}_gemm_stages": tuple(
             wrap({"gemm": {"stages": value}}) for value in (1, 2, 3, 4)
+        ),
+        f"{prefix}_gemm_k_unroll": tuple(
+            wrap({"gemm": {"k_tile_unroll": value}}) for value in (1, 2, 3, 4, 6, 8, 12)
         ),
         f"{prefix}_ldmatrix": tuple(
             wrap({"gemm": {"a_ldmatrix_matrices": a, "b_ldmatrix_matrices": b}})
@@ -1168,28 +1171,25 @@ class MXFP8BwdEvaluator:
                     torch.allclose(dx,ref_dx,rtol=self.policy.correctness_rtol,atol=self.policy.correctness_atol)
                     and torch.allclose(dw,ref_dw,rtol=self.policy.correctness_rtol,atol=self.policy.correctness_atol)):
                     return TrialOutcome('correctness_error',compile_ms=compile_ms,error='graph replay dX/dW differ from reference')
-            timings: list[float] = []
-            for _ in range(self.policy.samples):
-                begin = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                begin.record()
-                if graph is not None:
-                    graph.replay()
-                else:
-                    for _call in range(self.policy.calls_per_sample):
-                        runner(self.grad_output, self.x, self.weight, dx, dw)
-                end.record()
-                end.synchronize()
-                timings.append(
-                    float(begin.elapsed_time(end)) / self.policy.calls_per_sample
-                )
+            if graph is None:
+                timings, batching = measure_cuda_batches(
+                    lambda: runner(self.grad_output, self.x, self.weight, dx, dw),
+                    samples=self.policy.samples, calls_per_sample=self.policy.calls_per_sample,
+                    device=self.x.device)
+            else:
+                timings, batching = measure_cuda_batches(
+                    graph.replay, samples=self.policy.samples, calls_per_sample=1,
+                    device=self.x.device)
+                timings = [value/self.policy.calls_per_sample for value in timings]
+                batching['actual_calls_per_sample'] *= self.policy.calls_per_sample
+                batching['requested_calls_per_sample'] = self.policy.calls_per_sample
             return TrialOutcome(
                 "ok",
                 median_ms=float(statistics.median(timings)),
                 timings_ms=timings,
                 compile_ms=compile_ms,
                 max_abs_error=max_error,
-                metadata={**runtime_timing_metadata(timings),
+                metadata={**runtime_timing_metadata(timings), **batching,
                           'measurement_mode':self.measurement_mode,'graph_capture_ms':capture_ms,
                           'calls_per_sample':self.policy.calls_per_sample},
             )

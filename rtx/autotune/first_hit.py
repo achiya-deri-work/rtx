@@ -138,26 +138,44 @@ def bounded_candidates(adapter, candidates, limit=128):
     return accepted
 
 
-def retrieve_candidates(adapter, records, limit=8, max_records=4096):
-    """Retrieve measured nearby-context winners, never transfer their timings."""
+def retrieve_candidates(adapter, records, limit=8, max_records=4096, per_context=1):
+    """Retrieve measured nearby-context winners, never transfer their timings.
+
+    Keep at most max_records recent compatible observations in memory. Scan
+    the journal fully: unrelated/old families must not hide appended evidence.
+    """
+    from collections import deque
+    if limit < 1 or max_records < 1 or per_context < 1:
+        return []
     target=adapter.context.features()
-    semantics={k:v for k,v in target.items() if k.startswith("context.tags.")
-               or k.startswith("context.workload.") and "=" in k}
-    contexts={}
-    for index,record in enumerate(records):
-        if index>=max_records: break
+    def semantic_features(features):
+        return {k:v for k,v in features.items() if k.startswith("context.tags.")
+                or k.startswith("context.regime=")
+                or k.startswith("context.environment.")
+                or k.startswith("context.workload.") and "=" in k
+                or k.startswith("context.device.") and any(
+                    k.startswith("context.device." + field + "=") for field in
+                    ("torch_version", "torch_cuda_version", "cutlass_dsl_version"))}
+    semantics=semantic_features(target)
+    recent=deque(maxlen=max_records)
+    for record in records:
         if (record.get("family")!=adapter.context.family
                 or record.get("kernel_revision")!=adapter.context.kernel_revision
                 or record.get("outcome",{}).get("status")!="ok"):
             continue
         features=record.get("features",{})
-        if any(features.get(k)!=v for k,v in semantics.items()): continue
+        if record["outcome"].get("metadata",{}).get("sampling",{}).get("collection",{}).get("stationary") is False:
+            continue
+        if semantic_features(features) != semantics: continue
         try:
             score=float(record["outcome"]["median_ms"])
             if not math.isfinite(score) or score<=0:continue
-            previous=contexts.get(record["context_id"])
-            if previous is None or score<previous[0]:contexts[record["context_id"]]=(score,record)
+            if "context_id" not in record: continue
+            recent.append((score,record))
         except (TypeError,KeyError,ValueError):continue
+    contexts={}
+    for score,record in recent:
+        contexts.setdefault(record["context_id"],[]).append((score,record))
     def distance(item):
         features=item[1]["features"]
         total=0.0
@@ -165,14 +183,45 @@ def retrieve_candidates(adapter, records, limit=8, max_records=4096):
             key="context.workload."+axis
             if key in target:
                 total+=abs(math.log2(max(1,features.get(key,1))/max(1,target[key])))
-        return total
-    candidates=[]
-    for _,record in sorted(contexts.values(),key=distance):
-        try:
-            candidate=adapter.deserialize(record["config"])
-            if adapter.rejection(candidate) is None:candidates.append(candidate)
-        except (TypeError,KeyError,ValueError):continue
-        if len(candidates)>=limit:break
+        # Shapes remain the primary prior. At equal shape distance, prefer
+        # measured schedules from similar resource capacities, not SKU names
+        # or device UUIDs. Unknown capacities cannot look like a perfect match.
+        hardware, missing = 0., 0
+        for field in ("multiprocessor_count", "l2_cache_size", "memory_bus_width_bits"):
+            key = "context.device." + field
+            legacy_key = "context.device.memory_bus_width" if field == "memory_bus_width_bits" else key
+            target_value = target.get(key, target.get(legacy_key, 0))
+            if target_value > 0:
+                value = features.get(key, features.get(legacy_key, 0))
+                if value > 0:
+                    hardware += abs(math.log2(value / target_value))
+                else:
+                    missing += 1
+        return total, missing, hardware
+    portfolios = []
+    for group in sorted(contexts.values(),key=lambda group:distance(group[0])):
+        portfolio, local_seen = [], set()
+        for _,record in sorted(group,key=lambda item:item[0]):
+            try:
+                candidate=adapter.deserialize(record["config"])
+                cid=adapter.config_id(candidate)
+                if cid in local_seen or adapter.rejection(candidate) is not None:
+                    continue
+                local_seen.add(cid)
+                portfolio.append(candidate)
+            except (TypeError,KeyError,ValueError):continue
+            if len(portfolio)>=per_context:break
+        portfolios.append(portfolio)
+    candidates, seen=[], set()
+    for rank in range(per_context):
+        for portfolio in portfolios:
+            if rank>=len(portfolio):continue
+            candidate=portfolio[rank]
+            cid=adapter.config_id(candidate)
+            if cid not in seen:
+                candidates.append(candidate)
+                seen.add(cid)
+            if len(candidates)>=limit:return candidates
     return candidates
 
 
@@ -206,7 +255,8 @@ class PortfolioSearch:
         pass
 
 
-def tune_first_hit(adapter, store, candidates, *, policy=FirstHitPolicy(), ranker=None, progress=print):
+def tune_first_hit(adapter, store, candidates, *, policy=FirstHitPolicy(), ranker=None, progress=print,
+                   candidate_group=None, refine=False, retrieval_per_context=1):
     """Select a measured winner; exact compatible cache hits do no evaluation.
 
     A single compiler invocation is not preemptible here. Campaign supervisors
@@ -216,6 +266,8 @@ def tune_first_hit(adapter, store, candidates, *, policy=FirstHitPolicy(), ranke
     successful = []
     for record in store.records(adapter.context):
         outcome = record.get("outcome", {})
+        if outcome.get("metadata",{}).get("sampling",{}).get("collection",{}).get("stationary") is False:
+            continue
         if (record.get("kernel_revision") != adapter.context.kernel_revision
                 or outcome.get("status") != "ok"):
             continue
@@ -228,20 +280,27 @@ def tune_first_hit(adapter, store, candidates, *, policy=FirstHitPolicy(), ranke
                 successful.append((latency, config))
         except (KeyError, ValueError, TypeError):
             continue
-    if successful:
+    if successful and not refine:
         score, config = min(successful, key=lambda pair: pair[0])
         if progress:
             progress(f"FIRST_HIT cache {adapter.config_id(config)} {score*1000:.3f}us")
         return ComposableTuningResult(config, score, "cache", adapter.context.identifier,
                                       0, time.monotonic()-started, {}, str(store.path))
-    retrieved=retrieve_candidates(adapter,store.records(None))
-    pool = bounded_candidates(adapter, [*retrieved,*candidates], policy.pool_size)
+    retrieved=retrieve_candidates(adapter,store.records(None),per_context=retrieval_per_context)
+    combined = [*retrieved, *candidates]
+    pool = bounded_candidates(adapter, combined,
+                              max(1, len(combined)) if candidate_group is not None else policy.pool_size)
+    if candidate_group is not None:
+        from .preparation import preparation_portfolio
+        pool = preparation_portfolio(pool, plan_of=candidate_group,
+                                     score=lambda _: 0, limit=policy.pool_size)
     strategy = PortfolioSearch(pool, ranker, policy.challenger_stride)
     if progress:
         progress(f"FIRST_HIT pool={len(pool)} trials<={policy.max_trials} learned={ranker is not None}")
     return AutotuneOrchestrator(
         adapter, store, [strategy], SequentialScheduler(((strategy.name, None),)),
         TuningBudget(policy.max_trials, policy.seconds), transfer_history=False,
+        max_trials_includes_resumed=refine,
         confirmation=ConfirmationPolicy(policy.confirmation_repeats, .02, True),
         progress=progress,
     ).tune()

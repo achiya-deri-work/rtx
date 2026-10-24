@@ -21,10 +21,10 @@ from .configs.nvfp4 import (
 from .prequant_autotune import PREQUANT_SEARCH_SPACE
 
 
-NVFP4_INFERENCE_KERNEL_REVISION = 6
-NVFP4_DYNAMIC_KERNEL_REVISION = 9
-NVFP4_DELAYED_KERNEL_REVISION = 5
-NVFP4_JIT_ROW_REGION_KERNEL_REVISION = 11
+NVFP4_INFERENCE_KERNEL_REVISION = 7
+NVFP4_DYNAMIC_KERNEL_REVISION = 10
+NVFP4_DELAYED_KERNEL_REVISION = 6
+NVFP4_JIT_ROW_REGION_KERNEL_REVISION = 13
 
 
 def delayed_scale_variant(scale_policy=None) -> str:
@@ -82,6 +82,20 @@ def _gemm_axes() -> dict[str, tuple[dict[str, object], ...]]:
         for tile_n, atom_n in ((128, 2), (256, 4))
         for tile_k in (64, 128, 256)
     )
+    # Geometry, pipeline depth, and swizzle are coupled legality constraints.
+    # Keep the existing single-coordinate proposals, then add complete seeds
+    # so local search can enter K=64 and low-SMEM regimes from the default.
+    coupled = []
+    for update in axes["gemm_geometry"]:
+        geometry = dict(update["gemm"])
+        swizzles = ("32b", "none") if geometry["tile_k"] == 64 else (None,)
+        for swizzle in swizzles:
+            for stages in (1, 2, 3):
+                values = {**geometry, "stages": stages}
+                if swizzle is not None:
+                    values.update(a_swizzle=swizzle, b_swizzle=swizzle)
+                coupled.append({"gemm": values})
+    axes["gemm_geometry"] += tuple(coupled)
     fixed_persistence = tuple(
         {
             "gemm": {
@@ -110,6 +124,9 @@ def _gemm_axes() -> dict[str, tuple[dict[str, object], ...]]:
         )
     )
     axes["gemm_persistence"] = fixed_persistence + balanced_persistence
+    axes["gemm_k_unroll"] = tuple(
+        {"gemm": {"k_tile_unroll": factor}} for factor in (1, 2, 3, 4, 6, 8, 12)
+    )
     return axes
 
 
@@ -269,6 +286,8 @@ def preferred_dynamic_config(problem: NVFP4Problem) -> NVFP4DynamicConfig:
     return native if native.rejection(problem) is None else DEFAULT_NVFP4_DYNAMIC_CONFIG
 
 NVFP4_WEIGHT_PREQUANT_SEARCH_SPACE = {
+    "x_adaptive_decode": tuple({"quant": {"adaptive_decode": v}} for v in ("lut", "native")),
+    "x_packed_store": tuple({"quant": {"packed_store_bits": v}} for v in (8, 32)),
     "x_vector_load": _QUANT_VECTOR,
     "x_reduction": _QUANT_REDUCTION,
     "x_launch": _QUANT_LAUNCH,
@@ -279,6 +298,8 @@ NVFP4_WEIGHT_PREQUANT_SEARCH_SPACE = {
 }
 NVFP4_FULLY_PREQUANT_SEARCH_SPACE = _gemm_axes()
 NVFP4_DYNAMIC_SEARCH_SPACE = {
+    "quant_adaptive_decode": tuple({"quant": {"adaptive_decode": v}} for v in ("lut", "native")),
+    "quant_packed_store": tuple({"quant": {"packed_store_bits": v}} for v in (8, 32)),
     "implementation_anchor": _DYNAMIC_IMPLEMENTATION_ANCHORS,
     "quant_vector_load": _QUANT_VECTOR,
     "quant_reduction": _QUANT_REDUCTION,
@@ -591,7 +612,24 @@ _JIT_REGION_IMPLEMENTATION_ANCHORS += tuple(
 )
 
 _jit_gemm_axes = _gemm_axes()
+# A fragment-register seed cannot reach wider/taller tiles by geometry alone:
+# that epilogue deliberately supports only 128x128, atom-N=2. Couple the
+# incompatible geometries to the general direct-scale epilogue and row-major
+# scale transport (the native scale transport currently requires 128x128).
+# Region sizes and every quantization policy field remain unchanged.
+_jit_gemm_axes['gemm_geometry'] += tuple(
+    {'quant': {'scale_layout': 'row_major'},
+     'gemm': {**update['gemm'], 'regional_scale_epilogue': 'direct',
+              'scale_layout': 'row_major', 'scale_role': 'consumers'}}
+    for update in _jit_gemm_axes['gemm_geometry']
+    if update['gemm']['tile_m'] != 128
+    or update['gemm']['tile_n'] != 128
+    or update['gemm']['atom_layout_n'] != 2
+)
 NVFP4_JIT_ROW_REGION_SEARCH_SPACE = {
+    "adaptive_pack_reuse": tuple(
+        {"quant": {"adaptive_reuse_packed": enabled}} for enabled in (False, True)
+    ),
     "implementation_anchor": _JIT_REGION_IMPLEMENTATION_ANCHORS,
     "x_region_rows": tuple(
         {"x_scale_region_rows": rows}
@@ -681,6 +719,8 @@ NVFP4_JIT_ROW_REGION_SEARCH_SPACE = {
     "quant_scale_reciprocal": _QUANT_RECIPROCAL,
     "quant_scale_compute": _QUANT_SCALE_COMPUTE,
     "scale_transport": NVFP4_DYNAMIC_SEARCH_SPACE["scale_transport"],
+    "quant_packed_store": NVFP4_DYNAMIC_SEARCH_SPACE["quant_packed_store"],
+    "quant_adaptive_decode": NVFP4_DYNAMIC_SEARCH_SPACE["quant_adaptive_decode"],
     **_jit_gemm_axes,
 }
 
@@ -988,8 +1028,7 @@ def tune_nvfp4_inference_state(
         initial=initial,
         device=fingerprint,
         regime="hot",
-        **({"tags": {"delayed_scale_policy": asdict(harness.scale_policy)}}
-           if state == "delayed" and variant != "default" else {}),
+        **({"scale_policy": harness.scale_policy} if state == "delayed" else {}),
     )
     from .autotune.runtime_coordinates import runtime_schedule_adapter
     adapter = runtime_schedule_adapter(adapter)

@@ -77,8 +77,15 @@ class ProgressiveCacheCudaTests(unittest.TestCase):
                     forward_rows=[json.loads(line) for path in Path(root).rglob('observations.jsonl')
                                   for line in path.read_text().splitlines()
                                   if json.loads(line)['family']=='mxfp8_prequant_fwd']
-                    self.assertEqual([r['strategy'] for r in forward_rows[:7]],
-                        ['initial']+['initial_neighborhood']*2+['retrieval']*2+['portable_trees']*2)
+                    from tests.test_predictor_cuda import artifact_supports_record
+                    if artifact_supports_record(p.predictor_artifact, forward_rows[0]):
+                        self.assertEqual([r['strategy'] for r in forward_rows[:7]],
+                            ['initial']+['initial_neighborhood']*2+['retrieval']*2+['portable_trees']*2)
+                    else:
+                        self.assertEqual([r['strategy'] for r in forward_rows[:3]],
+                            ['initial']+['initial_neighborhood']*2)
+                        self.assertFalse(any(r['strategy'].startswith('portable_') or
+                                             r['strategy']=='retrieval' for r in forward_rows))
                 reference=(x.float()@layer.weight.float().T).bfloat16()
                 dx=(dy.float()@layer.weight.float()).bfloat16()
                 dw=(dy.float().T@x.float()).bfloat16()

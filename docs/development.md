@@ -29,14 +29,16 @@ Generic search-policy code should not import a particular CUDA kernel.
    end-to-end performance and model-level convergence.
 
 ```bash
-python -m unittest tests.test_documentation -v
-python -m unittest discover -s tests -v
-python -m unittest tests.test_mxfp8_mlp_frontend tests.test_mxfp8_mlp \
-  tests.test_mxfp8_mlp_decode -v
+python -m pytest -q tests/test_documentation.py
+python -m pytest -q
+python -m pytest -q tests/test_mxfp8_mlp_frontend.py tests/test_mxfp8_mlp.py \
+  tests/test_mxfp8_mlp_decode.py
 ```
 
 The full suite can take substantial time and optional suites require assets or
-devices. CUDA-gated tests skipped on CPU are **not** GPU passes. Use both pinned
+devices. Use pytest to collect both unittest classes and pytest functions;
+unittest discovery alone silently omits part of the qualification surface.
+CUDA-gated tests skipped on CPU are **not** GPU passes. Use both pinned
 Torch environments for integration changes. The numerical stress script is
 documented in [the MLP report](mxfp8_mlp_numerics.md); its known failing singleton
 case must run in a separate process. Stop after a poisoned CUDA context.

@@ -1334,7 +1334,7 @@ class MXFP8GemmKernel:
             for k_tile in cutlass.range(
                 first_k_tile,
                 final_k_tile,
-                unroll=1,
+                unroll=getattr(cfg, "k_tile_unroll", 1),
             ):
                 if warp_idx == cfg.num_mma_warps:
                     producer_stage = producer_state.index
@@ -1623,13 +1623,13 @@ class MXFP8GemmKernel:
                 cfg.epilogue == "tma" and self.cache_regional_output_scales
             ):
                 if warp_idx < cfg.num_mma_warps:
-                    if cutlass.const_expr(
-                        self.fragment_register_output_scales
-                    ):
+                    if cutlass.const_expr(self.fragment_register_output_scales):
                         # SM120's proven 128x128, atom-N=2 fragment repeats
                         # (row A, col C/C+1), (row B, col C/C+1).  Hoist the
-                        # two X factors across the fragment and the W factor
-                        # across each four-accumulator group.  Products and
+                        # two X factors across the fragment for atom-M=8.
+                        # Smaller atom-M layouts own additional row groups:
+                        # reload their X factors per four-accumulator group.
+                        # Reuse the W factor within each group. Products and
                         # accumulator scaling remain exact FP32 operations.
                         coord_a = t_cc_out[0]
                         coord_b = t_cc_out[2]
@@ -1644,6 +1644,14 @@ class MXFP8GemmKernel:
                         ):
                             fragment_first = fragment_group * 4
                             coord = t_cc_out[fragment_first]
+                            if cutlass.const_expr(cfg.atom_layout_m != 8):
+                                coord_b = t_cc_out[fragment_first + 2]
+                                x_scale_a = self._load_x_output_scale(
+                                    output_scale, coord[0]
+                                )
+                                x_scale_b = self._load_x_output_scale(
+                                    output_scale, coord_b[0]
+                                )
                             weight_scale = self._load_weight_output_scale(
                                 output_scale, coord[1]
                             )

@@ -123,7 +123,11 @@ def save_runtime_winner(
     median_ms: float | None = None,
     metadata: Mapping[str, object] | None = None,
     tuning_evidence: Mapping[str, object] | None = None,
-) -> Path:
+) -> Path | None:
+    if tuning_evidence is not None and tuning_evidence.get("timing_fallback"):
+        # A correctness-checked runtime seed is not latency evidence. Keep it
+        # process-local; a fresh process must be allowed to measure again.
+        return None
     base = default_cache_dir() if root is None else Path(root).expanduser()
     path = base / key.relative_path
     path.parent.mkdir(parents=True, exist_ok=True)

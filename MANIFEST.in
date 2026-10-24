@@ -9,9 +9,17 @@ include requirements-torch212-cu132.txt
 include requirements-dev.txt
 include requirements-first-hit.txt
 recursive-include docs *.md
+recursive-include docs/examples *.py
 recursive-include autotune_manifests *.json
 recursive-include autotune_manifests *.md
 recursive-include benchmarks *.py
 recursive-include benchmarks *.md
 recursive-include benchmarks *.sh
+recursive-include benchmarks/configs *.json
 recursive-include tests *.py
+recursive-include tools *.py
+# Match the private/chronological handoff exclusions in .gitignore. Explicit
+# recursive includes otherwise pull ignored local files into an sdist.
+exclude docs/afrl_*_202609*.md
+exclude docs/mlp_*_202609*.md
+exclude docs/mlp_deployment_goal_status.md

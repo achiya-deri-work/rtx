@@ -1198,6 +1198,7 @@ def _nvfp4_delayed_adapter(
         device=campaign.hardware_profile,
         regime=regime,
         tags=tags,
+        scale_policy=harness.scale_policy,
     )
 
 

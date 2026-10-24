@@ -30,6 +30,7 @@ def test_narrow_fused_linear_and_glu(tm,engine,stages):
     from rtx.kernels.mxfp8_glu import compile_mxfp8_glu
     from tests.test_mxfp8_glu import reference
     from tests.test_mxfp8_fwd import _reference_to_mx
+    from benchmarks.diagnose_mxfp8_rounding import round_fp64_to_bf16
     torch.manual_seed(1963)
     m,k,h=2*tm+17,256,161
     if engine == 'cpasync':
@@ -43,7 +44,19 @@ def test_narrow_fused_linear_and_glu(tm,engine,stages):
         q,s=_reference_to_mx(t)
         return q.float()*s.float().repeat_interleave(32,-1)
     y=mxfp8_linear(x,w,config=c,autotune='off',backend='fused')
-    torch.testing.assert_close(y,(dq(x)@dq(w).T).bfloat16(),rtol=.004,atol=2e-6)
+    # FP32 cuBLAS can round a dot onto a BF16 midpoint before the final cast.
+    # This seed's (632,12) is one such cell: the kernel agrees with the exact
+    # dot, not the double-rounded FP32 oracle. Keep the original FP32 gate;
+    # a disagreement is accepted ONLY if it equals the independently correctly
+    # rounded exact dot. Requiring exact dots everywhere would incorrectly
+    # demand FP64 accumulation from a deliberately FP32-accumulating kernel.
+    a,b=dq(x),dq(w)
+    expected=(a@b.T).bfloat16()
+    bad=~torch.isclose(y,expected,rtol=.004,atol=2e-6)
+    if bool(bad.any()):
+        exact=a.cpu().double()@b.cpu().double().T
+        rounded=round_fp64_to_bf16(exact).to(y.device)
+        torch.testing.assert_close(y[bad],rounded[bad],rtol=0,atol=0)
     gc=normalize_glu_config(weight_reuse_tile=(tm,engine,stages,2))
     assert glu_rejection(problem,gc,'mxfp8') is None
     width=(h+31)//32*32

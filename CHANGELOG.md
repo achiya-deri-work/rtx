@@ -5,6 +5,24 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Integrate fused `MXFP8GLU` and fully recomputed `MXFP8MLP`, their functional
+  APIs, packed intermediate path, deployment plans, and shared first-hit tuning.
+- Transfer outer-K-loop unrolling to packed MXFP8 linear, GLU, MLP and backward
+  GEMMs. Expose independent factors 1/2/3/4/6/8/12 and preserve factor-one
+  defaults and numerical policies. Fix NVFP4 regional fragment-factor reuse for
+  smaller atom-M layouts; retain FP32 outer scaling.
+- Add optional NVFP4 accuracy selection, offline PTQ calibration, native
+  Four-Over-Six quantization and preparation studies. Experimental MS-EDEN
+  backward remains opt-in; ordinary NVFP4 training retains MXFP8 backward.
+- Calibrate short MXFP8 timing batches and distinguish correct execution from
+  eligible latency evidence. Runtime MXFP8/NVFP4 may use a numerically checked
+  seed when clocks are unstable, without installing an unmeasured winner.
+  Invalidate older MXFP8 prequant/bwd measurements with revisions 11/26.
+- Run complete pytest discovery in CI, add compiled BF16-optimizer lifecycle
+  coverage, and exclude ignored private handoff notes from source packages.
+  See `docs/mxfp8_glu_merge_qualification.md` for current evidence and the
+  pre-existing DINO quality limits; this is not a 1.0 release certification.
+
 - Fix NVFP4 shuffle and leader-broadcast participation masks for incomplete
   warps. Invalidate NVFP4 runtime winners (dynamic r8, delayed r3, regional
   r10, packed inference r5). Historical model heads require retraining.

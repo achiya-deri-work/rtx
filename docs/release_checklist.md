@@ -10,7 +10,7 @@ or a test report from a different source revision does not satisfy the gate.
   local evidence may remain in the worktree);
 - every retained autotuning manifest validates and has never been edited after
   producing data;
-- `python -m unittest discover -s tests -v` passes;
+- `python -m pytest -q` passes (unittest classes and pytest functions);
 - `python -m build` and `python -m twine check dist/*` pass;
 - the built wheel imports as `rtx` in a clean environment;
 - both `requirements.txt` and `requirements-torch212-cu132.txt` satisfy
@@ -22,7 +22,7 @@ Run from the exact commit intended for the tag on both RTX 5070 variants and,
 when available, RTX 5090:
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pytest -q
 python benchmarks/validate_production.py \
   --output autotune_reports/release_1_0_production.json
 ```
@@ -36,6 +36,18 @@ bash benchmarks/run_release_qualification.sh .venv/bin/python
 The same script powers the manual self-hosted GPU release-qualification CI.
 Run it separately for each supported environment; it does not modify installed
 dependencies or update the checkout.
+
+Install the optional `model-test` dependencies before this script. It now also
+runs pinned Ettin/WikiText compiled inference with prospective quality guards
+and the 12-step BF16-state training matrix. Asset downloads use the external
+Hugging Face cache. This short training gate proves finite execution and
+gradient/state coverage, not convergence.
+
+By the model-target change on 2026-10-24, default pytest excludes the explicitly
+marked `dinov3_research` model studies. Their original assertions and known
+failures are retained; run `python -m pytest -q -m dinov3_research` to reproduce
+them with separately obtained assets. DINO format/oracle unit tests remain in
+the default suite. A green core/Ettin run is not a claim that DINO passes.
 
 The matrix must cover eager and `torch.compile(fullgraph=True, dynamic=False)`,
 dynamic training, dynamic-X/prequantized-W and fully packed inference, ragged

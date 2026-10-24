@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import math
 from typing import Literal, Mapping
 
 
@@ -59,6 +60,16 @@ class TrialOutcome:
     @property
     def successful(self) -> bool:
         return self.status == "ok" and self.median_ms is not None
+
+    @property
+    def timing_eligible(self) -> bool:
+        """Numerically valid is distinct from eligible latency evidence.
+
+        Historical outcomes without quality annotations retain compatibility.
+        Explicitly unstable timings remain successful feasibility evidence.
+        """
+        return (self.successful and math.isfinite(self.median_ms) and self.median_ms > 0
+                and self.metadata.get("sampling",{}).get("collection",{}).get("stationary") is not False)
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)

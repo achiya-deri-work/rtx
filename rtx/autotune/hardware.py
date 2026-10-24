@@ -509,6 +509,8 @@ def traffic_features(
     quantized_element_bits: int = 8,
     scale_vector_size: int = 32,
 ) -> dict[str, float]:
+    from .preparation import PreparationGeometry
+
     m_tiles = _ceil_div(m, tile_m)
     n_tiles = _ceil_div(n, tile_n)
     x_bytes = m * k * input_element_bytes
@@ -534,6 +536,16 @@ def traffic_features(
         or 0
     )
     return {
+        **{
+            f"preparation_{key}": float(value)
+            for key, value in PreparationGeometry(
+                m, n, k, tile_m, tile_n,
+                packed_bits=quantized_element_bits,
+                scale_group=scale_vector_size,
+                l2_bytes=int(l2_bytes),
+                sm_count=int(profile_value(profile, "multiprocessor_count", 0) or 0),
+            ).features("staged" if materialized_quant else "fused").items()
+        },
         "nominal_flops": flops,
         "x_bytes": float(x_bytes),
         "weight_bytes": float(w_bytes),

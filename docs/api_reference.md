@@ -7,6 +7,46 @@ Configuration listings show locally declared fields; inherited fields follow the
 `rtx.__version__` is the package version. Stable below means wildcard-export membership,
 not a declaration that this development checkout is a released 1.0 build.
 
+## `rtx.WorkspacePolicy`
+
+Stable runtime export; provider `rtx.workspace.WorkspacePolicy`.
+
+[Source](../rtx/workspace.py)
+
+Per-cache bytes with optional entry caps (None means byte-only).
+
+```python
+class WorkspacePolicy:
+    paired_bytes: int
+    partial_bytes: int
+    paired_entries: int | None = None
+    partial_entries: int | None = None
+```
+
+## `rtx.configure_workspace`
+
+Stable runtime export; provider `rtx.workspace.configure_workspace`.
+
+[Source](../rtx/workspace.py)
+
+Apply startup policy to empty backward caches; return resolved report.
+
+```python
+configure_workspace(policy: WorkspacePolicy)
+```
+
+## `rtx.workspace_report`
+
+Stable runtime export; provider `rtx.workspace.workspace_report`.
+
+[Source](../rtx/workspace.py)
+
+Resolved limits, explicit unique cache storage, and interval churn.
+
+```python
+workspace_report(previous=None)
+```
+
 ## `rtx.AutotunePolicy`
 
 Stable runtime export; provider `rtx.autotune.effort.AutotunePolicy`.
@@ -46,10 +86,29 @@ class AutotunePolicy:
     backward_measurement_mode: str = 'host'
     forward_trials: int | None = None
     backward_trials: int | None = None
+    preparation_selection: bool = False
     def preset(cls, name, **overrides)
     def for_pass(self, backward=False)
     def evidence_contract(self)
     def coordinate(self, *, rtol=0.05, atol=0.5)
+```
+
+## `rtx.MLPExecutionMix`
+
+Stable runtime export; provider `rtx.autotune.execution_mix.MLPExecutionMix`.
+
+[Source](../rtx/autotune/execution_mix.py)
+
+Calls per measured workload, not weights applied to unrelated timings.
+
+```python
+class MLPExecutionMix:
+    training_pairs: int = 1
+    grad_forwards: int = 0
+    inference_forwards: int = 0
+    def validate_phase(self, phase)
+    def contract(self)
+    def execute(self, forward, inputs, backward, grad_context)
 ```
 
 ## `rtx.MXTensor`
@@ -261,13 +320,15 @@ Bias-free GLU MLP with full recomputation and no saved hidden activations.
 
 ```python
 class MXFP8MLP(torch.nn.Module):
-    def __init__(self, in_features, hidden_features, out_features=None, *, activation='silu', config=DEFAULT_MLP_CONFIG, precision='mxfp8', device=None, dtype=torch.bfloat16, autotune='off', tuning_policy=None, autotune_cache_dir=None)
+    def __init__(self, in_features, hidden_features, out_features=None, *, activation='silu', config=DEFAULT_MLP_CONFIG, precision='mxfp8', device=None, dtype=torch.bfloat16, autotune='off', tuning_policy=None, autotune_cache_dir=None, training_mix=None, inference_mix=None)
     def reset_parameters(self)
     def from_linears(cls, gate, up, down, *, activation='silu', config=DEFAULT_MLP_CONFIG, precision='mxfp8')
     def forward(self, x)
     def configure_shape_(self, example_x, *, config=None, precision=None)
     def policy_for(self, example_x)
     def autotune_(self, example_x, **kwargs)
+    def export_tuning_spec(self, path=None)
+    def require_cached_(self)
     def extra_repr(self)
 ```
 
@@ -286,6 +347,9 @@ class MXFP8MLPConfig:
     gate_backward: MXFP8BwdConfig | None = None
     down_backward: MXFP8BwdConfig | None = None
     backward_recompute: str = 'joint'
+    joint_output_storage: str = 'packed'
+    gradient_quantization: str = 'separate'
+    hidden_quantization: str = 'separate'
     backward_overlap: bool = False
     gate_backend: str = 'onchip'
     cooperative_ctas_per_sm: float = 1.0
@@ -299,6 +363,54 @@ class MXFP8MLPConfig:
     def from_dict(cls, values)
     def to_json(self)
     def from_json(cls, text)
+```
+
+## `rtx.MLPCandidate`
+
+Explicit feature/compatibility export; provider `rtx.deployment.MLPCandidate`.
+
+[Source](../rtx/deployment.py)
+
+Exact contiguous-2D selected-direct MXFP8 MLP proposal.
+
+```python
+class MLPCandidate:
+    shape: tuple[int, int, int, int]
+    config: object
+    phase: str = 'train'
+    activation: str = 'silu'
+    evidence_json: str = '{}'
+    def to_dict(self)
+    def save(self, path)
+    def load(cls, path)
+    def from_qualification(cls, path, *, field='challenger')
+    def prepare(self, output, *, policy=None, cache_dir=None, execution_mix=None, reserve_mib=0)
+    def inspect(self, output)
+    def check_cache(self, output, *, device='cuda:0')
+```
+
+## `rtx.bind_qualified_mlp_plans_`
+
+Explicit feature/compatibility export; provider `rtx.deployment.bind_qualified_mlp_plans_`.
+
+[Source](../rtx/deployment.py)
+
+Pin current-source preflight winners by exact input shape and grad phase.
+
+```python
+bind_qualified_mlp_plans_(module, bindings)
+```
+
+## `rtx.require_qualified_mlp_cache_`
+
+Explicit feature/compatibility export; provider `rtx.deployment.require_qualified_mlp_cache_`.
+
+[Source](../rtx/deployment.py)
+
+Validate declared contexts, then make an existing MXFP8MLP cache-only.
+
+```python
+require_qualified_mlp_cache_(module, requests)
 ```
 
 ## `rtx.mxfp8_mlp`
@@ -412,6 +524,63 @@ Prequantize BF16 into TorchAO's canonical ``NVFP4Tensor``.
 quantize_nvfp4(tensor: torch.Tensor, *, tensor_scale: torch.Tensor | None=None, config: NVFP4QuantConfig | None=None)
 ```
 
+## `rtx.calibrate_nvfp4_weight`
+
+Stable runtime export; provider `rtx.nvfp4_calibration.calibrate_nvfp4_weight`.
+
+[Source](../rtx/nvfp4_calibration.py)
+
+Pack a calibrated [out_features,K] weight for explicit offline PTQ.
+
+```python
+calibrate_nvfp4_weight(weight: torch.Tensor, policy: str='local_hessian', *, second_moments: torch.Tensor | None=None, outer_scale: torch.Tensor | None=None, rows_per_chunk: int=64, hessian_shrinkage: float=0.0)
+```
+
+## `rtx.NVFP4SecondMomentCollector`
+
+Stable runtime export; provider `rtx.nvfp4_calibration.NVFP4SecondMomentCollector`.
+
+[Source](../rtx/nvfp4_calibration.py)
+
+Streaming CPU accumulator of E[x_b x_b.T], not centered covariance.
+
+```python
+class NVFP4SecondMomentCollector:
+    def __init__(self, in_features: int)
+    def update(self, activations: torch.Tensor)
+    def second_moments(self)
+```
+
+## `rtx.NVFP4CalibrationCollector`
+
+Stable runtime export; provider `rtx.calibration.NVFP4CalibrationCollector`.
+
+[Source](../rtx/calibration.py)
+
+Single-use context collecting uncentered block16 activation moments.
+
+```python
+class NVFP4CalibrationCollector:
+    def __init__(self, model: nn.Module, *, filter_fn: Callable[[nn.Module, str], bool] | None=None, max_tokens_per_batch: int=1024)
+    def second_moments(self)
+    def sample_counts(self)
+```
+
+## `rtx.NVFP4CalibrationConfig`
+
+Stable runtime export; provider `rtx.ptq.NVFP4CalibrationConfig`.
+
+[Source](../rtx/ptq.py)
+
+Explicit offline weight-scale calibration, never a training policy.
+
+```python
+class NVFP4CalibrationConfig:
+    method: Literal['max', 'four_over_six', 'mse', 'local_hessian'] = 'mse'
+    hessian_shrinkage: float = 0.0
+    rows_per_chunk: int = 64
+```
+
 ## `rtx.quantize_`
 
 Stable runtime export; provider `rtx.ptq.quantize_`.
@@ -421,7 +590,7 @@ Stable runtime export; provider `rtx.ptq.quantize_`.
 PTQ selected no-bias BF16 linears using a format policy.
 
 ```python
-quantize_(model: nn.Module, config: MXFP8WeightOnlyConfig | NVFP4WeightOnlyConfig, filter_fn: ModuleFilter | None=None, device: torch.device | str | int | None=None)
+quantize_(model: nn.Module, config: MXFP8WeightOnlyConfig | NVFP4WeightOnlyConfig, filter_fn: ModuleFilter | None=None, device: torch.device | str | int | None=None, *, calibration_moments: Mapping[str, torch.Tensor] | None=None, calibration_overrides: Mapping[str, NVFP4CalibrationConfig] | None=None)
 ```
 
 ## `rtx.MXFP8WeightOnlyConfig`
@@ -457,6 +626,7 @@ class NVFP4WeightOnlyConfig:
     autotune: AutotuneMode | bool | None = None
     tuning_policy: object | None = None
     autotune_cache_dir: Path | str | None = None
+    weight_calibration: NVFP4CalibrationConfig | None = None
 ```
 
 ## `rtx.MXFP8TrainingConfig`
@@ -592,6 +762,8 @@ Stable runtime export; provider `rtx.configs.MXFP8GemmConfig`.
 
 [Source](../rtx/configs/mxfp8.py)
 
+Packed MXFP8 schedule, also inherited by GLU and MLP GEMMs.
+
 ```python
 class MXFP8GemmConfig:
     tile_m: int = 128
@@ -600,6 +772,7 @@ class MXFP8GemmConfig:
     atom_layout_m: int = 8
     atom_layout_n: int = 2
     stages: int = 2
+    k_tile_unroll: int = 1
     a_swizzle: Literal['none', '32b', '64b', '128b'] = '64b'
     b_swizzle: Literal['none', '32b', '64b', '128b'] = '64b'
     a_ldmatrix_matrices: int = 4
@@ -767,7 +940,7 @@ Numerical policy for NVFP4 outer FP32 scaling.
 
 ```python
 class NVFP4ScaleConfig:
-    tensor_scale_mode: Literal['power2', 'exact'] = 'power2'
+    tensor_scale_mode: Literal['power2', 'exact', 'exact_four_over_six'] = 'power2'
     amax_history_len: Literal[1, 4, 16, 64] = 16
     amax_history_algo: Literal['most_recent', 'window_max'] = 'window_max'
 ```
@@ -820,6 +993,7 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
     regional_epilogue_warps: Literal[1, 2, 4, 8] = 4
     regional_epilogue_registers: Literal[24, 32, 40, 48, 64, 80] = 48
     regional_epilogue_values: Literal[1, 2, 4, 8] = 1
+    k_tile_unroll: int = 1
     def num_epilogue_warps(self)
     def num_threads(self)
     def native_operand_bits(self)
@@ -849,7 +1023,7 @@ Stable runtime export; provider `rtx.configs.NVFP4QuantConfig`.
 
 [Source](../rtx/configs/nvfp4.py)
 
-One independently compilable BF16-to-NVFP4 quantizer schedule.
+BF16-to-NVFP4 quantization policy and independently compilable schedule.
 
 ```python
 class NVFP4QuantConfig:
@@ -863,6 +1037,10 @@ class NVFP4QuantConfig:
     scale_reciprocal: Literal['direct', 'e4m3_lut', 'rcp_approx'] = 'direct'
     scale_compute: Literal['redundant', 'leader_broadcast'] = 'redundant'
     scale_layout: Literal['row_major', 'mma128'] = 'row_major'
+    block_scale_selection: Literal['amax', 'mse5', 'lsq1', 'four_over_six'] = 'amax'
+    adaptive_reuse_packed: bool = False
+    packed_store_bits: Literal[8, 32] = 8
+    adaptive_decode: Literal['lut', 'native'] = 'lut'
     def threads_per_scale(self)
     def blocks_per_warp(self)
     def rejection(self, rows: int, k: int)
@@ -928,6 +1106,7 @@ class MXFP8BwdConfig:
     execution_order: str = 'dx_first'
     stream_schedule: str = 'single'
     quant_schedule: str = 'per_matmul'
+    operand_storage: str = 'separate'
     def normalized(self)
     def rejection(self, forward: MXFP8Problem)
     def implementation_rejection(self, forward: MXFP8Problem)
@@ -990,7 +1169,7 @@ Stable runtime export; provider `rtx.runtime.clear_runtime_caches`.
 Release cached launch workspaces retained by the Python frontends.
 
 ```python
-clear_runtime_caches(*, synchronize: bool=True, device=None)
+clear_runtime_caches(*, synchronize: bool=True, device=None, preserve_compiled: bool=False)
 ```
 
 ## `rtx.validate_runtime_environment`

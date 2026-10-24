@@ -88,6 +88,11 @@ activations are still quantized for the low-precision GEMM. Packed modules
 are inference-only; keep your BF16 source checkpoint for future training.
 [Inference and checkpoint guide](docs/inference.md).
 
+NVFP4 PTQ supports opt-in MSE/local-Hessian weight calibration, bounded
+activation-statistics collection, and offline model-quality policy selection.
+See [quantization policy](docs/quantization_policy.md). Accuracy selection is
+separate from kernel schedule autotuning; existing defaults remain unchanged.
+
 ## Autotune
 
 Linear defaults use bounded balanced first-hit search: exact cache lookup,
@@ -158,7 +163,7 @@ Documentation examples can be run on a supported GPU:
 
 ```bash
 python docs/examples/basic_workflows.py --mode all
-python -m unittest tests.test_documentation -v
+python -m pytest -q tests/test_documentation.py
 ```
 
 [Developer guide](docs/development.md) ·

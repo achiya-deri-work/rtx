@@ -1,6 +1,7 @@
 """Composable autotuning framework plus compatibility with the original tuner."""
 
 from . import legacy as _legacy
+from .accuracy import AccuracySelectionResult, select_accuracy_policy
 from .effort import AutotunePolicy,make_effort_autotuner
 from .adapters import (
     make_mxfp8_bwd_adapter,
@@ -186,6 +187,8 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "AccuracySelectionResult",
+    "select_accuracy_policy",
     "AutotunePolicy",
     "make_effort_autotuner",
     "AdaptiveBanditScheduler",

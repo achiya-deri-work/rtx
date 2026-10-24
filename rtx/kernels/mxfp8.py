@@ -290,6 +290,8 @@ class MXFP8FwdConfig:
             return "quant_store_bits must divide the quantized per-thread vector (8/16/32/64)"
         if self.quant_unroll not in (1,2,4,8):
             return "quant_unroll must be 1/2/4/8"
+        if type(self.k_unroll) is not int or self.k_unroll not in (1,2,3,4,6,8,12):
+            return "k_unroll must be an integer in 1/2/3/4/6/8/12"
         if self.scalar_bounds not in ("always","auto"):
             return "scalar_bounds must be always or auto"
         if self.native_operand_bits != 8 and self.quant_store_bits != 8:
@@ -761,7 +763,7 @@ FWD_SEARCH_SPACE: dict[str, tuple[object, ...]] = {
     "cooperative_warps": (0,4,8,16,20,24,32),
     "quant_unroll": (1,2,4,8),
     "scalar_bounds": ("always","auto"),
-    "k_unroll": (1, 2, 4),
+    "k_unroll": (1, 2, 3, 4, 6, 8, 12),
     "maxrregcount": (128, 160, 192, 224, 255),
     "producer_registers": (32, 40, 48, 56),
     "quantizer_registers": (64, 80, 96, 112, 128),

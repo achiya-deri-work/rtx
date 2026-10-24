@@ -109,7 +109,19 @@ class ConcurrentCacheCudaTests(unittest.TestCase):
                 for path in paths:
                     rows=[json.loads(line) for line in path.read_text().splitlines()]
                     self.assertEqual(len(rows),16)
-                    self.assertEqual(len({r['config_id'] for r in rows}),16)
+                    # A later session may retry a numerically valid candidate
+                    # whose earlier clock samples were ineligible. Such retries
+                    # consume the trial budget; concurrent writers must not
+                    # duplicate an already eligible candidate.
+                    from rtx.autotune.outcomes import TrialOutcome
+                    seen={}
+                    for row in rows:
+                        previous=seen.get(row['config_id'], [])
+                        for old in previous:
+                            outcome=TrialOutcome.from_dict(old['outcome'])
+                            self.assertTrue(outcome.successful and not outcome.timing_eligible)
+                            self.assertNotEqual(old['session_id'],row['session_id'])
+                        seen.setdefault(row['config_id'],[]).append(row)
                 for path in Path(root).glob('runtime_winners/**/*.json'):
                     evidence=json.loads(path.read_text())['metadata']['tuning_evidence']
                     self.assertEqual(evidence['attempted_trials'],16)

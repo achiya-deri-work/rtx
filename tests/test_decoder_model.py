@@ -33,6 +33,14 @@ def _small_config(
 
 
 class DecoderConfigurationTests(unittest.TestCase):
+    def test_training_cli_exposes_all_nvfp4_scaling_modes(self) -> None:
+        from benchmarks.train_decoder import TRAINING_MODES, _linear_policy
+
+        for scaling in ("current", "delayed", "jit_row_region", "block"):
+            name = f"nvfp4_{scaling}"
+            self.assertIn(name, TRAINING_MODES)
+            self.assertEqual(_linear_policy(name), ("nvfp4", scaling))
+
     def test_default_is_the_short_convergence_shape(self) -> None:
         config = DecoderConfig()
         self.assertEqual(config.hidden_size, 768)

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import math
+from numbers import Real
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -77,8 +79,40 @@ class MXFP8WeightOnlyConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class NVFP4CalibrationConfig:
+    """Explicit offline weight-scale calibration, never a training policy.
+
+    Local-Hessian requires caller-collected uncentered second moments. A
+    nonzero shrinkage blends H toward mean(diag(H))*I; defaults are unchanged.
+    Activation quantization remains the selected native packed-weight policy.
+    """
+
+    method: Literal["max", "four_over_six", "mse", "local_hessian"] = "mse"
+    hessian_shrinkage: float = 0.0
+    rows_per_chunk: int = 64
+
+    def __post_init__(self) -> None:
+        if self.method not in ("max", "four_over_six", "mse", "local_hessian"):
+            raise ValueError(f"unknown NVFP4 calibration method: {self.method!r}")
+        alpha = self.hessian_shrinkage
+        if (not isinstance(alpha, Real) or isinstance(alpha, bool)
+                or not math.isfinite(alpha) or not 0 <= alpha <= 1):
+            raise ValueError("hessian_shrinkage must be a finite real number in [0,1]")
+        if alpha != 0 and self.method != "local_hessian":
+            raise ValueError("nonzero hessian_shrinkage requires local_hessian")
+        if (not isinstance(self.rows_per_chunk, int) or isinstance(self.rows_per_chunk, bool)
+                or self.rows_per_chunk <= 0):
+            raise ValueError("rows_per_chunk must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
 class NVFP4WeightOnlyConfig:
-    """PTQ policy for packed NVFP4 weights and dynamic BF16 activations."""
+    """PTQ policy for packed NVFP4 weights and dynamic BF16 activations.
+
+    ``weight_calibration`` opts into offline CPU scale search. It replaces,
+    rather than composes with, ``quant_config`` weight quantization. It never
+    changes the activation quantizer or adds work to the runtime forward.
+    """
 
     scaling: Literal["current", "block"] = "current"
     quant_config: "NVFP4QuantConfig | None" = None
@@ -87,10 +121,16 @@ class NVFP4WeightOnlyConfig:
     autotune: AutotuneMode | bool | None = None
     tuning_policy: object | None = None
     autotune_cache_dir: Path | str | None = None
+    weight_calibration: NVFP4CalibrationConfig | None = None
 
     def __post_init__(self) -> None:
         if self.scaling not in ("current", "block"):
             raise ValueError("packed NVFP4 PTQ scaling must be current or block")
+        if self.weight_calibration is not None:
+            if not isinstance(self.weight_calibration, NVFP4CalibrationConfig):
+                raise TypeError("weight_calibration must be NVFP4CalibrationConfig or None")
+            if self.quant_config is not None:
+                raise ValueError("quant_config conflicts with offline weight_calibration")
 
 
 def _default_linear_filter(module: nn.Module, fqn: str) -> bool:
@@ -101,22 +141,20 @@ def _default_linear_filter(module: nn.Module, fqn: str) -> bool:
 
 
 def _module_references(root: nn.Module) -> list[ModuleReference]:
-    """Return every module reference, including aliases, without recursing twice."""
+    """Return every acyclic module alias path, including shared descendants."""
 
     references: list[ModuleReference] = [(None, None, root, "")]
-    visited = {id(root)}
 
-    def visit(parent: nn.Module, parent_fqn: str) -> None:
+    def visit(parent: nn.Module, parent_fqn: str, ancestry: frozenset[int]) -> None:
         for name, child in tuple(parent._modules.items()):
             if child is None:
                 continue
             fqn = f"{parent_fqn}.{name}" if parent_fqn else name
             references.append((parent, name, child, fqn))
-            if id(child) not in visited:
-                visited.add(id(child))
-                visit(child, fqn)
+            if id(child) not in ancestry:
+                visit(child, fqn, ancestry | {id(child)})
 
-    visit(root, "")
+    visit(root, "", frozenset({id(root)}))
     return references
 
 
@@ -209,6 +247,59 @@ def _prepare_model(
         model.to(device=device)
 
 
+def _nvfp4_calibration_plan(
+    selected: list[tuple[nn.Linear, list[ModuleReference]]],
+    config: NVFP4WeightOnlyConfig,
+    moments: Mapping[str, torch.Tensor] | None,
+    overrides: Mapping[str, NVFP4CalibrationConfig] | None,
+) -> dict[int, tuple[NVFP4CalibrationConfig | None, torch.Tensor | None]]:
+    """Resolve all FQNs and shared aliases before building replacements."""
+    for name, mapping in (("calibration_moments", moments), ("calibration_overrides", overrides)):
+        if mapping is not None and not isinstance(mapping, Mapping):
+            raise TypeError(f"{name} must be a mapping from selected module FQNs")
+    moments = {} if moments is None else moments
+    overrides = {} if overrides is None else overrides
+    known = {reference[3] for _, aliases in selected for reference in aliases}
+    for name, mapping in (("calibration_moments", moments), ("calibration_overrides", overrides)):
+        unknown = set(mapping) - known
+        if unknown:
+            raise ValueError(f"{name} contains unknown or unselected FQNs: {sorted(map(repr, unknown))}")
+    for fqn, override in overrides.items():
+        if not isinstance(override, NVFP4CalibrationConfig):
+            raise TypeError(f"calibration_overrides[{fqn!r}] must be NVFP4CalibrationConfig")
+    plan: dict[int, tuple[NVFP4CalibrationConfig | None, torch.Tensor | None]] = {}
+    for module, aliases in selected:
+        names = [reference[3] for reference in aliases]
+        policies = [overrides.get(name, config.weight_calibration) for name in names]
+        if any(policy != policies[0] for policy in policies[1:]):
+            raise ValueError(f"conflicting calibration policies for shared aliases: {names}")
+        policy = policies[0]
+        if policy is not None and config.quant_config is not None:
+            raise ValueError("quant_config conflicts with offline weight calibration")
+        supplied = []
+        for name in names:
+            if name not in moments:
+                continue
+            value = moments[name]
+            if (not isinstance(value, torch.Tensor) or value.layout != torch.strided
+                    or not value.is_floating_point()):
+                raise TypeError(f"calibration_moments[{name!r}] must be a strided floating tensor")
+            expected = ((module.in_features + 15) // 16, 16, 16)
+            if tuple(value.shape) != expected:
+                raise ValueError(f"calibration_moments[{name!r}] must have shape {expected}")
+            cpu = value.detach().to(device="cpu", dtype=torch.float32)
+            if not bool(cpu.isfinite().all()):
+                raise ValueError(f"calibration_moments[{name!r}] must be finite in FP32")
+            supplied.append(cpu)
+        if supplied and any(not torch.equal(value, supplied[0]) for value in supplied[1:]):
+            raise ValueError(f"conflicting calibration moments for shared aliases: {names}")
+        second_moments = supplied[0] if supplied else None
+        if policy is not None and policy.method == "local_hessian" and second_moments is None:
+            raise ValueError(f"local_hessian requires calibration_moments for {names}")
+        plan[id(module)] = policy, second_moments
+    return plan
+
+
 def convert_to_mxfp8_training(
     model: nn.Module,
     *,
@@ -294,6 +385,9 @@ def quantize_(
     config: MXFP8WeightOnlyConfig | NVFP4WeightOnlyConfig,
     filter_fn: ModuleFilter | None = None,
     device: torch.device | str | int | None = None,
+    *,
+    calibration_moments: Mapping[str, torch.Tensor] | None = None,
+    calibration_overrides: Mapping[str, NVFP4CalibrationConfig] | None = None,
 ) -> nn.Module:
     """PTQ selected no-bias BF16 linears using a format policy.
 
@@ -301,6 +395,15 @@ def quantize_(
     are replaced in place and the possibly replaced root is returned. Every
     selected module is validated and every replacement is built before the
     module tree is mutated.
+
+    NVFP4 offline calibration is opt-in through ``config.weight_calibration``
+    and/or per-FQN ``calibration_overrides``. Root linear FQN is ``""``.
+    ``calibration_moments`` supplies uncentered [ceil(K/16),16,16] moments;
+    only local-Hessian consumes these, but every supplied entry is validated.
+    Shared aliases must resolve to one policy and equal supplied moments; one
+    moment entry under any shared alias suffices. Collection and statistical
+    independence are caller-owned. Block scaling fixes the outer scale to one.
+    These controls do not apply to MXFP8 or dynamic training conversion.
     """
 
     _prepare_model(model, device)
@@ -309,7 +412,16 @@ def quantize_(
             "rtx.quantize_ requires MXFP8WeightOnlyConfig or "
             f"NVFP4WeightOnlyConfig; got {type(config).__name__}"
         )
+    if isinstance(config, MXFP8WeightOnlyConfig) and (
+        calibration_moments is not None or calibration_overrides is not None
+    ):
+        raise TypeError("offline calibration arguments require NVFP4WeightOnlyConfig")
+    if (isinstance(config, NVFP4WeightOnlyConfig) and calibration_moments is not None
+            and config.weight_calibration is None and not calibration_overrides):
+        raise ValueError("calibration_moments requires weight_calibration or calibration_overrides")
     selected = _selected_linears(model, filter_fn, require_cuda=True)
+    calibration_plan = (_nvfp4_calibration_plan(selected, config, calibration_moments, calibration_overrides)
+                        if isinstance(config, NVFP4WeightOnlyConfig) else {})
     replacements: dict[int, nn.Module] = {}
     packing_outputs: list[torch.Tensor] = []
 
@@ -348,11 +460,23 @@ def quantize_(
                 if config.scaling == "block"
                 else None
             )
-            packed = quantize_nvfp4(
-                module.weight.detach(),
-                tensor_scale=tensor_scale,
-                config=config.quant_config,
-            )
+            calibration, moments = calibration_plan[id(module)]
+            if calibration is None:
+                packed = quantize_nvfp4(
+                    module.weight.detach(),
+                    tensor_scale=tensor_scale,
+                    config=config.quant_config,
+                )
+            else:
+                from .nvfp4_calibration import calibrate_nvfp4_weight
+
+                packed = calibrate_nvfp4_weight(
+                    module.weight.detach(), calibration.method,
+                    second_moments=moments if calibration.method == "local_hessian" else None,
+                    outer_scale=tensor_scale,
+                    rows_per_chunk=calibration.rows_per_chunk,
+                    hessian_shrinkage=calibration.hessian_shrinkage,
+                )
             packing_outputs.extend((packed.qdata, packed.scale))
             replacements[id(module)] = NVFP4Linear(
                 module.in_features,
@@ -380,6 +504,7 @@ __all__ = [
     "MXFP8WeightOnlyConfig",
     "ModuleFilter",
     "NVFP4TrainingConfig",
+    "NVFP4CalibrationConfig",
     "NVFP4WeightOnlyConfig",
     "convert_to_mxfp8_training",
     "convert_to_nvfp4_training",

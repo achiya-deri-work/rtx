@@ -298,6 +298,7 @@ class SearchHistory(Generic[ConfigT]):
     observations: list[Observation[ConfigT]] = field(default_factory=list)
     active_context_id: str | None = None
     excluded_config_ids: set[str] = field(default_factory=set)
+    retryable_config_ids: set[str] = field(default_factory=set)
 
     @property
     def current(self) -> list[Observation[ConfigT]]:
@@ -317,12 +318,12 @@ class SearchHistory(Generic[ConfigT]):
 
     @property
     def best(self) -> Observation[ConfigT] | None:
-        successes = self.successful
+        successes = [item for item in self.successful if item.outcome.timing_eligible]
         return min(successes, key=lambda item: item.score) if successes else None
 
     @property
     def seen_ids(self) -> set[str]:
-        return {item.config_id for item in self.current} | self.excluded_config_ids
+        return ({item.config_id for item in self.current} - self.retryable_config_ids) | self.excluded_config_ids
 
 
 @dataclass(frozen=True, slots=True)

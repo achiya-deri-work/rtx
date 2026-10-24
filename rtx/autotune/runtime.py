@@ -16,6 +16,40 @@ from .legacy import CoordinateDescentPolicy
 from .recipes import HybridTuningPolicy
 
 
+def run_runtime_tuner(tuner, *args, **kwargs):
+    """Keep a correct first invocation usable when the clock samples are noisy.
+
+    This is an in-process seed fallback, never a measured/cacheable winner.
+    Compilation, numerical, device errors and unverified seeds still raise.
+    Explicit offline tuning keeps its strict no-eligible-winner exception.
+    """
+    from types import SimpleNamespace
+    import warnings
+    from .orchestrator import NoEligibleTimingError
+    try:
+        return tuner(*args, **kwargs)
+    except NoEligibleTimingError as exc:
+        if exc.fallback_config is None:
+            raise
+        warnings.warn("RTX timing samples were unstable; using the correctness-checked "
+                      "initial schedule for this process without installing a winner.",
+                      RuntimeWarning, stacklevel=2)
+        return SimpleNamespace(config=exc.fallback_config, median_ms=None,
+                               tuning_evidence={"timing_fallback": True})
+
+
+def run_runtime_config_tuner(tuner, *args, **kwargs):
+    """Equivalent fallback for NVFP4 tuners returning a configuration directly.
+
+    Their persistence happens after successful orchestration. On this exception
+    that code was never reached; only the checked seed enters the process cache.
+    """
+    result = run_runtime_tuner(tuner, *args, **kwargs)
+    if getattr(result, "tuning_evidence", {}).get("timing_fallback"):
+        return result.config
+    return result
+
+
 def _seconds() -> float:
     return float(os.getenv("RTX_BALANCED_AUTOTUNE_SECONDS", "30"))
 

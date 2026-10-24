@@ -94,6 +94,136 @@ Block scaling is appropriate only when the data distribution safely fits the
 native block-scale exponent range. It is not a substitute for JIT regional
 scaling when convergence or abrupt distribution changes matter.
 
+### Experimental adaptive block scales
+
+Outer scaling and block-scale selection are separate decisions. The default
+`NVFP4QuantConfig.block_scale_selection="amax"` retains the original quantizer.
+Three explicit alternatives keep FP32 outer scales and native E4M3 block scales:
+
+- `lsq1`: try one least-squares scale update, requantize, and accept only if
+  reconstructed block squared error improves.
+- `mse5`: evaluate the baseline plus four scaled candidates and retain the
+  lowest-error reconstruction. It costs substantially more arithmetic.
+- `four_over_six`: compare scales targeting the block maximum at E2M1 values
+  six and four, retaining the lower reconstructed squared error (baseline on
+  ties). This is a bounded variant: the existing FP32 outer scale is unchanged,
+  and both candidates are clamped to the existing E4M3 range `[2**-6, 448]`.
+  Peak blocks may therefore lack headroom for the four-target candidate. It
+  does not claim exact equivalence to recipes that enlarge the outer scale.
+
+All operate on the loaded values inside the quantizer, including the cached
+regional implementation. Neither inserts eager Torch operations or changes
+MXFP8 backward. Lower operand reconstruction error does **not** guarantee
+lower GEMM error, better convergence, or a speedup. In particular, `mse5` can
+erase NVFP4's speed advantage. These are experimental opt-in policies, not
+new defaults or interchangeable schedule choices.
+
+`lsq1` is an algebraic one-step least-squares fit, **not** learned-scale
+quantization: it adds no trainable scale parameters or scale gradients.
+
+To reserve headroom for both Four Over Six candidates, explicitly choose
+`tensor_scale_mode="exact_four_over_six"` in **both** `NVFP4ScaleConfig` and
+the supplied `NVFP4DynamicConfig`. The FP32 outer decode factor is
+`amax * FP32(1 / (6 * 256))`, with one for all-zero regions. The maximum
+block's two raw E4M3 scales become 256 and 384 instead of 448 and 672.
+This mode can also be paired with `amax` for a same-outer control experiment.
+Existing `exact` and `power2` behavior is unchanged; changing outer scale
+changes the numerical policy and is not an interchangeable schedule option.
+The tuning adapter pins this mode, and default runtime-winner promotion
+rejects it. This does not reproduce every upstream recipe detail: RTX retains
+its minimum-normal E4M3 scale floor and native round-to-nearest-even conversion.
+
+For standalone packing with reserved headroom, pass an explicit FP32
+`tensor_scale` to `quantize_nvfp4`; its default outer scaling remains unchanged.
+The experimental module/functional mode requires matching explicit scale and
+dynamic configs and dynamic BF16 operands. Packed-weight and block-only calls
+reject it instead of silently ignoring the requested outer policy.
+
+The [Four-over-Six study](nvfp4_completion_20261023.md#four-over-six-policy-fixed-search-and-training)
+includes native-scale tuning, full-forward comparisons, held-out numerics and
+matched short decoder training. It remains opt-in: lower forward error did not
+consistently improve validation loss. The research tuner accepts
+`--selection four_over_six --outer-mode exact_four_over_six`, with
+`--scaling current` or `--scaling jit_row_region` and `--scope full`.
+These searches preserve numerical policy and do not promote default winners.
+
+To use an explicitly selected, matching-shape research configuration:
+
+```python
+import json
+from pathlib import Path
+import rtx
+
+record = json.loads(Path("path/to/winner.json").read_text())
+raw = dict(record["config"])
+raw["quant"] = rtx.NVFP4QuantConfig(**raw["quant"])
+raw["gemm"] = rtx.NVFP4GemmConfig(**raw["gemm"])
+config = rtx.NVFP4DynamicConfig(**raw)
+_, n, k = record["shape"]
+layer = rtx.NVFP4Linear(
+    k, n, device="cuda", autotune="off",
+    scaling=record["scaling"],
+    dynamic_config=config,
+    scale_config=rtx.NVFP4ScaleConfig(tensor_scale_mode=config.tensor_scale_mode),
+)
+```
+
+This fixes the execution schedule explicitly; it is not an automatic
+cross-shape/device performance guarantee. Inputs and outputs remain BF16 and
+backward remains MXFP8. Reconfirm schedules on the intended GPU.
+
+```python
+quant = rtx.NVFP4QuantConfig(block_scale_selection="lsq1")
+config = rtx.NVFP4DynamicConfig(
+    quant=quant,
+    x_scale_region_rows=8,
+    weight_scale_region_rows=8,
+    tensor_scale_mode="exact",
+)
+layer = rtx.NVFP4Linear(
+    1536, 768, device="cuda",
+    scaling="jit_row_region", scale_region_rows=8,
+    scale_config=rtx.NVFP4ScaleConfig(tensor_scale_mode="exact"),
+    dynamic_config=config, autotune="off",
+)
+```
+
+The example is a legal explicit configuration, not a tuned winner. Standalone
+packing also accepts `rtx.quantize_nvfp4(weight, config=quant)`. Adaptive modes
+require `scale_reciprocal="direct"`. Schedule updates preserve the selected
+policy; the dynamic tuning adapter rejects candidates that change it. Adaptive
+results cannot be installed into the default amax runtime-winner context.
+`adaptive_reuse_packed=True` is a separate schedule choice: retain the selected
+FP4 bytes from error evaluation instead of converting again at the store.
+It preserves the numerical policy but increases register live ranges, so it
+remains tunable rather than assumed faster on every device.
+`packed_store_bits=32` combines four packed bytes into each aligned store
+instead of the default 8-bit stores. It requires `values_per_lane` of 8 or 16,
+preserves the encoded values and scales exactly, and is a scheduling choice
+available to the quantizer autotuner, not a different precision policy.
+For adaptive block policies, `adaptive_decode="native"` uses the hardware
+FP4-pair decoder during candidate error evaluation. Widening E2M1 through FP16
+to FP32 is exact; scale products, reconstruction, and error accumulation still
+use FP32. The default `"lut"` decoder remains available for tuning. This
+coordinate is inactive (and rejected) for the non-adaptive `"amax"` policy.
+
+For a policy-pinned search that records durable tuning residuals without
+installing a runtime winner:
+
+```bash
+python -m benchmarks.tune_nvfp4_adaptive_scale \
+  --selection lsq1 --shape 8192,768,1536 --trials 32 \
+  --output autotune_reports/nvfp4_lsq1
+```
+
+The search keeps region geometry and GEMM fixed and varies quantizer schedules.
+Validate its exported explicit configuration through the public frontend and
+your training workload before adopting it.
+
+See [the numerical-policy study](nvfp4_precision_study.md) for headroom controls,
+independent reference tests, pretrained-model evaluation and offline
+activation-aware calibration commands.
+
 ### Region geometry
 
 The three region arguments are optional and matter only to
@@ -296,3 +426,37 @@ policies cannot be transferred because both observe a dynamic BF16 weight.
   its exponent-range assumptions hold.
 - Override region geometry only for controlled numerical experiments or when
   autotuning evidence supports it; do not assume a symmetric region is best.
+
+## Experimental FP4 backward
+
+`rtx.NVFP4Linear` still uses MXFP8 backward. For explicit research use only:
+
+```python
+from rtx.experimental_ms_eden import ms_eden_linear
+
+y = ms_eden_linear(
+    x, weight,
+    forward_scaling="jit_row_region",  # also "current" or "block"
+    forward_outer_mode="exact",
+    forward_config=nvfp4_config,       # optional NVFP4DynamicConfig
+    dx_schedule_json=dx_schedule_json,
+    dw_schedule_json=dw_schedule_json,
+)
+```
+
+This saves original BF16 operands and uses MS-EDEN FP4 gradients with fresh
+rotation signs and stochastic scale rounding. dX and dW can use different
+execution schedules. No unbiasedness guarantee is made; sparse-input bias
+has been observed. Supported inputs are contiguous rank-two BF16 CUDA tensors
+with positive dimensions divisible by 128; higher-order gradients are not
+supported. Eager and `torch.compile(fullgraph=True)` are tested.
+
+`source_policy="forward_current_roundtrip_bf16"` instead saves packed forward
+operands and changes the gradient's source values. It only supports the fixed
+tensor-current forward; combining it with regional/block forward or a custom
+forward config raises an error. Stateful delayed forward is not supported by
+this stateless experimental function. None of these choices is enabled by
+ordinary performance autotuning or changes the stable layer's backward policy.
+
+See the [NVFP4 evaluation](nvfp4_completion_20261023.md) for matched forward/
+backward timings, numerical error, and the boundary of current qualification.

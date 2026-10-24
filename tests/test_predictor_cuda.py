@@ -11,6 +11,14 @@ import rtx
 ARTIFACT = Path(__file__).resolve().parents[1]/'autotune_priors/tournament_predictors_v1.json.gz'
 
 
+def artifact_supports_record(path, row):
+    from types import SimpleNamespace
+    from rtx.autotune.predictors import load_predictor
+    context = SimpleNamespace(family=row['family'], kernel_revision=row['kernel_revision'],
+                              features=lambda: row['features'])
+    return load_predictor(str(path), research=True).bundle(SimpleNamespace(context=context)) is not None
+
+
 @unittest.skipUnless(torch.cuda.is_available() and ARTIFACT.is_file(), 'requires CUDA and exported research artifact')
 class PredictorCudaTests(unittest.TestCase):
     def test_cold_compile_training_and_cache(self):
@@ -39,7 +47,15 @@ class PredictorCudaTests(unittest.TestCase):
                     compiled(x).sum().backward()
                     self.assertEqual(count(), before)
             records = [json.loads(line) for p in Path(tmp).rglob('observations.jsonl') for line in p.read_text().splitlines()]
-            self.assertTrue({'portable_mlp', 'portable_residual', 'retrieval'} <= {r['strategy'] for r in records})
+            compatible=[r for r in records if artifact_supports_record(ARTIFACT, r)]
+            if compatible:
+                self.assertTrue({'portable_mlp', 'portable_residual', 'retrieval'} <= {r['strategy'] for r in compatible})
+            else:
+                # Historical research artifacts must not silently cross a
+                # kernel revision. Exercise cold-start/cache fallback instead.
+                self.assertTrue(records)
+                self.assertFalse(any(r['strategy'].startswith('portable_') or
+                                     r['strategy']=='retrieval' for r in records))
 
 
 if __name__ == '__main__':

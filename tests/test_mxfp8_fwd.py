@@ -48,6 +48,15 @@ def _reference_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 class MXFP8ConfigTests(unittest.TestCase):
+    def test_empty_and_negative_problem_extents_are_rejected(self) -> None:
+        for axis in range(3):
+            for value in (0, -1):
+                shape=[1,1,1]
+                shape[axis]=value
+                with self.subTest(shape=shape), self.assertRaisesRegex(ValueError, 'positive'):
+                    MXFP8Problem(*shape).validate()
+        MXFP8Problem(1,1,1).validate()
+
     def test_quantizer_register_decrease_fits_initial_allocation(self) -> None:
         config = normalize_fwd_config(load_engine="tma", schedule="three_role",
                                       quantizer_warps=16, bf16_tile_k=32,

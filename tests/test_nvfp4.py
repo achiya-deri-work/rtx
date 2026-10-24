@@ -42,6 +42,15 @@ def _has_sm12x() -> bool:
 
 
 class NVFP4ConfigTests(unittest.TestCase):
+    def test_empty_and_negative_problem_extents_are_rejected(self) -> None:
+        for axis in range(3):
+            for value in (0, -1):
+                shape=[1,1,1]
+                shape[axis]=value
+                with self.subTest(shape=shape), self.assertRaisesRegex(ValueError, 'positive'):
+                    NVFP4Problem(*shape).validate()
+        NVFP4Problem(1,1,1).validate()
+
     def test_packed_weight_requires_contract_preserving_reciprocal(self) -> None:
         from rtx.nvfp4_inference_autotune import NVFP4_WEIGHT_PREQUANT_SEARCH_SPACE
         for mode in ("e4m3_lut", "rcp_approx"):
@@ -296,11 +305,11 @@ class NVFP4ConfigTests(unittest.TestCase):
         ):
             with self.subTest(family=family):
                 expected_revision = {
-                    "nvfp4_dynamic_fwd": 9,
-                    "nvfp4_delayed_fwd": 5,
-                    "nvfp4_jit_row_region_fwd": 11,
-                    "nvfp4_weight_prequant_fwd": 6,
-                    "nvfp4_fully_prequant_fwd": 6,
+                    "nvfp4_dynamic_fwd": 10,
+                    "nvfp4_delayed_fwd": 6,
+                    "nvfp4_jit_row_region_fwd": 13,
+                    "nvfp4_weight_prequant_fwd": 7,
+                    "nvfp4_fully_prequant_fwd": 7,
                 }[family]
                 self.assertEqual(
                     _current_revision(family),
@@ -1144,10 +1153,14 @@ class NVFP4CudaTests(unittest.TestCase):
             problem.n, problem.k, device="cuda", dtype=torch.bfloat16
         )
         base = preferred_jit_row_region_config(problem)
-        for x_rows, weight_rows in ((5, 4), (8, 4), (8, 8)):
-            with self.subTest(geometry=(x_rows, weight_rows)):
+        for x_rows, weight_rows, atom_m in (
+            (xr, wr, am) for xr, wr in ((5, 4), (8, 4), (8, 8))
+            for am in (2, 4, 8)
+        ):
+            with self.subTest(geometry=(x_rows, weight_rows), atom_m=atom_m):
                 common = replace(
                     base,
+                    gemm=replace(base.gemm, atom_layout_m=atom_m),
                     x_scale_region_rows=x_rows,
                     weight_scale_region_rows=weight_rows,
                     programmatic_dependent_launch=False,

@@ -25,7 +25,7 @@ import uuid
 
 import torch
 
-from .autotune.measurement import runtime_timing_metadata
+from .autotune.measurement import runtime_timing_metadata, measure_cuda_batches
 
 from .autotune import (
     CoordinateDescentPolicy,
@@ -51,7 +51,7 @@ except ImportError:  # pragma: no cover - Linux/CUDA is the supported target.
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_prequant_e2e"
-KERNEL_REVISION = 10
+KERNEL_REVISION = 11
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -182,6 +182,9 @@ PREQUANT_SEARCH_SPACE: dict[str, tuple[dict[str, object], ...]] = {
     ),
     "gemm_stages": tuple(
         {"gemm": {"stages": value}} for value in (1, 2, 3, 4)
+    ),
+    "gemm_k_unroll": tuple(
+        {"gemm": {"k_tile_unroll": value}} for value in (1, 2, 3, 4, 6, 8, 12)
     ),
     "ldmatrix": tuple(
         {"gemm": {"a_ldmatrix_matrices": a, "b_ldmatrix_matrices": b}}
@@ -705,6 +708,9 @@ class MXFP8PrequantEvaluator:
         try:
             runner(self.x, self.weight, out)
             torch.cuda.synchronize(self.x.device)
+            if not bool(out.isfinite().all()):
+                return TrialOutcome("correctness_error", compile_ms=compile_ms,
+                                    error="nonfinite prequantized forward output")
             if self.policy.correctness != "none":
                 expected = self._reference()
                 max_abs_error = float((out.float() - expected.float()).abs().max())
@@ -724,25 +730,16 @@ class MXFP8PrequantEvaluator:
             for _ in range(self.policy.warmup):
                 runner(self.x, self.weight, out)
             torch.cuda.synchronize(self.x.device)
-            timings: list[float] = []
-            for _ in range(self.policy.samples):
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                for _call in range(self.policy.calls_per_sample):
-                    runner(self.x, self.weight, out)
-                end.record()
-                end.synchronize()
-                timings.append(
-                    float(start.elapsed_time(end)) / self.policy.calls_per_sample
-                )
+            timings, batching = measure_cuda_batches(
+                lambda: runner(self.x, self.weight, out), samples=self.policy.samples,
+                calls_per_sample=self.policy.calls_per_sample, device=self.x.device)
             return TrialOutcome(
                 "ok",
                 median_ms=float(statistics.median(timings)),
                 timings_ms=timings,
                 compile_ms=compile_ms,
                 max_abs_error=max_abs_error,
-                metadata=runtime_timing_metadata(timings),
+                metadata={**runtime_timing_metadata(timings), **batching},
             )
         except Exception as exc:
             return TrialOutcome(

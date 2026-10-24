@@ -780,6 +780,8 @@ def _resolve_bwd_context(
     x: torch.Tensor,
     weight: torch.Tensor,
     config_key: str,
+    *,
+    phase: str = "backward",
 ) -> tuple[
     MXFP8Problem,
     str,
@@ -790,6 +792,18 @@ def _resolve_bwd_context(
 ]:
     problem = _check_bwd_inputs(grad_output, x, weight)
     request = _bwd_request_from_key(config_key)
+    from .autotune.preparation import preparation_selection_enabled
+    if (request is not None and request.mode == "balanced"
+            and preparation_selection_enabled(request.policy)):
+        selection_key = (config_key, x.device.index, problem.m, problem.n, problem.k, phase)
+        selected_key = _AUTOTUNE_SELECTIONS.get(selection_key)
+        if selected_key is None:
+            from .autotune.preparation_runtime import select_backward_config
+
+            selected = select_backward_config(grad_output, x, weight, request, phase)
+            selected_key = _intern_bwd_config(selected)
+            _AUTOTUNE_SELECTIONS[selection_key] = selected_key
+        return _resolve_bwd_context(grad_output, x, weight, selected_key, phase=phase)
     if request is not None:
         selection_key = (
             config_key,
@@ -851,7 +865,8 @@ def _resolve_bwd_context(
                             )
 
                             policy = balanced_effort_policy()
-                        result = tune_mxfp8_backward(
+                        from .autotune.runtime import run_runtime_tuner
+                        result = run_runtime_tuner(tune_mxfp8_backward,
                             grad_output,
                             x,
                             weight,
@@ -993,7 +1008,7 @@ def _resolve_partial_bwd_runner(
     torch.Tensor,
 ]:
     return _partial_bwd_runner_from_context(
-        _resolve_bwd_context(grad_output, x, weight, config_key), gradient)
+        _resolve_bwd_context(grad_output, x, weight, config_key, phase=gradient), gradient)
 
 
 def _partial_bwd_runner_from_context(context, gradient):
@@ -1736,6 +1751,14 @@ def mxfp8_linear_backward(
                 "or coordinate; "
                 f"got {mode!r}"
             )
+        from .autotune.preparation import preparation_selection_enabled
+        if mode == "balanced" and preparation_selection_enabled(tuning_policy):
+            key = _intern_bwd_autotune_request(mode, tuning_policy, autotune_cache_dir)
+            if torch.compiler.is_compiling():
+                grad_x, grad_weight = _mxfp8_bwd_compiler_visible(grad_2d, x_2d, weight, key)
+            else:
+                grad_x, grad_weight = _mxfp8_linear_bwd_op(grad_2d, x_2d, weight, key)
+            return grad_x.reshape(*leading, x.shape[-1]), grad_weight
         problem = MXFP8Problem(
             int(x_2d.shape[0]), int(weight.shape[0]), int(x_2d.shape[1])
         )
@@ -1797,7 +1820,8 @@ def mxfp8_linear_backward(
                             )
 
                             policy = balanced_effort_policy()
-                        result = tune_mxfp8_backward(
+                        from .autotune.runtime import run_runtime_tuner
+                        result = run_runtime_tuner(tune_mxfp8_backward,
                             grad_2d,
                             x_2d,
                             weight,

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import unittest
+import pytest
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 import rtx
+
+# Ettin is the primary application gate. Preserve DINO's original assertions
+# and reproduce its known model-policy limitations explicitly, not as passes.
+pytestmark = pytest.mark.dinov3_research
 from benchmarks.dinov3_mixed_precision import (
     DEFAULT_MODES as DEFAULT_MIXED_MODES,
     mode_metadata,

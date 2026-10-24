@@ -113,12 +113,20 @@ class MXFP8QuantConfig:
 
 @dataclass(frozen=True, slots=True)
 class MXFP8GemmConfig:
+    """Packed MXFP8 schedule, also inherited by GLU and MLP GEMMs.
+
+    ``k_tile_unroll`` controls compiler unrolling of the outer reduction loop,
+    independently of pipeline ``stages``. It preserves accumulation order;
+    larger factors may trade loop overhead for registers and compile time.
+    Legacy configurations retain factor one.
+    """
     tile_m: int = 128
     tile_n: int = 128
     tile_k: int = 128
     atom_layout_m: int = 8
     atom_layout_n: int = 2
     stages: int = 2
+    k_tile_unroll: int = 1
     a_swizzle: Literal["none", "32b", "64b", "128b"] = "64b"
     b_swizzle: Literal["none", "32b", "64b", "128b"] = "64b"
     a_ldmatrix_matrices: int = 4
@@ -174,6 +182,8 @@ class MXFP8GemmConfig:
         return (self.num_mma_warps + 1) * 32
 
     def rejection(self, problem: MXFP8Problem) -> str | None:
+        if type(self.k_tile_unroll) is not int or self.k_tile_unroll not in (1, 2, 3, 4, 6, 8, 12):
+            return "k_tile_unroll must be an integer in 1/2/3/4/6/8/12"
         try:
             problem.validate()
         except ValueError as exc:

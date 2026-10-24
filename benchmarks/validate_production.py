@@ -167,6 +167,7 @@ def _nv_delayed_state_case() -> dict[str, object]:
     stream_ids = []
     outputs = []
     for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             outputs.append(layer(x))
             stream_ids.append(layer._delayed_problem[2])
@@ -175,10 +176,20 @@ def _nv_delayed_state_case() -> dict[str, object]:
         bool(torch.isfinite(value).all()) for value in outputs
     ):
         raise AssertionError("delayed state was not isolated by CUDA stream")
+    old_state = layer._x_amax_state
     layer.load_state_dict(layer.state_dict())
-    if layer._delayed_initialized or layer._x_amax_state.numel():
+    if (layer._delayed_initialized or layer._x_amax_state is old_state
+            or layer._x_amax_state.shape != old_state.shape):
         raise AssertionError("state_dict load did not reset delayed telemetry")
-    return {"streams": 2, "state_reset": True}
+    # Compiler-visible buffer shapes remain fixed; fresh storage is bootstrapped
+    # by the next invocation, not represented by an empty tensor anymore.
+    fresh_x = x * 2
+    fresh_out = layer(fresh_x)
+    torch.cuda.synchronize()
+    if not layer._delayed_initialized or not bool(fresh_out.isfinite().all()):
+        raise AssertionError("delayed state failed to bootstrap after load")
+    torch.testing.assert_close(layer._x_amax_state[0], fresh_x.float().abs().max(), rtol=0, atol=0)
+    return {"streams": 2, "state_reset": True, "fresh_amax_bootstrap": True}
 
 
 def _nv_variable_shape_cache_case() -> dict[str, object]:

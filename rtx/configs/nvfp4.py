@@ -30,7 +30,21 @@ def nvfp4_storage_k(k: int) -> int:
 
 @dataclass(frozen=True, slots=True)
 class NVFP4QuantConfig:
-    """One independently compilable BF16-to-NVFP4 quantizer schedule."""
+    """BF16-to-NVFP4 quantization policy and independently compilable schedule.
+
+    ``block_scale_selection`` is an explicit numerical policy, not a schedule
+    autotuning coordinate. ``amax`` preserves the original rounding contract;
+    ``mse5`` searches five E4M3 scales; ``lsq1`` tries one least-squares update;
+    ``four_over_six`` compares native E4M3 scales targeting amax/6 and amax/4.
+    All candidates use the unchanged FP32 outer scale and clamp stored E4M3
+    scales to [2**-6, 448]. Thus the amax/4 candidate may saturate at 448;
+    no extra outer-scale headroom is implied by ``four_over_six``. Select
+    outer ``exact_four_over_six`` separately to reserve that headroom.
+    Adaptive policies keep the amax candidate unless reconstructed block SSE
+    improves. This is not a guarantee of smaller GEMM error or better training.
+    ``packed_store_bits`` chooses byte stores or aligned 32-bit stores of
+    identical encoded bytes; 32-bit stores require at least eight values/lane.
+    """
 
     values_per_lane: int = 2
     load_bits: int = 32
@@ -42,6 +56,10 @@ class NVFP4QuantConfig:
     scale_reciprocal: Literal["direct", "e4m3_lut", "rcp_approx"] = "direct"
     scale_compute: Literal["redundant", "leader_broadcast"] = "redundant"
     scale_layout: Literal["row_major", "mma128"] = "row_major"
+    block_scale_selection: Literal["amax", "mse5", "lsq1", "four_over_six"] = "amax"
+    adaptive_reuse_packed: bool = False
+    packed_store_bits: Literal[8, 32] = 8
+    adaptive_decode: Literal["lut", "native"] = "lut"
 
     @property
     def threads_per_scale(self) -> int:
@@ -69,6 +87,20 @@ class NVFP4QuantConfig:
             return "reduction must be shuffle or redux"
         if self.quant_math != "fp32":
             return "only the implemented FP32 NVFP4 quantization path is legal"
+        if self.block_scale_selection not in ("amax", "mse5", "lsq1", "four_over_six"):
+            return "block_scale_selection must be amax, mse5, lsq1, or four_over_six"
+        if self.block_scale_selection != "amax" and self.scale_reciprocal != "direct":
+            return "adaptive block scaling requires the direct FP32 reciprocal"
+        if type(self.adaptive_reuse_packed) is not bool:
+            return "adaptive_reuse_packed must be boolean"
+        if self.packed_store_bits not in (8, 32):
+            return "packed_store_bits must be 8 or 32"
+        if self.packed_store_bits > self.values_per_lane * 4:
+            return "packed store width exceeds one lane's FP4 bytes"
+        if self.adaptive_decode not in ("lut", "native"):
+            return "adaptive_decode must be lut or native"
+        if self.block_scale_selection == "amax" and self.adaptive_decode != "lut":
+            return "adaptive_decode is inactive for amax block scaling"
         if self.scale_reciprocal not in ("direct", "e4m3_lut", "rcp_approx"):
             return "scale_reciprocal must be direct, e4m3_lut, or rcp_approx"
         if self.scale_compute not in ("redundant", "leader_broadcast"):
@@ -111,15 +143,21 @@ class NVFP4ScaleConfig:
     policy separate makes every public field effective for every retained
     NVFP4 implementation and avoids exposing controls from the retired fused
     forward experiment.
+
+    ``exact`` uses amax/(6*448); ``power2`` rounds that factor upward to a
+    power of two. ``exact_four_over_six`` explicitly uses amax/(6*256),
+    reserving headroom for native amax/4 block scales up to 384. It does not
+    select a block policy: pairing it with ``amax`` is a same-outer control.
+    All modes use FP32 factors and return 1 for a zero maximum.
     """
 
-    tensor_scale_mode: Literal["power2", "exact"] = "power2"
+    tensor_scale_mode: Literal["power2", "exact", "exact_four_over_six"] = "power2"
     amax_history_len: Literal[1, 4, 16, 64] = 16
     amax_history_algo: Literal["most_recent", "window_max"] = "window_max"
 
     def __post_init__(self) -> None:
-        if self.tensor_scale_mode not in ("power2", "exact"):
-            raise ValueError("tensor_scale_mode must be power2 or exact")
+        if self.tensor_scale_mode not in ("power2", "exact", "exact_four_over_six"):
+            raise ValueError("tensor_scale_mode must be power2, exact, or exact_four_over_six")
         if self.amax_history_len not in (1, 4, 16, 64):
             raise ValueError("amax_history_len must be 1, 4, 16, or 64")
         if self.amax_history_algo not in ("most_recent", "window_max"):
@@ -135,6 +173,12 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
     The transport and epilogue controls intentionally match MXFP8 so the
     portable autotuner can compare identical schedule coordinates. NVFP4
     differs in its packed E2M1 operands and twice-as-dense E4M3 scale vectors.
+
+    ``k_tile_unroll`` controls compiler unrolling of the outer K-tile loop;
+    it is independent of operand buffering (``stages``). Larger factors can
+    reduce loop/pipeline bookkeeping but increase compilation and code size.
+    The default 1 preserves the existing schedule. This is a performance-only
+    choice: FP32 accumulation order and all quantization policies are unchanged.
     """
 
     stages: int = 2
@@ -157,6 +201,7 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
     # Adjacent BF16 outputs sharing one regional-scale lookup. The enclosing
     # dynamic config ensures a packet cannot cross a weight-region boundary.
     regional_epilogue_values: Literal[1, 2, 4, 8] = 1
+    k_tile_unroll: int = 1
 
     @property
     def num_epilogue_warps(self) -> int:
@@ -189,6 +234,8 @@ class NVFP4GemmConfig(MXFP8GemmConfig):
             return str(exc)
         if self.tile_k % 64:
             return "NVFP4 tile K must be divisible by 64"
+        if type(self.k_tile_unroll) is not int or self.k_tile_unroll not in (1, 2, 3, 4, 6, 8, 12):
+            return "k_tile_unroll must be 1, 2, 3, 4, 6, 8, or 12"
         if self.tile_m == 64:
             return (
                 "64-row NVFP4 GEMM is quarantined after large-grid scale mismatches; "
@@ -378,8 +425,8 @@ class NVFP4DynamicConfig:
         if self.jit_row_region:
             if self.x_scale_region_rows < 1 or self.weight_scale_region_rows < 1:
                 return "JIT row-region sizes must be positive"
-            if self.tensor_scale_mode not in ("power2", "exact"):
-                return "JIT row-region tensor_scale_mode must be power2 or exact"
+            if self.tensor_scale_mode not in ("power2", "exact", "exact_four_over_six"):
+                return "JIT row-region tensor_scale_mode must be power2, exact, or exact_four_over_six"
             if self.region_amax_load_bits not in (16, 32, 64, 128):
                 return "region_amax_load_bits must be 16, 32, 64, or 128"
             if self.region_amax_unroll not in (1, 2, 4, 8):

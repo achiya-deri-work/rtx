@@ -92,6 +92,11 @@ inference-only and reject dtype conversion.
 
 ## Replacement behavior
 
+For opt-in NVFP4 calibration, activation-statistics collection and per-module
+accuracy selection, see [quantization policy](quantization_policy.md).
+These offline PTQ tools are separate from runtime schedule tuning and dynamic
+training conversion. Default conversion behavior is unchanged.
+
 - The default filter selects every `nn.Linear` subclass, including TorchAO
   `Float8Linear`.
 - Passing a filter is strongly recommended for architectures containing bias.

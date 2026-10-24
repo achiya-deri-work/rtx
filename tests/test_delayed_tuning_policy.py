@@ -1,5 +1,6 @@
 """Delayed tuning must measure and identify the requested numerical policy."""
 from contextlib import nullcontext
+from dataclasses import asdict
 from itertools import product
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,6 +12,29 @@ from rtx.nvfp4_inference_autotune import delayed_scale_variant
 
 
 class DelayedTuningPolicyTests(unittest.TestCase):
+    def test_adapter_partitions_all_policies_and_accepts_legacy_tags(self):
+        from rtx.autotune.adapters import make_nvfp4_delayed_adapter
+        problem = NVFP4Problem(128, 128, 128)
+        def build(**kwargs):
+            return make_nvfp4_delayed_adapter(problem, lambda c: None, device={}, **kwargs).context
+        identities = set()
+        for mode, length, algo in product(
+                ('power2', 'exact', 'exact_four_over_six'),
+                (1, 4, 16, 64), ('most_recent', 'window_max')):
+            policy = NVFP4ScaleConfig(mode, length, algo)
+            context = build(scale_policy=policy)
+            identities.add(context.identifier)
+            self.assertEqual(context.identifier,
+                             build(tags={'delayed_scale_policy': asdict(policy)}).identifier)
+        self.assertEqual(len(identities), 24)
+        self.assertEqual(build().identifier, build(scale_policy=NVFP4ScaleConfig()).identifier)
+        self.assertNotIn('delayed_scale_policy', build().tags)
+        with self.assertRaisesRegex(ValueError, 'conflicts'):
+            build(scale_policy=NVFP4ScaleConfig('exact'),
+                  tags={'delayed_scale_policy': asdict(NVFP4ScaleConfig())})
+        with self.assertRaises(TypeError):
+            build(scale_policy={})
+
     def test_all_policies_have_distinct_identities(self):
         variants = {
             delayed_scale_variant(NVFP4ScaleConfig(mode, length, algo))

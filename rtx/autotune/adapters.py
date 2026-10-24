@@ -1070,9 +1070,11 @@ def make_nvfp4_dynamic_adapter(
     )
 
     initial_config = preferred_dynamic_config(problem) if initial is None else initial
+    block_scale_selection = initial_config.quant.block_scale_selection
     revision = NVFP4_DYNAMIC_KERNEL_REVISION if _revision is None else _revision
     selected_axes = NVFP4_DYNAMIC_SEARCH_SPACE if axes is None else axes
-    axis_values = {name: tuple(values) for name, values in selected_axes.items()}
+    axis_values = {name: tuple(values) for name, values in selected_axes.items()
+                   if name != "adaptive_pack_reuse" or block_scale_selection != "amax"}
     allowed_axes = (
         NVFP4_DYNAMIC_SEARCH_SPACE if _allowed_axes is None else _allowed_axes
     )
@@ -1081,6 +1083,11 @@ def make_nvfp4_dynamic_adapter(
         raise ValueError(f"unknown dynamic NVFP4 tuning axes: {sorted(unknown)}")
 
     def rejection(config: object) -> tuple[str, str] | None:
+        if config.quant.block_scale_selection != block_scale_selection:
+            return ("implementation_rejected", "block-scale numerical policy must remain fixed during tuning")
+        if ("exact_four_over_six" in (initial_config.tensor_scale_mode, config.tensor_scale_mode)
+                and initial_config.tensor_scale_mode != config.tensor_scale_mode):
+            return ("implementation_rejected", "experimental outer-scale headroom policy must remain fixed during tuning")
         reason = config.rejection(problem)  # type: ignore[attr-defined]
         if reason is None:
             reason = _gemm_smem_rejection(config.gemm, device)  # type: ignore[attr-defined]
@@ -1227,8 +1234,24 @@ def make_nvfp4_dynamic_adapter(
         )
         return values
 
+    def update(config, coordinate, value):
+        candidate = update_dynamic_config(config, value)
+        if coordinate == "implementation_anchor":
+            # Anchors describe scheduling basins, not permission to reset
+            # the caller's quantization policy to the anchor's defaults.
+            candidate = replace(
+                candidate,
+                quant=replace(candidate.quant,
+                              block_scale_selection=config.quant.block_scale_selection),
+                tensor_scale_mode=config.tensor_scale_mode,
+            )
+        return candidate
+
     state_tags = {
         **dict(tags or {}),
+        "block_scale_selection": block_scale_selection,
+        **({"experimental_outer_scale": "exact_four_over_six"}
+           if initial_config.tensor_scale_mode == "exact_four_over_six" else {}),
         "operand_state": (
             "delayed_materialized"
             if _family == "nvfp4_delayed_fwd"
@@ -1251,9 +1274,7 @@ def make_nvfp4_dynamic_adapter(
         config_id_fn=dynamic_config_id,
         serialize_fn=dynamic_config_to_dict,
         deserialize_fn=dynamic_config_from_dict,
-        update_fn=lambda config, _coordinate, value: update_dynamic_config(
-            config, value
-        ),
+        update_fn=update,
         evaluator=evaluator,
         rejection_fn=rejection,
         extra_features_fn=derived,
@@ -1269,15 +1290,34 @@ def make_nvfp4_delayed_adapter(
     device: DeviceFingerprint | Mapping[str, object] | None = None,
     regime: str = "hot",
     tags: Mapping[str, object] | None = None,
+    scale_policy=None,
 ) -> DiscreteKernelAdapter[object]:
-    """Tune the one-launch delayed observer/quantizer plus native GEMM."""
+    """Tune delayed preparation, partitioning evidence by its history policy.
 
+    ``scale_policy`` must match the evaluator's policy. Legacy callers may
+    provide ``delayed_scale_policy`` in tags; conflicting declarations fail.
+    The default retains its historical context identity.
+    """
+
+    from dataclasses import asdict
+    from ..configs.nvfp4 import NVFP4ScaleConfig, DEFAULT_NVFP4_SCALE_CONFIG
     from ..nvfp4_inference_autotune import (
         NVFP4_DELAYED_KERNEL_REVISION,
         NVFP4_DELAYED_SEARCH_SPACE,
         preferred_dynamic_config,
+        delayed_scale_variant,
     )
 
+    policy_tags = dict(tags or {})
+    declared = policy_tags.pop("delayed_scale_policy", None)
+    if scale_policy is None and declared is not None:
+        scale_policy = NVFP4ScaleConfig(**dict(declared))
+    delayed_scale_variant(scale_policy)  # Validate before constructing a context.
+    selected_policy = DEFAULT_NVFP4_SCALE_CONFIG if scale_policy is None else scale_policy
+    if declared is not None and dict(declared) != asdict(selected_policy):
+        raise ValueError("delayed scale_policy conflicts with delayed_scale_policy tag")
+    if selected_policy != DEFAULT_NVFP4_SCALE_CONFIG:
+        policy_tags["delayed_scale_policy"] = asdict(selected_policy)
     selected_initial = preferred_dynamic_config(problem) if initial is None else initial
     selected_initial = replace(selected_initial, quant_launches="dual")
     return make_nvfp4_dynamic_adapter(
@@ -1287,7 +1327,7 @@ def make_nvfp4_delayed_adapter(
         axes=NVFP4_DELAYED_SEARCH_SPACE if axes is None else axes,
         device=device,
         regime=regime,
-        tags=tags,
+        tags=policy_tags,
         _family="nvfp4_delayed_fwd",
         _revision=NVFP4_DELAYED_KERNEL_REVISION,
     )

@@ -100,6 +100,94 @@ and policy/layout. Never copy a raw fastest config from another SKU and assume
 equivalent performance. Runtime schema-v1 winners are invalidated; schema v2
 includes the kernel revision. Preserve their source datasets for analysis.
 
+### Shared packed-GEMM outer-loop scheduling
+
+`MXFP8GemmConfig.k_tile_unroll` and `NVFP4GemmConfig.k_tile_unroll` are
+performance-only outer K-loop controls:
+`1` (the backward-compatible default), `2`, `3`, `4`, `6`, `8`, or `12`.
+All NVFP4 GEMM search spaces expose it as `gemm_k_unroll`, independently of
+operand-buffer count (`stages`) and the inner MMA schedule. Larger factors
+can reduce loop bookkeeping but increase compile time and code size; they
+are choices for the autotuner, not universal recommendations. Quantization
+policy, FP32 accumulation order, and the MXFP8 backward path do not change.
+Older explicit configs omit the field and retain `1`; newly saved configs
+record the chosen factor. Research benchmark winners are not installed into
+the runtime cache automatically.
+
+The MXFP8 prequantized-forward space exposes the same `gemm_k_unroll` axis.
+Backward exposes independent `dx_gemm_k_unroll` and `dw_gemm_k_unroll` axes;
+never assume that a forward winner is suitable for the long dW reduction.
+`MXFP8GLUGemmConfig` inherits the control, including BF16 and packed MXFP8
+GLU outputs and backward derivative recomputation. The MLP search forwards
+the axis to gate projection (`cooperative_gemm`), down projection
+(`down_gemm`), recomputation (`recompute_gemm`), and both backward groups.
+Existing on-chip BF16-to-MXFP8 fused paths retain their distinct `k_unroll`
+control. Neither control changes the activation, scale policy, or FP32
+accumulation contract. Changing this scheduling axis alone is not permission
+to choose a less accurate quantization recipe.
+
+The host-launched MXFP8 preparation evaluator calibrates repetitions to a
+2-ms timing window (bounded at 4096 calls) while retaining the requested
+sample count. Records include requested and actual calls; calibration is not
+part of the measured samples. This remains host timing, not implicit graph
+replay. Revision 11 separates these measurements from old short-window records.
+Backward uses the same batch calibration (revision 26); its explicit
+`host` versus `cuda_graph` choice remains intact, and graph batch counts are
+reported in complete backward calls rather than replay counts.
+If a runtime MXFP8 forward/backward or NVFP4 forward search has no stationary
+candidate but its initial schedule passed numerical checks, execution may use that seed with a
+warning for the current process. No persistent winner is written. Explicit
+offline tuning still fails without eligible timing evidence, and numerical or
+compilation failures never authorize this fallback.
+
+## Experimental MXFP8 preparation selection
+
+For dynamic BF16-input MXFP8 linears, opt in per layer to measured fused versus
+staged preparation selection:
+
+```python
+policy = rtx.AutotunePolicy(
+    preparation_selection=True,
+    max_trials=8,
+    max_seconds=30,
+    confirmation_repeats=1,
+)
+layer = rtx.MXFP8Linear(
+    768, 3072, device="cuda", backend="auto", autotune="balanced",
+    tuning_policy=policy, autotune_cache_dir=".rtx-cache",
+)
+compiled = torch.compile(layer, fullgraph=True, dynamic=False)
+```
+
+This is experimental and off by default. Forward needs `backend="auto"`
+without an explicit forward kernel config. Explicit backward configs retain
+their meaning; automatic backward selection compares staged, fused-dX,
+fused-dW, and fully fused execution, with separate contexts for partial
+gradients. The gradients still use original BF16 operands and MXFP8 GEMMs:
+this flag does not enable FP4 backward or change quantization policy.
+
+Each forward/backward context has its own budget; `forward_trials` and
+`backward_trials` can override it. A two-trial budget cannot cover all four
+paired-backward plans. The selector uses policy-matched seeds and compatible
+nearby measured candidates, then measures on the target device; it does not
+deploy the unqualified analytical/ML priors. `prior_artifact` and
+`predictor_artifact` are rejected on this path. Its fixed, revisioned graph
+measurement protocol includes bounded time-based warmup and stationarity
+checks; `warmup`, `samples`, and `calls_per_sample` do not override that
+experimental protocol.
+
+Evidence lives under `<autotune_cache_dir>/preparation/`. Compatible exact
+hits reuse measured schedules, including across processes; kernel, numerical,
+and measurement revisions partition the evidence. `cache_behavior="refine"`
+allows a larger cumulative trial budget. The legacy process-wide opt-in
+`RTX_PREPARATION_SELECTION=1` remains supported and enables selection even
+when the policy flag is false. Warm before manual CUDA graph capture.
+
+Local tests cover eager/fullgraph execution, paired/partial gradients,
+logical tails, changed-input graph replay, persistent cache hits and stable
+live allocations. These are bounded qualification results, not universal
+shape/SKU certification. See [evidence and limits](operand_preparation_plan.md).
+
 ## GLU/MLP distinction
 
 Feature-branch modules default to tuning off, but accept the same

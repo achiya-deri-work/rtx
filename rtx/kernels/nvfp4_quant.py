@@ -14,7 +14,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
-from cutlass import BFloat16, Float8E4M3FN, Float32, Int16, Int32, Uint16, Uint8
+from cutlass import BFloat16, Float8E4M3FN, Float32, Int16, Int32, Uint16, Uint32, Uint8
 from cutlass.experimental.primitives import nvvm_wrapper as nvvm
 
 from ..configs.nvfp4 import (
@@ -123,8 +123,11 @@ class NVFP4QuantKernel:
     ):
         """Return the delayed outer scale without logarithms or division."""
 
-        if cutlass.const_expr(tensor_scale_mode == "exact"):
-            scale = amax * Float32(1.0 / 2688.0)
+        if cutlass.const_expr(tensor_scale_mode != "power2"):
+            if cutlass.const_expr(tensor_scale_mode == "exact_four_over_six"):
+                scale = amax * Float32(1.0 / 1536.0)
+            else:
+                scale = amax * Float32(1.0 / 2688.0)
             if amax == Float32(0.0):
                 scale = Float32(1.0)
             return scale
@@ -181,6 +184,126 @@ class NVFP4QuantKernel:
                 read_only_args=[denominator],
             )
         return (Float32(1.0) / tensor_scale) / Float32(block_scale)
+
+    @cute.jit
+    def _decode_fp4(self, code: Int32):
+        # Twice the eight E2M1 magnitudes in a register-resident nibble LUT.
+        magnitude = Int32((Uint32(0xC8643210) >> Uint32((code & 7) * 4)) & Uint32(15))
+        value = Float32(magnitude) * Float32(0.5)
+        if (code & 8) != 0:
+            value = -value
+        return value
+
+    @cute.jit
+    def _subwarp_sum(self, value: Float32):
+        threads = self.config.threads_per_scale
+        lane = cute.arch.lane_idx()
+        base = lane & Int32(~(threads - 1))
+        mask = Int32((1 << threads) - 1) << base
+        clamp = ((32 - threads) << 8) | (threads - 1)
+        total = value
+        for level in cutlass.range_constexpr(int(math.log2(threads))):
+            total += cute.arch.shuffle_sync_bfly(
+                total, (threads // 2) >> level, mask=mask, mask_and_clamp=clamp
+            )
+        return total
+
+    @cute.jit
+    def _block_fit(self, values, scale: Float8E4M3FN, outer: Float32,
+                   need_fit: cutlass.Constexpr):
+        reciprocal = self._block_reciprocal(scale, outer)
+        decode_scale = Float32(scale) * outer
+        error = Float32(0.0)
+        numerator = Float32(0.0)
+        denominator = Float32(0.0)
+        packed_codes = [Int32(0)] * (self.config.values_per_lane // 2)
+        for pair in cutlass.range_constexpr(self.config.values_per_lane // 2):
+            packed = Int32(self._quantize_pair(values[pair * 2] * reciprocal,
+                                             values[pair * 2 + 1] * reciprocal))
+            packed_codes[pair] = packed
+            if cutlass.const_expr(self.config.adaptive_decode == "native"):
+                # E2M1 -> FP16 -> FP32 is exact, including signed zero. Only
+                # decode uses the half format; SSE and scale math stay FP32.
+                q0, q1 = nvvm.inline_ptx_hl(
+                    "{.reg .b8 b0,b1,b2,b3; .reg .b32 h2; .reg .b16 h0,h1; "
+                    "mov.b32 {b0,b1,b2,b3}, {$r0}; "
+                    "cvt.rn.f16x2.e2m1x2 h2, b0; "
+                    "mov.b32 {h0,h1}, h2; "
+                    "cvt.f32.f16 {$w0}, h0; cvt.f32.f16 {$w1}, h1;}",
+                    write_only_types=[Float32, Float32], read_only_args=[packed])
+            for half in cutlass.range_constexpr(2):
+                if cutlass.const_expr(self.config.adaptive_decode == "native"):
+                    q = q0 if cutlass.const_expr(half == 0) else q1
+                else:
+                    q = self._decode_fp4((packed >> (half * 4)) & Int32(15))
+                v = values[pair * 2 + half]
+                # Explicit rounded multiply/subtract keeps the SSE decision
+                # independent of compiler FMA contraction.
+                reconstructed = nvvm.inline_ptx_hl(
+                    "mul.rn.f32 {$w0}, {$r0}, {$r1};",
+                    write_only_types=[Float32], read_only_args=[q, decode_scale])
+                delta = v - reconstructed
+                error += delta * delta
+                if cutlass.const_expr(need_fit):
+                    numerator += v * q
+                    denominator += q * q
+        error = self._subwarp_sum(error)
+        if cutlass.const_expr(need_fit):
+            numerator = self._subwarp_sum(numerator)
+            denominator = self._subwarp_sum(denominator)
+        return error, numerator, denominator, packed_codes
+
+    @cute.jit
+    def _adaptive_block_scale(self, values, block_amax: Float32,
+                              outer: Float32, baseline: Float8E4M3FN):
+        best = baseline
+        best_error, numerator, denominator, best_packed = self._block_fit(
+            values, baseline, outer, self.config.block_scale_selection == "lsq1")
+        if cutlass.const_expr(self.config.block_scale_selection == "mse5"):
+            raw = block_amax / (Float32(6.0) * outer)
+            for factor in cutlass.range_constexpr(4):
+                multiplier = (0.75, 0.875, 1.125, 1.25)[factor]
+                candidate = self._e4m3_scale(raw * Float32(multiplier))
+                error, _, _, candidate_packed = self._block_fit(values, candidate, outer, False)
+                if error < best_error:
+                    best = candidate
+                    best_error = error
+                    if cutlass.const_expr(self.config.adaptive_reuse_packed):
+                        for pair in cutlass.range_constexpr(self.config.values_per_lane // 2):
+                            best_packed[pair] = candidate_packed[pair]
+        elif cutlass.const_expr(self.config.block_scale_selection == "four_over_six"):
+            # Preserve the supplied FP32 outer scale. Native E4M3 saturation
+            # can collapse amax/4 onto amax/6 near the scale ceiling; evaluate
+            # the actual encoded scale, never a hypothetical unclipped scale.
+            candidate = self._e4m3_scale(block_amax / (Float32(4.0) * outer))
+            error, _, _, candidate_packed = self._block_fit(values, candidate, outer, False)
+            if error < best_error:
+                best = candidate
+                if cutlass.const_expr(self.config.adaptive_reuse_packed):
+                    for pair in cutlass.range_constexpr(self.config.values_per_lane // 2):
+                        best_packed[pair] = candidate_packed[pair]
+        else:
+            fitted = numerator / cute.arch.fmax(denominator, Float32(1.0e-20))
+            candidate = self._e4m3_scale(fitted / outer)
+            error, _, _, candidate_packed = self._block_fit(values, candidate, outer, False)
+            if error < best_error:
+                best = candidate
+                if cutlass.const_expr(self.config.adaptive_reuse_packed):
+                    for pair in cutlass.range_constexpr(self.config.values_per_lane // 2):
+                        best_packed[pair] = candidate_packed[pair]
+        return best, best_packed
+
+    @cute.jit
+    def _store_packed_codes(self, packed_row, byte_base, codes):
+        if cutlass.const_expr(self.config.packed_store_bits == 32):
+            for word in cutlass.range_constexpr(self.config.values_per_lane // 8):
+                bits = Uint32(0)
+                for byte in cutlass.range_constexpr(4):
+                    bits |= (Uint32(codes[word * 4 + byte]) & Uint32(255)) << (byte * 8)
+                nvvm.store_ext(bits, packed_row.iterator + packed_row.layout(byte_base + word * 4))
+        else:
+            for byte in cutlass.range_constexpr(self.config.values_per_lane // 2):
+                packed_row[byte_base + byte] = Uint8(codes[byte])
 
     @cute.jit
     def _quantize_task(
@@ -274,30 +397,26 @@ class NVFP4QuantKernel:
             # ``1 / (global * block)`` and ``(1 / global) / block`` can round
             # to different E2M1 values despite being algebraically identical.
             reciprocal = self._block_reciprocal(block_scale, tensor_scale)
+        if cutlass.const_expr(cfg.block_scale_selection != "amax"):
+            block_scale, adaptive_packed = self._adaptive_block_scale(values, block_amax, tensor_scale, block_scale)
+            reciprocal = self._block_reciprocal(block_scale, tensor_scale)
         packed_row = quantized_packed[row, None]
+        packed_codes = [Int32(0)] * (cfg.values_per_lane // 2)
         for pair in cutlass.range_constexpr((cfg.values_per_lane + 1) // 2):
             value0_idx = pair * 2
             value1_idx = cutlass.min(
                 value0_idx + 1,
                 cfg.values_per_lane - 1,
             )
-            packed = self._quantize_pair(
-                values[value0_idx] * reciprocal,
-                values[value1_idx] * reciprocal,
-            )
-            if cutlass.const_expr(cfg.values_per_lane == 1):
-                # A one-value lane shares its destination byte with its
-                # immediate neighbor. Keep this legal baseline simple; wider
-                # candidates use every converter lane and one full-byte store.
-                nibble = Uint8(packed & Int16(0xF))
-                byte_index = (k_base + value0_idx) // 2
-                old = packed_row[byte_index]
-                if (k_base + value0_idx) % 2 == 0:
-                    packed_row[byte_index] = (old & Uint8(0xF0)) | nibble
-                else:
-                    packed_row[byte_index] = (old & Uint8(0x0F)) | (nibble << 4)
+            if cutlass.const_expr(cfg.block_scale_selection != "amax" and cfg.adaptive_reuse_packed):
+                packed = adaptive_packed[pair]
             else:
-                packed_row[(k_base + value0_idx) // 2] = Uint8(packed)
+                packed = self._quantize_pair(
+                    values[value0_idx] * reciprocal,
+                    values[value1_idx] * reciprocal,
+                )
+            packed_codes[pair] = Int32(packed)
+        self._store_packed_codes(packed_row, k_base // 2, packed_codes)
         if lane_in_scale == 0:
             if cutlass.const_expr(cfg.scale_layout == "row_major"):
                 scales[row, scale_block] = block_scale
@@ -495,7 +614,7 @@ class NVFP4DelayedDualQuantKernel(NVFP4DualQuantKernel):
             raise ValueError("delayed NVFP4 history must have 1, 4, 16, or 64 values")
         if history_algo not in ("most_recent", "window_max"):
             raise ValueError("unknown delayed NVFP4 history algorithm")
-        if tensor_scale_mode not in ("power2", "exact"):
+        if tensor_scale_mode not in ("power2", "exact", "exact_four_over_six"):
             raise ValueError("unknown delayed NVFP4 tensor-scale mode")
         self.history_len = history_len
         self.history_algo = history_algo
@@ -695,7 +814,7 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
         super().__init__(x_rows, weight_rows, k, config)
         if x_region_rows < 1 or weight_region_rows < 1:
             raise ValueError("JIT NVFP4 region rows must be positive")
-        if tensor_scale_mode not in ("power2", "exact"):
+        if tensor_scale_mode not in ("power2", "exact", "exact_four_over_six"):
             raise ValueError("unknown JIT NVFP4 tensor-scale mode")
         if amax_load_bits not in (16, 32, 64, 128):
             raise ValueError("JIT NVFP4 amax loads must be 16, 32, 64, or 128 bits")
@@ -1073,6 +1192,9 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
                     reciprocal = self._block_reciprocal(
                         block_scale, tensor_scale
                     )
+                if cutlass.const_expr(cfg.block_scale_selection != "amax"):
+                    block_scale, adaptive_packed = self._adaptive_block_scale(values, block_amax, tensor_scale, block_scale)
+                    reciprocal = self._block_reciprocal(block_scale, tensor_scale)
                 output_row = cached_rows[iteration]
                 scale_block = cached_blocks[iteration]
                 k_base = (
@@ -1080,6 +1202,7 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
                     + lane_in_scale * cfg.values_per_lane
                 )
                 packed_row = packed[output_row, None]
+                packed_codes = [Int32(0)] * (cfg.values_per_lane // 2)
                 for pair in cutlass.range_constexpr(
                     (cfg.values_per_lane + 1) // 2
                 ):
@@ -1087,26 +1210,15 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
                     value1_idx = cutlass.min(
                         value0_idx + 1, cfg.values_per_lane - 1
                     )
-                    quantized = self._quantize_pair(
-                        values[value0_idx] * reciprocal,
-                        values[value1_idx] * reciprocal,
-                    )
-                    if cutlass.const_expr(cfg.values_per_lane == 1):
-                        nibble = Uint8(quantized & Int16(0xF))
-                        byte_index = (k_base + value0_idx) // 2
-                        old = packed_row[byte_index]
-                        if (k_base + value0_idx) % 2 == 0:
-                            packed_row[byte_index] = (
-                                old & Uint8(0xF0)
-                            ) | nibble
-                        else:
-                            packed_row[byte_index] = (
-                                old & Uint8(0x0F)
-                            ) | (nibble << 4)
+                    if cutlass.const_expr(cfg.block_scale_selection != "amax" and cfg.adaptive_reuse_packed):
+                        quantized = adaptive_packed[pair]
                     else:
-                        packed_row[(k_base + value0_idx) // 2] = Uint8(
-                            quantized
+                        quantized = self._quantize_pair(
+                            values[value0_idx] * reciprocal,
+                            values[value1_idx] * reciprocal,
                         )
+                    packed_codes[pair] = Int32(quantized)
+                self._store_packed_codes(packed_row, k_base // 2, packed_codes)
                 if lane_in_scale == 0:
                     if cutlass.const_expr(cfg.scale_layout == "row_major"):
                         scales[output_row, scale_block] = block_scale

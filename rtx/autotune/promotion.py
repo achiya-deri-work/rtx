@@ -52,6 +52,12 @@ def _config_rejection(
     family: str, config: Mapping[str, object], problem: MXFP8Problem
 ) -> str | None:
     try:
+        if family.startswith("nvfp4_"):
+            if config.get("tensor_scale_mode") == "exact_four_over_six":
+                return "experimental NVFP4 outer-scale headroom requires an explicit config; not a default runtime winner"
+            quant = config.get("quant", config.get("quant_x", {}))
+            if isinstance(quant, Mapping) and quant.get("block_scale_selection", "amax") != "amax":
+                return "adaptive NVFP4 block scaling requires an explicit config; not a default runtime winner"
         if family == "mxfp8_fused_fwd":
             from ..kernels.mxfp8 import fwd_config_from_dict
 

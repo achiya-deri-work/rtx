@@ -50,8 +50,11 @@ class AutotunePolicy:
     backward_measurement_mode: str = 'host'
     forward_trials: int | None = None
     backward_trials: int | None = None
+    preparation_selection: bool = False
 
     def __post_init__(self):
+        if type(self.preparation_selection) is not bool:
+            raise ValueError('preparation_selection must be bool')
         if self.backward_measurement_mode not in ('host','cuda_graph','auto'):
             raise ValueError('backward_measurement_mode must be host, cuda_graph or auto')
         if type(self.ranked_opening_trials) is not int or not 0 <= self.ranked_opening_trials <= 2:

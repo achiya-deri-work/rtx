@@ -6,6 +6,12 @@ top-level exports, callable signatures and locally declared configuration
 fields directly from source, including compatibility names. Use the guides
 below for semantics rather than treating a signature as a support guarantee.
 
+Native GEMMs require positive flattened M, N and K. Ragged positive extents
+are supported through logical padding; empty batches and zero feature extents
+are not part of the native contract. The linears are bias-free, so these are
+qualified replacements for bias-free `nn.Linear`, not every possible PyTorch
+linear input or constructor combination.
+
 ## Model and functional entry points
 
 | API | Purpose |
@@ -15,12 +21,19 @@ below for semantics rather than treating a signature as a support guarantee.
 | `quantize_mxfp8`, `quantize_nvfp4` | Explicit BF16-to-packed conversion; [formats](formats.md) |
 | `convert_to_mxfp8_training`, `convert_to_nvfp4_training` | Preserve BF16 parameters while replacing linears |
 | `quantize_` | In-place selected-module PTQ; always use returned root |
+| `NVFP4CalibrationConfig`, `NVFP4CalibrationCollector` | Offline weight calibration and bounded activation moments |
+| `calibrate_nvfp4_weight`, `NVFP4SecondMomentCollector` | Lower-level native packed calibration and streaming statistics |
+| `rtx.autotune.select_accuracy_policy` | Offline full-model policy search with an independent guard |
 | `mxfp8_linear_backward` | Advanced explicit dX/dW API; ordinary users use autograd |
 
 The conversion policies are `MXFP8TrainingConfig`, `NVFP4TrainingConfig`,
 `MXFP8WeightOnlyConfig`, `NVFP4WeightOnlyConfig`. See
 [conversion](model_conversion.md). Functional NVFP4 does **not** accept delayed
 history; delayed mode belongs to `NVFP4Linear`.
+
+See [quantization policy](quantization_policy.md) for calibration methods,
+per-module overrides and accuracy selection. These never silently change a
+training precision policy or run inside compiled forwards.
 
 ## Shared frontend controls
 

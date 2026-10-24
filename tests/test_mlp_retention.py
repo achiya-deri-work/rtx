@@ -42,8 +42,14 @@ def test_joint_placeholder_live_memory_delta(tmp_path, record_property, m):
         original_derivative=mlp._run_derivative
         def run(reuse):
             entry=[]
+            dx_exit=[]
             def dx(*args,shape_only=False):
-                return original_dx(*args,shape_only=shape_only and reuse)
+                result=original_dx(*args,shape_only=shape_only and reuse)
+                # Measure while the caller still owns the placeholder. The
+                # production backward now releases it before the derivative,
+                # so derivative-entry memory is no longer a reuse oracle.
+                dx_exit.append(torch.cuda.memory_allocated())
+                return result
             def derivative(*args,**kwargs):
                 entry.append(torch.cuda.memory_allocated())
                 return original_derivative(*args,**kwargs)
@@ -53,15 +59,17 @@ def test_joint_placeholder_live_memory_delta(tmp_path, record_property, m):
                 grads=selected._selected_backward(*values,dy,token,'silu',True,True,True)
             torch.cuda.synchronize()
             peak=torch.cuda.max_memory_allocated()
-            return entry,peak,tuple(g.cpu() for g in grads)
+            return entry,dx_exit,peak,tuple(g.cpu() for g in grads)
         run(False);run(True)
-        before,peak_before,expected=run(False)
-        after,peak_after,actual=run(True)
+        before,dx_before,peak_before,expected=run(False)
+        after,dx_after,peak_after,actual=run(True)
     assert len(before)==len(after)==1
-    assert before[0]-after[0]==m*h*2
+    assert len(dx_before)==len(dx_after)==1
+    assert dx_before[0]-dx_after[0]==m*h*2
+    assert before[0]==after[0]  # non-reused placeholder is already released
     for a,b in zip(actual,expected):
         torch.testing.assert_close(a,b,rtol=0,atol=0)
-    record_property('derivative_entry_bytes_saved',before[0]-after[0])
+    record_property('dx_exit_bytes_saved',dx_before[0]-dx_after[0])
     record_property('backward_peak_before',peak_before)
     record_property('backward_peak_after',peak_after)
 

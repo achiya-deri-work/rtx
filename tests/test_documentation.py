@@ -15,7 +15,8 @@ class DocumentationTests(unittest.TestCase):
         # Public manual pages; historical study notes are not rewritten here.
         names=("README","installation","quickstart","api","api_reference",
                "formats","training","inference","execution","autotuning",
-               "development","model_conversion","runtime_contract",
+               "development","model_conversion","quantization_policy",
+               "nvfp4_broad_evaluation_20261023","runtime_contract",
                "mxfp8_linear","nvfp4_linear","mxfp8_glu","mxfp8_mlp",
                "mxfp8_mlp_numerics","troubleshooting","research",
                "first_hit_autotuning","mxfp8_glu_history","mxfp8_mlp_history")
@@ -50,6 +51,25 @@ class DocumentationTests(unittest.TestCase):
                           "there is no implicit per-shape tuning dispatcher yet",
                           "GLU/MLP tuning is explicit, not automatic"):
                 self.assertNotIn(stale,content)
+
+    def test_offline_calibration_exports(self):
+        import rtx
+        from rtx import calibration, nvfp4_calibration, ptq
+        from rtx.autotune import AccuracySelectionResult, select_accuracy_policy
+        for name, provider in (
+            ("NVFP4CalibrationConfig", ptq),
+            ("NVFP4CalibrationCollector", calibration),
+            ("NVFP4SecondMomentCollector", nvfp4_calibration),
+            ("calibrate_nvfp4_weight", nvfp4_calibration),
+        ):
+            self.assertIn(name, rtx.__all__)
+            self.assertIs(getattr(rtx, name), getattr(provider, name))
+        result = select_accuracy_policy(
+            ["layer"], ["max"], lambda state: 0.,
+            guard_evaluate=lambda state: 0., baselines=("max",),
+        )
+        self.assertIsInstance(result, AccuracySelectionResult)
+        self.assertEqual(result.guard_choice, "baseline:max")
 
 
 if __name__=="__main__":

@@ -356,8 +356,13 @@ def _current_tensor_scale(tensor: torch.Tensor) -> torch.Tensor:
 def _outer_tensor_scale(tensor: torch.Tensor, mode: str) -> torch.Tensor:
     """Return the scalar outer decode scale consumed by materialized quant."""
 
-    if mode == "exact":
-        return _current_tensor_scale(tensor)
+    if mode in ("exact", "exact_four_over_six"):
+        if mode == "exact":
+            return _current_tensor_scale(tensor)
+        amax = torch.amax(torch.abs(tensor.detach().float()))
+        # Explicit numerical policy: reserve E4M3 headroom for both FP4 grids.
+        # This remains traceable outside the opaque launch operator.
+        return torch.where(amax > 0.0, amax * (1.0 / 1536.0), torch.ones_like(amax)).reshape(1)
     if mode == "power2":
         amax = torch.amax(torch.abs(tensor.detach().float()))
         target = amax / 2688.0
@@ -365,6 +370,17 @@ def _outer_tensor_scale(tensor: torch.Tensor, mode: str) -> torch.Tensor:
         scale = torch.exp2(torch.ceil(torch.log2(safe_target)))
         return torch.where(amax > 0.0, scale, torch.ones_like(scale)).reshape(1)
     raise ValueError(f"unknown NVFP4 tensor scale mode {mode!r}")
+
+
+def _validate_experimental_outer_contract(scale_config, dynamic_config, scaling, packed):
+    public_mode = getattr(scale_config, "tensor_scale_mode", "power2")
+    explicit_mode = getattr(dynamic_config, "tensor_scale_mode", None)
+    if "exact_four_over_six" not in (public_mode, explicit_mode):
+        return
+    if packed or scaling == "block":
+        raise ValueError("experimental outer-scale headroom requires dynamic BF16 operands and outer scaling")
+    if public_mode != "exact_four_over_six" or explicit_mode != public_mode:
+        raise ValueError("experimental outer-scale headroom requires matching explicit scale_config and dynamic_config")
 
 
 def _delayed_amax_state(tensor: torch.Tensor, values: int) -> torch.Tensor:
@@ -920,6 +936,16 @@ def _resolve_forward_config(key: str) -> NVFP4ForwardConfig:
         raise RuntimeError("unknown NVFP4 forward configuration key") from exc
 
 
+def _default_runtime_schedule_rejection(config, problem: NVFP4Problem) -> str | None:
+    """Default first-hit/cache contexts never change block numerical policy."""
+    quant = getattr(config, "quant", getattr(config, "quant_x", None))
+    if quant is not None and quant.block_scale_selection != "amax":
+        return "adaptive NVFP4 block scaling requires an explicit config"
+    if getattr(config, "tensor_scale_mode", None) == "exact_four_over_six":
+        return "experimental NVFP4 outer-scale headroom requires an explicit config"
+    return config.rejection(problem)
+
+
 def _packed_inference_config_key(
     problem: NVFP4Problem,
     device: torch.device,
@@ -967,11 +993,11 @@ def _packed_inference_config_key(
                 fully_prequant_config_from_dict,
                 root=request.cache_dir,
                 tuning_policy=request.policy if request.mode == 'balanced' else None,
-                rejection=lambda value: value.rejection(problem),
+                rejection=lambda value: _default_runtime_schedule_rejection(value, problem),
             )
         if selected is None and request.mode in ("balanced", "coordinate"):
             from .nvfp4_inference_autotune import tune_nvfp4_inference_state
-            from .autotune.runtime import balanced_effort_policy
+            from .autotune.runtime import balanced_effort_policy, run_runtime_config_tuner
 
             winner_key = runtime_winner_key(
                 family, problem, device=device, variant=variant
@@ -982,10 +1008,10 @@ def _packed_inference_config_key(
                     fully_prequant_config_from_dict,
                     root=request.cache_dir,
                     tuning_policy=request.policy if request.mode == 'balanced' else None,
-                    rejection=lambda value: value.rejection(problem),
+                    rejection=lambda value: _default_runtime_schedule_rejection(value, problem),
                 )
                 if selected is None:
-                    selected = tune_nvfp4_inference_state(
+                    selected = run_runtime_config_tuner(tune_nvfp4_inference_state,
                         problem,
                         state=state,
                         device=device,
@@ -1012,11 +1038,11 @@ def _packed_inference_config_key(
                 weight_prequant_config_from_dict,
                 root=request.cache_dir,
                 tuning_policy=request.policy if request.mode == 'balanced' else None,
-                rejection=lambda value: value.rejection(problem),
+                rejection=lambda value: _default_runtime_schedule_rejection(value, problem),
             )
         if selected is None and request.mode in ("balanced", "coordinate"):
             from .nvfp4_inference_autotune import tune_nvfp4_inference_state
-            from .autotune.runtime import balanced_effort_policy
+            from .autotune.runtime import balanced_effort_policy, run_runtime_config_tuner
 
             winner_key = runtime_winner_key(
                 family, problem, device=device, variant=variant
@@ -1027,10 +1053,10 @@ def _packed_inference_config_key(
                     weight_prequant_config_from_dict,
                     root=request.cache_dir,
                     tuning_policy=request.policy if request.mode == 'balanced' else None,
-                    rejection=lambda value: value.rejection(problem),
+                    rejection=lambda value: _default_runtime_schedule_rejection(value, problem),
                 )
                 if selected is None:
-                    selected = tune_nvfp4_inference_state(
+                    selected = run_runtime_config_tuner(tune_nvfp4_inference_state,
                         problem,
                         state=state,
                         device=device,
@@ -1120,7 +1146,7 @@ def _materialized_dynamic_config_key(
     def reject_runtime_dynamic(value: NVFP4DynamicConfig) -> str | None:
         if family == "nvfp4_jit_row_region_fwd" and not value.jit_row_region:
             return "JIT row-region winner has no region geometry"
-        return value.rejection(problem)
+        return _default_runtime_schedule_rejection(value, problem)
 
     winner_key = None
     selected = request.dynamic
@@ -1143,7 +1169,7 @@ def _materialized_dynamic_config_key(
                 dynamic_config_from_dict,
                 root=request.cache_dir,
                 tuning_policy=request.policy if request.mode == 'balanced' else None,
-                rejection=lambda value: value.rejection(problem),
+                rejection=lambda value: _default_runtime_schedule_rejection(value, problem),
             )
     if (
         selected is None
@@ -1151,7 +1177,7 @@ def _materialized_dynamic_config_key(
         and family in ("nvfp4_dynamic_fwd", "nvfp4_jit_row_region_fwd", "nvfp4_delayed_fwd")
     ):
         from .nvfp4_inference_autotune import tune_nvfp4_inference_state
-        from .autotune.runtime import balanced_effort_policy
+        from .autotune.runtime import balanced_effort_policy, run_runtime_config_tuner
 
         assert winner_key is not None
         with runtime_tuning_lock(winner_key, root=request.cache_dir):
@@ -1163,7 +1189,7 @@ def _materialized_dynamic_config_key(
                 rejection=reject_runtime_dynamic,
             )
             if selected is None:
-                selected = tune_nvfp4_inference_state(
+                selected = run_runtime_config_tuner(tune_nvfp4_inference_state,
                     problem,
                     state=(
                         "jit_row_region"
@@ -2815,6 +2841,8 @@ def nvfp4_linear(
 
     if scaling is None:
         scaling = "current" if isinstance(weight, NVFP4Tensor) else "jit_row_region"
+    _validate_experimental_outer_contract(scale_config, dynamic_config, scaling,
+                                         isinstance(weight, NVFP4Tensor))
     if scaling not in ("current", "jit_row_region", "block"):
         raise ValueError(
             "functional NVFP4 scaling must be current, jit_row_region, or block"
@@ -3077,7 +3105,10 @@ class NVFP4Linear(nn.Module):
         device: Initial parameter device.
         dtype: Master-weight dtype. Only ``torch.bfloat16`` is supported.
         scale_config: Optional outer-scale and delayed-history policy. Leave unset for the
-            portable default.
+            portable default. Experimental ``tensor_scale_mode="exact_four_over_six"``
+            reserves FP32 outer-scale headroom for the two FP4 grids; pair it
+            with an explicit matching ``dynamic_config``. It does not select
+            the block policy automatically or modify MXFP8 backward.
         backward_config: Optional MXFP8 backward configuration shared by dX
             and dW. Leave unset to use the runtime cache/default.
         scaling: Outer-scale policy. ``None`` selects ``"jit_row_region"`` for
@@ -3103,7 +3134,9 @@ class NVFP4Linear(nn.Module):
             their documented compatibility mapping.
         tuning_policy: Optional autotuner policy object used for online tuning.
         autotune_cache_dir: Optional runtime-winner/cache directory.
-        dynamic_config: Optional fixed schedule for dynamic BF16 X/W.
+        dynamic_config: Optional fixed schedule and explicit quantizer policy
+            for dynamic BF16 X/W. ``quant.block_scale_selection`` can opt into
+            adaptive experimental policies; schedule tuning must preserve it.
         weight_prequant_config: Optional fixed schedule for dynamic-X,
             prequantized-W inference.
         fully_prequant_config: Optional fixed schedule when both X and W are
@@ -3166,6 +3199,8 @@ class NVFP4Linear(nn.Module):
         self.out_features = int(out_features)
         if scaling is None:
             scaling = "current" if packed_weight is not None else "jit_row_region"
+        _validate_experimental_outer_contract(scale_config, dynamic_config, scaling,
+                                             packed_weight is not None)
         if scaling not in (
             "delayed", "current", "jit_row_region", "block"
         ):
@@ -3293,7 +3328,15 @@ class NVFP4Linear(nn.Module):
             if nvfp4_orientation(packed_weight) != "row_major":
                 raise ValueError("packed linear weights must be row-major")
             if device is not None:
-                packed_weight = packed_weight.to(device)
+                # Move underlying storage explicitly: TorchAO's tensor subclass
+                # .to() can attempt invalid cross-device storage aliasing.
+                packed_weight = make_nvfp4_tensor(
+                    packed_weight.qdata.to(device),
+                    packed_weight.scale.to(device),
+                    nvfp4_tensor_scale(packed_weight).to(device),
+                    (out_features, in_features),
+                    nvfp4_scale_layout(packed_weight),
+                )
             packed_layout = nvfp4_scale_layout(packed_weight)
             self.register_parameter("weight", None)
             self.register_buffer("weight_data", packed_weight.qdata)
