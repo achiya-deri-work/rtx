@@ -7,6 +7,30 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize('error',[FileNotFoundError('missing'),
+                                  subprocess.TimeoutExpired('nvidia-smi',5)])
+def test_optional_monitoring_failure_is_reported(monkeypatch,error):
+    import rtx.autotune.replacement_benchmark as benchmark
+    def fail(*args,**kwargs):
+        assert kwargs['timeout']==5
+        raise error
+    monkeypatch.setattr(benchmark.subprocess,'run',fail)
+    snapshot=benchmark.gpu_monitoring_snapshot()
+    assert snapshot.returncode!=0 and not snapshot.stdout
+    assert type(error).__name__ in snapshot.stderr
+
+
+def test_monitoring_finds_wsl_executable(monkeypatch):
+    import rtx.autotune.replacement_benchmark as benchmark
+    monkeypatch.setattr(benchmark.shutil,'which',lambda name:None)
+    monkeypatch.setattr(benchmark.Path,'is_file',lambda path:True)
+    def run(command,**kwargs):
+        assert command[0]=='/usr/lib/wsl/lib/nvidia-smi'
+        return subprocess.CompletedProcess(command,0,stdout='GPU',stderr='')
+    monkeypatch.setattr(benchmark.subprocess,'run',run)
+    assert benchmark.gpu_monitoring_snapshot().stdout=='GPU'
+
+
 @pytest.mark.parametrize('side', ['candidate','reference'])
 @pytest.mark.parametrize('bad', [float('nan'),float('inf'),float('-inf')])
 def test_recipe_gate_rejects_nonfinite_either_side(side,bad):

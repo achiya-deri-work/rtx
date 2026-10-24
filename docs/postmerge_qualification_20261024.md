@@ -96,7 +96,23 @@ was explicitly nonstationary; the journal proves that the duplicate was a
 legitimate retry, not redundant stable exploration. Torch 2.12.1's singleton
 coordinate test had no eligible timing window. Test corrections and GPU
 requalification are in progress; stationarity and numerical gates are unchanged.
-The 5060 suite has also reported failures; its complete traces remain pending.
+The 5060 full suite finished with 47 failures (including subtest failures),
+1,714 passes, 14 skips and 1,021 passing subtests. Its separate 49-case production
+matrix, Ettin inference and short-training subprocesses exited successfully.
+Open failures include timing eligibility/cache assumptions and a single BF16
+output discrepancy repeated across fused MXFP8 schedules. Additional portability
+failures were missing optional `nvidia-smi` on PATH, links to unshipped local
+reports, and an OOM test whose 2x-VRAM allocation succeeded under WSL. These are
+not blanket kernel failures, but the device is not fully qualified.
+
+The two local timing-contract corrections pass three fresh-process GPU repeats
+per stack. The OOM observer test now uses a disposable worker's allocator limit
+instead of physical VRAM capacity and passes both local stacks. Optional
+telemetry now supports WSL's executable location and reports unavailable or
+timed-out monitoring without aborting the numerical benchmark; its CPU tests
+and both three-way GPU comparison modes pass locally. Laptop retests remain
+necessary. The queued second-stack laptop campaign was stopped before launch
+to prioritize this triage; no unrelated workload was stopped.
 
 An operational error affected the local shell wrappers: editing their script
 while they were running changed the continuation read offsets. This overwrote
@@ -116,8 +132,11 @@ Both dependency requirement files have now installed successfully into genuinely
 fresh virtual environments. Both Torch stacks pass `pip check`, runtime version
 validation, CLI help and all 58 public-export imports outside the checkout.
 Both fresh environments subsequently passed the 49-case production GPU matrix
-outside the checkout. This installed-wheel matrix covers linears; installed
-GLU validation remains separate. The `c728aae` wheel/sdist pass build and twine checks;
+outside the checkout. Separate installed-wheel GLU checks pass eight cases per
+stack: SiLU/GELU, aligned/ragged and eager/fullgraph compiled forward plus all
+three gradients against the independent quantized recipe (NRMS gate 0.025).
+These are small-shape installation checks, not a replacement for full GLU tests.
+The `c728aae` wheel/sdist pass build and twine checks;
 archive inspection found no ignored source artifacts (136 wheel / 622 sdist
 entries). No release tag or package upload has been made.
 

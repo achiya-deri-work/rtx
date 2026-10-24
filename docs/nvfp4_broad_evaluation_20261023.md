@@ -124,7 +124,8 @@ the separate synthetic sweep described next, not this decoder experiment.
 
 ### Existing width study, not newly rerun here
 
-The preceding [width sweep](../autotune_reports/width_sweep_5060_20261023/REPORT.md)
+The preceding width sweep (local artifact
+`autotune_reports/width_sweep_5060_20261023/REPORT.md`, not shipped in the package)
 contains 84 compiled synthetic regression trajectories, widths128/256/384/512,
 three seeds and seven policies. Every trajectory stayed finite. Four-over-six
 plus headroom was best among NVFP4 at128/256; amax slightly won at384/512.
@@ -228,7 +229,8 @@ BF16, and isolated packed-operator compile parity was tested independently.
 
 ### Earlier guarded selection evidence, separate query set
 
-The earlier [model-level selection study](../autotune_reports/nvfp4_model_selection_20261023/REPORT.md)
+The earlier model-level selection study (local artifact
+`autotune_reports/nvfp4_model_selection_20261023/REPORT.md`, not shipped in the package)
 used1000 different queries: BF16932, max907, MSE900, selected917. Selected CLS
 NRMS .3599 versus max .4162. The selected-minus-max accuracy interval included
 zero, while selected-minus-MSE did not. This is supportive evidence for a

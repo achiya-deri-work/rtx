@@ -5,6 +5,7 @@ import gc
 import hashlib
 import json
 import math
+import shutil
 from pathlib import Path
 import statistics
 import subprocess
@@ -14,6 +15,21 @@ import time
 from .execution_mix import MLPExecutionMix
 from .replacement import (ReplacementPolicy, recommend_replacement,
                           comparison_orders, summarize_repeated_comparison)
+
+
+def gpu_monitoring_snapshot():
+    """Optional telemetry must not prevent numerical qualification on WSL."""
+    executable=shutil.which('nvidia-smi')
+    if executable is None:
+        wsl=Path('/usr/lib/wsl/lib/nvidia-smi')
+        executable=str(wsl) if wsl.is_file() else 'nvidia-smi'
+    command=[executable,'--query-gpu=name,driver_version,utilization.gpu',
+             '--format=csv,noheader']
+    try:
+        return subprocess.run(command,capture_output=True,text=True,timeout=5)
+    except (OSError,subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(command,1,stdout='',
+                                           stderr=f'{type(exc).__name__}: {exc}')
 
 
 def source_manifest(root=None):
@@ -106,7 +122,7 @@ def worker(args):
             return compiled(*inputs)
     def workload():
         return mix.execute(compiled,inputs,backward,torch.set_grad_enabled)
-    smi=subprocess.run(['nvidia-smi','--query-gpu=name,driver_version,utilization.gpu','--format=csv,noheader'],capture_output=True,text=True)
+    smi=gpu_monitoring_snapshot()
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     input_bytes=torch.cuda.memory_allocated()

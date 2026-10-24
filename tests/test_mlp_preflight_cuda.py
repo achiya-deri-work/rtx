@@ -62,9 +62,12 @@ def test_oom_snapshot_precedes_stack_unwind(tmp_path):
 import json,sys,torch
 from rtx.autotune.memory_diagnostics import install_oom_recorder
 events=install_oom_recorder(sys.argv[1],history_entries=1000)
+# Limit only this disposable worker's allocator. Physical VRAM alone is not a
+# capacity bound on WSL/WDDM, and enormous requests hit an earlier size guard.
+torch.cuda.set_per_process_memory_fraction(.01)
 def fail():
     live=torch.empty(1024*1024,device="cuda",dtype=torch.uint8)
-    torch.empty(torch.cuda.get_device_properties(0).total_memory*2,device="cuda",dtype=torch.uint8)
+    torch.empty(int(torch.cuda.get_device_properties(0).total_memory*.02),device="cuda",dtype=torch.uint8)
 try:
     fail()
 except torch.OutOfMemoryError:
