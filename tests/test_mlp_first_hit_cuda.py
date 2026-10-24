@@ -139,8 +139,7 @@ def test_compiled_mlp_selection_and_refinement(tmp_path, mode, monkeypatch):
         assert len(journals())==1
         assert len(tune_calls)==2
         assert tune_calls[0]['initial']==tune_calls[1]['initial']
-        if tune_calls[1]['qualification_incumbent'] is not None:
-            assert tune_calls[1]['qualification_incumbent'] in tune_calls[1]['portfolio']
+        assert tune_calls[1]['portfolio'] == tune_calls[0]['portfolio'] == ()
 
 
 @pytest.mark.parametrize("mask", [(True,False,False),(False,True,False),(False,False,True)])

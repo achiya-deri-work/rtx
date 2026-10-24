@@ -138,8 +138,10 @@ def _select(x, gu, down, activation, spec_key, training, *, replay=False):
                 if selected is None:
                     incumbent=load_runtime_winner(key,MXFP8MLPConfig.from_dict,root=root) or initial
                     # Keep the user's initial search anchor stable across
-                    # effort increases. A new winner is a candidate and the
-                    # qualification baseline, not a new journal namespace.
+                    # effort increases. History already contains the winner;
+                    # injecting it into the opening portfolio changes the
+                    # progressive checkpoint contract on the next invocation.
+                    # Retain it only as the deployment qualification baseline.
                     # Custom-op dispatch runs below autograd; the harness owns
                     # independent differentiable inputs and its compiled graph.
                     stream = torch.cuda.current_stream(x.device)
@@ -150,7 +152,7 @@ def _select(x, gu, down, activation, spec_key, training, *, replay=False):
                         with torch.cuda.device(x.device), torch.cuda.stream(stream), torch.enable_grad():
                             return tune_mxfp8_mlp(x, gu, down, activation=activation,
                                 phase="train" if training else "forward", initial=initial,
-                                portfolio=() if incumbent == initial else (incumbent,),
+                                portfolio=(),
                                 qualification_incumbent=None if incumbent == initial else incumbent,
                                 tuning_policy=policy, output_dir=root / "mlp_effort", progress=_LOG.info,
                                 measurement_mode='private_replay' if replay else 'selected_direct',

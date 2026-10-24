@@ -643,8 +643,9 @@ def tune_mxfp8_mlp(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT_M
     only; that disables the extra deployment promotion gate.
     ``qualification_incumbent`` can retain a previously deployed winner as the
     paired performance baseline without changing ``initial`` and therefore
-    the progressive search journal identity. Pass a fully resolved config and
-    include it in ``portfolio`` when resuming runtime refinement.
+    the progressive search journal identity. Pass a fully resolved config.
+    Keep ``portfolio`` unchanged when resuming progressive search: the prior
+    winner is already in history and must not change the opening sequence.
     """
     if qualification_rounds != 0 and (type(qualification_rounds) is not int or
                                       qualification_rounds < 4 or qualification_rounds % 2):
