@@ -1,5 +1,6 @@
 """Ownership equivalence; independent arithmetic gates live in prequant_gate tests."""
 from dataclasses import replace
+import gc
 import json
 
 import pytest
@@ -49,6 +50,7 @@ def test_prequant_down_multishape_graph_cleanup(preserve, selected_overlap, reco
 
     clear_runtime_caches(device='cuda:0', preserve_compiled=preserve)
     live = []
+    raw_live = []
     for iteration in range(8):
         expected = []
         for values, stream, graph, owners, captured, step in cases:
@@ -66,7 +68,14 @@ def test_prequant_down_multishape_graph_cleanup(preserve, selected_overlap, reco
                 torch.testing.assert_close(actual, ref, rtol=.001, atol=1e-6)
         del expected, reference, actual, ref
         torch.cuda.synchronize()
+        raw_live.append(torch.cuda.memory_allocated())
+        # All captured graphs and owner dictionaries remain reachable. Collect
+        # only unreachable Python cycles before checking their stable footprint;
+        # arbitrary GC timing elsewhere in a full suite is not an ownership leak.
+        gc.collect()
+        torch.cuda.synchronize()
         live.append(torch.cuda.memory_allocated())
+    record_property('raw_live_allocated_bytes', str(raw_live))
     record_property('live_allocated_bytes', str(live))
     # Ignore the first two iterations where cleared runners are rebuilt.
     assert max(live[2:]) - min(live[2:]) <= 4096, live

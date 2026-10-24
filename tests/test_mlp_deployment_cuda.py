@@ -1,4 +1,5 @@
 """Real execution surfaces: correctness, prepared reuse, and live memory."""
+import gc
 import pytest
 import torch
 
@@ -35,6 +36,10 @@ def test_deployment_mode(mode,phase,shape,execution_mix=None,recompute='joint'):
         for metrics in result.metadata['numerics'].values():
             assert metrics['finite']
             assert metrics['relative_l2']<.025
+        # Measure reachable ownership, not when Python happens to collect
+        # unreachable graphs from this or earlier tests. Keep the adapter and
+        # its prepared executable alive; do not evict caches between samples.
+        gc.collect()
         torch.cuda.synchronize()
         allocations.append(torch.cuda.memory_allocated())
     assert len(set(allocations))==1,allocations

@@ -3,6 +3,52 @@
 Work in progress; this is not a release announcement. The GLU integration was
 published at `24d13e6`. Follow-up campaign/setup fixes are on `main`.
 
+## Latest completed qualification
+
+The following supersedes the earlier campaign status recorded below. It is
+not a claim that every release gate is closed.
+
+- At `6886304`, the local Torch 2.12.1 suite passes 1,743 tests and 1,064
+  subtests (eight skips, 22 optional DINO studies deselected). Its 49-case
+  production matrix, prospective Ettin inference and short training also pass.
+- The matching Torch 2.13 suite passes 1,741 tests and 1,064 subtests, with
+  two failures: intermittent 23,040-byte live-allocation fluctuation in the
+  GLU ownership test, and a short-budget persistent-winner assertion. Its
+  production, Ettin inference and short-training checks all pass.
+- The 5060 Torch 2.12.1 suite at runtime revision `2c1d9e0` passes 1,735 tests
+  and 1,057 subtests, with three failures: concurrent tuner-call accounting,
+  the short-budget winner assertion, and singleton timing eligibility. These
+  failures do not report numerical mismatches. The device is not fully qualified.
+- The rebuilt `6886304` wheel passes all 49 production cases in each genuinely
+  clean dependency environment, outside the checkout. Build, twine and
+  dependency checks pass. Archive inspection finds 136 wheel files and 605
+  sdist regular files, with no dataset, checkpoint, log or environment paths.
+
+The cache integration test had overridden balanced tuning with four trials
+and three seconds while unconditionally demanding persistent winners. With
+the public balanced defaults, three fresh-process repetitions per local stack
+pass winner writes and zero-tuner-call cross-process reuse. The 5060 also passes
+this corrected test on Torch 2.12.1. Numerical and timing-eligibility gates are
+unchanged; forced-noise tests still prohibit persistent unmeasured fallbacks.
+
+The isolated ownership test passes eight traced repetitions, and another eight
+after preceding MLP tests. The original 23,040-byte fluctuation was not
+reproduced. That preceding-test run instead exposed a deployment memory
+assertion failing when allocation decreased. Memory checks now collect
+unreachable Python cycles before sampling the retained footprint, without
+clearing live owners, graphs or caches. The original equality/4 KiB gates remain
+unchanged; the ownership check also records raw pre-collection allocation.
+This is a test-measurement correction, not evidence of a repaired kernel leak.
+All 34 focused ownership/deployment tests pass on each supported local Torch
+stack with the revised protocol; this is separate from the original full run.
+
+Artifacts reside under `autotune_reports/postmerge_20261024/`: the two
+`final_6886304_*` bundles, `full_2c1d9e0_212.xml`, `installed_6886304_*.json`,
+`dist-6886304-audit.json`, `balanced_default_*` and `ownership_trace_*`.
+The 5070 laptop remains unavailable and unqualified; no release tag or upload
+has been made. Remaining timing/concurrency checks and memory-test requalification
+must not be replaced by the green production matrix alone.
+
 ## Matched longer training trajectories
 
 Two RTX 5090 workers completed all eight policies for 256 compiled steps each,

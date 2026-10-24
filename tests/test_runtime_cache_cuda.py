@@ -282,10 +282,13 @@ class RuntimeCacheCudaTests(unittest.TestCase):
                     self.assertEqual(run.returncode,0,run.stdout+run.stderr)
 
     def test_balanced_first_hit_and_cross_process_load(self):
-        # Exercise orchestration, not search quality; production uses its normal
-        # larger budget. Keep this integration test bounded on a fresh machine.
-        env = dict(os.environ, RTX_BALANCED_AUTOTUNE_TRIALS="4",
-                   RTX_BALANCED_AUTOTUNE_SECONDS="3")
+        # Qualify the public balanced budget, including measured winner writes.
+        # A three-second/four-trial override can legitimately exhaust its budget
+        # without stationary timings; forced-noise tests separately require that
+        # such a checked fallback never becomes a persisted winner.
+        env = dict(os.environ)
+        env.pop("RTX_BALANCED_AUTOTUNE_TRIALS", None)
+        env.pop("RTX_BALANCED_AUTOTUNE_SECONDS", None)
         with tempfile.TemporaryDirectory(prefix="rtx-runtime-cache-") as root:
             for phase in ("write", "read"):
                 run = subprocess.run(
@@ -294,7 +297,8 @@ class RuntimeCacheCudaTests(unittest.TestCase):
                 )
                 self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
                 self.assertGreaterEqual(
-                    len(list((Path(root) / "runtime_winners").rglob("*.json"))), 2
+                    len(list((Path(root) / "runtime_winners").rglob("*.json"))), 2,
+                    run.stdout + run.stderr,
                 )
 
 
