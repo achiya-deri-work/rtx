@@ -128,6 +128,27 @@ class FirstHitTests(unittest.TestCase):
         a.evaluator=lambda c:self.fail("stable cache evaluated")
         self.assertEqual(tune_first_hit(a,store,[],progress=None).median_ms,1.)
 
+    def test_progressive_refinement_counts_nonstationary_retry_in_budget(self):
+        from rtx.autotune.outcomes import TrialOutcome
+        a=adapter();store=InMemoryTuningStore()
+        calls={}
+        def evaluate(c):
+            cid=a.config_id(c)
+            calls[cid]=calls.get(cid,0)+1
+            stationary=c != a.initial_config or calls[cid] > 1
+            return TrialOutcome("ok",median_ms=1.,metadata={
+                "sampling":{"collection":{"stationary":stationary}}})
+        a.evaluator=evaluate
+        pool=[Config(a=2),Config(b=1)]
+        for budget in (2,4):
+            tune_first_hit(a,store,pool,policy=FirstHitPolicy(
+                max_trials=budget,confirmation_repeats=0),refine=True,progress=None)
+        rows=list(store.records())
+        self.assertEqual(len(rows),4)
+        self.assertEqual(len({r['config_id'] for r in rows}),3)
+        self.assertEqual(calls[a.config_id(a.initial_config)],2)
+        self.assertEqual(calls[a.config_id(Config(a=2))],1)
+
     def test_unstable_confirmation_cannot_be_hidden_by_stable_screen(self):
         from rtx.autotune.outcomes import TrialOutcome
         a=adapter();store=InMemoryTuningStore()

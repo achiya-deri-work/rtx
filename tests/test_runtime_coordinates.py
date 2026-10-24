@@ -133,16 +133,32 @@ class RuntimeCoordinateTests(unittest.TestCase):
         import torch
         import rtx
         from rtx.prequant_autotune import tune_mxfp8_prequant
+        from rtx.autotune.orchestrator import NoEligibleTimingError
         if not torch.cuda.is_available():
             self.skipTest('CUDA required')
         torch.manual_seed(1729)
         x=torch.randn(128,128,device='cuda',dtype=torch.bfloat16)*.1
         w=torch.randn(128,128,device='cuda',dtype=torch.bfloat16)*.02
         policy=rtx.AutotunePolicy(max_trials=8,search_schedule='progressive',
-            confirmation_repeats=0,warmup=1,samples=3,calls_per_sample=2)
+            confirmation_repeats=0,warmup=3,samples=9,calls_per_sample=8)
         axes={'global_l2_fetch': ({'l2_fetch_granularity':None},{'l2_fetch_granularity':128})}
         with tempfile.TemporaryDirectory() as root:
-            first=tune_mxfp8_prequant(x,w,policy=policy,axes=axes,cache_dir=root,progress=None)
+            # A singleton has no alternate candidate when a timing window is
+            # noisy. Resume its journal, with a bounded number of attempts;
+            # do not install noisy evidence or relax the stationarity gate.
+            for attempt in range(3):
+                try:
+                    first=tune_mxfp8_prequant(x,w,policy=policy,axes=axes,cache_dir=root,progress=None)
+                    break
+                except NoEligibleTimingError:
+                    if attempt == 2:
+                        import json
+                        from pathlib import Path
+                        for journal in Path(root).rglob('observations.jsonl'):
+                            for line in journal.read_text().splitlines():
+                                record=json.loads(line)
+                                print('SINGLETON_TIMING_FAILURE',record['outcome'],flush=True)
+                        raise
             second=tune_mxfp8_prequant(x,w,policy=policy,axes=axes,cache_dir=root,progress=None)
             self.assertEqual(first.evaluated_trials,1)
             self.assertEqual(second.evaluated_trials,0)

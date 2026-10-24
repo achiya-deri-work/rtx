@@ -130,7 +130,16 @@ def test_runtime_refinement_expands_budget(tmp_path, monkeypatch):
         assert result.isfinite().all()
         rows = [json.loads(line) for line in path.read_text().splitlines()]
         assert len(rows) == budget
-        assert len({row["config_id"] for row in rows}) == budget
+        # Refinement may remeasure a correctness-valid candidate whose earlier
+        # latency was nonstationary. Those attempts still consume the budget;
+        # a stable observation must never be redundantly explored again.
+        previous = {}
+        for row in rows:
+            cid = row["config_id"]
+            for prior in previous.get(cid, []):
+                assert prior["outcome"]["status"] == "ok"
+                assert prior["outcome"]["metadata"]["sampling"]["collection"]["stationary"] is False
+            previous.setdefault(cid, []).append(row)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

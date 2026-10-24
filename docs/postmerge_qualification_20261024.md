@@ -89,10 +89,25 @@ stopped to include the runtime refinement fix. The 5070 WSL instance restarted
 externally during its partial suite; the cause is not established. Those partial
 logs remain intact. Full suites restarted at `7ec987e` with four compiler workers
 by default (caller-overridable), avoiding excessive parallel compiler memory use.
-Fresh final local suites on both Torch stacks are also running against this code.
-The restarted 5060 suite and the local Torch 2.13 suite have reported failures;
-complete traces are pending suite completion. They are not qualified, and
-release remains blocked until those failures are understood and resolved.
+Both local full suites finished with 1,730 passes, eight skips and one failure
+each (plus 1,063 passing subtests). Torch 2.13's preparation-refinement assertion
+incorrectly required unique configurations even when the earlier measurement
+was explicitly nonstationary; the journal proves that the duplicate was a
+legitimate retry, not redundant stable exploration. Torch 2.12.1's singleton
+coordinate test had no eligible timing window. Test corrections and GPU
+requalification are in progress; stationarity and numerical gates are unchanged.
+The 5060 suite has also reported failures; its complete traces remain pending.
+
+An operational error affected the local shell wrappers: editing their script
+while they were running changed the continuation read offsets. This overwrote
+the Torch 2.13 text test log and recorded a shell exit of 127 in both status
+files. The completed JUnit XML files preserve the actual test results and
+tracebacks. Do not interpret the shell exit as a kernel failure or a test pass.
+No more runner edits were made while either wrapper remained live.
+
+Both local production matrices separately passed 49/49; their Ettin prospective
+inference and short-training processes also exited successfully. These passes
+do not erase the outstanding full-suite and laptop gates.
 
 The built wheel imports MXFP8Linear, NVFP4Linear and MXFP8MLP outside the source
 tree and passes runtime version validation. That check reused the qualified
@@ -100,8 +115,9 @@ environment's dependency directory; it is not a fresh network dependency solve.
 Both dependency requirement files have now installed successfully into genuinely
 fresh virtual environments. Both Torch stacks pass `pip check`, runtime version
 validation, CLI help and all 58 public-export imports outside the checkout.
-These installation checks are not fresh-environment GPU execution evidence;
-that remains a separate gate. The `c728aae` wheel/sdist pass build and twine checks;
+Both fresh environments subsequently passed the 49-case production GPU matrix
+outside the checkout. This installed-wheel matrix covers linears; installed
+GLU validation remains separate. The `c728aae` wheel/sdist pass build and twine checks;
 archive inspection found no ignored source artifacts (136 wheel / 622 sdist
 entries). No release tag or package upload has been made.
 
