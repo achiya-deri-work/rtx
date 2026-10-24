@@ -76,8 +76,11 @@ was installed into the user's default runtime cache.
 
 ## Cross-device and installation status
 
-Isolated source snapshots on the RTX 5060 and 5070 laptops are running release
-qualification. Initial attempts had missing test dependencies and an import-path
+An isolated source snapshot on the RTX 5060 laptop is running release
+qualification. The user confirmed the 5070 laptop is unavailable; its interrupted
+results do not count as qualification, and no further work is waiting on that
+machine. Its cross-device release gate remains outstanding. Initial attempts
+had missing test dependencies and an import-path
 setup error; those are failed attempts, not kernel passes. The corrected runner
 explicitly imports its own checkout, and Pillow is now a declared test dependency.
 Both initial Ettin model/short-training subprocesses passed, but their parent
@@ -87,20 +90,26 @@ externally during its partial suite; the cause is not established. Those partial
 logs remain intact. Full suites restarted at `7ec987e` with four compiler workers
 by default (caller-overridable), avoiding excessive parallel compiler memory use.
 Fresh final local suites on both Torch stacks are also running against this code.
-The restarted laptop suites have reported early failures; complete traces are
-pending suite completion. They are not qualified, and release remains blocked
-until those failures are understood and resolved.
+The restarted 5060 suite and the local Torch 2.13 suite have reported failures;
+complete traces are pending suite completion. They are not qualified, and
+release remains blocked until those failures are understood and resolved.
 
 The built wheel imports MXFP8Linear, NVFP4Linear and MXFP8MLP outside the source
 tree and passes runtime version validation. That check reused the qualified
 environment's dependency directory; it is not a fresh network dependency solve.
-Both dependency requirement files are additionally being installed into genuinely
-fresh virtual environments. The Torch 2.13 fresh install has passed `pip check`,
-runtime version validation and public frontend imports outside the checkout;
-its CLI help and all 58 public exports also load. Torch 2.12.1 installation is
-still in progress. The `c728aae` wheel/sdist pass build and twine checks;
+Both dependency requirement files have now installed successfully into genuinely
+fresh virtual environments. Both Torch stacks pass `pip check`, runtime version
+validation, CLI help and all 58 public-export imports outside the checkout.
+These installation checks are not fresh-environment GPU execution evidence;
+that remains a separate gate. The `c728aae` wheel/sdist pass build and twine checks;
 archive inspection found no ignored source artifacts (136 wheel / 622 sdist
 entries). No release tag or package upload has been made.
+
+A subsequent rebuild from `2034ecb` plus this documentation update passes build,
+twine, wheel namespace and ignored-file checks (136 wheel files, 605 sdist
+regular files; generated egg-info is excluded from the ignored-file audit).
+The source archive includes the immediate-failure plugin and qualification
+runner. This rebuild is separate from the wheel used by the fresh installs.
 
 Subsequent qualification runs record failures immediately in
 `test-events.jsonl`, including collection failures and tracebacks. The optional
