@@ -21,3 +21,6 @@ def test_release_runner_qualifies_its_own_checkout():
     assert 'export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"' in script
     assert script.index("export PYTHONPATH") < script.index("validate_runtime_environment")
     assert "pillow>=10" in (root / "requirements-dev.txt").read_text()
+    import tomllib
+    metadata = tomllib.loads((root / "pyproject.toml").read_text())
+    assert "pillow>=10" in metadata["project"]["optional-dependencies"]["dev"]

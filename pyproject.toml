@@ -42,7 +42,7 @@ Issues = "https://github.com/achiya-deri-work/rtx/issues"
 Documentation = "https://github.com/achiya-deri-work/rtx/tree/main/docs"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "build>=1.2", "twine>=5", "joblib>=1.4,<2", "scikit-learn>=1.5,<2"]
+dev = ["pytest>=8", "build>=1.2", "twine>=5", "joblib>=1.4,<2", "scikit-learn>=1.5,<2", "pillow>=10"]
 vision = ["torchvision>=0.27,<=0.28"]
 model-test = ["transformers==4.57.6", "safetensors>=0.4,<1"]
 
