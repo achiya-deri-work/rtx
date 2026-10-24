@@ -4,3 +4,4 @@ build>=1.2
 twine>=5
 joblib>=1.4,<2
 scikit-learn>=1.5,<2
+pillow>=10
