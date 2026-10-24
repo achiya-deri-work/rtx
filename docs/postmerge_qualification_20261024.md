@@ -1,9 +1,43 @@
 # Post-merge qualification
 
-Work in progress; this is not a release announcement. The GLU integration was
-published at `24d13e6`. Follow-up campaign/setup fixes are on `main`.
+This is an evidence-bounded main-branch handoff, not a 1.0 release announcement.
+The GLU integration was published at `24d13e6`; qualification fixes are on `main`.
 
-## Latest completed qualification
+## Handoff status
+
+- The final RTX 5090 Torch 2.13 run at `a4930e8` passes 1,743 tests and 1,064
+  subtests, with eight skips and 22 optional DINO studies deselected. Production
+  (49/49), prospective Ettin inference and short training also pass; all four
+  wrapper exit statuses are zero.
+- The RTX 5090 Torch 2.12.1 full run at `6886304` has the same passing counts
+  and four zero exit statuses. The subsequent changes are test/documentation
+  only; its revised 34-case ownership/deployment checks and three fresh normal
+  balanced-cache repetitions also pass. Executable library sources are identical.
+- RTX 5060 Laptop production passes 49/49 on both Torch stacks at clean
+  `a4930e8`. Its 256-step/eight-policy compiled training and all 12 MLP
+  first-hit/refinement/reuse probes pass their stated contracts.
+- Both clean dependency installations pass runtime validation, imports,
+  dependency checks and installed-wheel production tests. The `a4930e8` rebuild
+  passes build/twine checks; all 136 wheel members are byte-identical to the
+  previously GPU-qualified `6886304` wheel. Source archives exclude generated
+  datasets, checkpoints, logs and environments.
+
+**Qualification remains incomplete:** the 5060 full suite was not green.
+Normal-budget cache persistence and isolated concurrent refinement subsequently
+passed, but the singleton host-timing test still rejects all three windows.
+Numerics are exact in that test; the measurement ranges violate its unchanged
+stationarity gate. Longer measurement windows, process-only GC/CPU-affinity
+experiments and a two-second GPU warm-up did not establish a reliable remedy.
+No noisy winner is installed. The 5070 laptop is unavailable by user confirmation
+and its partial results do not qualify it. No 1.0 tag or package upload was made.
+
+Final evidence is under `autotune_reports/postmerge_20261024/`, including
+`final_a4930e8_213`, `final_6886304_212`, `production_a4930e8_{212,213}.json`,
+`wheel-equivalence-a4930e8.json`, and the training/first-hit artifacts below.
+The following sections retain earlier failures and their corrections; they
+must not be read as the current status above.
+
+## Qualification history and corrections
 
 The following supersedes the earlier campaign status recorded below. It is
 not a claim that every release gate is closed.
@@ -79,6 +113,52 @@ not be reported as production throughput.
 
 Reproduce using `benchmarks/run_postmerge_validation.sh`; raw JSONL, checkpoint
 revision and source identities are retained in the output directory.
+
+### Same-stack cross-device follow-up
+
+Both devices completed 256 steps per policy on Torch 2.12.1, seed 4810, at
+`a4930e8`, using the same pinned model/data and settings above. Every checked
+loss, gradient and BF16 optimizer state was finite. Final validation NLL:
+
+| Policy | RTX 5060 Laptop | RTX 5090 |
+|---|---:|---:|
+| BF16 | 2.0486 | 2.0482 |
+| MXFP8 dynamic | 2.0620 | 2.0713 |
+| NVFP4 JIT-region | 2.3593 | 2.3552 |
+| NVFP4 delayed | 2.3593 | 2.3343 |
+| NVFP4 current | 2.3554 | 2.3559 |
+| NVFP4 block | 2.3731 | 2.3697 |
+| NVFP4 block Four Over Six | 2.3534 | 2.3488 |
+| MXFP8 recomputed MLP | 2.0654 | 2.0660 |
+
+The first losses and initial validation NLL match across devices, but losses
+diverge after the first optimizer update, including the BF16 baseline. A
+fresh-process BF16/delayed repeat on the same 5090 reproduces their final NLL
+exactly. This does not isolate the cross-device difference to RTX kernels:
+other compiled operations, gradients and BF16 optimizer arithmetic are involved.
+NVFP4's quality gap remains substantial; Four Over Six worsens slightly from
+its own initial 2.3476 NLL on both devices in this follow-up. Do not claim a
+universal quality ranking or throughput advantage from these trajectories.
+
+Artifacts: `training256_a4930e8_212.jsonl`,
+`training256_5090_a4930e8_212_seed4810.jsonl`, and
+`training256_5090_a4930e8_212_seed4810_repeat.jsonl`.
+
+### 5060 first-hit follow-up
+
+All 12 compiled-training MLP probes pass on the 5060/Torch 2.12.1: the same
+three M,K,H,O shapes as the local study, progressive budgets 8/16/32 and one
+fresh-process reuse per shape. Each has exactly the requested trial count,
+one compiled graph, finite output/all three gradients and NRMS below 0.025
+against the independent quantized operational reference (not BF16 equivalence).
+Reuse performs zero tuner calls and leaves journal hashes unchanged.
+
+Initial/refinement calls take 15.45–43.03 seconds; fresh-process reuse takes
+1.75–2.18 seconds, including compilation but not process startup. Warm
+host-inclusive timings do not establish a consistent benefit from larger
+budgets. They are unpaired measurements on a noisy host, not kernel-only speed
+or proof that more search is intrinsically worse. No winners were promoted to
+the user's default cache. Reports and journals are in `first_hit_a4930e8_212/`.
 
 ## First-hit refinement finding
 
