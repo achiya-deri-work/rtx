@@ -16,7 +16,7 @@ class PackedRefinementCudaTests(unittest.TestCase):
         # No reset occurs between a study's budgets or repeated calls.
         torch.compiler.reset()
 
-    def _case(self, family, state, scaling='current', scale_config=None):
+    def _case(self, family, state, scaling='current', scale_config=None, *, require_no_eligible=False):
         from torch._inductor.compile_fx import compile_fx
         torch.manual_seed(1729)
         cls=rtx.MXFP8Linear if family=='mxfp8' else rtx.NVFP4Linear
@@ -59,6 +59,21 @@ class PackedRefinementCudaTests(unittest.TestCase):
                 self.assertEqual(count(), before)
                 self.assertEqual(len(graphs), graph_count)
                 winners=list(Path(root).glob('runtime_winners/**/*.json'))
+                from rtx.autotune.outcomes import TrialOutcome
+                rows=[json.loads(line) for path in Path(root).rglob('observations.jsonl')
+                      for line in path.read_text().splitlines()]
+                self.assertTrue(rows)
+                eligible=[row for row in rows if TrialOutcome.from_dict(row['outcome']).timing_eligible]
+                if require_no_eligible:
+                    self.assertFalse(eligible)
+                if not eligible:
+                    # A checked process-local fallback is the public contract
+                    # under unstable measurements, not a durable winner.
+                    # Numerics, reuse, refinement and live-memory checks above
+                    # still apply. Never turn rejected timing into cache data.
+                    self.assertFalse(winners)
+                    print('NO_ELIGIBLE_WINNER',family,state,scaling,budget,len(rows),flush=True)
+                    continue
                 self.assertTrue(winners)
                 for path in winners:
                     document = json.loads(path.read_text())
@@ -75,6 +90,23 @@ class PackedRefinementCudaTests(unittest.TestCase):
     def test_nvfp4_fully_packed(self): self._case('nvfp4','fully_prequantized')
     def test_nvfp4_current(self): self._case('nvfp4','dynamic','current')
     def test_nvfp4_block(self): self._case('nvfp4','dynamic','block')
+
+    def test_nvfp4_block_noisy_refinement_does_not_persist(self):
+        from unittest.mock import patch
+        from rtx.autotune.evaluators import CalibratedPrequantEvaluator
+        original=CalibratedPrequantEvaluator.__call__
+        rejected=[]
+        def evaluate(evaluator,config,**kwargs):
+            outcome=original(evaluator,config,**kwargs)
+            if not kwargs.get('validate_only') and outcome.successful:
+                outcome.metadata={**outcome.metadata,'sampling':{'collection':{'stationary':False}},
+                                  'test_forced_ineligible':True}
+                rejected.append(True)
+            return outcome
+        with patch.object(CalibratedPrequantEvaluator,'__call__',evaluate):
+            self._case('nvfp4','dynamic','block',require_no_eligible=True)
+        self.assertTrue(rejected)
+
     def test_nvfp4_jit_region(self): self._case('nvfp4','dynamic','jit_row_region')
     def test_nvfp4_delayed(self): self._case('nvfp4','dynamic','delayed')
 
