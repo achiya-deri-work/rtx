@@ -9,6 +9,7 @@ import argparse
 import copy
 import gc
 import json
+import time
 from pathlib import Path
 
 import torch
@@ -56,19 +57,25 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=12)
     parser.add_argument("--length", type=int, default=128)
+    parser.add_argument("--seed", type=int, default=4810)
+    parser.add_argument("--train-paragraphs", type=int, default=16)
+    parser.add_argument("--validation-paragraphs", type=int, default=16)
+    parser.add_argument("--validate-every", type=int, default=0)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--modes", nargs="+", choices=TRAIN_MODES, default=list(TRAIN_MODES))
     args = parser.parse_args()
     if args.steps < 1:
         parser.error("steps must be positive")
+    if min(args.length, args.train_paragraphs, args.validation_paragraphs) < 1 or args.validate_every < 0:
+        parser.error("length/paragraph counts must be positive; validate-every must be nonnegative")
     from transformers import AutoModelForMaskedLM, AutoTokenizer, __version__ as hf_version
     from rtx.autotune.dataset import _source_snapshot
     torch.set_num_threads(4)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, revision=REVISION)
     original = AutoModelForMaskedLM.from_pretrained(MODEL_ID, revision=REVISION,
         dtype=torch.bfloat16, attn_implementation="sdpa", reference_compile=False).cuda().eval()
-    train_batches = list(batches(tokenizer, 4810, corpus_texts("train", 16), max_length=args.length))
-    validation_batches = list(batches(tokenizer, 4811, corpus_texts("validation", 16), max_length=args.length))
+    train_batches = list(batches(tokenizer, args.seed, corpus_texts("train", args.train_paragraphs), max_length=args.length))
+    validation_batches = list(batches(tokenizer, args.seed+1, corpus_texts("validation", args.validation_paragraphs), max_length=args.length))
     def device_batch(batch):
         inputs, labels = batch
         return {**{k: v.cuda() for k, v in inputs.items()}, "labels": labels.cuda()}
@@ -80,12 +87,14 @@ def main():
         def emit(row):
             stream.write(json.dumps(row)+"\n"); stream.flush()
         emit(dict(metadata=dict(model=MODEL_ID, revision=REVISION, corpus_revision=CORPUS_REVISION,
-            train_seed=4810, validation_seed=4811, torch=torch.__version__, transformers=hf_version,
+            train_seed=args.seed, validation_seed=args.seed+1, torch=torch.__version__, transformers=hf_version,
+            train_paragraphs=args.train_paragraphs, validation_paragraphs=args.validation_paragraphs,
+            validate_every=args.validate_every, gpu=torch.cuda.get_device_name(),
             source=_source_snapshot(), compiled=args.compile, steps=args.steps, length=args.length,
             optimizer="AdamW", learning_rate=1e-5, weight_decay=.01,
             scope="short lifecycle/trajectory qualification, not convergence")))
         for mode in dict.fromkeys(["bf16", *args.modes]):
-            torch.manual_seed(4812)
+            torch.manual_seed(args.seed+2)
             model = convert(copy.deepcopy(original), mode)
             objective = MaskedLoss(model)
             if args.compile:
@@ -107,7 +116,10 @@ def main():
                 return total/count
             before = validation()
             losses = []
+            elapsed = []
             for step in range(args.steps):
+                torch.cuda.synchronize()
+                started = time.perf_counter()
                 optimizer.zero_grad(set_to_none=True)
                 batch = train_batches[step % len(train_batches)]
                 loss = objective(**batch)
@@ -132,9 +144,15 @@ def main():
                         if state[key].dtype != torch.bfloat16 or not bool(state[key].isfinite().all()):
                             raise AssertionError("invalid BF16 optimizer state")
                 losses.append(float(loss.detach()))
-                emit(dict(mode=mode, step=step, loss=losses[-1]))
+                torch.cuda.synchronize()
+                elapsed.append(time.perf_counter()-started)
+                emit(dict(mode=mode, step=step, loss=losses[-1], diagnostic_step_seconds=elapsed[-1]))
                 print(f"{mode} step={step} loss={losses[-1]:.5f}", flush=True)
-            emit(dict(mode=mode, validation_before=before, validation_after=validation(), losses=losses))
+                if args.validate_every and (step+1) % args.validate_every == 0:
+                    emit(dict(mode=mode, validation_step=step+1, validation_nll=validation()))
+            emit(dict(mode=mode, validation_before=before, validation_after=validation(), losses=losses,
+                diagnostic_training_seconds=sum(elapsed),
+                timing_scope="includes compile, gradient/state checks and synchronization; not throughput"))
             del optimizer, objective, model
             gc.collect()
 
