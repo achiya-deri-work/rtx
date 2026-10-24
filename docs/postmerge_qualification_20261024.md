@@ -22,14 +22,61 @@ The GLU integration was published at `24d13e6`; qualification fixes are on `main
   previously GPU-qualified `6886304` wheel. Source archives exclude generated
   datasets, checkpoints, logs and environments.
 
-**Qualification remains incomplete:** the 5060 full suite was not green.
-Normal-budget cache persistence and isolated concurrent refinement subsequently
-passed, but the singleton host-timing test still rejects all three windows.
-Numerics are exact in that test; the measurement ranges violate its unchanged
-stationarity gate. Longer measurement windows, process-only GC/CPU-affinity
-experiments and a two-second GPU warm-up did not establish a reliable remedy.
-No noisy winner is installed. The 5070 laptop is unavailable by user confirmation
-and its partial results do not qualify it. No 1.0 tag or package upload was made.
+**Qualification remains incomplete.** Both laptops became available again;
+the resumed results below supersede their earlier availability status. No
+1.0 tag or package upload was made. Noisy measurements must not become durable
+winners merely to make a cache test pass.
+
+### Resumed laptop checks and focused follow-up
+
+- The resumed 5060 Torch 2.12.1 suite passed 1,736 tests and 1,057 subtests,
+  with two failures, 14 skips and 22 DINO deselections. Production (49/49),
+  prospective Ettin inference and 12-step training passed. The singleton timing
+  check passed in this full run but failed in isolated repetitions: this is
+  intermittent, not fixed. Failures were interrupted-tuning winner persistence
+  under rejected timings and a ragged GLU live-allocation increase of 22,016
+  bytes on the fourth sample. The latter remains unlocalized.
+- The resumed 5070 Torch 2.13 suite finished with five failures: block and
+  JIT-region packed winner persistence, progressive inference and training
+  cross-process reuse, and singleton timing eligibility. These are not reported
+  numerical mismatches. Its run began on battery and continued after the user
+  plugged it in; timing results are not controlled plugged-in performance
+  evidence. Its production matrix passed 49/49; model checks are separate gates.
+- The 5070 prospective Ettin check passed all ten prespecified policy gates
+  over 2,898 masked tokens. MXFP8 dynamic/PTQ had NLL increase 0.00522 and
+  mean hidden cosine 0.99234; MXFP8 MLP had 0.00664 and 0.99207. NVFP4
+  policies had NLL increases 0.29210–0.32481 and mean cosines
+  0.91315–0.93414. Passing the broader NVFP4 gates is not BF16-equivalent
+  quality; Four Over Six was the best NVFP4 policy on this particular check.
+- Test-only commits `ad8636a` and `b7d2e75` distinguish rejected noisy timings
+  from valid durable winners for interrupted and packed refinement. They retain
+  numerical/budget checks and explicitly test forced-noise non-persistence.
+  Both supported local Torch stacks passed the focused checks. These changes
+  do **not** establish reliable laptop first-hit winner availability, nor fix
+  the separate progressive cross-process failures.
+- Allocation tracing on both local 5090 stacks passed all 16 additional
+  ragged deployment repetitions after 379 preceding linear/MLP tests per
+  stack. This does not reproduce or explain the 5060's allocation increase;
+  snapshot instrumentation can perturb execution.
+- Four focused 5060 deployment repetitions also passed with allocation
+  snapshots enabled (`rtx-5060-deployment-focused.jsonl`). The full-suite
+  allocation observation remains unresolved, rather than being reclassified
+  as repaired on the strength of non-reproduction.
+- A short 5060 Torch 2.12.1 diagnostic compared identical 128x128x128 MXFP8
+  work with host submission versus a graph containing 128 calls. Outputs
+  matched exactly, with BF16-reference NRMS 0.03773. Host per-window medians
+  ranged from 23.46 to 75.73 us/call; graph medians ranged from 3.443 to
+  3.602 us/call. Only 0/12 host and 4/12 graph windows passed the unchanged
+  stationarity gate. This implicates submission overhead/variability, but
+  does not establish a reliable measurement remedy or justify silently
+  substituting graph timings for host-deployment timings.
+
+Redundant full-suite reruns and queued chains were stopped at the user's
+request. Follow-up is restricted to the observed failures; already completed
+release evidence is retained. The 5060 Torch 2.13 rerun was cancelled, not
+qualified. Artifacts: `resumed_5060_212/`, `resumed_5070_213/`,
+`rtx-5060-jitter-focused.json`, and `deployment_broad_trace_{212,213}.jsonl`
+under the report root below.
 
 Final evidence is under `autotune_reports/postmerge_20261024/`, including
 `final_a4930e8_213`, `final_6886304_212`, `production_a4930e8_{212,213}.json`,
