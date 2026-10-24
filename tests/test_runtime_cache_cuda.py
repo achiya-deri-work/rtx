@@ -155,6 +155,45 @@ print('PASS',phase,budget)
     "requires RTX Blackwell CUDA",
 )
 class RuntimeCacheCudaTests(unittest.TestCase):
+    def test_mxfp8_packed_and_fused_runtime_noise_fallback(self):
+        from unittest.mock import patch
+        import rtx
+        import rtx.fp8 as fp8
+        from rtx.autotune.evaluators import CalibratedPrequantEvaluator
+        policy=rtx.AutotunePolicy(max_trials=1,max_seconds=60,
+            search_schedule='progressive',confirmation_repeats=0,finalist_rounds=0,
+            warmup=1,samples=3,calls_per_sample=2)
+        original=CalibratedPrequantEvaluator.__call__
+        def noisy(evaluator,config,*,validate_only=False):
+            outcome=original(evaluator,config,validate_only=validate_only)
+            if not validate_only:
+                outcome.metadata['sampling']={'collection':{'stationary':False}}
+            return outcome
+        torch.manual_seed(8022)
+        x=torch.randn(128,128,device='cuda',dtype=torch.bfloat16)*.1
+        w=torch.randn_like(x)*.1
+        with torch.inference_mode():
+            qx,qw=rtx.quantize_mxfp8(x),rtx.quantize_mxfp8(w)
+            for name,a,b,backend in [('weight',x,qw,'materialized'),
+                                      ('packed',qx,qw,'materialized'),('fused',x,w,'fused')]:
+                with self.subTest(name=name), tempfile.TemporaryDirectory() as root, \
+                     patch.object(CalibratedPrequantEvaluator,'__call__',noisy), \
+                     patch('rtx.autotune.legacy.runtime_timing_metadata',return_value={
+                         'sampling':{'collection':{'stationary':False}}}):
+                    with self.assertWarnsRegex(RuntimeWarning,'without installing'):
+                        out=rtx.mxfp8_linear(a,b,backend=backend,autotune='balanced',
+                            tuning_policy=policy,autotune_cache_dir=root)
+                    expected=(x.float()@w.float().T).bfloat16()
+                    self.assertTrue(out.isfinite().all())
+                    self.assertLess(float((out.float()-expected.float()).norm()/expected.float().norm()),.07)
+                    self.assertFalse(list((Path(root)/'runtime_winners').rglob('*.json')))
+                    if name!='fused':
+                        fp8._PACKED_INFERENCE_SELECTIONS.clear()
+                        with self.assertWarnsRegex(RuntimeWarning,'without installing'):
+                            again=rtx.mxfp8_linear(a,b,backend=backend,autotune='balanced',
+                                tuning_policy=policy,autotune_cache_dir=root)
+                        torch.testing.assert_close(out,again,rtol=0,atol=0)
+
     def test_exhausted_noisy_nvfp4_history_uses_unmeasured_checked_seed(self):
         from unittest.mock import patch
         import rtx

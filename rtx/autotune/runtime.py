@@ -72,7 +72,7 @@ def checked_seed_validator(adapter, evaluator, store):
 
 
 def run_runtime_config_tuner(tuner, *args, **kwargs):
-    """Equivalent fallback for NVFP4 tuners returning a configuration directly.
+    """Fallback for packed MXFP8/NVFP4 tuners returning configurations directly.
 
     Their persistence happens after successful orchestration. On this exception
     that code was never reached; only the checked seed enters the process cache.

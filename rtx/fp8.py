@@ -1891,7 +1891,8 @@ def _resolve_packed_inference_config(
                     ),
                 )
                 if selected is None:
-                    selected = tune_mxfp8_inference_state(
+                    from .autotune.runtime import run_runtime_config_tuner
+                    selected = run_runtime_config_tuner(tune_mxfp8_inference_state,
                         problem,
                         state="weight_prequantized",
                         weight_layout=weight_layout,
@@ -1958,7 +1959,8 @@ def _resolve_packed_inference_config(
                 ),
             )
             if selected is None:
-                selected = tune_mxfp8_inference_state(
+                from .autotune.runtime import run_runtime_config_tuner
+                selected = run_runtime_config_tuner(tune_mxfp8_inference_state,
                     problem,
                     state="fully_prequantized",
                     activation_layout=x_layout,
@@ -2411,7 +2413,8 @@ def _resolve_fwd_config(
                 ),
                 max_passes=int(os.getenv("RTX_MXFP8_AUTOTUNE_PASSES", "4")),
             )
-        result = tune_mxfp8_fwd(x, weight, policy=policy, cache_dir=cache_dir)
+        from .autotune.runtime import run_runtime_tuner
+        result = run_runtime_tuner(tune_mxfp8_fwd,x,weight,policy=policy,cache_dir=cache_dir)
         serialized = fwd_config_to_dict(result.config)
         save_runtime_winner(
             winner_key,

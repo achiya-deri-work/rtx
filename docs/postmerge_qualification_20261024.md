@@ -184,3 +184,19 @@ validation mechanism now covers that tuner using its normal harness probe;
 it does not claim application-data validation. A deterministic noisy-history
 GPU regression passes both local stacks and verifies zero extra timing trials,
 unchanged observation journals and no persistent winner.
+
+The remaining-runtime sweep at `a6abc2f` passed 14/17 tests on Torch 2.13 and
+15/17 on Torch 2.12.1 on the 5060. It exposed the analogous missing runtime
+fallback wiring in packed MXFP8 inference; that path and fused MXFP8 forward
+now use the same checked fallback. Forced-noise GPU tests cover packed W,
+packed X/W and fused forward without permitting persistent unmeasured winners.
+The larger progressive training-cache test passed on both laptop stacks in
+this sweep; the short first-hit cache-write test remained timing-inconclusive.
+
+A diagnostic host-timing sweep compared minimum batch windows of 2/8/32 ms,
+3/9 samples and three repetitions for forward and backward at 128x128x128.
+The original timing gates accepted 8/36 windows on the 5060 versus 32/36 on
+the 5090. Longer windows did not consistently improve laptop stability, so an
+experimental automatic long-window retry was discarded, not shipped. These
+small studies describe measurement reliability, not kernel speedup or SKU-wide
+performance. The original timing thresholds and measurement mode remain intact.

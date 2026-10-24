@@ -319,9 +319,16 @@ def tune_mxfp8_inference_state(
         / fingerprint.identifier
         / f"m{problem.m}_n{problem.n}_k{problem.k}_{variant}"
     )
-    result = make_hybrid_autotuner(
-        adapter, store, hybrid, progress=progress,started_at=tuning_started
-    ).tune()
+    from .autotune.orchestrator import NoEligibleTimingError
+    try:
+        result = make_hybrid_autotuner(
+            adapter, store, hybrid, progress=progress,started_at=tuning_started
+        ).tune()
+    except NoEligibleTimingError as exc:
+        if exc.fallback_config is None:
+            from .autotune.runtime import checked_seed_validator
+            exc.fallback_validation=checked_seed_validator(adapter,evaluator,store)
+        raise
     key = runtime_winner_key(
         adapter.context.family,
         problem,
