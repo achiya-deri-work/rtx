@@ -3,6 +3,8 @@
 # bash benchmarks/run_postmerge_validation.sh PYTHON OUTPUT SEED
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-4}"
 runtime_python="${1:-.venv/bin/python}"
 report_dir="${2:?provide a fresh output directory}"
 study_seed="${3:-4810}"

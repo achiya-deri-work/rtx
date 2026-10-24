@@ -5,6 +5,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # Qualify this checkout even when the interpreter belongs to another environment.
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+# Bound independent compiler processes on laptop/WSL hosts; callers may override.
+export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-4}"
 runtime_python="${1:-.venv/bin/python}"
 report_dir="${2:-autotune_reports/release_$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$report_dir"
