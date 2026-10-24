@@ -49,6 +49,13 @@ failures are retained; run `python -m pytest -q -m dinov3_research` to reproduce
 them with separately obtained assets. DINO format/oracle unit tests remain in
 the default suite. A green core/Ettin run is not a claim that DINO passes.
 
+By the release-policy decision on 2026-10-25, default pytest also excludes
+`timing_environment`: the strict singleton host-clock diagnostic is not a
+release gate on noisy laptop/WSL systems. Run it explicitly with
+`python -m pytest -q -m timing_environment`. Its timing thresholds remain
+unchanged. Forced-noise fallback safety, correctness, and persistent cache
+reuse remain in the default qualification suite.
+
 The matrix must cover eager and `torch.compile(fullgraph=True, dynamic=False)`,
 dynamic training, dynamic-X/prequantized-W and fully packed inference, ragged
 M/N/K, dX-only, dW-only, combined backward, long-sequence dW accumulation,
@@ -74,7 +81,11 @@ rtx-autotune verify-winners \
 
 Only audited, remeasured schema-v2 winners whose kernel revision matches the
 release may be installed. Verify an online cache miss, persistent cache write,
-same-shape hit, cross-process load, and safe fallback after compilation error.
+same-shape hit, cross-process load, and the correctness-checked process-local
+fallback when no candidate has eligible timing evidence. No unmeasured
+fallback may be installed as a persistent winner. Candidate compilation
+failures may be rejected during search; compilation or numerical failure
+alone never authorizes execution of an unchecked fallback.
 
 ## Numerical and performance evidence
 

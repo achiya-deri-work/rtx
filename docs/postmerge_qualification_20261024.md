@@ -163,6 +163,12 @@ the earlier full-suite observation remains unlocalized. Artifacts are
 `diagnose_ragged_retention.py`, `ragged_retention_5090_{212,213}.jsonl` and
 `rtx-ragged-retention-5060.jsonl`.
 
+The 5060 then passed the complete 30-test deployment-mode file in its original
+order, followed by four additional ragged selected-direct training repetitions
+with allocation tracing. This tests interference from preceding deployment
+modes without repeating the full library suite. The original allocation
+increase was not reproduced (`rtx-5060-deployment-order.{log,jsonl}`).
+
 ### Completed 5070 first-hit study
 
 All 12 compiled training checks passed: three shapes at cumulative budgets
