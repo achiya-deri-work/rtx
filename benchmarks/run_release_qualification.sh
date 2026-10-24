@@ -22,7 +22,8 @@ git rev-parse HEAD > "$report_dir/commit.txt"
 git diff --stat > "$report_dir/worktree.txt"
 echo "START tests: $report_dir/tests.log"
 test_status=0
-timeout 3600s "$runtime_python" -m pytest -q --junitxml="$report_dir/tests.xml" \
+RTX_QUALIFICATION_EVENTS="$report_dir/test-events.jsonl" \
+timeout 3600s "$runtime_python" -m pytest -q -p tools.qualification_events --junitxml="$report_dir/tests.xml" \
     > "$report_dir/tests.log" 2>&1 || test_status=$?
 # A separate process prevents a failed CUDA context contaminating this matrix.
 echo "START production matrix (tests exit=$test_status): $report_dir/production.log"
