@@ -1102,7 +1102,7 @@ class MXFP8BwdEvaluator:
                 self._reference = (dx.clone(), dw.clone())
         return self._reference
 
-    def __call__(self, config: MXFP8BwdConfig) -> TrialOutcome:
+    def __call__(self, config: MXFP8BwdConfig, *, validate_only: bool = False) -> TrialOutcome:
         start_compile = time.monotonic()
         try:
             runner = _build_bwd_runner(self.problem, config, self.x.device)
@@ -1149,6 +1149,9 @@ class MXFP8BwdEvaluator:
                         max_abs_error=max_error,
                         error="candidate dX/dW differ from the backward reference",
                     )
+            if validate_only:
+                return TrialOutcome('ok',compile_ms=compile_ms,max_abs_error=max_error,
+                                    metadata={'validation_only':True})
             for _ in range(self.policy.warmup):
                 runner(self.grad_output, self.x, self.weight, dx, dw)
             torch.cuda.synchronize(self.x.device)

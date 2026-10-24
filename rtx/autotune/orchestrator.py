@@ -40,9 +40,10 @@ class NoEligibleTimingError(RuntimeError):
     without promoting the unstable observations to a persistent winner.
     """
 
-    def __init__(self, fallback_config=None):
+    def __init__(self, fallback_config=None, *, fallback_validation=None):
         super().__init__("autotuning produced no successful configurations with eligible timings")
         self.fallback_config = fallback_config
+        self.fallback_validation = fallback_validation
 
 
 @dataclass(frozen=True, slots=True)

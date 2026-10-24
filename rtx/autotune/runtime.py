@@ -29,6 +29,8 @@ def run_runtime_tuner(tuner, *args, **kwargs):
     try:
         return tuner(*args, **kwargs)
     except NoEligibleTimingError as exc:
+        if exc.fallback_config is None and exc.fallback_validation is not None:
+            exc.fallback_config = exc.fallback_validation()
         if exc.fallback_config is None:
             raise
         warnings.warn("RTX timing samples were unstable; using the correctness-checked "
@@ -36,6 +38,36 @@ def run_runtime_tuner(tuner, *args, **kwargs):
                       RuntimeWarning, stacklevel=2)
         return SimpleNamespace(config=exc.fallback_config, median_ms=None,
                                tuning_evidence={"timing_fallback": True})
+
+
+def checked_seed_validator(adapter, evaluator, store):
+    """Lazy current-input validation after noisy history exhausts search.
+
+    This records a separate correctness-only session, never a timing trial or
+    winner. Offline callers do not invoke it. Historical correctness alone is
+    insufficient because the current operands may have a different range.
+    """
+    def validate():
+        import math
+        from .outcomes import raise_if_fatal_device_context_error
+        config=adapter.initial_config
+        rejection=adapter.rejection(config)
+        if rejection is not None:
+            raise RuntimeError(f"runtime fallback rejected: {rejection}")
+        session=store.start_session(adapter.context,{
+            "purpose":"runtime_fallback_validation", "search_trials":0})
+        outcome=evaluator(config,validate_only=True)
+        checked=(outcome.status == 'ok' and outcome.max_abs_error is not None
+                 and math.isfinite(outcome.max_abs_error))
+        store.record_event(session,'runtime_fallback_validation',{
+            'config_id':adapter.config_id(config),'outcome':outcome.as_dict(),
+            'checked':checked})
+        store.finish_session(session,{'status':'validated' if checked else 'failed'})
+        raise_if_fatal_device_context_error(outcome.error)
+        if not checked:
+            raise RuntimeError(f"runtime fallback validation failed: {outcome.status}: {outcome.error}")
+        return config
+    return validate
 
 
 def run_runtime_config_tuner(tuner, *args, **kwargs):

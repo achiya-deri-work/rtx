@@ -681,7 +681,7 @@ class MXFP8PrequantEvaluator:
             self._expected = out.clone()
         return self._expected
 
-    def __call__(self, config: MXFP8PrequantConfig) -> TrialOutcome:
+    def __call__(self, config: MXFP8PrequantConfig, *, validate_only: bool = False) -> TrialOutcome:
         previous_l2: int | None = None
         if config.l2_fetch_granularity is not None:
             previous_l2 = _set_l2_fetch_granularity(config.l2_fetch_granularity)
@@ -727,6 +727,9 @@ class MXFP8PrequantEvaluator:
                         max_abs_error=max_abs_error,
                         error="candidate differs from the reference prequant pipeline",
                     )
+            if validate_only:
+                return TrialOutcome('ok',compile_ms=compile_ms,max_abs_error=max_abs_error,
+                                    metadata={'validation_only':True})
             for _ in range(self.policy.warmup):
                 runner(self.x, self.weight, out)
             torch.cuda.synchronize(self.x.device)

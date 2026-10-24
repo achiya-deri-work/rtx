@@ -6,6 +6,13 @@ from benchmarks.diagnose_mxfp8_rounding import round_fp64_to_bf16
 
 
 class RoundingDiagnosticTests(unittest.TestCase):
+    def test_captured_5060_reference_midpoint(self):
+        # Exact dyadic dot product from the 257x385x256 seed-321 capture.
+        value=torch.tensor([4538369 / 8388608],dtype=torch.float64)
+        self.assertEqual(round_fp64_to_bf16(value).item(),.54296875)
+        fp32_reference=torch.tensor([.541015625],dtype=torch.float32)
+        self.assertEqual(fp32_reference.bfloat16().item(),.5390625)
+
     def test_midpoint_neighbors_do_not_double_round(self):
         midpoint = 1.0 + 2**-8
         values = torch.tensor([midpoint - 2**-30, midpoint, midpoint + 2**-30],

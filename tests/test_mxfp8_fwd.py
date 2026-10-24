@@ -37,13 +37,20 @@ def _reference_to_mx(
     )
 
 
-def _reference_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def _reference_linear(x: torch.Tensor, weight: torch.Tensor, *, exact_rounding: bool = False) -> torch.Tensor:
     k = x.shape[-1]
     flat_x = x.reshape(-1, k)
     qx, sx = _reference_to_mx(flat_x)
     qw, sw = _reference_to_mx(weight)
     dx = qx.float() * sx.float().repeat_interleave(32, dim=-1)
     dw = qw.float() * sw.float().repeat_interleave(32, dim=-1)
+    if exact_rounding:
+        # FP32 cuBLAS accumulation can land on a BF16 midpoint even when the
+        # exact sum is just above it. Do not reject a more accurate TC result.
+        # Direct nearest-even rounding avoids an FP64 -> FP32 -> BF16 tie.
+        from benchmarks.diagnose_mxfp8_rounding import round_fp64_to_bf16
+        total = dx.double() @ dw.double().T
+        return round_fp64_to_bf16(total).reshape(*x.shape[:-1], weight.shape[0])
     return (dx @ dw.T).bfloat16().reshape(*x.shape[:-1], weight.shape[0])
 
 
@@ -499,7 +506,7 @@ class MXFP8CudaTests(unittest.TestCase):
         weight = (
             torch.randn(problem.n, problem.k, device="cuda") * 0.5
         ).bfloat16()
-        expected = _reference_linear(x, weight)
+        expected = _reference_linear(x, weight, exact_rounding=True)
         for config in variants:
             with self.subTest(config=config):
                 out = torch.empty_like(expected)

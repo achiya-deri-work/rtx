@@ -16,6 +16,36 @@ from rtx.autotune.first_hit_study import study_tasks,grouped_key
 
 
 class FirstHitTests(unittest.TestCase):
+    def test_exhausted_noisy_history_revalidates_seed_only_at_runtime(self):
+        from rtx.autotune.runtime import checked_seed_validator,run_runtime_tuner
+        from rtx.autotune.orchestrator import NoEligibleTimingError
+        from rtx.autotune.outcomes import TrialOutcome
+        a=adapter();store=InMemoryTuningStore();calls=[]
+        def evaluate(config,*,validate_only):
+            self.assertTrue(validate_only)
+            calls.append(config)
+            return TrialOutcome('ok',max_abs_error=0.,metadata={'validation_only':True})
+        def tune():
+            raise NoEligibleTimingError(fallback_validation=checked_seed_validator(a,evaluate,store))
+        with self.assertRaises(NoEligibleTimingError):tune()
+        self.assertEqual(calls,[])
+        with self.assertWarnsRegex(RuntimeWarning,'without installing'):
+            result=run_runtime_tuner(tune)
+        self.assertEqual(calls,[a.initial_config])
+        self.assertEqual(result.config,a.initial_config)
+        self.assertIsNone(result.median_ms)
+        self.assertEqual(list(store.records()),[])
+
+    def test_fallback_revalidation_rejects_unchecked_or_bad_results(self):
+        from rtx.autotune.runtime import checked_seed_validator
+        from rtx.autotune.outcomes import TrialOutcome
+        for outcome in (TrialOutcome('ok'),TrialOutcome('ok',max_abs_error=float('nan')),
+                        TrialOutcome('correctness_error',max_abs_error=0.,error='bad')):
+            a=adapter();store=InMemoryTuningStore()
+            with self.assertRaisesRegex(RuntimeError,'validation failed'):
+                checked_seed_validator(a,lambda *args,**kwargs:outcome,store)()
+            self.assertEqual(list(store.records()),[])
+
     def test_configuration_returning_runtime_tuner_checked_fallback(self):
         from rtx.autotune.runtime import run_runtime_config_tuner
         from rtx.autotune.orchestrator import NoEligibleTimingError

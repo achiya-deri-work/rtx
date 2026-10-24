@@ -861,7 +861,7 @@ class MXFP8ForwardEvaluator:
                 self._expected = expected.clone()
         return self._expected
 
-    def __call__(self, config: MXFP8FwdConfig) -> TrialOutcome:
+    def __call__(self, config: MXFP8FwdConfig, *, validate_only: bool = False) -> TrialOutcome:
         compile_start = time.monotonic()
         try:
             launcher = compile_mxfp8_fwd(self.problem, config)
@@ -906,6 +906,11 @@ class MXFP8ForwardEvaluator:
                     error="candidate output differs from the configured reference",
                 )
 
+        if validate_only:
+            if not bool(out.isfinite().all()):
+                return TrialOutcome('correctness_error',error='nonfinite forward output')
+            return TrialOutcome('ok',compile_ms=compile_ms,max_abs_error=max_abs_error,
+                                metadata={'validation_only':True})
         try:
             for _ in range(self.policy.warmup):
                 launcher(self.x, self.weight, out)

@@ -377,7 +377,14 @@ def tune_legacy_effort(kind,x,weight,*,policy,initial,axes,cache_dir,progress,gr
     root = effort_residual_root(root, policy)
     store=ResidualTuningStore(root)
     reused=len(list(store.records(adapter.context)))
-    result=make_effort_autotuner(adapter,store,policy,progress=progress,started_at=started_at).tune()
+    from .orchestrator import NoEligibleTimingError
+    try:
+        result=make_effort_autotuner(adapter,store,policy,progress=progress,started_at=started_at).tune()
+    except NoEligibleTimingError as exc:
+        if exc.fallback_config is None:
+            from .runtime import checked_seed_validator
+            exc.fallback_validation=checked_seed_validator(adapter,evaluator,store)
+        raise
     return result_type(config=result.config,median_ms=result.median_ms,database_path=root,
         session_id=result.session_id,evaluated_trials=result.evaluated_trials,reused_trials=reused,elapsed_s=result.elapsed_s,
         tuning_evidence=result.tuning_evidence)

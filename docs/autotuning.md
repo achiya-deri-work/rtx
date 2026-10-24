@@ -139,6 +139,10 @@ candidate but its initial schedule passed numerical checks, execution may use th
 warning for the current process. No persistent winner is written. Explicit
 offline tuning still fails without eligible timing evidence, and numerical or
 compilation failures never authorize this fallback.
+For MXFP8 tuning resumed from an exhausted, noisy history, a runtime caller
+revalidates the initial schedule on the current operands before using it.
+This is a separately recorded correctness-only session: it collects no timing
+samples, adds no search trials, and does not create a persistent winner.
 
 ## Experimental MXFP8 preparation selection
 

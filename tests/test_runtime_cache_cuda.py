@@ -155,6 +155,39 @@ print('PASS',phase,budget)
     "requires RTX Blackwell CUDA",
 )
 class RuntimeCacheCudaTests(unittest.TestCase):
+    def test_exhausted_noisy_backward_history_revalidates_current_inputs(self):
+        from unittest.mock import patch
+        import rtx
+        import rtx.bwd_autotune as bwd
+        from rtx.autotune.runtime import run_runtime_tuner
+        policy=rtx.AutotunePolicy(max_trials=1,max_seconds=60,
+            search_schedule='progressive',confirmation_repeats=0,finalist_rounds=0,
+            warmup=1,samples=3,calls_per_sample=2)
+        torch.manual_seed(7721)
+        x=torch.randn(128,128,device='cuda',dtype=torch.bfloat16)*.1
+        w=torch.randn(128,128,device='cuda',dtype=torch.bfloat16)*.1
+        dy=torch.randn(128,128,device='cuda',dtype=torch.bfloat16)*.1
+        noisy={'sampling':{'collection':{'stationary':False}}}
+        with tempfile.TemporaryDirectory() as root, patch.object(
+                bwd,'runtime_timing_metadata',return_value=noisy) as timing:
+            def run():
+                return run_runtime_tuner(bwd.tune_mxfp8_backward,dy,x,w,
+                    policy=policy,cache_dir=root,progress=None)
+            with self.assertWarnsRegex(RuntimeWarning,'without installing'):
+                first=run()
+            records={str(p):p.read_bytes() for p in Path(root).rglob('observations.jsonl')}
+            self.assertEqual(timing.call_count,1)
+            x.mul_(2)
+            with self.assertWarnsRegex(RuntimeWarning,'without installing'):
+                second=run()
+            self.assertEqual(first.config,second.config)
+            self.assertIsNone(second.median_ms)
+            self.assertEqual(timing.call_count,1,'fallback collected extra timing trials')
+            self.assertEqual(records,{str(p):p.read_bytes() for p in Path(root).rglob('observations.jsonl')})
+            x.fill_(float('nan'))
+            with self.assertRaisesRegex(RuntimeError,'fallback validation failed'):
+                run()
+
     def test_progressive_training_refinement_in_fresh_processes(self):
         with tempfile.TemporaryDirectory(prefix='rtx-progressive-training-process-') as root:
             phases=[(phase,budget) for budget in (8,16,32,64) for phase in ('write','read')]

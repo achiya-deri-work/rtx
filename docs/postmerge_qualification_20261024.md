@@ -151,3 +151,28 @@ Subsequent qualification runs record failures immediately in
 pytest plugin refuses existing output files and fsyncs failure/final records.
 Its passing/failing-probe and overwrite-protection tests pass on both stacks.
 This does not change any numerical or runtime gate.
+
+## Follow-up failure localization
+
+The 5060 portability retests pass on both Torch stacks: 19 tests and 251
+documentation subtests each, including the allocator observer and both
+replacement-benchmark execution modes.
+
+The MXFP8 discrepancy was a reference error, not a kernel error. At `[91,187]`
+the exact quantized dot product is `4538369/8388608 = 0.5410157442092896`.
+All five diagnostic schedules return the correctly rounded BF16 `0.54296875`;
+the FP32 GEMM reference instead lands on `0.541015625`, a midpoint rounding to
+`0.5390625`. Captured inputs, exact rational sums and cross-reference metrics
+are retained in `rounding_5060_fd2360a`. The strict schedule test now uses FP64
+accumulation and explicit nearest-even BF16 rounding without an intermediate
+FP32 conversion. Its zero-tolerance assertion is unchanged. All 34 schedules
+pass on the 5060 and 5090 on both supported Torch stacks.
+
+A separate runtime bug arises when a resumed history exhausts its budget with
+no stable timings: no seed has been checked on the current invocation. The
+runtime now offers lazy, current-input correctness-only seed validation, with
+a separate journal session and no extra timing trials or installed winner.
+Offline tuning remains strict. GPU regressions pass on both local stacks,
+including changed finite operands, unchanged trial journals, and rejection of
+NaN operands. Both local 49-case production matrices also pass after this fix.
+The laptop's affected runtime cases still require retesting.
