@@ -115,8 +115,49 @@ numerical policies are unchanged. Focused CPU validation passed 28 tests and
 14 subtests, including noisy initial candidates, a single eligible candidate,
 all-noisy rejection and revision-2 cache invalidation. The compiled real-GPU
 progressive inference/cross-process reuse test passed on both local 5090 Torch
-stacks (`promotion_v3_{212,213}.xml`). The ongoing 5070 first-hit study uses its
+stacks (`promotion_v3_{212,213}.xml`). The 5070 first-hit study below uses its
 unchanged revision-2 checkout and must not be presented as revision-3 coverage.
+
+The same focused inference/refinement test subsequently passed on the 5060
+Torch 2.12.1 stack (one test, five subtests, 55.70 seconds;
+`rtx-promotion-v3-5060.xml`). The three new regression cases were also run
+against the previous implementation: all three failed there and pass with
+the correction.
+
+### Completed 5070 first-hit study
+
+All 12 compiled training checks passed: three shapes at cumulative budgets
+8/16/32, then a fresh-process 32-trial cache read for each shape. Every run
+used one Dynamo compilation; all three read-only runs made zero tuner calls
+and left observation journals unchanged. The maximum output/gradient NRMS
+was 0.000252 against the independent FP32 oracle **with explicit MXFP8
+rounding**, not against an unquantized BF16 model.
+
+| M,K,H,O | 8-trial first-forward wall seconds | Fresh-process cached first-forward seconds | Paired deployment decision |
+|---|---:|---:|---|
+| 256,256,512,256 | 19.81 | 2.14 | Retain incumbent; no qualified improvement through 32 trials |
+| 2048,768,1536,768 | 27.84 | 2.53 | 2.095x incumbent/challenger median-time ratio at eight trials |
+| 511,384,576,384 | 17.04 | 1.91 | 1.148x incumbent/challenger median-time ratio at 16 trials |
+
+The two promotions passed six balanced deployment rounds and the existing
+1% aggregate/lower-quartile margin rule. These comparisons are against the
+current RTX incumbent, not BF16 or an exhaustive optimum. Cold wall time
+includes compilation/tuning and is not steady-state kernel latency. The
+larger-budget runs resume history; their cold times are not independent
+from-scratch effort comparisons. Artifacts are under
+`resumed-first-hit-1CBf5jSc/`. This study used the unchanged laptop checkout;
+it does not qualify promotion revision 3 on that laptop.
+
+### Package refresh after the promotion fix
+
+The `e7bac04` wheel and source archive rebuild successfully and pass twine
+checks. All 123 packaged runtime Python sources match the checkout exactly,
+including promotion revision 3; the wheel has 136 members and the source
+archive 605 files. Archive inspection excludes environments, generated
+datasets/reports, Git metadata and the optional DINO checkout. Artifacts are
+`dist-e7bac04/` and `build-e7bac04.log`. This is a package refresh, not a new
+claim of a clean dependency installation; those earlier checks remain listed
+separately.
 
 The following supersedes the earlier campaign status recorded below. It is
 not a claim that every release gate is closed.
