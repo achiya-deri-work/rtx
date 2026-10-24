@@ -22,7 +22,16 @@ The GLU integration was published at `24d13e6`; qualification fixes are on `main
   previously GPU-qualified `6886304` wheel. Source archives exclude generated
   datasets, checkpoints, logs and environments.
 
-**Qualification remains incomplete.** Both laptops became available again;
+**Release-policy update, 2026-10-25:** the user approved documenting and
+qualifying the correctness-checked runtime fallback. Reliable singleton
+host timing on WSL is therefore no longer a release gate. Its strict test
+remains available through `-m timing_environment`; no timing thresholds or
+past results were changed. Forced-noise GPU safety tests remain in default
+qualification and passed on both 5060 Torch stacks. The fallback implementation
+is unchanged since those recorded runs. This approval does not resolve the
+separate, unreproduced 22,016-byte allocation observation below.
+
+**Qualification has the limitations recorded below.** Both laptops became available again;
 the resumed results below supersede their earlier availability status. No
 1.0 tag or package upload was made. Noisy measurements must not become durable
 winners merely to make a cache test pass.

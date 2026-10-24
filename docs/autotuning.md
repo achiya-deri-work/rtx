@@ -139,6 +139,23 @@ candidate but its initial schedule passed numerical checks, execution may use th
 warning for the current process. No persistent winner is written. Explicit
 offline tuning still fails without eligible timing evidence, and numerical or
 compilation failures never authorize this fallback.
+This is supported runtime behavior, including on noisy WSL/laptop systems;
+it is not a claim of optimal performance or a reusable measured winner. A
+fresh process may need to tune or revalidate again. Do not delete the raw
+observations or disable correctness checks to suppress the warning.
+
+The strict singleton host-clock diagnostic is opt-in, rather than a release
+gate. Run it explicitly with:
+
+```bash
+python -m pytest -q tests/test_runtime_coordinates.py -m timing_environment
+```
+
+Default qualification still includes forced-noise fallback safety, numerical
+validation, and persistent cache-reuse tests. Offline tuning continues to
+raise `NoEligibleTimingError` when it cannot obtain eligible measurements;
+this diagnostic's acceptance thresholds have not been loosened.
+
 For MXFP8 tuning resumed from an exhausted, noisy history, a runtime caller
 revalidates the initial schedule on the current operands before using it.
 This is a separately recorded correctness-only session: it collects no timing

@@ -62,5 +62,8 @@ rtx = ["py.typed", "autotune/artifacts/**/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not dinov3_research'"
-markers = ["dinov3_research: optional historical DINO model-quality study; run explicitly with -m dinov3_research"]
+addopts = "-m 'not dinov3_research and not timing_environment'"
+markers = [
+    "dinov3_research: optional historical DINO model-quality study; run explicitly with -m dinov3_research",
+    "timing_environment: opt-in stationary-clock diagnostic, not a runtime correctness release gate; run with -m timing_environment",
+]

@@ -1,5 +1,6 @@
 from dataclasses import replace
 import unittest
+import pytest
 from unittest.mock import patch
 
 from rtx.autotune.runtime_coordinates import process_l2_policy, runtime_schedule_adapter
@@ -128,6 +129,7 @@ class RuntimeCoordinateTests(unittest.TestCase):
             search_schedule='progressive',confirmation_repeats=0)).tune()
         self.assertEqual(len(measured),1)
 
+    @pytest.mark.timing_environment
     def test_singleton_real_cuda_measurement_and_resume(self):
         import tempfile
         import torch
