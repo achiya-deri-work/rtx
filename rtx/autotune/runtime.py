@@ -41,11 +41,12 @@ def run_runtime_tuner(tuner, *args, **kwargs):
 
 
 def checked_seed_validator(adapter, evaluator, store):
-    """Lazy current-input validation after noisy history exhausts search.
+    """Lazy fresh validation after noisy history exhausts search.
 
     This records a separate correctness-only session, never a timing trial or
     winner. Offline callers do not invoke it. Historical correctness alone is
-    insufficient because the current operands may have a different range.
+    insufficient. MXFP8 uses current operands; dimension-only NVFP4 tuning
+    reuses its established synthetic harness oracle, not application inputs.
     """
     def validate():
         import math

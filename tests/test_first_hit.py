@@ -16,6 +16,20 @@ from rtx.autotune.first_hit_study import study_tasks,grouped_key
 
 
 class FirstHitTests(unittest.TestCase):
+    def test_calibrated_validation_does_not_measure_or_consume_trial_seed(self):
+        from types import SimpleNamespace
+        from rtx.autotune.evaluators import CalibratedPrequantEvaluator
+        harness=SimpleNamespace(problem=None,prepare=MagicMock(return_value=
+            SimpleNamespace(compile_ms=1.,max_abs_error=.01)),
+            measure=MagicMock(side_effect=AssertionError('unexpected timing')))
+        evaluator=CalibratedPrequantEvaluator(harness,samples=9)
+        outcome=evaluator(Config(),validate_only=True)
+        self.assertEqual(outcome.status,'ok')
+        self.assertIsNone(outcome.median_ms)
+        self.assertEqual(outcome.max_abs_error,.01)
+        self.assertEqual(evaluator.evaluated,0)
+        harness.measure.assert_not_called()
+
     def test_exhausted_noisy_history_revalidates_seed_only_at_runtime(self):
         from rtx.autotune.runtime import checked_seed_validator,run_runtime_tuner
         from rtx.autotune.orchestrator import NoEligibleTimingError

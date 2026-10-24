@@ -23,7 +23,18 @@ class CalibratedPrequantEvaluator:
         self.components = components
         self.evaluated = 0
 
-    def __call__(self, config) -> TrialOutcome:
+    def __call__(self, config, *, validate_only=False) -> TrialOutcome:
+        if validate_only:
+            from ..prequant_experiments import CandidateCompileError, CandidateCorrectnessError
+            try:
+                prepared=self.harness.prepare(config)
+            except Exception as exc:
+                status=('compile_error' if isinstance(exc,CandidateCompileError) else
+                        'correctness_error' if isinstance(exc,CandidateCorrectnessError) else 'runtime_error')
+                return TrialOutcome(status,error=f'{type(exc).__name__}: {exc}'[:4000])
+            return TrialOutcome('ok',compile_ms=prepared.compile_ms,
+                                max_abs_error=prepared.max_abs_error,
+                                metadata={'validation_only':True,'oracle_inputs':'harness'})
         result = self.harness.measure(
             config,
             samples=self.samples,

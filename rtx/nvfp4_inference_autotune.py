@@ -1058,9 +1058,16 @@ def tune_nvfp4_inference_state(
     if isinstance(hybrid, AutotunePolicy) and hybrid.search_schedule == 'progressive':
         session_root = session_root / hybrid.evidence_contract()
     store = JsonlTuningStore(session_root)
-    result = make_hybrid_autotuner(
-        adapter, store, hybrid, progress=progress,started_at=tuning_started
-    ).tune()
+    from .autotune.orchestrator import NoEligibleTimingError
+    try:
+        result = make_hybrid_autotuner(
+            adapter, store, hybrid, progress=progress,started_at=tuning_started
+        ).tune()
+    except NoEligibleTimingError as exc:
+        if exc.fallback_config is None:
+            from .autotune.runtime import checked_seed_validator
+            exc.fallback_validation=checked_seed_validator(adapter,evaluator,store)
+        raise
     key = runtime_winner_key(
         adapter.context.family,
         problem,

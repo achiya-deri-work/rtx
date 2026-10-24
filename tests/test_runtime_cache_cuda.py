@@ -155,6 +155,37 @@ print('PASS',phase,budget)
     "requires RTX Blackwell CUDA",
 )
 class RuntimeCacheCudaTests(unittest.TestCase):
+    def test_exhausted_noisy_nvfp4_history_uses_unmeasured_checked_seed(self):
+        from unittest.mock import patch
+        import rtx
+        from rtx.autotune.evaluators import CalibratedPrequantEvaluator
+        from rtx.autotune.runtime import run_runtime_config_tuner
+        from rtx.kernels.mxfp8 import MXFP8Problem
+        from rtx.nvfp4_inference_autotune import tune_nvfp4_inference_state
+        policy=rtx.AutotunePolicy(max_trials=1,max_seconds=60,
+            search_schedule='progressive',confirmation_repeats=0,finalist_rounds=0,
+            warmup=1,samples=3,calls_per_sample=2)
+        original=CalibratedPrequantEvaluator.__call__
+        calls=[]
+        def noisy(evaluator,config,*,validate_only=False):
+            calls.append(validate_only)
+            outcome=original(evaluator,config,validate_only=validate_only)
+            if not validate_only:
+                outcome.metadata['sampling']={'collection':{'stationary':False}}
+            return outcome
+        with tempfile.TemporaryDirectory() as root, patch.object(CalibratedPrequantEvaluator,'__call__',noisy):
+            def run():
+                return run_runtime_config_tuner(tune_nvfp4_inference_state,
+                    MXFP8Problem(128,128,128),state='dynamic',device='cuda',
+                    policy=policy,cache_dir=root,progress=None)
+            with self.assertWarnsRegex(RuntimeWarning,'without installing'):first=run()
+            records={str(p):p.read_bytes() for p in Path(root).rglob('observations.jsonl')}
+            with self.assertWarnsRegex(RuntimeWarning,'without installing'):second=run()
+            self.assertEqual(first,second)
+            self.assertEqual(calls,[False,True])
+            self.assertEqual(records,{str(p):p.read_bytes() for p in Path(root).rglob('observations.jsonl')})
+            self.assertFalse(list((Path(root)/'runtime_winners').rglob('*.json')))
+
     def test_exhausted_noisy_backward_history_revalidates_current_inputs(self):
         from unittest.mock import patch
         import rtx

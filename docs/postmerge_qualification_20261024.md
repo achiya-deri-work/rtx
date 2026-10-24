@@ -176,3 +176,11 @@ Offline tuning remains strict. GPU regressions pass on both local stacks,
 including changed finite operands, unchanged trial journals, and rejection of
 NaN operands. Both local 49-case production matrices also pass after this fix.
 The laptop's affected runtime cases still require retesting.
+
+The laptop backward fallback regression and the previously failing NVFP4
+backward cases now pass. A remaining Torch 2.13 functional-forward case exposed
+the same exhausted-history issue in the dimension-based NVFP4 tuner. The lazy
+validation mechanism now covers that tuner using its normal harness probe;
+it does not claim application-data validation. A deterministic noisy-history
+GPU regression passes both local stacks and verifies zero extra timing trials,
+unchanged observation journals and no persistent winner.
