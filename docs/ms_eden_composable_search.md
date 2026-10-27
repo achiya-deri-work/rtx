@@ -213,3 +213,44 @@ Consolidated search coverage supports `--coverage tma` and
 `--coverage row_producer`; `--row-transform native|fma` explicitly selects the
 recorded butterfly implementation. Candidate identities, actual dispatch
 checks and training/profile source fingerprints include this distinction.
+
+### Cross-device closeout and reusable study tools
+
+The follow-up broad campaign was stopped on 2026-10-27 at the user's request.
+The performance goal is paused, not achieved. No further tuning or training
+is scheduled, and partial searches are not cross-device performance claims.
+The committed kernel snapshot `9f6526a` passed the same focused 183-case
+GPU/contract qualification on RTX 5060 Laptop, RTX 5070 Laptop and RTX 5090.
+The stopped searches and qualification logs are preserved locally under
+`autotune_reports/nvfp4_cross_device_20261027/*-stopped-evidence.tar.gz`.
+These ignored artifacts are not distributed with the library.
+
+Reusable research commands (run from the repository root):
+
+```bash
+bash tools/run_nvfp4_backward_campaign.sh PYTHON INITIAL_SELECTION NEW_OUTPUT
+python -m benchmarks.select_ms_eden_training_designs \
+  --campaign NEW_OUTPUT --output NEW_DESIGN_DIRECTORY
+python -m benchmarks.prepare_precision20m_corpus \
+  --source ORIGINAL_TOKENS.npy --output NEW_TOKENS.npy --tokens 10000000
+bash tools/run_nvfp4_backward_training.sh \
+  PYTHON NEW_TOKENS.npy NEW_DESIGN_DIRECTORY NEW_TRAINING_OUTPUT
+```
+
+These commands are manual, offline experiments, not first-hit runtime tuning.
+Do not overlap their GPU workloads. The campaign searches seven shapes with
+64 trials / 30 minutes per shape, then independently confirms eligible
+winners. Selection rechecks numerical/dispatch gates, requires explicitly
+stationary timings, rejects mixed device/source identities, and chooses a
+shared implementation family covering all four model projections. It does
+not promote candidates into the runtime cache or alter defaults.
+
+The training launcher requires one independent 24-round confirmation per
+projection and stops on any failure, including unstable timing; it does not
+retry until a favorable result appears. It then uses two seeds with reversed
+mode order for MXFP8, NVFP4-forward/MXFP8-backward and full experimental NVFP4.
+The corpus helper preserves token bytes and refuses overwrites. Output paths
+must be new. Inspect matched-step losses, training-block throughput and total
+wall time separately; candidate selection is not end-to-end qualification.
+The helpers have CPU contract tests; this stopped campaign did not execute
+their complete cross-device training workflow.
