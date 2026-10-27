@@ -11,10 +11,11 @@ def dispatch(design):
         raise ValueError(rejection[1])
     records = []
     with ExitStack() as stack:
-        if design.transpose_loader != "native":
+        if design.transpose_loader != "native" or design.row_transform != "native":
             from benchmarks.experiment_ms_eden_bank_layout import patched
             stack.enter_context(patched(design.transpose_loader, records=records, strict=True,
-                                        tma_tile_rows=design.tma_tile_rows))
+                                        tma_tile_rows=design.tma_tile_rows,
+                                        row_fma=design.row_transform == "fma"))
         if design.finalizer != "separate":
             from benchmarks.experiment_ms_eden_dual_finalizer import patched
             stack.enter_context(patched("both",

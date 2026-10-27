@@ -95,6 +95,39 @@ def layout_seeds(adapter, anchor):
     return seeds
 
 
+def tma_seeds(anchor):
+    """Cover transfer geometry and buffering without changing GEMM policy."""
+    seeds = [anchor]
+    for rows in (32, 64, 128):
+        for stages in (1, 2, 3):
+            for xor in (4, 5):
+                schedule = replace(anchor.schedule, **{
+                    phase: replace(getattr(anchor.schedule, phase),
+                        producer_threads=128, producer_async_copy=True,
+                        producer_load="coalesced_x8", producer_transpose_values_per_lane=16,
+                        producer_copy_bits=32, producer_unroll_rows=False,
+                        producer_stages=stages) for phase in ("dx", "dw")})
+                seeds.append(replace(anchor, schedule=schedule,
+                    transpose_loader=f"tma_xor{xor}_{stages}", tma_tile_rows=rows))
+    return seeds
+
+
+def row_producer_seeds(anchor, sm_count):
+    """Vary only row dY ownership; preserve all three transpose producers."""
+    from rtx.autotune.posthoc import PosthocOperandGeometry
+    grids = (sm_count, sm_count * 4, 256)
+    seeds = [anchor]
+    for blocks in grids:
+        for values in (4, 8, 16):
+            for threads in (64, 128, 256, 512):
+                geometry = anchor.schedule.dx.a_geometry or PosthocOperandGeometry()
+                leg = replace(anchor.schedule.dx,
+                    a_geometry=replace(geometry, producer_threads=threads, producer_blocks=blocks),
+                    producer_values_per_lane=values, producer_row_tile_batch=1)
+                seeds.append(replace(anchor, schedule=replace(anchor.schedule, dx=leg)))
+    return seeds
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--selection", type=Path)
@@ -106,13 +139,15 @@ def main(argv=None):
     parser.add_argument("--rounds", type=int, default=8)
     parser.add_argument("--allow-row-major", action="store_true",
                         help="opt into experimental row-major scale layout and broader GEMM tiles")
-    parser.add_argument("--coverage", choices=("implementation", "layout"), default="implementation",
+    parser.add_argument("--coverage", choices=("implementation", "layout", "tma", "row_producer"), default="implementation",
                         help="prioritize implementation families or the new layout/tile combinations")
     parser.add_argument("--replays", type=int, default=16)
     parser.add_argument("--min-batch-ms", type=float, default=2.)
     parser.add_argument("--warmup-ms", type=float, default=5000.)
     parser.add_argument("--confirm-only", action="store_true",
                         help="remeasure precisely the selected design, without search")
+    parser.add_argument("--row-transform", choices=("native", "fma"),
+                        help="explicit row butterfly implementation; recorded in the design identity")
     parser.add_argument("--config-json", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if min(args.trials, args.seconds, args.trial_timeout) <= 0:
@@ -147,6 +182,8 @@ def main(argv=None):
         schedule = MSEdenPipelineSchedule(
             backward_pipeline=source["candidate_pipeline"],
             **{p: json.loads(source["schedules"]["candidate"][p]) for p in ("dx", "dw")})
+    if args.row_transform is not None:
+        selected_design = replace(selected_design or MSEdenDesign(schedule), row_transform=args.row_transform)
     if args.confirm_only and selected_design is None:
         parser.error("confirmation requires a selection containing the exact design")
     if selected_design is not None and any(getattr(selected_design.schedule, p).gemm.scale_layout == "row_major"
@@ -186,6 +223,9 @@ def main(argv=None):
         return json.loads((trial / "result.json").read_text())
 
     seeds = ([selected_design] if args.confirm_only else
+             row_producer_seeds(selected_design or MSEdenDesign(schedule), device["multiprocessor_count"])
+             if args.coverage == "row_producer" else
+             tma_seeds(selected_design or MSEdenDesign(schedule)) if args.coverage == "tma" else
              [selected_design or MSEdenDesign(schedule)] if args.coverage == "layout" else
              ([selected_design] if selected_design is not None else []) + implementation_seeds(schedule))
     adapter = make_ms_eden_design_adapter(shape, evaluate, initial=seeds[0],

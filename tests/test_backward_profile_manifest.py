@@ -74,7 +74,8 @@ def test_exact_design_selection_reaches_profile_and_records_dispatch(monkeypatch
     driver.main()
     result=json.loads(output.read_text())
     assert result['design']==asdict(design)
-    assert len(result['design_source_sha256'])==5
+    assert len(result['design_source_sha256'])==7
+    assert 'rtx/kernels/ms_eden_bank_layout.py' in result['design_source_sha256']
     assert events==['enter','exit']
     monkeypatch.setattr(sys,'argv',argv+['--preparation-variant','tma_xor5_1'])
     import pytest

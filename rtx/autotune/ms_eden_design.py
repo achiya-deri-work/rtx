@@ -19,6 +19,7 @@ class MSEdenDesign:
     transpose_loader: str = "native"
     finalizer: str = "separate"
     tma_tile_rows: int = 32
+    row_transform: str = "native"
 
     def __post_init__(self):
         if isinstance(self.schedule, dict):
@@ -30,6 +31,7 @@ IMPLEMENTATIONS = {
                          "tma_xor5_1", "tma_xor5_2", "tma_xor5_3"),
     "finalizer": ("separate", "dual", "dual_paired", "dual_cta"),
     "tma_tile_rows": (32,64,128),
+    "row_transform": ("native", "fma"),
 }
 
 
@@ -40,6 +42,8 @@ def implementation_rejection(design):
             return "implementation_rejected", f"unknown {name}"
     if type(design.tma_tile_rows) is not int or (design.transpose_loader=='native' and design.tma_tile_rows!=32):
         return "implementation_rejected", "TMA tile geometry requires a TMA loader"
+    if design.row_transform == "fma" and design.schedule.dx.producer_values_per_lane not in (8,16):
+        return "implementation_rejected", "row FMA requires grouped row preparation"
     if design.finalizer != "separate":
         if design.schedule.backward_pipeline != "operand_paired":
             return "implementation_rejected", "dual finalizers require operand_paired"
@@ -99,6 +103,10 @@ def make_ms_eden_design_adapter(shape, evaluator, *, initial=None, **kwargs):
             return TrialOutcome("correctness_error", error="missing or mismatched implementation manifest")
         if result.get("baseline_policy") != "stable_mxfp8":
             return TrialOutcome("correctness_error", error="matched stable MXFP8 baseline required")
+        if config.row_transform == "fma":
+            rows = [r for r in result.get("design_dispatch", []) if r.get("transpose") is False]
+            if not rows or any(r.get("selected") != "row_fma" for r in rows):
+                return TrialOutcome("correctness_error", error="requested row FMA dispatch was not established")
         if config.transpose_loader != "native":
             records = result.get("design_dispatch", [])
             transposes = [record for record in records if record.get("transpose") is True]
@@ -138,10 +146,10 @@ def make_ms_eden_design_adapter(shape, evaluator, *, initial=None, **kwargs):
             producer_row_tile_batch=1, producer_row_load_bits=16, producer_values_per_lane=4))
         return stable_id(dict(schedule=base.config_id(schedule),
             transpose_loader=config.transpose_loader, finalizer=config.finalizer,
-            tma_tile_rows=config.tma_tile_rows))
+            tma_tile_rows=config.tma_tile_rows, row_transform=config.row_transform))
 
     return DiscreteKernelAdapter(
-        context=KernelContext("ms_eden_design_research", 5, base.context.workload,
+        context=KernelContext("ms_eden_design_research", 6, base.context.workload,
             device=base.context.device, environment=base.context.environment,
             tags={"pipeline_context": base.context.identifier, "automatic_promotion": False}),
         initial_config=initial, axes={**axes, **IMPLEMENTATIONS},

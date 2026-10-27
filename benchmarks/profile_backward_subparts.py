@@ -55,7 +55,7 @@ def load_design_selection(args):
     record=json.loads(args.design_selection.read_text())
     value=record.get('candidate')
     required={'schedule','transpose_loader','finalizer'}
-    if not isinstance(value,dict) or not required<=set(value) or set(value)-required-{'tma_tile_rows'}:
+    if not isinstance(value,dict) or not required<=set(value) or set(value)-required-{'tma_tile_rows','row_transform'}:
         raise ValueError('selection must contain the complete design candidate')
     design=MSEdenDesign(**value)
     shape=tuple(map(int,args.shape.split(',')))
@@ -265,6 +265,10 @@ def main():
                 contexts.enter_context(compiler_config.patch(combo_kernels=True,combo_kernels_pointwise_only=True))
             result=worker(args)
             if args.design is not None:
+                if args.policy=='fp4_fp4' and args.design.row_transform=='fma':
+                    rows=[r for r in dispatch_records if r.get('transpose') is False]
+                    if not rows or any(r.get('selected')!='row_fma' for r in rows):
+                        raise RuntimeError('profile did not establish requested row FMA implementation')
                 if args.policy=='fp4_fp4' and args.design.transpose_loader!='native':
                     transposes=[r for r in dispatch_records if r.get('transpose') is True]
                     if not transposes or any(r.get('selected')!=args.design.transpose_loader
@@ -276,7 +280,8 @@ def main():
                 result['design_source_sha256']={name:hashlib.sha256((root/name).read_bytes()).hexdigest()
                     for name in ('benchmarks/ms_eden_design_dispatch.py',
                         'benchmarks/experiment_ms_eden_bank_layout.py','benchmarks/experiment_ms_eden_dual_finalizer.py',
-                        'rtx/kernels/ms_eden_tma_preparation.py','rtx/kernels/ms_eden_dual_finalizer.py')}
+                        'rtx/kernels/ms_eden_tma_preparation.py','rtx/kernels/ms_eden_dual_finalizer.py',
+                        'rtx/kernels/ms_eden_bank_layout.py','rtx/kernels/nvfp4_posthoc.py')}
         if args.combo_kernels:
             result['compiler_options']={'combo_kernels':True,'combo_kernels_pointwise_only':True}
         result['preparation_variant'] = args.preparation_variant

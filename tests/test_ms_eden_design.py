@@ -7,6 +7,58 @@ from rtx.autotune.ms_eden_design import (
 )
 
 
+def test_tma_coverage_crosses_geometry_and_buffering_without_gemm_mutation():
+    from benchmarks.tune_ms_eden_design import tma_seeds
+    anchor = MSEdenDesign()
+    seeds = tma_seeds(anchor)
+    assert seeds[0] == anchor
+    assert len(seeds) == 19
+    assert {(c.tma_tile_rows, c.transpose_loader) for c in seeds[1:]} == {
+        (rows, f"tma_xor{xor}_{stages}")
+        for rows in (32, 64, 128) for xor in (4, 5) for stages in (1, 2, 3)
+    }
+    for candidate in seeds[1:]:
+        assert implementation_rejection(candidate) is None
+        assert candidate.finalizer == anchor.finalizer
+        for phase in ("dx", "dw"):
+            assert getattr(candidate.schedule, phase).gemm == getattr(anchor.schedule, phase).gemm
+
+
+def test_row_coverage_preserves_transpose_geometry_and_gemms():
+    from benchmarks.tune_ms_eden_design import row_producer_seeds, tma_seeds
+    anchor = tma_seeds(MSEdenDesign())[1]
+    seeds = row_producer_seeds(anchor, 26)
+    assert len(seeds) == 37
+    assert seeds[0] == anchor
+    assert {(c.schedule.dx.operand_schedule('a').producer_threads,
+             c.schedule.dx.operand_schedule('a').producer_blocks,
+             c.schedule.dx.producer_values_per_lane) for c in seeds[1:]} == {
+                 (t, b, v) for t in (64,128,256,512) for b in (26,104,256) for v in (4,8,16)}
+    for c in seeds:
+        assert implementation_rejection(c) is None
+        assert c.schedule.dw == anchor.schedule.dw
+        assert c.schedule.dx.gemm == anchor.schedule.dx.gemm
+        original = anchor.schedule.dx.operand_schedule('b')
+        changed = c.schedule.dx.operand_schedule('b')
+        for key in ('producer_threads','producer_blocks','producer_transpose_values_per_lane',
+                    'producer_stages','producer_async_copy','producer_load'):
+            assert getattr(original,key) == getattr(changed,key)
+
+
+def test_row_fma_has_distinct_identity_and_requires_dispatch_evidence():
+    base=MSEdenDesign()
+    invalid=replace(base,row_transform='fma')
+    assert implementation_rejection(invalid)
+    candidate=replace(invalid,schedule=replace(base.schedule,
+        dx=replace(base.schedule.dx,producer_values_per_lane=16)))
+    adapter=make_ms_eden_design_adapter((4096,1536,512),lambda c:dict(
+        design=asdict(c),baseline_policy='stable_mxfp8'),initial=candidate)
+    assert adapter.config_id(candidate)!=adapter.config_id(replace(candidate,row_transform='native'))
+    result=adapter.evaluate(candidate)
+    assert result.status=='correctness_error'
+    assert 'row FMA dispatch' in result.error
+
+
 def test_roundtrip_identity_and_schedule_axes():
     adapter = make_ms_eden_design_adapter((512, 512, 512), lambda _: {})
     initial = adapter.initial_config

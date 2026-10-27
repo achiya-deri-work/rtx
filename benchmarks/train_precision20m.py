@@ -179,7 +179,7 @@ def load_design_map(path):
         if len(shape)!=3 or key!=','.join(map(str,shape)) or any(v<=0 or v%128 for v in shape):
             raise ValueError('design keys must be canonical positive 128-aligned M,N,K')
         required={'schedule','transpose_loader','finalizer'}
-        if not isinstance(value,dict) or not required<=set(value) or set(value)-required-{'tma_tile_rows'}:
+        if not isinstance(value,dict) or not required<=set(value) or set(value)-required-{'tma_tile_rows','row_transform'}:
             raise ValueError('each design requires explicit schedule, transpose_loader and finalizer')
         if not isinstance(value['schedule'],dict) or set(value['schedule'])!={'dx','dw','backward_pipeline'}:
             raise ValueError('each design schedule requires explicit dx, dw, backward_pipeline')
@@ -189,7 +189,7 @@ def load_design_map(path):
         if rejection:
             raise ValueError(f'{key}: {rejection[1]}')
         result[key]=asdict(design)
-    implementations={(v['transpose_loader'],v['finalizer'],v['tma_tile_rows']) for v in result.values()}
+    implementations={(v['transpose_loader'],v['finalizer'],v['tma_tile_rows'],v['row_transform']) for v in result.values()}
     if len(implementations)!=1:
         raise ValueError('training dispatch requires one shared loader/finalizer implementation')
     return result
@@ -202,6 +202,10 @@ def verify_design_dispatch(args):
     loader=next(iter(designs.values()))['transpose_loader']
     tile_rows=next(iter(designs.values())).get('tma_tile_rows',32)
     records=getattr(args,'ms_eden_dispatch_records',[])
+    if next(iter(designs.values())).get('row_transform','native')=='fma':
+        rows=[r for r in records if r.get('transpose') is False]
+        if not rows or any(r.get('selected')!='row_fma' for r in rows):
+            raise RuntimeError('training warmup did not establish requested row FMA implementation')
     transposes=[record for record in records if record.get('transpose') is True]
     if loader!='native' and (not transposes or any(record.get('selected')!=loader
             or record.get('tile_rows',32)!=tile_rows for record in transposes)):
@@ -398,7 +402,8 @@ def ms_eden_identity_overrides(args):
         values['design_dispatch_source_sha256']={name:hashlib.sha256((root/name).read_bytes()).hexdigest()
             for name in ('benchmarks/ms_eden_design_dispatch.py',
                 'benchmarks/experiment_ms_eden_bank_layout.py','benchmarks/experiment_ms_eden_dual_finalizer.py',
-                'rtx/kernels/ms_eden_tma_preparation.py','rtx/kernels/ms_eden_dual_finalizer.py')}
+                'rtx/kernels/ms_eden_tma_preparation.py','rtx/kernels/ms_eden_dual_finalizer.py',
+                'rtx/kernels/ms_eden_bank_layout.py','rtx/kernels/nvfp4_posthoc.py')}
     if getattr(args,"combo_kernels",False):
         values["compiler_options"]=training_compiler_options(args)
     if getattr(args,"ms_eden_research_variant","retained") != "retained":

@@ -144,11 +144,25 @@ def test_exact_design_map_identity_and_model_transfer(tmp_path):
     assert args.ms_eden_schedule_map=={k:v['schedule'] for k,v in selected.items()}
     identity=study.ms_eden_identity_overrides(args)
     assert identity['ms_eden_design_map']==selected
-    assert len(identity['design_dispatch_source_sha256'])==5
+    assert len(identity['design_dispatch_source_sha256'])==7
+    assert 'rtx/kernels/ms_eden_bank_layout.py' in identity['design_dispatch_source_sha256']
     candidate=study.build_model(config(),'nvfp4_full',16,26,schedule_map=args.ms_eden_schedule_map)
     assert schedules(candidate)==schedules(model)
     args.ms_eden_research_variant='tma_dual'
     with pytest.raises(ValueError,match='cannot be combined'):study.validate_args(args)
+
+
+def test_row_fma_training_requires_actual_dispatch():
+    from types import SimpleNamespace
+    args=SimpleNamespace(ms_eden_design_map={'128,128,128':dict(
+        transpose_loader='native',row_transform='fma')},ms_eden_dispatch_records=[])
+    with pytest.raises(RuntimeError,match='row FMA'):
+        study.verify_design_dispatch(args)
+    args.ms_eden_dispatch_records=[dict(transpose=False,selected='native')]
+    with pytest.raises(RuntimeError,match='row FMA'):
+        study.verify_design_dispatch(args)
+    args.ms_eden_dispatch_records=[dict(transpose=False,selected='row_fma')]
+    study.verify_design_dispatch(args)
 
 
 def test_design_map_rejects_mixed_implementations_and_illegal_layout(tmp_path):

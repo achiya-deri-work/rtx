@@ -148,3 +148,68 @@ On the RTX 5060, all 18 shape/tile/stage combinations passed byte-exact packed
 value and scale checks, global-maximum checks, and changed-input CUDA-graph
 replay (19 tests including constructor validation). These are correctness
 results only: larger tiles have not been promoted as performance winners.
+
+The subsequent 24-trial RTX 5060 complete-backward sweep on
+`4096x1536x512` covered both XOR load layouts, all three tile sizes and all
+three buffer depths, then random/local proposals. Larger transfers regressed:
+128-row two/three-stage candidates took roughly 370–383 us. The selected
+eligible candidate retained 32 rows, XOR5 and one stage. Independent 24-round
+confirmation measured MXFP8 272.456 us versus MS-EDEN 246.860 us, paired
+speedup 1.103867 (95% round-cluster interval 1.100441–1.107148), with both
+order-stationarity gates passing. This does not establish a new performance
+win over the prior retained composition or meet the 1.20x goal. No defaults
+were changed. Full search and confirmation evidence is retained under
+`autotune_reports/ms_eden_speed20_20261026_5060/composable-design/tma-v10/`.
+
+A follow-up 40-trial row-dY geometry search varied 64/128/256/512 threads,
+26/104/256 CTAs and 4/8/16 values per lane, preserving transposed producers
+and GEMMs. It retained the unchanged anchor (240.685 us, paired 1.103327x);
+there was no new winner. Evidence is in the adjacent `row-v11/` directory.
+An isolated native row-producer Nsight Compute capture (`row-counters-v12/`)
+found 57 registers/thread, 51.07% achieved occupancy, zero local/shared spills,
+8,611,310 executed warp instructions and 31.30% scheduler cycles without an
+eligible warp. The detailed capture reported 1,277,952 fused and 2,248,704
+non-fused FP32 instructions. Profiler duration is diagnostic, not full-backward
+latency. This favors investigating arithmetic instruction work rather than
+manual register caps; changing FP32 association remains prohibited by the
+same-draw contract. The profiler's suggested FMA speedup is not a measured win.
+
+The opt-in `row_transform="fma"` design (context revision 6) reuses the
+cross-lane ±1 FMA butterfly without changing register-local association,
+normalization or EDEN correction. Four GPU cases passed byte-exact packed,
+scale and partial-maximum checks, including changed-input graph replay, zero,
+outliers and exponent-range inputs. Complete-backward confirmation first
+failed timing stability; that attempt is retained. A fresh 24-round run with
+15-second warmup passed unchanged gates: MXFP8 269.942 us, candidate 241.963 us,
+paired 1.115712x (95% interval 1.113527–1.117724). This remains below 1.20x;
+cross-session comparison does not establish the gain over native preparation.
+Evidence: adjacent `row-fma-v13/`. Stable defaults remain native.
+
+### Final consolidation (2026-10-27)
+
+The performance pursuit is paused at the user's request. No automatic
+promotion or additional tuning/training run is scheduled. The final five-shape
+matrix used the retained per-shape schedules, 24 paired rounds against stable
+MXFP8 and 15-second warmups. Ratios below are MXFP8/MS-EDEN within each run,
+not a direct paired native-versus-FMA comparison:
+
+| M,N,K | Native ratio | Row-FMA ratio |
+|---|---:|---:|
+| 4096,1536,512 | ineligible | 1.1143 |
+| 4096,2048,512 | 1.1648 | 1.1677 |
+| 4096,512,512 | 0.9863 | ineligible |
+| 4096,512,1024 | ineligible | ineligible |
+| 4096,2048,2048 | 1.3071 | 1.3085 |
+
+All ten trials passed the numerical/runtime checks; four failed timing
+stationarity and remain excluded. The matrix does not establish a meaningful
+row-FMA improvement, nor 1.20x across the representative shapes. Narrow-shape
+regression remains explicit. Row-FMA stays an opt-in research axis, not a
+runtime default. No new model-training speedup is claimed. The complete
+matrix, including failed timing attempts, is retained in
+`row-fma-v13/matrix-consolidation.tar.gz` under the report root above.
+
+Consolidated search coverage supports `--coverage tma` and
+`--coverage row_producer`; `--row-transform native|fma` explicitly selects the
+recorded butterfly implementation. Candidate identities, actual dispatch
+checks and training/profile source fingerprints include this distinction.

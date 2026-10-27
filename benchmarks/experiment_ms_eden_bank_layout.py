@@ -6,9 +6,9 @@ from benchmarks import experiment_ms_eden_dependency as study
 
 
 @contextmanager
-def patched(mode, *, records=None, strict=False, tma_tile_rows=32):
+def patched(mode, *, records=None, strict=False, tma_tile_rows=32, row_fma=False):
     from rtx.kernels import nvfp4_posthoc as module
-    from rtx.kernels.ms_eden_bank_layout import compile_bank_layout
+    from rtx.kernels.ms_eden_bank_layout import compile_bank_layout, compile_row_fma
     from rtx.kernels.ms_eden_packed_signs import compile_packed_rademacher
     from rtx.kernels.ms_eden_group32 import compile_group32
     from rtx.kernels.ms_eden_tma_preparation import compile_tma_preparation
@@ -20,6 +20,11 @@ def patched(mode, *, records=None, strict=False, tma_tile_rows=32):
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
         values = dict(bound.arguments)
+        if row_fma and not values['transpose']:
+            if records is not None:
+                records.append(dict(rows=values['rows'],cols=values['cols'],
+                    transpose=False,selected='row_fma'))
+            return compile_row_fma(**values)
         eligible = (values['transpose'] and values['async_copy']
                     and values['config'].threads == 128
                     and values['load_mode'] == 'coalesced_x8'

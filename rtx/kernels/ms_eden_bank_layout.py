@@ -130,3 +130,29 @@ def compile_bank_layout(rows, cols, config=PosthocScaleConfig(), mantissa_bits=4
         fake(Uint8, rows * cols // 2, max(4, kernel.grouped_store_bits // 8)), fake(BFloat16, rows * cols // 16), fake(Float32, kernel.partial_count),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options='--enable-tvm-ffi --opt-level 3')
     return run, kernel.partial_count
+
+
+class RowFmaPreparationKernel(HadamardPreparationKernel):
+    """Research row reader with the already-tested exact butterfly instruction form."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.transpose or self.values_per_lane not in (8, 16) or self.packed_source:
+            raise ValueError('row FMA requires original BF16 grouped row preparation')
+        self.butterfly_fma = True
+
+    @cute.jit
+    def grouped_transform_values(self, values, local_lane):
+        BankLayoutPreparationKernel.grouped_transform_values(self, values, local_lane)
+
+
+@lru_cache(maxsize=64)
+def compile_row_fma(rows, cols, config=PosthocScaleConfig(), mantissa_bits=4, transpose=False, **kwargs):
+    kernel = RowFmaPreparationKernel(rows, cols, config, mantissa_bits, transpose, **kwargs)
+    def fake(dtype, size, align=4):
+        return cute.runtime.make_fake_tensor(dtype, (size,), stride=(1,), assumed_align=align)
+    run = cute.compile(kernel, fake(BFloat16, rows * cols), fake(Float32, 128),
+        fake(Uint8, rows * cols // 2, max(4, kernel.grouped_store_bits // 8)),
+        fake(BFloat16, rows * cols // 16), fake(Float32, kernel.partial_count),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options='--enable-tvm-ffi --opt-level 3')
+    return run, kernel.partial_count
