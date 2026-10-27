@@ -54,7 +54,8 @@ def load_design_selection(args):
         raise ValueError('design selection requires public mode without other schedule overrides')
     record=json.loads(args.design_selection.read_text())
     value=record.get('candidate')
-    if not isinstance(value,dict) or set(value)!={'schedule','transpose_loader','finalizer'}:
+    required={'schedule','transpose_loader','finalizer'}
+    if not isinstance(value,dict) or not required<=set(value) or set(value)-required-{'tma_tile_rows'}:
         raise ValueError('selection must contain the complete design candidate')
     design=MSEdenDesign(**value)
     shape=tuple(map(int,args.shape.split(',')))
@@ -266,7 +267,8 @@ def main():
             if args.design is not None:
                 if args.policy=='fp4_fp4' and args.design.transpose_loader!='native':
                     transposes=[r for r in dispatch_records if r.get('transpose') is True]
-                    if not transposes or any(r.get('selected')!=args.design.transpose_loader for r in transposes):
+                    if not transposes or any(r.get('selected')!=args.design.transpose_loader
+                            or r.get('tile_rows',32)!=args.design.tma_tile_rows for r in transposes):
                         raise RuntimeError('profile did not establish requested TMA implementation')
                 result['design']=asdict(args.design)
                 result['design_dispatch']=dispatch_records

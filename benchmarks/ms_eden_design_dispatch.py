@@ -13,7 +13,8 @@ def dispatch(design):
     with ExitStack() as stack:
         if design.transpose_loader != "native":
             from benchmarks.experiment_ms_eden_bank_layout import patched
-            stack.enter_context(patched(design.transpose_loader, records=records, strict=True))
+            stack.enter_context(patched(design.transpose_loader, records=records, strict=True,
+                                        tma_tile_rows=design.tma_tile_rows))
         if design.finalizer != "separate":
             from benchmarks.experiment_ms_eden_dual_finalizer import patched
             stack.enter_context(patched("both",

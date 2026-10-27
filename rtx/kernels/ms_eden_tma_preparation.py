@@ -14,7 +14,7 @@ from .nvfp4_posthoc import HadamardPreparationKernel, PosthocScaleConfig
 
 
 class TmaPreparationKernel(HadamardPreparationKernel):
-    def __init__(self, *args, tma_swizzle='64b', consumer_order='retained', **kwargs):
+    def __init__(self, *args, tma_swizzle='64b', consumer_order='retained', tma_tile_rows=32, **kwargs):
         super().__init__(*args, **kwargs)
         if not (self.transpose and self.async_copy and self.config.threads == 128
                 and self.source_tile_rows == 32 and self.values_per_lane == 16
@@ -23,6 +23,9 @@ class TmaPreparationKernel(HadamardPreparationKernel):
         if tma_swizzle not in ('none', '32b', '64b'):
             raise ValueError('unsupported TMA preparation swizzle')
         self.tma_swizzle = tma_swizzle
+        if type(tma_tile_rows) is not int or tma_tile_rows not in (32,64,128) or self.rows%tma_tile_rows:
+            raise ValueError('TMA tile rows must be 32/64/128 and divide output rows')
+        self.tma_tile_rows=tma_tile_rows
         if consumer_order not in ('retained','xor4','xor5','columns'):
             raise ValueError('unsupported TMA consumer order')
         self.consumer_order = consumer_order
@@ -75,11 +78,11 @@ class TmaPreparationKernel(HadamardPreparationKernel):
                  '32b': cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW32,
                  '64b': cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW64}
         layout = cute.tile_to_shape(cute.nvgpu.warpgroup.make_smem_layout_atom(
-            kinds[self.tma_swizzle], BFloat16), (128,32,self.stages), order=(0,1,2))
+            kinds[self.tma_swizzle], BFloat16), (128,self.tma_tile_rows,self.stages), order=(0,1,2))
         source = cute.make_tensor(src.iterator, cute.make_layout(
             (self.source_rows,self.source_cols), stride=(self.source_cols,1)))
         atom, tensor = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(),
-            source, cute.slice_(layout,(None,None,0)), (128,32))
+            source, cute.slice_(layout,(None,None,0)), (128,self.tma_tile_rows))
         self.kernel(atom,tensor,layout,signs,packed,scales,partials).launch(
             grid=(self.blocks,1,1), block=(128,1,1), stream=stream)
 
@@ -88,12 +91,12 @@ class TmaPreparationKernel(HadamardPreparationKernel):
         row_group = work//(self.cols//128)
         chunk = work%(self.cols//128)
         if cutlass.const_expr(self.tile_order == 'reduction_major'):
-            row_group = work%(self.rows//32)
-            chunk = work//(self.rows//32)
+            row_group = work%(self.rows//self.tma_tile_rows)
+            chunk = work//(self.rows//self.tma_tile_rows)
         # TMA copy lowering elects a lane with a full-warp mask. Enter it from
         # the whole producer warp, not a thread==0 divergent region.
         with cute.arch.elect_one():
-            cute.arch.mbarrier_arrive_and_expect_tx(barriers.iterator+slot, 128*32*2)
+            cute.arch.mbarrier_arrive_and_expect_tx(barriers.iterator+slot, 128*self.tma_tile_rows*2)
         cute.copy(atom,source[None,chunk,row_group],destination[None,slot],
                   tma_bar_ptr=barriers.iterator+slot)
 
@@ -114,14 +117,14 @@ class TmaPreparationKernel(HadamardPreparationKernel):
                 cute.arch.mbarrier_init(barriers.iterator+stage,1)
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
-        tiled = cute.local_tile(tensor,(128,32),(None,None))
+        tiled = cute.local_tile(tensor,(128,self.tma_tile_rows),(None,None))
         destination,source = cpasync.tma_partition(atom,0,cute.make_layout(1),
             cute.group_modes(staged,0,2),cute.group_modes(tiled,0,2))
         cached_signs = cute.make_rmem_tensor((16,),Float32)
         if cutlass.const_expr(self.signs_mode == 'register'):
             for j in cutlass.range_constexpr(16):
                 cached_signs[j] = signs[(lane%8)*16+j]
-        limit = self.tiles//32
+        limit = self.tiles//self.tma_tile_rows
         if thread//32 == 0:
             for slot in cutlass.range_constexpr(self.stages):
                 work = block+slot*self.blocks
@@ -134,11 +137,13 @@ class TmaPreparationKernel(HadamardPreparationKernel):
             cute.arch.mbarrier_wait(barriers.iterator+slot,(iteration//self.stages)%2)
             row_group,chunk = work//(self.cols//128),work%(self.cols//128)
             if cutlass.const_expr(self.tile_order == 'reduction_major'):
-                row_group,chunk = work%(self.rows//32),work//(self.rows//32)
-            tile = (row_group*32+thread//32)*(self.cols//128)+chunk
-            largest = self.prepare_rows(tensor,
-                cached_signs if cutlass.const_expr(self.signs_mode == 'register') else signs,
-                packed,scales,signs,signs,staged[None,None,slot],tile,largest,Float32(1.))
+                row_group,chunk = work%(self.rows//self.tma_tile_rows),work//(self.rows//self.tma_tile_rows)
+            for group in cutlass.range_constexpr(self.tma_tile_rows//32):
+                tile = (row_group*self.tma_tile_rows+group*32+thread//32)*(self.cols//128)+chunk
+                substage=cute.local_tile(staged[None,None,slot],(128,32),(0,group))
+                largest = self.prepare_rows(tensor,
+                    cached_signs if cutlass.const_expr(self.signs_mode == 'register') else signs,
+                    packed,scales,signs,signs,substage,tile,largest,Float32(1.))
             cute.arch.sync_threads()
             future = work+self.stages*self.blocks
             if thread//32 == 0 and future < limit:

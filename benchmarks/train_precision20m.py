@@ -178,7 +178,8 @@ def load_design_map(path):
             raise ValueError('design keys must be canonical M,N,K') from exc
         if len(shape)!=3 or key!=','.join(map(str,shape)) or any(v<=0 or v%128 for v in shape):
             raise ValueError('design keys must be canonical positive 128-aligned M,N,K')
-        if not isinstance(value,dict) or set(value)!={'schedule','transpose_loader','finalizer'}:
+        required={'schedule','transpose_loader','finalizer'}
+        if not isinstance(value,dict) or not required<=set(value) or set(value)-required-{'tma_tile_rows'}:
             raise ValueError('each design requires explicit schedule, transpose_loader and finalizer')
         if not isinstance(value['schedule'],dict) or set(value['schedule'])!={'dx','dw','backward_pipeline'}:
             raise ValueError('each design schedule requires explicit dx, dw, backward_pipeline')
@@ -188,7 +189,7 @@ def load_design_map(path):
         if rejection:
             raise ValueError(f'{key}: {rejection[1]}')
         result[key]=asdict(design)
-    implementations={(v['transpose_loader'],v['finalizer']) for v in result.values()}
+    implementations={(v['transpose_loader'],v['finalizer'],v['tma_tile_rows']) for v in result.values()}
     if len(implementations)!=1:
         raise ValueError('training dispatch requires one shared loader/finalizer implementation')
     return result
@@ -199,9 +200,11 @@ def verify_design_dispatch(args):
     if designs is None:
         return
     loader=next(iter(designs.values()))['transpose_loader']
+    tile_rows=next(iter(designs.values())).get('tma_tile_rows',32)
     records=getattr(args,'ms_eden_dispatch_records',[])
     transposes=[record for record in records if record.get('transpose') is True]
-    if loader!='native' and (not transposes or any(record.get('selected')!=loader for record in transposes)):
+    if loader!='native' and (not transposes or any(record.get('selected')!=loader
+            or record.get('tile_rows',32)!=tile_rows for record in transposes)):
         raise RuntimeError('training warmup did not establish the requested TMA implementation')
 
 

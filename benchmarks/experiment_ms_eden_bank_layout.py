@@ -6,7 +6,7 @@ from benchmarks import experiment_ms_eden_dependency as study
 
 
 @contextmanager
-def patched(mode, *, records=None, strict=False):
+def patched(mode, *, records=None, strict=False, tma_tile_rows=32):
     from rtx.kernels import nvfp4_posthoc as module
     from rtx.kernels.ms_eden_bank_layout import compile_bank_layout
     from rtx.kernels.ms_eden_packed_signs import compile_packed_rademacher
@@ -31,11 +31,12 @@ def patched(mode, *, records=None, strict=False):
         if records is not None:
             records.append(dict(rows=values['rows'], cols=values['cols'],
                 transpose=values['transpose'], selected=mode if tma and eligible else 'native',
-                stages=int(mode[-1]) if tma and eligible else values['stages']))
+                stages=int(mode[-1]) if tma and eligible else values['stages'],
+                tile_rows=tma_tile_rows if tma and eligible else None))
         if tma and eligible:
             values['producer_unroll_rows'] = False
             values['stages'] = int(mode[-1])
-            return compile_tma_preparation(**values, consumer_order='columns' if 'columns' in mode else 'xor5' if 'xor5' in mode else 'xor4' if 'xor4' in mode else 'retained')
+            return compile_tma_preparation(**values, tma_tile_rows=tma_tile_rows, consumer_order='columns' if 'columns' in mode else 'xor5' if 'xor5' in mode else 'xor4' if 'xor4' in mode else 'retained')
         if mode in ('group32', 'group32_reload', 'group32_stores', 'group32_reload_stores') and eligible:
             values['producer_unroll_rows'] = False
             if mode.startswith('group32_reload'):

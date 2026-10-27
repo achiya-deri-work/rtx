@@ -18,6 +18,7 @@ class MSEdenDesign:
     schedule: MSEdenPipelineSchedule = field(default_factory=MSEdenPipelineSchedule)
     transpose_loader: str = "native"
     finalizer: str = "separate"
+    tma_tile_rows: int = 32
 
     def __post_init__(self):
         if isinstance(self.schedule, dict):
@@ -28,6 +29,7 @@ IMPLEMENTATIONS = {
     "transpose_loader": ("native", "tma_xor4_1", "tma_xor4_2", "tma_xor4_3",
                          "tma_xor5_1", "tma_xor5_2", "tma_xor5_3"),
     "finalizer": ("separate", "dual", "dual_paired", "dual_cta"),
+    "tma_tile_rows": (32,64,128),
 }
 
 
@@ -36,6 +38,8 @@ def implementation_rejection(design):
     for name, choices in IMPLEMENTATIONS.items():
         if getattr(design, name) not in choices:
             return "implementation_rejected", f"unknown {name}"
+    if type(design.tma_tile_rows) is not int or (design.transpose_loader=='native' and design.tma_tile_rows!=32):
+        return "implementation_rejected", "TMA tile geometry requires a TMA loader"
     if design.finalizer != "separate":
         if design.schedule.backward_pipeline != "operand_paired":
             return "implementation_rejected", "dual finalizers require operand_paired"
@@ -99,6 +103,7 @@ def make_ms_eden_design_adapter(shape, evaluator, *, initial=None, **kwargs):
             records = result.get("design_dispatch", [])
             transposes = [record for record in records if record.get("transpose") is True]
             if not transposes or any(record.get("selected") != config.transpose_loader
+                                     or record.get('tile_rows',32) != config.tma_tile_rows
                                      for record in transposes):
                 return TrialOutcome("correctness_error", error="requested TMA dispatch was not established")
         return pipeline_outcome(result, expected_config=config.schedule,
@@ -132,10 +137,11 @@ def make_ms_eden_design_adapter(shape, evaluator, *, initial=None, **kwargs):
         schedule = replace(config.schedule, dw=replace(config.schedule.dw,
             producer_row_tile_batch=1, producer_row_load_bits=16, producer_values_per_lane=4))
         return stable_id(dict(schedule=base.config_id(schedule),
-            transpose_loader=config.transpose_loader, finalizer=config.finalizer))
+            transpose_loader=config.transpose_loader, finalizer=config.finalizer,
+            tma_tile_rows=config.tma_tile_rows))
 
     return DiscreteKernelAdapter(
-        context=KernelContext("ms_eden_design_research", 4, base.context.workload,
+        context=KernelContext("ms_eden_design_research", 5, base.context.workload,
             device=base.context.device, environment=base.context.environment,
             tags={"pipeline_context": base.context.identifier, "automatic_promotion": False}),
         initial_config=initial, axes={**axes, **IMPLEMENTATIONS},

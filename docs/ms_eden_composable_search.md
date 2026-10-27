@@ -138,3 +138,13 @@ entry points are regression-tested.
 These bounded qualification results are not full training convergence or
 proof of the outstanding multi-shape speedup target. Logs and machine-readable
 matrix output are retained in the ignored local consolidation report directory.
+
+The research adapter additionally exposes `tma_tile_rows=32|64|128` for TMA
+loaders, independently of one/two/three-stage buffering. The default remains
+32; larger transfers retain the same 32-row arithmetic groups. Non-default
+geometry with a native loader is rejected. Design context revision 5 includes
+this field in candidate identity; older design manifests load with 32 rows.
+On the RTX 5060, all 18 shape/tile/stage combinations passed byte-exact packed
+value and scale checks, global-maximum checks, and changed-input CUDA-graph
+replay (19 tests including constructor validation). These are correctness
+results only: larger tiles have not been promoted as performance winners.
