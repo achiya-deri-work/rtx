@@ -143,8 +143,13 @@ def test_matched_forward_and_independent_backward_schedules(scaling,compiled):
             dw_schedule_json='{"producer_blocks":96,"producer_load":"coalesced"}')
     fn=torch.compile(call,fullgraph=True,dynamic=False) if compiled else call
     out=fn(x,w)
+    # Stable regional execution takes its mode from dynamic_config, whereas
+    # the research API's explicit forward_outer_mode overrides that mode.
+    # Match the requested exact policy, not the preferred config's power2.
+    from dataclasses import replace
+    reference_cfg=replace(cfg,tensor_scale_mode='exact') if cfg is not None else None
     ref=rtx.nvfp4_linear(x.detach(),w.detach(),scaling=scaling,scale_config=policy,
-                         dynamic_config=cfg,autotune='off')
+                         dynamic_config=reference_cfg,autotune='off')
     torch.testing.assert_close(out,ref,rtol=0,atol=0)
     grads=torch.autograd.grad(out,(x,w),torch.ones_like(out))
     assert all(torch.isfinite(g).all() for g in grads)
@@ -162,6 +167,8 @@ def test_packed_source_cannot_silently_change_forward_policy():
     ("original_bf16",'{"amax_reduction":"staged","producer_order":"reduction_major"}'),
     ("original_bf16",'{"producer_load":"coalesced","producer_order":"reduction_major"}'),
     ("forward_current_roundtrip_bf16",'{"producer_load":"coalesced","producer_order":"reduction_major"}'),
+    ("original_bf16",'{"producer_load":"coalesced_wide","producer_order":"reduction_major"}'),
+    ("forward_current_roundtrip_bf16",'{"producer_load":"coalesced_wide","producer_order":"reduction_major"}'),
     ("forward_current_roundtrip_bf16",'{"amax_reduction":"staged","producer_order":"reduction_major"}'),
     ("forward_current_roundtrip_bf16",'{"reader_mode":"staged","decoder_threads":256,"decoder_blocks":512}')])
 def test_linear_compiled_training_rng_reproducible(source_policy,schedule_json):
@@ -241,3 +248,97 @@ def test_gradient_nondefault_gemm_schedule(phase,order,reduction):
     output=ms_eden_gradient(*args,phase=phase,schedule_json=json.dumps(asdict(schedule)))
     reference=independent_reference(args,phase)
     assert (output.float()-reference).norm()/reference.norm() < .005
+
+
+@pytest.mark.parametrize("dx_policy,dw_policy",[
+    ("ms_eden","mxfp8"),("mxfp8","ms_eden"),("mxfp8","mxfp8")])
+@pytest.mark.parametrize("compiled",[False,True])
+def test_mixed_backward_policy_rng_checkpoint_and_missing_gradients(dx_policy,dw_policy,compiled):
+    from rtx.experimental_ms_eden import ms_eden_linear
+    from torch.utils.checkpoint import checkpoint
+    torch.compiler.reset()
+    x=torch.randn(128,128,device="cuda",dtype=torch.bfloat16,requires_grad=True)
+    w=torch.randn_like(x,requires_grad=True)
+    dy=torch.randn(128,256,device="cuda",dtype=torch.bfloat16)[:,::2]
+    def linear(a,b):
+        return ms_eden_linear(a,b,dx_policy=dx_policy,dw_policy=dw_policy)
+    fn=torch.compile(linear,fullgraph=True,dynamic=False) if compiled else linear
+    # Compile/warm before recording RNG state.
+    torch.autograd.grad(fn(x,w),(x,w),dy)
+    state=torch.cuda.get_rng_state()
+    first=torch.autograd.grad(fn(x,w),(x,w),dy)
+    after=torch.cuda.get_rng_state()
+    torch.cuda.set_rng_state(state)
+    second=torch.autograd.grad(fn(x,w),(x,w),dy)
+    for a,b in zip(first,second):
+        assert torch.isfinite(a).all()
+        torch.testing.assert_close(a,b,rtol=0,atol=0)
+    assert torch.equal(after,torch.cuda.get_rng_state())
+    if dx_policy==dw_policy=="mxfp8":
+        assert torch.equal(state,after)
+    if not compiled:
+        torch.cuda.set_rng_state(state)
+        replay=torch.autograd.grad(checkpoint(linear,x,w,use_reentrant=False),(x,w),dy)
+        for a,b in zip(first,replay):
+            torch.testing.assert_close(a,b,rtol=0,atol=0)
+    for need_x,need_w in ((True,False),(False,True)):
+        a=x.detach().requires_grad_(need_x)
+        b=w.detach().requires_grad_(need_w)
+        fn(a,b).backward(dy)
+        assert (a.grad is not None)==need_x and (b.grad is not None)==need_w
+
+
+@pytest.mark.parametrize("dx_policy,dw_policy",[
+    ("ms_eden","ms_eden"),("ms_eden","mxfp8"),
+    ("mxfp8","ms_eden"),("mxfp8","mxfp8")])
+def test_backward_policy_matches_independent_phase_calls(dx_policy,dw_policy):
+    from rtx.experimental_ms_eden import ms_eden_linear
+    from rtx.fp8_bwd import mxfp8_linear_backward
+    from rtx.kernels.mxfp8_bwd import DEFAULT_MXFP8_BWD_CONFIG
+    x=torch.randn(128,128,device="cuda",dtype=torch.bfloat16,requires_grad=True)
+    w=torch.randn_like(x,requires_grad=True)
+    dy=torch.randn_like(x)
+    config=DEFAULT_MXFP8_BWD_CONFIG
+    state=torch.cuda.get_rng_state()
+    actual=torch.autograd.grad(ms_eden_linear(x,w,dx_policy=dx_policy,dw_policy=dw_policy,
+        mxfp8_backward_config=config if "mxfp8" in (dx_policy,dw_policy) else None),(x,w),dy)
+    actual_state=torch.cuda.get_rng_state()
+    torch.cuda.set_rng_state(state)
+    stable=mxfp8_linear_backward(dy,x.detach(),w.detach(),config=config,autotune="off")
+    expected=[]
+    for phase,policy,operand,reference in (("dx",dx_policy,w,stable[0]),("dw",dw_policy,x,stable[1])):
+        if policy=="mxfp8":
+            expected.append(reference)
+        else:
+            signs=torch.where(torch.rand(128,device="cuda")<.5,-1.,1.)
+            ua=torch.rand(dy.numel()//16,device="cuda",dtype=torch.float32)
+            ub=torch.rand(operand.numel()//16,device="cuda",dtype=torch.float32)
+            expected.append(ms_eden_gradient(dy,operand.detach(),signs,ua,ub,phase=phase))
+    for a,b in zip(actual,expected):
+        torch.testing.assert_close(a,b,rtol=0,atol=0)
+    assert torch.equal(actual_state,torch.cuda.get_rng_state())
+
+
+@pytest.mark.parametrize("compiled",[False,True])
+@pytest.mark.parametrize("explicit_config",[False,True])
+def test_jit_exact_outer_request_reaches_quantizer(compiled,explicit_config):
+    from dataclasses import replace
+    import rtx
+    from rtx.experimental_ms_eden import ms_eden_linear
+    from rtx.nvfp4_inference_autotune import preferred_jit_row_region_config
+    torch.compiler.reset()
+    torch.manual_seed(194)
+    x=torch.randn(128,128,device="cuda",dtype=torch.bfloat16)*.27
+    w=torch.randn_like(x)*.021
+    power2=preferred_jit_row_region_config(rtx.NVFP4Problem(128,128,128))
+    exact=replace(power2,tensor_scale_mode="exact")
+    def forward(a,b):
+        return ms_eden_linear(a,b,forward_scaling="jit_row_region",forward_outer_mode="exact",
+            forward_config=power2 if explicit_config else None)
+    fn=torch.compile(forward,fullgraph=True,dynamic=False) if compiled else forward
+    actual=fn(x,w)
+    reference=rtx.nvfp4_linear(x,w,scaling="jit_row_region",dynamic_config=exact,
+        scale_config=rtx.NVFP4ScaleConfig(tensor_scale_mode="exact"),autotune="off")
+    old_power2=rtx.nvfp4_linear(x,w,scaling="jit_row_region",dynamic_config=power2,autotune="off")
+    torch.testing.assert_close(actual,reference,atol=0,rtol=0)
+    assert not torch.equal(actual,old_power2),"test input must distinguish actual exact/power2 quantization"

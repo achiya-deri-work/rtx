@@ -13,7 +13,10 @@ import traceback
 import torch
 
 import rtx
-import validate_mxfp8_production as mx
+if __package__:
+    from . import validate_mxfp8_production as mx
+else:
+    import validate_mxfp8_production as mx
 
 
 def _nv_dynamic_case(

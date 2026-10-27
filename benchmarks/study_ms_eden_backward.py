@@ -7,13 +7,19 @@ import argparse
 from dataclasses import asdict,replace
 import json
 from pathlib import Path
+import time
 
 import torch
 from benchmarks.compare_nvfp4_packed_gemm import decode
 from benchmarks.profile_preparation_phases import measure
 
 
-def prepare(source, transpose, layout, schedule, packed_source=None, stage_packed=False):
+def prepare(source, transpose, layout, schedule, packed_source=None, stage_packed=False, *, operand=None, factor_output=None):
+    if operand is not None:
+        schedule=schedule.operand_schedule(operand)
+    from rtx.autotune.posthoc import check_preparation_copy_alignment
+    if packed_source is None:
+        check_preparation_copy_alignment(source,schedule,transpose)
     from rtx.kernels.nvfp4_posthoc import (compile_hadamard_preparation,
         compile_posthoc_scales,PosthocScaleConfig)
     from rtx.fp4 import _packed_fp4_view
@@ -21,10 +27,10 @@ def prepare(source, transpose, layout, schedule, packed_source=None, stage_packe
     rows,k=(c,r) if transpose else (r,c)
     groups=k//16
     if packed_source is None or stage_packed:
-        producer,count=compile_hadamard_preparation(r,c,PosthocScaleConfig(schedule.producer_threads,schedule.producer_blocks),4,transpose,schedule.producer_order,schedule.producer_load)
+        producer,count=compile_hadamard_preparation(r,c,PosthocScaleConfig(schedule.producer_threads,schedule.producer_blocks),4,transpose,schedule.producer_order,schedule.producer_load,schedule.producer_signs,schedule.producer_stages,schedule.producer_async_copy,correction_decode=schedule.correction_decode,partial_max_scope=schedule.partial_max_scope,normalization_math=schedule.normalization_math,producer_copy_bits=schedule.producer_copy_bits,producer_unroll_rows=schedule.producer_unroll_rows,producer_row_tile_batch=schedule.producer_row_tile_batch,producer_row_load_bits=schedule.producer_row_load_bits,producer_values_per_lane=schedule.producer_values_per_lane,producer_transpose_values_per_lane=schedule.producer_transpose_values_per_lane,producer_scale_math=schedule.producer_scale_math,producer_grouped_store_bits=schedule.producer_grouped_store_bits)
     else:
         from rtx.kernels.nvfp4_posthoc import compile_packed_hadamard_preparation
-        producer,count=compile_packed_hadamard_preparation(r,c,PosthocScaleConfig(schedule.producer_threads,schedule.producer_blocks),4,transpose,schedule.producer_order,schedule.producer_load)
+        producer,count=compile_packed_hadamard_preparation(r,c,PosthocScaleConfig(schedule.producer_threads,schedule.producer_blocks),4,transpose,schedule.producer_order,schedule.producer_load,schedule.producer_signs,schedule.producer_stages,schedule.producer_async_copy,correction_decode=schedule.correction_decode,partial_max_scope=schedule.partial_max_scope,normalization_math=schedule.normalization_math,producer_copy_bits=schedule.producer_copy_bits,producer_unroll_rows=schedule.producer_unroll_rows,producer_row_tile_batch=schedule.producer_row_tile_batch,producer_row_load_bits=schedule.producer_row_load_bits,producer_values_per_lane=schedule.producer_values_per_lane,producer_transpose_values_per_lane=schedule.producer_transpose_values_per_lane,producer_scale_math=schedule.producer_scale_math,producer_grouped_store_bits=schedule.producer_grouped_store_bits)
     if packed_source is not None:
         source_bytes=packed_source.qdata.view(torch.uint8).flatten()
         source_scales=packed_source.scale.flatten()
@@ -33,31 +39,38 @@ def prepare(source, transpose, layout, schedule, packed_source=None, stage_packe
         from rtx.kernels.nvfp4_posthoc import compile_packed_bf16_decode
         decode_runner=compile_packed_bf16_decode(r,c,PosthocScaleConfig(schedule.decoder_threads,schedule.decoder_blocks))
         source=torch.empty_like(source)
+        check_preparation_copy_alignment(source,schedule,transpose)
     reducer=None
     if schedule.amax_reduction == "staged":
         from rtx.kernels.nvfp4_posthoc import compile_partial_maximum
         reducer=compile_partial_maximum(count)
-    finalizer=compile_posthoc_scales(rows,groups,PosthocScaleConfig(schedule.finalizer_threads,schedule.finalizer_blocks,layout),1 if reducer else count)
+    finalizer=compile_posthoc_scales(rows,groups,PosthocScaleConfig(schedule.finalizer_threads,schedule.finalizer_blocks,layout,probability_math=schedule.probability_math),1 if reducer else count)
     packed=torch.empty(rows,k//2,device=source.device,dtype=torch.uint8)
     temporary=torch.empty(rows*groups,device=source.device,dtype=torch.bfloat16)
     partials=torch.empty(count,device=source.device)
     maximum=torch.empty(1,device=source.device) if reducer else partials
     scales=torch.empty(rows*groups,device=source.device,dtype=torch.float8_e4m3fn)
-    factor=torch.empty(1,device=source.device)
+    factor=torch.empty(1,device=source.device,dtype=torch.float32) if factor_output is None else factor_output
+    if factor.shape!=(1,) or factor.dtype!=torch.float32 or factor.device!=source.device or not factor.is_contiguous():
+        raise ValueError("factor output must be contiguous FP32[1] on the source device")
     uniforms=torch.rand(rows*groups,device=source.device)
     src=source.flatten() if packed_source is None or stage_packed else None
     packed_flat=packed.flatten()
     gemm_scales=scales.reshape(rows,groups) if layout=="row_major" else scales.reshape(rows//128,groups//8,1024)
-    def run(signs):
+    def produce(signs):
         if stage_packed:
             decode_runner(source_bytes,source_scales,source_outer,src)
         if packed_source is None or stage_packed:
             producer(src,signs,packed_flat,temporary,partials)
         else:
             producer(source_bytes,source_scales,source_outer,signs,packed_flat,temporary,partials)
+    def finalize():
         if reducer:
             reducer(partials,maximum)
         finalizer(temporary,maximum,uniforms,scales,factor)
+    def run(signs):
+        produce(signs)
+        finalize()
     def decode_operand():
         raw=gemm_scales
         if layout=="mma128":
@@ -65,7 +78,9 @@ def prepare(source, transpose, layout, schedule, packed_source=None, stage_packe
                  .permute(0,4,3,1,2,5).contiguous().reshape(rows,groups).view(raw.dtype))
         return decode(packed,raw,factor)
     return dict(run=run,packed=_packed_fp4_view(packed),scales=gemm_scales,
-                factor=factor,decode=decode_operand,uniforms=uniforms)
+                factor=factor,decode=decode_operand,uniforms=uniforms,
+                produce=produce,finalize=finalize,partials=partials,
+                temporary_scales=temporary)
 
 
 def study_operand(rows, cols, scale, distribution):
@@ -85,7 +100,10 @@ def study_operand(rows, cols, scale, distribution):
 
 def run_study(shape, phase, layout, benchmark=True, schedule=None, stochastic_samples=0,
               distribution="gaussian", seed=807, decoded_samples=False, oracle_samples=False,
-              source_policy="original_bf16", packed_reader=False, staged_packed_reader=False, profile=False):
+              source_policy="original_bf16", packed_reader=False, staged_packed_reader=False, profile=False,
+              preparation_phases=False, precondition_seconds=0.):
+    if not 0 <= precondition_seconds <= 10:
+        raise ValueError("precondition_seconds must be between zero and ten")
     if stochastic_samples not in (0,) and stochastic_samples < 2:
         raise ValueError("stochastic_samples must be zero or at least two")
     if decoded_samples and not stochastic_samples:
@@ -125,29 +143,50 @@ def run_study(shape, phase, layout, benchmark=True, schedule=None, stochastic_sa
         packed_x, packed_w = quantize_nvfp4(x), quantize_nvfp4(w)
         x = packed_x.dequantize(torch.bfloat16)
         w = packed_w.dequantize(torch.bfloat16)
+    factors=torch.empty(2,device="cuda",dtype=torch.float32) if schedule.outer_factor_mode=="pair" else None
+    factor_options={"outer_factor_mode":"pair"} if factors is not None else {}
+    a_factor=None if factors is None else factors[:1]
+    b_factor=None if factors is None else factors[1:]
     if phase=="dx":
-        a,b=prepare(dy,False,layout,schedule),prepare(w,True,layout,schedule,packed_w if packed_reader or staged_packed_reader else None,staged_packed_reader)
+        a,b=prepare(dy,False,layout,schedule,operand="a",factor_output=a_factor),prepare(w,True,layout,schedule,packed_w if packed_reader or staged_packed_reader else None,staged_packed_reader,operand="b",factor_output=b_factor)
         problem=NVFP4Problem(m,k,n)
         reference=dy.float()@w.float()
     elif phase=="dw":
-        a,b=prepare(dy,True,layout,schedule),prepare(x,True,layout,schedule,packed_x if packed_reader or staged_packed_reader else None,staged_packed_reader)
+        a,b=prepare(dy,True,layout,schedule,operand="a",factor_output=a_factor),prepare(x,True,layout,schedule,packed_x if packed_reader or staged_packed_reader else None,staged_packed_reader,operand="b",factor_output=b_factor)
         problem=NVFP4Problem(n,k,m)
         reference=dy.float().T@x.float()
     else:
         raise ValueError("phase must be dx or dw")
     signs=(torch.randint(2,(128,),device="cuda")*2-1).float()
-    alpha=torch.empty(1,device="cuda")
+    alpha=torch.empty(1,device="cuda") if factors is None else factors
     out=torch.empty(problem.m,problem.n,device="cuda",dtype=torch.bfloat16)
     config=schedule.gemm
     if config.scale_layout != layout:
         config=replace(config,scale_layout=layout,scale_role="tma" if layout=="mma128" else "consumers")
-    gemm=compile_nvfp4_gemm(problem,config)
-    product=compile_posthoc_scale_product()
+    reduction_tile=schedule.gemm_reduction_tile(problem.k)
+    workspace=None
+    gemm_reducer=None
+    if schedule.gemm_split_reduction>1:
+        from rtx.kernels.nvfp4_gemm import compile_nvfp4_split_gemm,compile_nvfp4_split_workspace_reduce
+        workspace=torch.empty(schedule.gemm_split_reduction*problem.m*problem.n,device="cuda",dtype=torch.float32)
+        gemm=compile_nvfp4_split_gemm(problem,config,split_reduction=schedule.gemm_split_reduction,
+                                    reduction_tile=reduction_tile)
+        gemm_reducer=compile_nvfp4_split_workspace_reduce(problem.m,problem.n,schedule.gemm_split_reduction,
+            algorithm=schedule.gemm_reduction_algorithm,threads=schedule.gemm_reduction_threads,
+            vector=schedule.gemm_reduction_vector,persistent_waves=schedule.gemm_reduction_waves,**factor_options)
+    else:
+        gemm=compile_nvfp4_gemm(problem,config,**factor_options)
+    product=compile_posthoc_scale_product() if factors is None else None
     def prep():
         a["run"](signs); b["run"](signs)
-        product(a["factor"],b["factor"],alpha)
+        if product is not None:
+            product(a["factor"],b["factor"],alpha)
     def multiply():
-        gemm(a["packed"],b["packed"],a["scales"],b["scales"],out,alpha)
+        if workspace is not None:
+            gemm(a["packed"],b["packed"],a["scales"],b["scales"],workspace)
+            gemm_reducer(workspace,out,alpha)
+        else:
+            gemm(a["packed"],b["packed"],a["scales"],b["scales"],out,alpha)
     def full():
         prep(); multiply()
     full()
@@ -163,6 +202,8 @@ def run_study(shape, phase, layout, benchmark=True, schedule=None, stochastic_sa
     if not out.isfinite().all() or metrics["packed"]["nrms"]>.005:
         raise RuntimeError(f"packed GEMM contract failed: {metrics}")
     result=dict(shape=list(shape),phase=phase,layout=layout,metrics=metrics,gemm_config=asdict(config),
+                gemm_split_reduction=schedule.gemm_split_reduction,gemm_reduction_tile=reduction_tile,
+                gemm_workspace_bytes=workspace.numel()*workspace.element_size() if workspace is not None else 0,
                 preparation_schedule=asdict(schedule),
                 policy=source_policy+"_shared_rademacher_hadamard128_e8m4_rtz_eden_scale_sr",
                 source_policy=source_policy,
@@ -254,9 +295,45 @@ def run_study(shape, phase, layout, benchmark=True, schedule=None, stochastic_sa
                 interpretation="Finite-sample diagnostic, not proof of unbiasedness; conditional on fixed BF16 operands.")
         signs.copy_(original_signs)
     if benchmark:
+        if precondition_seconds:
+            # Same complete work, outside all timings; no power/clock changes.
+            deadline=time.monotonic()+precondition_seconds
+            while time.monotonic()<deadline:
+                for _ in range(32):
+                    full()
+                torch.cuda.synchronize()
+            result["precondition_seconds"]=precondition_seconds
         result["measurement_contract"]="graph8x10_samples15_warm200ms_revision2"
         result["timings"]={name:measure(fn,time_based_warmup=True) for name,fn in (("preparation",prep),("gemm",multiply),("full",full))}
         result["quality"]={name:runtime_timing_metadata(t["samples_ms"]) for name,t in result["timings"].items()}
+        if preparation_phases:
+            # Fixed inputs above isolate arithmetic. Charge caller-owned RNG
+            # separately and in a complete gradient; graph replay advances it.
+            def randomize():
+                signs.random_(0,2).mul_(2).sub_(1)
+                a["uniforms"].uniform_(); b["uniforms"].uniform_()
+            def full_with_rng():
+                randomize(); full()
+            phases={"a_producer":lambda:a["produce"](signs),
+                    "b_producer":lambda:b["produce"](signs),
+                    "a_finalizer":a["finalize"],"b_finalizer":b["finalize"]}
+            if product is not None:
+                phases["scale_product"]=lambda:product(a["factor"],b["factor"],alpha)
+            phases.update(rng=randomize,full_with_rng=full_with_rng)
+            result["preparation_phases"]={name:measure(fn,time_based_warmup=True)
+                                           for name,fn in phases.items()}
+            result["preparation_phase_quality"]={name:runtime_timing_metadata(t["samples_ms"])
+                for name,t in result["preparation_phases"].items()}
+            randomized_reference=a["decode"]()@b["decode"]().T
+            randomized_error=out.float()-randomized_reference
+            randomized_nrms=(randomized_error.norm()/randomized_reference.norm().clamp_min(1e-12)).item()
+            randomized_finite=bool(out.isfinite().all())
+            if not randomized_finite or randomized_nrms > .005:
+                raise RuntimeError("RNG-inclusive packed GEMM contract failed")
+            result["rng_inclusive_packed_contract"]={"finite":randomized_finite,"nrms":randomized_nrms}
+            result["preparation_phase_caveat"]=("Isolated phases change cache reuse; full and full_with_rng are authoritative. "
+                "Diagnostic RNG uses caller-owned Torch state, materialized FP32 signs/uniforms, no implicit kernel RNG. "
+                "Its in-place RNG sequence differs from public API RNG and does not measure public compiled backward.")
     if profile:
         # Keep allocations, compilation, oracle work and warmup out of capture.
         for _ in range(25):
@@ -279,7 +356,7 @@ def main():
     p.add_argument("--output",required=True)
     p.add_argument("--schedule-json")
     p.add_argument("--producer-order", choices=("row_major", "reduction_major"))
-    p.add_argument("--producer-load", choices=("direct", "coalesced"))
+    p.add_argument("--producer-load", choices=("direct", "coalesced", "coalesced_wide", "coalesced_x4", "coalesced_x8"))
     p.add_argument("--producer-threads", type=int, choices=(64,128,256,512))
     p.add_argument("--amax-reduction", choices=("inline", "staged"))
     p.add_argument("--stochastic-samples", type=int, default=0)
@@ -292,6 +369,8 @@ def main():
     p.add_argument("--packed-reader", action="store_true")
     p.add_argument("--staged-packed-reader", action="store_true")
     p.add_argument("--profile", action="store_true")
+    p.add_argument("--preparation-phases", action="store_true")
+    p.add_argument("--precondition-seconds", type=float, default=0.)
     args=p.parse_args()
     from rtx.autotune.posthoc import PosthocPreparationSchedule
     schedule=PosthocPreparationSchedule(**json.loads(Path(args.schedule_json).read_text())) if args.schedule_json else None
@@ -308,7 +387,8 @@ def main():
                      stochastic_samples=args.stochastic_samples, distribution=args.distribution, seed=args.seed,
                      decoded_samples=args.decoded_samples, oracle_samples=args.oracle_samples,
                      source_policy=args.source_policy, packed_reader=args.packed_reader,
-                     staged_packed_reader=args.staged_packed_reader,profile=args.profile)
+                     staged_packed_reader=args.staged_packed_reader,profile=args.profile,
+                     preparation_phases=args.preparation_phases,precondition_seconds=args.precondition_seconds)
     path=Path(args.output); path.parent.mkdir(parents=True,exist_ok=True)
     with path.open("x") as handle:
         json.dump(result,handle,indent=2)

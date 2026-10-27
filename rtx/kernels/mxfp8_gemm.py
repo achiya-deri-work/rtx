@@ -302,6 +302,11 @@ class MXFP8GemmKernel:
         return warp.MmaMXF8Op(self.ab_dtype, Float32, self.sf_dtype)
 
     @cute.jit
+    def _load_global_output_scale(self, output_scale: cute.Tensor):
+        """Scalar default; NVFP4 research modes may supply factor pairs."""
+        return Float32(output_scale[0])
+
+    @cute.jit
     def _epilogue_output_scale(
         self,
         output_scale: cute.Tensor,
@@ -358,6 +363,11 @@ class MXFP8GemmKernel:
         return value
 
     @cute.jit
+    def _load_scale_element(self, source, row, group, is_a, output_scale):
+        # Identity hook; experimental consumers may finalize temporary scales.
+        return source[row, group]
+
+    @cute.jit
     def _stage_scales(
         self,
         sx: cute.Tensor,
@@ -370,6 +380,7 @@ class MXFP8GemmKernel:
         k_tile: Int32,
         start_thread: Int32,
         thread_count: cutlass.Constexpr,
+        output_scale=None,
     ):
         cfg = self.config
         scale_prefetch = {
@@ -423,9 +434,9 @@ class MXFP8GemmKernel:
                     < self.problem.k // self.sf_vec_size
                 ):
                     if is_a:
-                        scale = sx[global_row, global_k_block]
+                        scale = self._load_scale_element(sx, global_row, global_k_block, True, output_scale)
                     else:
-                        scale = sw[global_row, global_k_block]
+                        scale = self._load_scale_element(sw, global_row, global_k_block, False, output_scale)
                 if is_a:
                     s_sfa[row, k_block * self.sf_vec_size, stage] = scale
                 else:
@@ -806,7 +817,7 @@ class MXFP8GemmKernel:
         }[cfg.scale_cache]
         global_output_scale = Float32(1.0)
         if cutlass.const_expr(self.apply_output_scale):
-            global_output_scale = Float32(output_scale[0])
+            global_output_scale = self._load_global_output_scale(output_scale)
         sx_row_view = cute.make_tensor(
             sx.iterator,
             cute.make_layout(
@@ -1384,6 +1395,7 @@ class MXFP8GemmKernel:
                             k_tile,
                             tidx - cfg.num_mma_warps * 32,
                             32,
+                            output_scale,
                         )
                         self.scale_barrier.arrive_and_wait()
 
@@ -1426,9 +1438,9 @@ class MXFP8GemmKernel:
                                 < self.problem.k // self.sf_vec_size
                             ):
                                 if is_a:
-                                    scale = sx_row_view[global_row, global_k_block]
+                                    scale = self._load_scale_element(sx_row_view, global_row, global_k_block, True, output_scale)
                                 else:
-                                    scale = sw_row_view[global_row, global_k_block]
+                                    scale = self._load_scale_element(sw_row_view, global_row, global_k_block, False, output_scale)
                             if is_a:
                                 s_sfa[row, k_block * self.sf_vec_size, stage] = scale
                             else:

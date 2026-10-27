@@ -75,6 +75,7 @@ class RandomSearch(Generic[ConfigT]):
     max_batches: int = 8
     max_pool_size: int = 4096
     name: str = "random"
+    require_timing_eligible: bool = False
 
     def __post_init__(self) -> None:
         if self.pool_multiplier <= 0 or self.max_batches <= 0:
@@ -89,7 +90,9 @@ class RandomSearch(Generic[ConfigT]):
         rng: random.Random,
         limit: int,
     ) -> list[Proposal[ConfigT]]:
-        seeds = [item.config for item in sorted(history.successful, key=lambda item: item.score)[:8]]
+        successes = [item for item in history.successful
+                     if not self.require_timing_eligible or item.outcome.timing_eligible]
+        seeds = [item.config for item in sorted(successes, key=lambda item: item.score)[:8]]
         pool_size = max(limit * self.pool_multiplier, limit)
         eligible: list[ConfigT] = []
         eligible_ids: set[str] = set()
@@ -143,6 +146,7 @@ class CoordinateLocalSearch(Generic[ConfigT]):
     shuffle_coordinates: bool = False
     name: str = "coordinate_local"
     anchor_tolerance: float = 0.0
+    require_timing_eligible: bool = False
 
     def __post_init__(self):
         if not math.isfinite(self.anchor_tolerance) or not 0 <= self.anchor_tolerance < 1:
@@ -155,13 +159,15 @@ class CoordinateLocalSearch(Generic[ConfigT]):
         rng: random.Random,
         limit: int,
     ) -> list[Proposal[ConfigT]]:
-        ranked = sorted(history.successful, key=lambda item: item.score)
+        successes = [item for item in history.successful
+                     if not self.require_timing_eligible or item.outcome.timing_eligible]
+        ranked = sorted(successes, key=lambda item: item.score)
         if self.anchor_tolerance and ranked:
             # Stable chronological anchor: a near tie must not redirect the
             # local search. This is a policy margin, not a confidence interval;
             # raw timings and final winner selection remain unchanged.
-            anchor = history.successful[0]
-            for item in history.successful[1:]:
+            anchor = successes[0]
+            for item in successes[1:]:
                 if item.score < anchor.score * (1 - self.anchor_tolerance):
                     anchor = item
             ranked = [anchor] + [item for item in ranked if item.config_id != anchor.config_id]

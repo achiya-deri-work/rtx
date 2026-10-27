@@ -17,12 +17,40 @@ from rtx.models import DecoderConfig, DecoderOnlyTransformer, LinearSpec, causal
 from benchmarks.evaluate_quartet2 import build
 
 
+RESEARCH_POLICIES={
+    'research_mx_mx':('mxfp8','mxfp8'),
+    'research_fp4_fp4':('ms_eden','ms_eden'),
+    'research_mx_fp4':('mxfp8','ms_eden'),
+    'research_fp4_mx':('ms_eden','mxfp8'),
+}
+
+
+class ResearchBackwardLinear(torch.nn.Module):
+    """Same exact-outer NVFP4 forward; only original-source backward differs."""
+    def __init__(self, module, mode):
+        super().__init__()
+        if module.bias is not None:
+            raise ValueError('research projection is bias-free')
+        self.weight=module.weight
+        self.dx_policy,self.dw_policy=RESEARCH_POLICIES[mode]
+
+    def forward(self,x):
+        from rtx import DEFAULT_MXFP8_BWD_CONFIG
+        from rtx.experimental_ms_eden import ms_eden_linear
+        shape=x.shape
+        out=ms_eden_linear(x.reshape(-1,shape[-1]).contiguous(),self.weight,
+            source_policy='original_bf16',forward_scaling='jit_row_region',
+            mxfp8_backward_config=DEFAULT_MXFP8_BWD_CONFIG if 'mxfp8' in (self.dx_policy,self.dw_policy) else None,
+            forward_outer_mode='exact',dx_policy=self.dx_policy,dw_policy=self.dw_policy)
+        return out.reshape(*shape[:-1],self.weight.shape[0])
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--tokens', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--mode', choices=('bf16','mxfp8','rtx_nvfp4','rtx_four_six','quartet','quartet_hybrid','quartet_ste',
-                                    'rtx_jit_four_six','rtx_jit_amax_exact'), required=True)
+                                    'rtx_jit_four_six','rtx_jit_amax_exact',*RESEARCH_POLICIES), required=True)
     p.add_argument('--seed', type=int, default=17)
     p.add_argument('--width', type=int, default=256)
     p.add_argument('--steps', type=int, default=250)
@@ -52,7 +80,8 @@ def main():
         if a.mode != 'bf16':
             for name,module in list(model.named_modules()):
                 if name.startswith('layers.') and isinstance(module,torch.nn.Linear):
-                    replacement=build(a.mode,module.in_features,module.out_features)
+                    replacement=(ResearchBackwardLinear(module,a.mode) if a.mode in RESEARCH_POLICIES
+                                 else build(a.mode,module.in_features,module.out_features))
                     replacement.weight=module.weight
                     parent,leaf=name.rsplit('.',1)
                     setattr(model.get_submodule(parent),leaf,replacement)
@@ -64,6 +93,11 @@ def main():
              token_count=len(tokens),split=split,optimizer='BF16 fused AdamW',
              recipe='QK norm; pre/post norm; 0.02 trunc normal; depth residual scaling',
              compile='fullgraph static; cudagraphs disabled',batch=a.batch,sequence=128,layers=a.layers)
+        if a.mode in RESEARCH_POLICIES:
+            emit(kind='research_policy',dx_policy=RESEARCH_POLICIES[a.mode][0],
+                 dw_policy=RESEARCH_POLICIES[a.mode][1],source='original_bf16',
+                 forward='NVFP4 jit_row_region exact FP32 outer scaling',
+                 scope='short decoder trajectory, not convergence qualification')
         def batch(step,validation=False):
             rng=np.random.default_rng(a.seed+step*0x9E3779B1)
             lo,hi=(split,len(tokens)) if validation else (0,split)
@@ -78,8 +112,19 @@ def main():
         optimizer=torch.optim.AdamW(model.parameters(),lr=3e-4,betas=(.9,.95),
                                     weight_decay=.1,fused=True)
         try:
+            if a.mode in RESEARCH_POLICIES:
+                with torch.no_grad():
+                    initial_logits=model(batch(0)[0]).detach().contiguous()
+                    initial_forward_hash=hashlib.sha256(initial_logits.view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+                emit(kind='initial_forward',sha256=initial_forward_hash)
+                del initial_logits
             # Compile both phases before resetting stochastic state for training.
+            torch.cuda.synchronize()
+            compilation_start=time.monotonic()
             loss=compiled(*batch(0)); loss.backward(); optimizer.zero_grad(set_to_none=True)
+            torch.cuda.synchronize()
+            emit(kind='compile_warmup',seconds=time.monotonic()-compilation_start,
+                 scope='first compiled loss plus backward and gradient clear; not pure compilation')
             torch.manual_seed(a.seed+100_000)
             start=time.monotonic()
             for step in range(a.steps):

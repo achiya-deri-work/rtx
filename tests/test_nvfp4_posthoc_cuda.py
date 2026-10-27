@@ -4,6 +4,14 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(),reason="CUDA required")
 
 
+def test_wide_coalesced_rejects_partial_source_column_tile():
+    from rtx.kernels.nvfp4_posthoc import HadamardPreparationKernel,PosthocScaleConfig
+    # 512 threads stage 32 columns with the wide loader, not 16.
+    with pytest.raises(ValueError,match="complete row groups"):
+        HadamardPreparationKernel(128,16,PosthocScaleConfig(512,3),4,True,
+                                  load_mode="coalesced_wide")
+
+
 def test_ms_eden_timing_records_bounded_time_based_warmup():
     from benchmarks.study_ms_eden_backward import run_study
     result=run_study((128,128,128),"dw","mma128")
@@ -70,7 +78,8 @@ def test_partial_maximum_independent_reference_and_replay(count):
 @pytest.mark.parametrize("threads", [64,128,256,512])
 @pytest.mark.parametrize("packed_source", [False,True])
 @pytest.mark.parametrize("order", ["row_major","reduction_major"])
-def test_coalesced_producer_thread_geometry(threads,packed_source,order):
+@pytest.mark.parametrize("load", ["coalesced","coalesced_wide","coalesced_x4","coalesced_x8"])
+def test_coalesced_producer_thread_geometry(threads,packed_source,order,load):
     from benchmarks.study_ms_eden_backward import prepare
     from rtx.autotune.posthoc import PosthocPreparationSchedule
     from benchmarks.compare_nvfp4_packed_gemm import decode
@@ -88,7 +97,7 @@ def test_coalesced_producer_thread_geometry(threads,packed_source,order):
         source=decode(packed.qdata,packed.scale,packed.per_tensor_scale).bfloat16()
     reference=prepare(source,True,"mma128",PosthocPreparationSchedule())
     candidate=prepare(source,True,"mma128",PosthocPreparationSchedule(
-        producer_threads=threads,producer_blocks=3,producer_order=order,producer_load="coalesced"),packed)
+        producer_threads=threads,producer_blocks=3,producer_order=order,producer_load=load),packed)
     signs=(torch.randint(2,(128,),device="cuda")*2-1).float()
     candidate["uniforms"].copy_(reference["uniforms"])
     reference["run"](signs);candidate["run"](signs)

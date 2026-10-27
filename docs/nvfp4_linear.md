@@ -333,8 +333,12 @@ compiler-visible FX where specified.
 - `autotune="coordinate"` requests the full deep-search policy.
 - `tuning_policy` supplies a custom orchestration/search policy.
 - `autotune_cache_dir` selects a non-default winner/cache root.
-- `scale_config` selects exact/power-of-two outer scaling and delayed-history
-  policy; `backward_config` overrides the low-level MXFP8 backward schedule.
+- `scale_config` selects tensor-current/delayed outer scaling and delayed-history
+  policy. For stable JIT-region execution, the effective outer mode belongs to
+  `dynamic_config.tensor_scale_mode`; passing only `scale_config` does not
+  override the preferred regional configuration. Pin matching configurations
+  as in the examples above when selecting exact regional scaling.
+  `backward_config` overrides the low-level MXFP8 backward schedule.
 - `dynamic_config` fixes the dynamic-X/dynamic-W materialized schedule.
 - `weight_prequant_config` fixes dynamic-X/prequantized-W inference.
 - `fully_prequant_config` fixes prequantized-X/prequantized-W inference.
@@ -451,6 +455,20 @@ has been observed. Supported inputs are contiguous rank-two BF16 CUDA tensors
 with positive dimensions divisible by 128; higher-order gradients are not
 supported. Eager and `torch.compile(fullgraph=True)` are tested.
 
+Experimental overlap is opt-in: `backward_pipeline="paired"` schedules dX and
+dW on joined CUDA streams for original-BF16, two-gradient MS-EDEN execution.
+Partial/mixed-policy backwards retain their individual paths. Warm the actual
+caller stream before CUDA graph capture. Independent preparation schedules
+also expose `producer_async_copy` and `producer_stages` (1/2/3); asynchronous
+buffering requires a supported coalesced source reader. These are performance
+choices, not changes to FP32 scale/correction semantics or a switch away from
+the original BF16 gradient sources. Serial execution and synchronous loading
+remain defaults: overlap helps some shapes and can add contention on others.
+See the [consolidated complete-backward guide](ms_eden_composable_search.md) for
+validated configurations, bounded training results, and the opt-in research
+tuner (`python -m benchmarks.tune_ms_eden_pipeline`). Its selections do not
+automatically replace stable layer defaults.
+
 `source_policy="forward_current_roundtrip_bf16"` instead saves packed forward
 operands and changes the gradient's source values. It only supports the fixed
 tensor-current forward; combining it with regional/block forward or a custom
@@ -460,3 +478,100 @@ ordinary performance autotuning or changes the stable layer's backward policy.
 
 See the [NVFP4 evaluation](nvfp4_completion_20261023.md) for matched forward/
 backward timings, numerical error, and the boundary of current qualification.
+
+### Independent experimental gradient policies
+
+For this research function's JIT-region forward, an explicit
+`forward_outer_mode="exact"` or `"power2"` controls the effective dynamic
+configuration, even if a supplied schedule carries a different outer mode.
+When the argument is omitted, a supplied JIT configuration retains its mode
+(including Four-over-Six); without a supplied configuration, the historical
+research default remains power-of-two. This does not change the stable layer's
+configuration precedence. Earlier research runs requesting exact mode without
+pinning the dynamic configuration used power-of-two scaling; corrected evidence
+labels are recorded in the backward study report.
+
+The research function also accepts `dx_policy` and `dw_policy`, each either
+`"ms_eden"` (the existing experimental FP4 estimator) or `"mxfp8"`:
+
+```python
+y = ms_eden_linear(
+    x, weight,
+    forward_scaling="jit_row_region",
+    forward_outer_mode="exact",
+    dx_policy="ms_eden",
+    dw_policy="mxfp8",
+)
+```
+
+This example investigates FP4 activation gradients while retaining MXFP8 weight
+gradients; it is not a recommended training default. Both policy arguments
+default to `"ms_eden"`, preserving this experimental function's previous
+behavior. Stable `rtx.NVFP4Linear` remains MXFP8 backward for both gradients.
+
+Mixed policies require `source_policy="original_bf16"`. Packed-forward-source
+reuse is rejected with any MXFP8 phase, rather than silently changing the
+saved-state or gradient-source contract. Missing gradients perform no work or
+random-number generation. MXFP8 phases consume no RNG.
+
+`dx_schedule_json` / `dw_schedule_json` configure FP4 phases only. An optional
+`mxfp8_backward_config=MXFP8BwdConfig(...)` controls the MXFP8 phases, including
+its independent dX/dW matrix-multiplication schedules; otherwise the existing
+deterministic default is used. This research API does not perform implicit
+online tuning. Choose precision explicitly, then tune schedules within that
+fixed numerical policy. The active qualification work is recorded in the
+[backward study plan](nvfp4_backward_workplan_20261025.md); do not interpret API
+availability as demonstrated mixed-policy convergence or a speedup.
+
+The research all-MXFP8 option invokes the existing separate dX/dW operators;
+it is not a substitute performance baseline for the stable layer's paired
+backward implementation. Use `NVFP4Linear` for the stable training path.
+The [estimator and short-training report](nvfp4_backward_numerics_20261025.md)
+separates stochastic variance, residual sparse-input error, and corrected
+exact-forward training evidence.
+
+### Experimental preparation reuse and RNG choices
+
+`PosthocPreparationSchedule` exposes `producer_signs="reload" | "register"`.
+Register mode loads each lane's four fixed Hadamard signs once per producer
+launch and reuses them across its tiles. The controlled GPU comparisons are
+bit-exact; it is a scheduling choice, not a different gradient estimator.
+Producer grids and thread counts remain independently configurable. A good
+grid on one SKU/shape is not a universal default.
+
+`rng_mode="explicit"` retains the original caller-generated uniform vectors.
+The opt-in `rng_mode="philox"` instead draws a tiny key using PyTorch RNG and
+generates scale-rounding uniforms inside the finalizer. `philox_packet_size`
+may be `1` or `4`; four reuses the four words from each Philox calculation.
+This mode only supports original-BF16 backward sources. It uses a documented
+24-bit uniform grid and changes the random sequence/consumption; it is not a
+promise of bit-identical training trajectories or unbiased gradients. It passed
+the focused seed/reset/checkpoint and compiled graph tests, but measured slower
+backward on the tested large 5060 projection while reducing peak allocation.
+Keep it an explicit memory/performance tradeoff, not an assumed speed upgrade.
+
+For direct deterministic tests, `rtx.experimental_ms_eden.ms_eden_seeded_gradient`
+accepts a caller-owned contiguous CUDA `int64[2]` key and explicit signs. Its
+two operands use separate Philox counter streams. The older
+`ms_eden_gradient` still requires explicit uniform vectors and rejects a
+misleading Philox schedule.
+
+The preparation tuner supports `--public-rng` to measure caller randomness and
+the complete compiled gradient. Without that flag it measures fixed supplied
+random inputs and deliberately excludes/rejects RNG implementation choices.
+Use `--initial-schedule-json` to start from a known schedule, and `--trials` to
+bound effort. These experiments do not change the stable layer's backward
+policy. See [the amortization study](nvfp4_amortization_20261025.md) for measured
+tradeoffs and qualification boundaries.
+
+Grouped preparation also exposes `producer_grouped_store_bits` in the
+experimental `PosthocPreparationSchedule` / schedule JSON: `8` (default),
+`16`, `32`, or `64`. This is a maximum FP4 packed-store width, not a quantization
+precision choice. It applies to VPL8/16 producers; VPL4 keeps byte stores, and
+VPL8 caps a requested 64-bit width at its 32-bit packed fragment. All arithmetic
+and output bytes remain unchanged. For grouped transpose use
+`producer_transpose_values_per_lane=16` with `producer_load="coalesced_x8"`.
+The autotuner exposes this axis and records effective widths per operand;
+schedule context revision 27 / feature revision 22 separates new records.
+Initial 5060 results favor 32-bit stores on some shapes, not universally.
+Stable `NVFP4Linear` still uses MXFP8 backward, and no default is promoted.

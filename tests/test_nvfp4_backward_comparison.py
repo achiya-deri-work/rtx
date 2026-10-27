@@ -38,7 +38,13 @@ def test_focused_refinement_preserves_other_phase():
     gemm=focused_candidates(adapter,initial,'gemm')
     assert prep[0]==gemm[0]==initial
     assert all(c.gemm==initial.gemm for c in prep)
-    assert all(replace(c,gemm=initial.gemm)==initial for c in gemm)
+    assert all(c.gemm_split_reduction==initial.gemm_split_reduction for c in prep)
+    assert any(c.gemm_split_reduction!=initial.gemm_split_reduction for c in gemm)
+    from dataclasses import fields
+    preparation_fields=[f.name for f in fields(initial)
+                        if f.name!='gemm' and not f.name.startswith('gemm_')]
+    assert all(all(getattr(c,name)==getattr(initial,name) for name in preparation_fields)
+               for c in gemm)
     assert any(c.amax_reduction=='staged' for c in prep[:9])
     assert len({c.gemm for c in gemm[:12]})>4
 
@@ -48,3 +54,33 @@ def test_training_probe_rejects_invalid_contract_before_cuda(kwargs):
     from benchmarks.train_ms_eden_probe import run
     with pytest.raises(ValueError):
         run(**kwargs)
+
+
+def test_public_rng_tuning_uses_actual_public_phase_evaluator(tmp_path):
+    import json
+    from types import SimpleNamespace
+    from benchmarks.tune_ms_eden_preparation import evaluation_command
+    from rtx.autotune.posthoc import PosthocPreparationSchedule
+    args=SimpleNamespace(public_rng=True,shape="4096,2048,512",phase="dw",
+                         source_policy="original_bf16",packed_reader=False)
+    config=PosthocPreparationSchedule(rng_mode="philox",producer_blocks=256)
+    command=evaluation_command(args,config,tmp_path)
+    assert command[2]=="benchmarks.compare_ms_eden_amortization"
+    assert command[command.index("--evaluate-phase")+1]=="dw"
+    assert json.loads(command[command.index("--schedule-json")+1])["rng_mode"]=="philox"
+    args.public_rng=False
+    command=evaluation_command(args,PosthocPreparationSchedule(),tmp_path)
+    assert command[2]=="benchmarks.study_ms_eden_backward"
+    assert command[command.index("--schedule-json")+1]==str(tmp_path/"schedule.json")
+
+
+@pytest.mark.parametrize("rng,signs",[("explicit","reload"),("philox","register")])
+def test_public_seed_portfolio_covers_both_rng_and_reuse_choices(rng,signs):
+    from benchmarks.tune_ms_eden_preparation import public_rng_seeds
+    from rtx.autotune.posthoc import PosthocPreparationSchedule
+    initial=PosthocPreparationSchedule(rng_mode=rng,producer_signs=signs,producer_blocks=256)
+    proposals=public_rng_seeds(initial)
+    assert proposals[0]==initial
+    assert {(c.rng_mode,c.producer_signs) for c in proposals}=={
+        (r,s) for r in ("explicit","philox") for s in ("reload","register")}
+    assert all(c.producer_blocks==256 for c in proposals)
