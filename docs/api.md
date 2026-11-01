@@ -86,9 +86,10 @@ users normally leave low-level settings unset and use verified selection.
 `validate_runtime_environment()` checks the supported dependency contract.
 `clear_runtime_caches()` releases process cache ownership after synchronization;
 live graphs retain their required resources. It does not delete source datasets
-or model checkpoints. `ExecutionResources`, `retire_runtime_contexts()` and
-`runtime_memory_report()` provide [explicit execution ownership, selective
-retirement and complete scratch accounting](execution_resources.md).
+or model checkpoints. Default-mode compilation owns its working set and reuses
+compatible scratch automatically. `runtime_memory_report()` exposes accounting;
+`ExecutionResources` and `retire_runtime_contexts()` are optional advanced
+[ownership and retirement controls](execution_resources.md), not required setup.
 
 ## Feature-branch GLU and MLP
 

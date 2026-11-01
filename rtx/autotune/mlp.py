@@ -1,5 +1,6 @@
 """Whole-recomputed-MLP tuning using the shared persistent search portfolio."""
 from dataclasses import asdict,replace
+from .._managed import tuning_resources
 import json
 from pathlib import Path
 from functools import lru_cache
@@ -643,6 +644,7 @@ def mlp_structural_seeds(adapter,precision,phase):
     return unique
 
 
+@tuning_resources
 def tune_mxfp8_mlp(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT_MLP_CONFIG,
                    precision="mxfp8",max_trials=32,time_budget_s=120,output_dir="autotune_results/mlp",seed=0,progress=print,
                    coverage_fraction=2/3,warmup=3,samples=7,calls_per_sample=3,confirmation_repeats=2,

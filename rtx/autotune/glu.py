@@ -12,6 +12,7 @@ from .outcomes import TrialOutcome, raise_if_fatal_device_context_error
 from .recipes import HybridTuningPolicy, make_hybrid_autotuner
 from .store import ResidualTuningStore
 from ..glu import DEFAULT_GLU_CONFIG, _validate
+from .._managed import tuning_resources
 from ..configs.glu import (normalize_glu_config, glu_config_from_dict,
                           MXFP8GLUPrequantConfig, prequant_glu_config_from_dict)
 from ..kernels.mxfp8 import (
@@ -165,6 +166,7 @@ def make_glu_adapter(x, weight, *, activation="silu", output_format="bf16",
     )
 
 
+@tuning_resources
 def tune_mxfp8_glu(x, weight, *, activation="silu", output_format="bf16",
                     output_dir="autotune_results/glu", max_trials=32,
                     time_budget_s=120, seed=0, progress=print, backend="auto", seed_history=None,tuning_policy=None,

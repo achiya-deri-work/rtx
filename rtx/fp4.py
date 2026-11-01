@@ -2480,6 +2480,8 @@ _INDUCTOR_PREQUANT_LAUNCHERS = _InductorNVFP4PrequantRegistry()
 
 
 def _register_delayed_inductor_lowering() -> None:
+    from ._managed import install
+    install()
     from torch._inductor import ir
     from torch._inductor.lowering import register_lowering
 

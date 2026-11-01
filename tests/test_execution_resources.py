@@ -1,5 +1,6 @@
 """Explicit ownership contracts, plus actual graph replay under eviction."""
 import gc
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import weakref
 
@@ -168,7 +169,8 @@ def test_orphan_stream_pool_is_not_retained_by_routing_table():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA required')
-def test_concurrent_host_submissions_use_isolated_stream_arenas():
+@pytest.mark.parametrize('automatic',[False,True])
+def test_concurrent_host_submissions_use_isolated_stream_arenas(automatic):
     from concurrent.futures import ThreadPoolExecutor
     from rtx import fp8_bwd as b
     from rtx._bwd_search import backward_structural_seeds
@@ -178,18 +180,19 @@ def test_concurrent_host_submissions_use_isolated_stream_arenas():
     cfg=next(c for c in backward_structural_seeds(p,DEFAULT_FUSED_MXFP8_BWD_CONFIG)
              if c.dx.backend==c.dw.backend=='decomposed')
     streams=[torch.cuda.Stream(),torch.cuda.Stream()]
-    owners=[ExecutionResources(split_workspace_bytes=2<<20) for _ in streams]
+    owners=[None if automatic else ExecutionResources(split_workspace_bytes=2<<20) for _ in streams]
     values=[(torch.randn(p.m,p.n,device='cuda',dtype=torch.bfloat16)*.1,
              torch.randn(p.m,p.k,device='cuda',dtype=torch.bfloat16)*.1,
              torch.randn(p.n,p.k,device='cuda',dtype=torch.bfloat16)*.1) for _ in streams]
     expected=[]
     for s,o,v in zip(streams,owners,values):
         s.wait_stream(torch.cuda.current_stream())
-        with o.activate(),torch.cuda.stream(s):
+        with o.activate() if o is not None else nullcontext(),torch.cuda.stream(s):
             expected.append(tuple(t.clone() for t in b.mxfp8_linear_backward(*v,config=cfg,autotune=False)))
     torch.cuda.synchronize()
     def worker(index):
-        with owners[index].activate(),torch.cuda.stream(streams[index]):
+        owner=owners[index]
+        with owner.activate() if owner is not None else nullcontext(),torch.cuda.stream(streams[index]):
             for _ in range(5):
                 result=b.mxfp8_linear_backward(*values[index],config=cfg,autotune=False)
             streams[index].synchronize()

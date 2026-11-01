@@ -26,6 +26,7 @@ import uuid
 import torch
 
 from .autotune.measurement import runtime_timing_metadata, measure_cuda_batches
+from ._managed import tuning_resources
 
 from .autotune import (
     CoordinateDescentPolicy,
@@ -1044,6 +1045,7 @@ def _legal_default_prequant_config(problem: MXFP8Problem) -> MXFP8PrequantConfig
     raise RuntimeError(f'no legal default prequant configuration for {problem}')
 
 
+@tuning_resources
 def tune_mxfp8_prequant(
     x: torch.Tensor,
     weight: torch.Tensor,

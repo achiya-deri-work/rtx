@@ -1499,6 +1499,8 @@ _INDUCTOR_BWD_LAUNCHERS = _InductorMXFP8BwdRegistry()
 
 
 def _register_bwd_inductor_lowerings() -> None:
+    from ._managed import install
+    install()
     from torch._inductor import ir
     from torch._inductor.lowering import register_lowering
 

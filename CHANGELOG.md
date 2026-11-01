@@ -5,6 +5,10 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Make scratch ownership automatic with ordinary default-mode `torch.compile`:
+  retain compiled working sets beyond the runner LRU, share compatible ordered
+  split workspaces, exclude cold tuning trials, and retire duplicate graph
+  preparation contexts. Resource scopes and stream controls remain optional.
 - Bind accessed RTX scratch to public PyTorch CUDA graph lifetime, including
   Inductor Graph Trees. Add `ExecutionResources`, selective preparation-stream
   retirement, per-stream private-pool ownership, and unique nested-cache/graph

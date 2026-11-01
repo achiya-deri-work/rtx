@@ -25,6 +25,7 @@ import uuid
 import torch
 
 from .autotune.measurement import runtime_timing_metadata, measure_cuda_batches
+from ._managed import tuning_resources
 
 from .autotune import (
     CoordinateDescentPolicy,
@@ -1455,6 +1456,7 @@ def _policy_for_bwd(policy: CoordinateDescentPolicy | None) -> CoordinateDescent
     return policy
 
 
+@tuning_resources
 def tune_mxfp8_backward(
     grad_output: torch.Tensor,
     x: torch.Tensor,

@@ -44,7 +44,7 @@ def install_graph_resource_tracking():
         if _installed:
             return
         import torch
-        if torch.cuda.is_current_stream_capturing():
+        if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
             raise RuntimeError('warm RTX runners before CUDA graph capture')
         graph_type = torch.cuda.CUDAGraph
         begin, end, reset = graph_type.capture_begin, graph_type.capture_end, graph_type.reset
@@ -188,6 +188,8 @@ def runtime_memory_report(*, include_allocator=False):
         unique_storage_bytes=tensor_storage_bytes([*entries,*pins,*execution]),
         duplicated_context_groups=sum(len(v)>1 for v in duplicates.values()),
         accounting='unique explicit tensor storage; excludes allocator rounding/reserve and opaque executable internals')
+    from ._managed import stats as managed_stats
+    result['automatic_execution']=managed_stats()
     if include_allocator:
         import torch
         if torch.cuda.is_initialized():

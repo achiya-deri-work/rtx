@@ -1588,6 +1588,8 @@ _INDUCTOR_FULLY_PREQUANT_LAUNCHERS = _InductorFullyPrequantRegistry()
 
 
 def _register_packed_inductor_lowerings() -> None:
+    from ._managed import install
+    install()
     from torch._inductor import ir
     from torch._inductor.lowering import register_lowering
 

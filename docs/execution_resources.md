@@ -5,6 +5,27 @@ lifetimes. A bounded runner LRU alone is not a graph lifetime contract or a
 process-wide VRAM cap. These APIs preserve numerical policies and work with
 MXFP8/NVFP4 linears, packed-weight launchers, GLU and recomputed MLP caches.
 
+## Ordinary usage: library-owned resources
+
+```python
+compiled = torch.compile(model, fullgraph=True, dynamic=False)
+y = compiled(x)
+```
+
+This is the primary contract: default mode, without `reduce-overhead`, forced
+CUDA graphs, explicit resource scopes, stream management or scratch allocation.
+Each compiled RTX callable owns its accessed runner working set independently
+of the global bounded LRU. Ownership ends with that callable or an explicit
+between-phase cache clear. First-hit autotuning does not attach trial scratch
+to the enclosing model owner. Compatible FP32 write/reduce chains automatically
+reuse size-classed storage per device, stream and execution lane.
+
+CUDA graphs remain an application choice. The version-pinned Inductor
+integration observes compiled-callable creation and cold Graph Trees warmup/
+recording; it does not create extra graphs or wrap replay. Completed captures
+retire unpinned duplicate preparation contexts automatically. No user-side
+retirement boundary or cache-entry override is required for normal compilation.
+
 ## Automatic graph ownership
 
 The first CUDA runner warmup installs a small integration around the public
@@ -25,7 +46,10 @@ external CUDA graph APIs bypassing the public PyTorch capture methods require
 `rtx.runtime.retain_runtime_resources()` and explicit ownership of its returned
 dictionary for the whole replay lifetime.
 
-## Large working sets and selective retirement
+## Optional advanced controls
+
+The following is a diagnostic/advanced override, **not** a required setup step.
+Normal compiled working-set retention and scratch reuse above are automatic.
 
 ```python
 resources = rtx.ExecutionResources(split_workspace_bytes=16 << 20)
@@ -66,7 +90,8 @@ thread. Live graphs retain their pins even when their cache entries are retired.
 
 ## Optional split-workspace arena
 
-The default capacity is zero: no shared reduction arena. A positive fixed
+An explicit `ExecutionResources` owner defaults to zero fixed arena capacity;
+ordinary execution instead uses automatic size classes. A positive fixed
 `split_workspace_bytes` supplies FP32 views to compatible fused/decomposed split
 and atomic backward runners. Requests larger than capacity fall back to private
 storage. This is per parent stream and execution lane, not total process memory.

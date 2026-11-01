@@ -16,6 +16,7 @@ from .configs import (
     MXFP8WeightPrequantConfig,
 )
 from .prequant_autotune import PREQUANT_SEARCH_SPACE
+from ._managed import tuning_resources
 
 
 INFERENCE_KERNEL_REVISION = 8
@@ -179,6 +180,7 @@ def _layout_updates_for(
     return tuple(result)
 
 
+@tuning_resources
 def tune_mxfp8_inference_state(
     problem,
     *,

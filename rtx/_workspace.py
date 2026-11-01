@@ -53,6 +53,8 @@ def persistent_scratch(factory):
         try:
             with torch.cuda.use_mem_pool(pool, device=index):
                 result=factory(*args, **kwargs)
+                from ._managed import instrument_runner
+                instrument_runner(result)
                 _tag_pool_owners(result,pool)
                 return result
         finally:

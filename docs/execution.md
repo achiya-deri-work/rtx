@@ -53,10 +53,12 @@ Cache eviction or cleanup does not invalidate those captured addresses; it also
 does not free graph-pinned memory. External C++/raw CUDA graph capture must use
 an explicit `retain_runtime_resources()` scope and keep its owners alive.
 
-Use [execution resource ownership](execution_resources.md) for selective
-preparation-stream retirement, optional shared FP32 workspaces, and complete
-nested-cache/graph-pinned telemetry. Global cleanup is not a replacement for
-the selective startup-boundary API.
+Default-mode compilation automatically retains the compiled working set and
+shares compatible ordered FP32 split workspaces. No explicit resource owner,
+stream selection, cache-size override or cleanup call is required. CUDA graphs
+are optional, not forced by RTX; their completed captures automatically retire
+duplicate preparation-stream scratch. See [memory ownership](execution_resources.md)
+for telemetry and optional advanced controls.
 
 Dynamic runners use bounded caches (normally eight entries per family).
 `RTX_MXFP8_RUNNER_CACHE_ENTRIES` and family-specific bounds such as

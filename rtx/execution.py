@@ -1,4 +1,4 @@
-"""Explicit ordered-execution workspace ownership, independent of kernel plans."""
+"""Automatic and optional explicit scratch ownership, independent of plans."""
 from contextlib import contextmanager
 from threading import RLock, local
 import weakref
@@ -7,6 +7,8 @@ _local = local()
 _active = {}
 _lock = RLock()
 _owners = weakref.WeakValueDictionary()
+_automatic_slots = weakref.WeakValueDictionary()
+_suspended = {}
 
 
 class ExecutionResources:
@@ -100,10 +102,59 @@ class ExecutionResources:
 
 def current_owner():
     owner=getattr(_local,'owner',None)
+    if owner is not None and id(owner) in _suspended:
+        owner=None
     if owner is None:
         with _lock:
-            if len(_active)==1:owner=next(iter(_active.values()))[1]
+            candidates=[v[1] for k,v in _active.items() if k not in _suspended]
+            if len(candidates)==1:owner=candidates[0]
     return owner
+
+
+@contextmanager
+def suspend_automatic_retention():
+    owner=current_owner()
+    identity=id(owner) if owner is not None and getattr(owner,'_rtx_automatic',False) else None
+    with _lock:
+        if identity is not None:_suspended[identity]=_suspended.get(identity,0)+1
+    try:
+        yield
+    finally:
+        with _lock:
+            if identity is not None:
+                remaining=_suspended[identity]-1
+                if remaining:_suspended[identity]=remaining
+                else:del _suspended[identity]
+
+
+def clear_automatic_resources():
+    """Explicit cleanup releases inactive compiled working sets, not active calls."""
+    with _lock:
+        owners=[o for key,o in _owners.items() if key not in _active and getattr(o,'_rtx_automatic',False)]
+        _automatic_slots.clear()
+    for owner in owners:
+        with owner._lock:
+            owner._runners.clear();owner._cache_refs.clear();owner._slots.clear()
+
+
+def inactive_automatic_contexts():
+    with _lock:
+        owners=[o for key,o in _owners.items() if key not in _active and getattr(o,'_rtx_automatic',False)]
+    result=[]
+    for owner in owners:
+        with owner._lock:
+            result.extend((owner,cid,key,value) for (cid,key),value in owner._runners.items())
+    return result
+
+
+def retire_automatic_contexts(contexts,streams,device):
+    from ._resources import _stream_context
+    for owner,cid,key,value in contexts:
+        context=_stream_context(key)
+        if context is None or context[0]!=device or context[1] not in streams:continue
+        with owner._lock:
+            if owner._runners.get((cid,key)) is value:owner._runners.pop((cid,key))
+            if not any(k[0]==cid for k in owner._runners):owner._cache_refs.pop(cid,None)
 
 
 def remember_resource(cache,key,value):
@@ -120,6 +171,12 @@ def lookup_resource(cache,key):
         with owner._lock:
             pair=(id(cache),key)
             if pair in owner._runners:return True,owner._runners[pair]
+        if getattr(owner,'_rtx_recording',False):
+            from ._managed import lookup_recorded
+            found,value=lookup_recorded(cache,key)
+            if found:
+                remember_resource(cache,key,value)
+                return True,value
     return False,None
 
 
@@ -138,8 +195,25 @@ def split_workspace(count, device, *, lane='ordered'):
     import torch
     owner = current_owner()
     if owner is None:
-        return torch.empty(count, dtype=torch.float32, device=device)
+        return automatic_split_workspace(count,torch.device(device),lane=lane)
     return owner._allocate(count, torch.device(device), lane)
+
+
+def automatic_split_workspace(count,device,*,lane='ordered'):
+    """Default weak, size-classed arena; users never allocate workspace."""
+    import torch
+    from ._managed import submission_lock
+    capacity=max(256,1 << (count*4-1).bit_length())
+    index=device.index if device.index is not None else torch.cuda.current_device()
+    key=(index,int(torch.cuda.current_stream(index).cuda_stream),lane,capacity)
+    with _lock:
+        storage=_automatic_slots.get(key)
+        if storage is None:
+            storage=torch.empty(capacity//4,device=device,dtype=torch.float32)
+            _automatic_slots[key]=storage
+        view=storage[:count]
+        view._rtx_workspace_lock=submission_lock(index)
+        return view
 
 
 def workspace_guard(tensor):

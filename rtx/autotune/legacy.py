@@ -41,6 +41,7 @@ from ..kernels.mxfp8 import (
     normalize_fwd_config,
 )
 from ..runtime import load_kernel_symbol
+from .._managed import tuning_resources
 from .outcomes import TrialOutcome, TrialStatus
 from .measurement import runtime_timing_metadata
 
@@ -976,6 +977,7 @@ def load_cached_mxfp8_fwd_config(
     return config
 
 
+@tuning_resources
 def tune_mxfp8_fwd(
     x: torch.Tensor,
     weight: torch.Tensor,

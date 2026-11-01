@@ -41,7 +41,7 @@ def test_interleaved_checkpoint_teacher_workspace(tmp_path, monkeypatch, record_
                 teachers.append(layer(x))
             students.append(checkpoint(layer,x,use_reentrant=True))
         return tuple(teachers),tuple(students)
-    fn=torch.compile(workload,fullgraph=True,dynamic=False,options={'triton.cudagraphs':False})
+    fn=torch.compile(workload,fullgraph=True,dynamic=False)
 
     def step(validate=False):
         for layer,x,dy in cases:
@@ -88,10 +88,9 @@ def test_interleaved_checkpoint_teacher_workspace(tmp_path, monkeypatch, record_
     record_property('live_allocated',json.dumps(live))
     assert len(set(live))==1,live
     partial=report['caches']['partial']['interval_counts']
-    if entries==8:
-        assert partial['entry_limit_evictions']>0 and partial['insertions']>0
-    else:
-        assert partial['evictions']==partial['insertions']==0
+    # The compiled callable owns its finite working set beyond the bounded
+    # global LRU. Even the smaller cache must not rebuild between hot steps.
+    assert partial['evictions']==partial['insertions']==0
     assert report['caches']['paired']['interval_counts']['insertions']==0
     assert report['caches']['partial']['resident_bytes']<=64<<20
     step(validate=True)

@@ -425,7 +425,9 @@ def clear_runtime_caches(*, synchronize: bool = True, device=None,
         if clear is not None:
             released[module_name] = clear(preserve_compiled=preserve_compiled)
     from ._workspace import clear_scratch_pools
+    from .execution import clear_automatic_resources
 
+    clear_automatic_resources()
     clear_scratch_pools()
     return released
 

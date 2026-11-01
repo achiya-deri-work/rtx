@@ -8,6 +8,7 @@ import random
 import statistics as python_statistics
 import time
 from typing import Callable, Generic, Mapping, Protocol, Sequence
+from .._managed import tuning_resources
 
 from .bandit import (
     AdaptiveBanditScheduler,
@@ -157,6 +158,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         improvement = max(0.0, math.log(before / observation.score))
         return 0.002 + improvement
 
+    @tuning_resources
     def tune(self) -> ComposableTuningResult[ConfigT]:
         from .store import tuning_session_lock
         with tuning_session_lock(self.store, self.adapter.context):

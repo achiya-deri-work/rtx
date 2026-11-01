@@ -135,10 +135,11 @@ journals, resumable campaigns, ask/tell workers, and CSV/Parquet exports.
 [Runtime and dataset workflow](docs/autotuning.md) ·
 [Framework extension reference](rtx/autotune/README.md).
 
-Large compiled workloads can use `rtx.ExecutionResources` to retain their
-working set independently of the default runner LRU, share ordered FP32 split
-workspaces, and retire preparation-stream scratch after capture. Live CUDA
-graphs pin their RTX resources automatically after warmup.
+Ordinary default-mode `torch.compile` automatically retains each compiled
+working set independently of the runner LRU and shares compatible ordered
+FP32 reduction workspaces. Users do not allocate scratch, manage RTX streams,
+or add cleanup scopes. CUDA graphs are optional; when enabled by the application,
+they own captured resources and retire duplicate preparation scratch automatically.
 [Memory ownership and cleanup](docs/execution_resources.md).
 
 ## GLU / recomputed MLP feature branch

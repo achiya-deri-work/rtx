@@ -19,6 +19,7 @@ from .configs.nvfp4 import (
     NVFP4WeightPrequantConfig,
 )
 from .prequant_autotune import PREQUANT_SEARCH_SPACE
+from ._managed import tuning_resources
 
 
 NVFP4_INFERENCE_KERNEL_REVISION = 7
@@ -921,6 +922,7 @@ def update_fully_prequant_config(
     )
 
 
+@tuning_resources
 def tune_nvfp4_inference_state(
     problem,
     *,
