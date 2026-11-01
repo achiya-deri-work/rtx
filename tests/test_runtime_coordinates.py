@@ -42,7 +42,8 @@ class RuntimeCoordinateTests(unittest.TestCase):
         first=make_effort_autotuner(a,store,p).tune()
         second=make_effort_autotuner(a,store,p).tune()
         self.assertEqual((first.evaluated_trials,second.evaluated_trials),(1,0))
-        self.assertEqual(first.tuning_evidence['backward_coordinate_revision'],1)
+        from rtx.autotune.runtime_coordinates import BWD_COORDINATE_REVISION
+        self.assertEqual(first.tuning_evidence['backward_coordinate_revision'],BWD_COORDINATE_REVISION)
 
     def test_search_space_identity_includes_initial_and_ordered_axes(self):
         from tests.test_autotune_coverage import adapter

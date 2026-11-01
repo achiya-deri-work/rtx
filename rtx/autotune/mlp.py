@@ -22,7 +22,7 @@ from ..mlp import DEFAULT_MLP_CONFIG,MLP_CONFIG_REVISION,_parse,_validate,mxfp8_
 # Revision 39 admits policy-preserving BF16x2/bits fused backward quantization.
 # Older searches rejected these candidates; do not reuse their coverage or
 # runtime winner namespace as evidence for this expanded implementation set.
-MLP_AUTOTUNE_REVISION = 39
+MLP_AUTOTUNE_REVISION = 40
 from ..configs.glu import normalize_glu_config,glu_rejection,prequant_recompute_rejection
 from ..kernels.mxfp8 import FWD_SEARCH_SPACE,MXFP8Problem,normalize_fwd_config
 
@@ -239,7 +239,9 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
         axes["recompute_quant.arithmetic"]=axes["down_quant.arithmetic"]
         axes["recompute_quant.warps"]=(4,8,16)
         for group in ("gate_backward","down_backward"):
-            axes.update({f"{group}.{name}":values for name,values in BWD_SEARCH_SPACE.items()})
+            from .._bwd_search import backward_search_space
+            axes.update({f"{group}.{name}":values for name,values in
+                         backward_search_space(gp if group=='gate_backward' else dp,BWD_SEARCH_SPACE).items()})
             axes[f"{group}.dw_split_count"]=(1,2,4,8,16,32)
             # A coupled proposal for an independently tunable leg, not a new
             # default. Valuable when M is ragged but dX's reduction is aligned.
@@ -324,11 +326,9 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
             return replace(c,**{group:materialized_dw_config(current,value)})
         if name=="dw_split_count":
             current=getattr(c,group)
-            needed=(m+value-1)//value
-            tile=(
-                ((needed+current.dw.gemm.tile_k-1)//current.dw.gemm.tile_k)*current.dw.gemm.tile_k
-                if current.dw.backend=="decomposed" else
-                next((t for t in (128,256,512,1024,2048,4096) if t>=needed),8192))
+            from .._bwd_search import reduction_chunk
+            tile=reduction_chunk(m,value,current.dw.gemm.tile_k if current.dw.backend=='decomposed'
+                                 else current.dw.fused.bf16_tile_k)
             dw=replace(current.dw,
                        reduction="full_fp32" if value==1 else "split_fp32_workspace",
                        split_reduction=value,reduction_tile=0 if value==1 else tile,
@@ -512,7 +512,7 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
                               tags={"warmup":warmup,"samples":samples,"calls_per_sample":calls_per_sample,
                                     "capture_warmup":"candidate_leaves_evaluator_stream_v3","compile":"fullgraph_static",
                                     "measurement_mode":measurement_mode,"execution_contract_revision":1,
-                                    "structural_seed_revision":5,
+                                    "structural_seed_revision":6,
                                     "recompute_pipeline_search_revision":1,
                                     **({'execution_mix':mix.contract()} if execution_mix is not None else {}),
                                     "gradient_probe":"normal_seed1729"}),
@@ -561,6 +561,19 @@ def mlp_structural_seeds(adapter,precision,phase):
     seeds=[]
     opening=[]
     base=adapter.initial_config
+    if phase=='train' and hasattr(adapter,'context') and all(
+            k in adapter.context.workload for k in ('m','k','h','o')):
+        from .._bwd_search import backward_structural_seeds
+        workload=adapter.context.workload
+        # The context uses m/k/h/o; build both actual projection geometries.
+        joint=base
+        for group,p in (('gate_backward',MXFP8Problem(workload['m'],2*workload['h'],workload['k'])),
+                        ('down_backward',MXFP8Problem(workload['m'],workload['o'],workload['h']))):
+            families=backward_structural_seeds(p,getattr(base,group))
+            if families:
+                joint=replace(joint,**{group:families[0]})
+            seeds.extend(replace(base,**{group:c}) for c in families)
+        opening.append(replace(joint,backward_overlap=False))
     if phase=="train":
         # Try complete legal execution families before refining tile geometry.
         for group in ("gate_backward","down_backward"):

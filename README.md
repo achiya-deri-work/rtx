@@ -135,6 +135,12 @@ journals, resumable campaigns, ask/tell workers, and CSV/Parquet exports.
 [Runtime and dataset workflow](docs/autotuning.md) ·
 [Framework extension reference](rtx/autotune/README.md).
 
+Large compiled workloads can use `rtx.ExecutionResources` to retain their
+working set independently of the default runner LRU, share ordered FP32 split
+workspaces, and retire preparation-stream scratch after capture. Live CUDA
+graphs pin their RTX resources automatically after warmup.
+[Memory ownership and cleanup](docs/execution_resources.md).
+
 ## GLU / recomputed MLP feature branch
 
 - `MXFP8GLU`: fused gate/up + SiLU/GELU/ReLU; BF16 or MXFP8 output;

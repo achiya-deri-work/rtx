@@ -21,6 +21,7 @@ the [generated reference](api_reference.md) owns exact signatures and defaults.
 | Understand precision | [Training](training.md) · [Formats](formats.md) |
 | Configure effort and cache reuse/refinement | [First-hit autotuning](first_hit_autotuning.md) |
 | Compile and use graphs, streams and caches | [Execution](execution.md) |
+| Retire warmup scratch and share reduction workspaces safely | [Execution resources](execution_resources.md) |
 | Collect datasets and deploy winners | [Autotuning operations](autotuning.md) |
 | Diagnose errors and limitations | [Troubleshooting](troubleshooting.md) · [Runtime contract](runtime_contract.md) |
 

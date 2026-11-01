@@ -57,7 +57,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 26
+KERNEL_REVISION = 28
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -860,7 +860,8 @@ def update_bwd_config(
 
 
 def bwd_config_id(config: MXFP8BwdConfig) -> str:
-    payload = json.dumps(bwd_config_to_dict(config), sort_keys=True, separators=(",", ":"))
+    from ._bwd_search import active_backward_dict
+    payload = json.dumps(active_backward_dict(config), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:20]
 
 
@@ -1333,6 +1334,16 @@ class BwdCoordinateDescentTuner:
                     f"initial backward configuration failed: {first.status}: {first.error}"
                 )
             best_score = float(first.median_ms)
+            from ._bwd_search import backward_structural_seeds
+            structural=(backward_structural_seeds(self.evaluator.problem, initial)
+                        if 'dw_backend' in self.axes and 'dw_reduction' in self.axes else [])
+            for candidate in structural[:3]:
+                if (time.monotonic()-self.started >= self.policy.time_budget_s or
+                    (self.policy.max_trials is not None and self.evaluated>=self.policy.max_trials)):
+                    break
+                outcome=self._evaluate(candidate,-1,'structural_family',None)
+                if outcome.successful and float(outcome.median_ms)<best_score:
+                    best_config,best_score=candidate,float(outcome.median_ms)
             rng = random.Random(self.policy.seed)
             budget_stop = False
             for restart in range(self.policy.restarts):
@@ -1463,6 +1474,8 @@ def tune_mxfp8_backward(
     x_2d = x.reshape(-1, x.shape[-1])
     grad_2d = grad_output.reshape(-1, grad_output.shape[-1])
     evaluator = MXFP8BwdEvaluator(grad_2d, x_2d, weight, selected_policy)
+    from ._bwd_search import backward_search_space
+    axes = backward_search_space(evaluator.problem, axes)
     missing = set(selected_policy.coordinate_order).difference(axes)
     if missing:
         raise ValueError(f"backward coordinate order has missing axes: {sorted(missing)}")
@@ -1488,8 +1501,9 @@ def load_cached_mxfp8_bwd_config(
     cache_dir: Path | str | None = None,
     axes: Mapping[str, Iterable[dict[str, object]]] = BWD_SEARCH_SPACE,
 ) -> MXFP8BwdConfig | None:
+    from ._bwd_search import backward_search_space
     database = BwdJsonTuningDatabase(
-        cache_dir, DeviceFingerprint.current(device), problem, axes
+        cache_dir, DeviceFingerprint.current(device), problem, backward_search_space(problem,axes)
     )
     best = database.best()
     if best is None or best[0].implementation_rejection(problem) is not None:

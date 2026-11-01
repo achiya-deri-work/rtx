@@ -1218,6 +1218,16 @@ def _packed_gemm_config(
     return config
 
 
+@persistent_scratch
+def _build_weight_prequant_runner(problem, storage_problem, config, device):
+    return _WeightPrequantRunner(
+        quant_x=compile_mxfp8_quant(problem.m,problem.k,config.quant),
+        gemm=compile_mxfp8_gemm(storage_problem,config.gemm),
+        qx=torch.empty((problem.m,storage_problem.k),dtype=torch.float8_e4m3fn,device=device),
+        sx=_allocate_scales(problem.m,problem.k,config.quant.scale_layout,device),
+        l2_fetch_granularity=config.l2_fetch_granularity)
+
+
 def _launch_weight_prequant_out(
     x: torch.Tensor,
     weight: MXFP8Tensor,
@@ -1272,26 +1282,7 @@ def _launch_weight_prequant_out(
             runner = _WEIGHT_PREQUANT_RUNNERS.get(runner_key)
             if runner is None:
                 _ensure_l2_fetch_granularity(config.l2_fetch_granularity)
-                qx = torch.empty(
-                    (problem.m, storage_problem.k),
-                    dtype=torch.float8_e4m3fn,
-                    device=x.device,
-                )
-                sx = _allocate_scales(
-                    problem.m,
-                    problem.k,
-                    config.quant.scale_layout,
-                    x.device,
-                )
-                runner = _WeightPrequantRunner(
-                    quant_x=compile_mxfp8_quant(
-                        problem.m, problem.k, config.quant
-                    ),
-                    gemm=compile_mxfp8_gemm(storage_problem, config.gemm),
-                    qx=qx,
-                    sx=sx,
-                    l2_fetch_granularity=config.l2_fetch_granularity,
-                )
+                runner = _build_weight_prequant_runner(problem,storage_problem,config,x.device)
                 _WEIGHT_PREQUANT_RUNNERS[runner_key] = runner
     runner(x_c, weight, out)
 
@@ -1464,24 +1455,7 @@ class _InductorWeightPrequantLauncher:
                         raise RuntimeError(
                             f"activation quantizer cannot run: {rejection}"
                         )
-                    runner = _WeightPrequantRunner(
-                        quant_x=compile_mxfp8_quant(
-                            problem.m, problem.k, config.quant
-                        ),
-                        gemm=compile_mxfp8_gemm(storage_problem, config.gemm),
-                        qx=torch.empty(
-                            (problem.m, storage_problem.k),
-                            dtype=torch.float8_e4m3fn,
-                            device=x.device,
-                        ),
-                        sx=_allocate_scales(
-                            problem.m,
-                            problem.k,
-                            config.quant.scale_layout,
-                            x.device,
-                        ),
-                        l2_fetch_granularity=config.l2_fetch_granularity,
-                    )
+                    runner = _build_weight_prequant_runner(problem,storage_problem,config,x.device)
                     self.runners[key] = runner
         runner.launch_raw(x, weight_data, weight_scales, out)
 

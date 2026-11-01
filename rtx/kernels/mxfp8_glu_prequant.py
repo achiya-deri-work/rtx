@@ -103,4 +103,9 @@ def build_prequant_glu_runner(x,weight,out,scales,config,activation,output_forma
             quant_w(runtime_weight,qw,sw)
         aux = runtime_out if output_format=="bf16" and not derivative else runtime_scales
         gemm(qx,qw,sx,sw,runtime_out,aux)
-    return (lambda:run(x,weight,out,scales)) if bind_inputs else run
+    run.__rtx_resources__ = (qx,qw,sx,sw)
+    if bind_inputs:
+        bound = lambda:run(x,weight,out,scales)
+        bound.__rtx_resources__ = run.__rtx_resources__
+        return bound
+    return run

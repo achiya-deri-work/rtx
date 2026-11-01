@@ -2,7 +2,7 @@
 from dataclasses import replace
 import os
 
-BWD_COORDINATE_REVISION = 1
+BWD_COORDINATE_REVISION = 2
 
 
 def _backward_schedule_adapter(adapter):

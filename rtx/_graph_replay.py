@@ -12,6 +12,10 @@ from .runtime import retain_runtime_resources
 
 
 class KernelReplay:
+    @property
+    def __rtx_resources__(self):
+        return self.inputs,self.outputs,self.owners,self.pools
+
     def __init__(self, execute, values):
         with torch.cuda.device(values[0].device):
             self._initialize(execute, values)
@@ -45,8 +49,7 @@ class KernelReplay:
             self.owners = tuple(owners.values())
             # Persistent scratch factories allocate outside the graph pool.
             # Keep their pool alive alongside the captured runner references.
-            from ._workspace import _pools
-            self.pools = tuple(pool for index, pool in _pools.items() if index == self.device.index)
+            self.pools = tuple(v for v in owners.values() if isinstance(v,torch.cuda.MemPool))
         caller.wait_stream(self.stream)
 
     def __call__(self, *values):

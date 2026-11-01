@@ -1482,7 +1482,8 @@ def make_mxfp8_bwd_adapter(
         )
     else:
         initial_config = initial
-    selected_axes = BWD_SEARCH_SPACE if axes is None else axes
+    from .._bwd_search import backward_search_space
+    selected_axes = backward_search_space(problem, BWD_SEARCH_SPACE if axes is None else axes)
     axis_values = {name: tuple(values) for name, values in selected_axes.items()}
     unknown = set(axis_values).difference(BWD_SEARCH_SPACE)
     if unknown:
@@ -1929,7 +1930,8 @@ def make_mxfp8_bwd_adapter(
         return values
 
     return DiscreteKernelAdapter(
-        context=_context("mxfp8_bwd", KERNEL_REVISION, problem, device, regime, tags),
+        context=_context("mxfp8_bwd", KERNEL_REVISION, problem, device, regime,
+                         {**(tags or {}),'backward_structural_revision':2}),
         initial_config=initial_config,
         axes=axis_values,
         config_id_fn=bwd_config_id,

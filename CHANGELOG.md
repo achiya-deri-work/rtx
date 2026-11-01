@@ -5,6 +5,19 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Bind accessed RTX scratch to public PyTorch CUDA graph lifetime, including
+  Inductor Graph Trees. Add `ExecutionResources`, selective preparation-stream
+  retirement, per-stream private-pool ownership, and unique nested-cache/graph
+  storage accounting. Unused stream pools no longer retain allocator reserve.
+- Add optional execution-scoped FP32 split-workspace arenas with isolated
+  overlapping lanes. Preserve existing quantized-operand alias legality and
+  keep preparation/consumption liveness explicit.
+- Fix backward search undercoverage with complete execution-family opening
+  trials, shape-derived split chunks, inactive-coordinate deduplication and
+  structural CTA coverage evidence. Extend linear/MLP search and preserve
+  fresh-process cache lookup for the derived domain (backward revision 28).
+- Support ragged token reductions in separate, row-major transpose quantizers
+  using zero-filled final quantized blocks, without padded BF16 copies.
 - Integrate fused `MXFP8GLU` and fully recomputed `MXFP8MLP`, their functional
   APIs, packed intermediate path, deployment plans, and shared first-hit tuning.
 - Transfer outer-K-loop unrolling to packed MXFP8 linear, GLU, MLP and backward

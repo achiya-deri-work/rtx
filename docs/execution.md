@@ -45,10 +45,18 @@ Do not enable inference freezing for dynamic-weight training comparisons.
 
 `autotune="cache"` avoids benchmarking but may still compile selected kernels.
 Clearing runner caches is not the same as deleting datasets or installed
-winners. `rtx.clear_runtime_caches()` synchronizes before releasing retained
-runtime resources; use it between phases, not in a hot training loop. Do not
-clear caches backing an active captured graph and expect that graph to remain
-valid. Inspect its docstring for the returned release accounting.
+winners. `rtx.clear_runtime_caches()` synchronizes before releasing cache
+ownership; use it between phases, not in a hot training loop. After uncaptured
+RTX warmup, public `torch.cuda.CUDAGraph` captures (including Inductor CUDA
+Graph Trees) automatically pin accessed RTX resources through graph lifetime.
+Cache eviction or cleanup does not invalidate those captured addresses; it also
+does not free graph-pinned memory. External C++/raw CUDA graph capture must use
+an explicit `retain_runtime_resources()` scope and keep its owners alive.
+
+Use [execution resource ownership](execution_resources.md) for selective
+preparation-stream retirement, optional shared FP32 workspaces, and complete
+nested-cache/graph-pinned telemetry. Global cleanup is not a replacement for
+the selective startup-boundary API.
 
 Dynamic runners use bounded caches (normally eight entries per family).
 `RTX_MXFP8_RUNNER_CACHE_ENTRIES` and family-specific bounds such as

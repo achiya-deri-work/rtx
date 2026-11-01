@@ -18,7 +18,8 @@ class EffortCacheTests(unittest.TestCase):
             self.assertIsNone(load_runtime_winner(key,dict,root=root,tuning_policy=policy))
             self.assertIsNotNone(load_runtime_winner(key,dict,root=root,
                 tuning_policy=replace(policy,cache_behavior='reuse')))
-            evidence['backward_coordinate_revision']=1
+            from rtx.autotune.runtime_coordinates import BWD_COORDINATE_REVISION
+            evidence['backward_coordinate_revision']=BWD_COORDINATE_REVISION
             save_runtime_winner(key,{'value':1},config_id='one',root=root,tuning_evidence=evidence)
             self.assertIsNotNone(load_runtime_winner(key,dict,root=root,tuning_policy=policy))
 

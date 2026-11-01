@@ -562,7 +562,7 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
                 "transposed_tile_rows must be divisible by num_warps * quant_vec"
             )
         self.task_groups = (
-            rows // config.transposed_tile_rows * (k // config.transposed_tile_k)
+            rows // config.transposed_tile_rows * cute.ceil_div(k, config.transposed_tile_k)
         )
         sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
         self.grid_ctas = min(
@@ -822,7 +822,7 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         physical_stride = cfg.transposed_tile_rows + cfg.transposed_smem_padding
         blocks_per_tile = cfg.transposed_tile_k // SF_VEC_SIZE
-        k_tiles = k // cfg.transposed_tile_k
+        k_tiles = cute.ceil_div(k, cfg.transposed_tile_k)
         tile_values = cfg.transposed_tile_rows * cfg.transposed_tile_k
         values_per_load = cfg.load_bits // BFloat16.width
         load_tasks = tile_values // values_per_load
@@ -890,7 +890,13 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
                 src_ptr = src.iterator + src.layout(
                     (row_base + row_local, k_base + k_local)
                 )
-                if cutlass.const_expr(values_per_load == 1):
+                if cutlass.const_expr(k % cfg.transposed_tile_k != 0):
+                    for vec in cutlass.range_constexpr(values_per_load):
+                        value=BFloat16(0.0)
+                        if k_base+k_local<k:
+                            value=src[row_base+row_local+vec,k_base+k_local]
+                        physical_smem[k_local,row_local+vec]=value
+                elif cutlass.const_expr(values_per_load == 1):
                     physical_smem[k_local, row_local] = src[
                         row_base + row_local, k_base + k_local
                     ]
@@ -1057,6 +1063,8 @@ class MXFP8OrientedDualQuantKernel(MXFP8TransposedQuantKernel):
         a_orientation: str,
         b_orientation: str,
     ):
+        if k % SF_VEC_SIZE:
+            raise ValueError('ragged oriented quantization requires separate quantizer launches')
         if a_orientation not in ("row", "transpose") or b_orientation not in (
             "row",
             "transpose",
@@ -1308,6 +1316,8 @@ class MXFP8BackwardQuadQuantKernel(MXFP8OrientedDualQuantKernel):
         row_config: MXFP8QuantConfig,
         transposed_config: MXFP8QuantConfig,
     ):
+        if k_cd % SF_VEC_SIZE:
+            raise ValueError('ragged quad quantization requires separate quantizer launches')
         super().__init__(
             a_rows,
             b_rows,
@@ -1920,8 +1930,8 @@ def _fake_quant_scales(rows: int, k: int, scale_layout: str):
     if scale_layout == "row_major":
         return cute.runtime.make_fake_tensor(
             Float8E8M0FNU,
-            (rows, k // SF_VEC_SIZE),
-            stride=(k // SF_VEC_SIZE, 1),
+            (rows, cute.ceil_div(k, SF_VEC_SIZE)),
+            stride=(cute.ceil_div(k, SF_VEC_SIZE), 1),
             assumed_align=16,
         )
     tile_rows = _native_scale_tile_rows(scale_layout)
@@ -1954,8 +1964,8 @@ def compile_mxfp8_transposed_quant(
     )
     quantized = cute.runtime.make_fake_tensor(
         Float8E4M3FN,
-        (rows, k),
-        stride=(k, 1),
+        (rows, cute.ceil_div(k, SF_VEC_SIZE)*SF_VEC_SIZE),
+        stride=(cute.ceil_div(k, SF_VEC_SIZE)*SF_VEC_SIZE, 1),
         assumed_align=16,
     )
     scales = _fake_quant_scales(rows, k, config.scale_layout)

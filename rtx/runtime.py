@@ -38,10 +38,7 @@ def retain_runtime_resources():
     _resource_scope.owners = owners
     with _resource_scope_lock:
         _active_resource_scopes[id(owners)] = owners
-    # A captured allocation also depends on its private allocator pool lifetime.
-    from ._workspace import retain_scratch_pools
     try:
-        retain_scratch_pools(owners)
         yield owners
     finally:
         with _resource_scope_lock:
@@ -210,16 +207,26 @@ class BoundedCache(MutableMapping[KeyT, ValueT], Generic[KeyT, ValueT]):
         self.entry_limit_evictions = 0
         self.byte_limit_evictions = 0
         self.recent_evicted_keys = []
+        from ._resources import register_cache
+        register_cache(self)
 
     def __getitem__(self, key: KeyT) -> ValueT:
         with self._lock:
             try:
                 value = self._values.pop(key)
             except KeyError:
+                from .execution import lookup_resource
+                found,value=lookup_resource(self,key)
+                if found:
+                    self.hits+=1
+                    _retain_resource(value)
+                    return value
                 self.misses += 1
                 raise
             self._values[key] = value
             self.hits += 1
+            from .execution import remember_resource
+            remember_resource(self,key,value)
             _retain_resource(value)
             return value
 
@@ -230,10 +237,19 @@ class BoundedCache(MutableMapping[KeyT, ValueT], Generic[KeyT, ValueT]):
             return default
 
     def __setitem__(self, key: KeyT, value: ValueT) -> None:
+        # CUDA launchers not using persistent_scratch (including GLU runners)
+        # must install graph ownership during uncaptured warmup as well.
+        import sys
+        torch = sys.modules.get('torch')
+        if torch is not None and torch.cuda.is_initialized():
+            from ._resources import install_graph_resource_tracking
+            install_graph_resource_tracking()
         size = 0 if self._sizeof is None else self._sizeof(value)
         if type(size) is not int or size < 0:
             raise ValueError("sizeof must return a nonnegative integer")
         _retain_resource(value)
+        from .execution import remember_resource
+        remember_resource(self,key,value)
         with self._lock:
             self.insertions += 1
             self._values.pop(key, None)
@@ -323,6 +339,8 @@ def tensor_storage_bytes(value) -> int:
         elif isinstance(item, (tuple, list)):
             for child in item:
                 visit(child)
+        elif hasattr(item, '__rtx_resources__'):
+            visit(item.__rtx_resources__)
     visit(value)
     return sum(storages.values())
 
@@ -430,6 +448,44 @@ def runtime_cache_stats() -> dict[str, dict[str, object]]:
     return result
 
 
+def retire_runtime_contexts(*, streams, device=None, synchronize=True):
+    """Retire quiescent preparation-stream scratch without invalidating graphs."""
+    from ._resources import retire_runtime_contexts as retire
+    return retire(streams=streams,device=device,synchronize=synchronize)
+
+
+def runtime_memory_report(*, include_allocator=False):
+    """Unique explicit cache, execution-owner and live-graph scratch storage."""
+    from ._resources import runtime_memory_report as report
+    return report(include_allocator=include_allocator)
+
+
+def tensor_storage_inventory(value):
+    """JSON-safe explicit owner/role/address inventory; never inspect closures."""
+    from dataclasses import fields, is_dataclass
+    import torch
+    visited, storages = set(), {}
+    def visit(item,path):
+        if id(item) in visited:return
+        visited.add(id(item))
+        if isinstance(item,torch.Tensor):
+            storage=item.untyped_storage()
+            key=f'{item.device}:{storage.data_ptr()}'
+            row=storages.setdefault(key,dict(device=str(item.device),address=storage.data_ptr(),
+                bytes=storage.nbytes(),roles=[]))
+            row['roles'].append(path)
+        elif is_dataclass(item) and not isinstance(item,type):
+            for f in fields(item):visit(getattr(item,f.name),f'{path}.{f.name}')
+        elif isinstance(item,dict):
+            for k,v in item.items():visit(v,f'{path}.{k}')
+        elif isinstance(item,(tuple,list)):
+            for i,v in enumerate(item):visit(v,f'{path}.{i}')
+        elif hasattr(item,'__rtx_resources__'):
+            visit(item.__rtx_resources__,path+'.resources')
+    visit(value,'owner')
+    return list(storages.values())
+
+
 __all__ = [
     "BoundedCache",
     "clear_runtime_caches",
@@ -437,5 +493,7 @@ __all__ = [
     "runner_cache_limit",
     "runner_cache_byte_limit",
     "runtime_cache_stats",
+    "retire_runtime_contexts",
+    "runtime_memory_report",
     "validate_runtime_environment",
 ]

@@ -630,6 +630,14 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 "proposal_elapsed_s":sum(a.proposal_elapsed_s for a in statistics.values()),
             },
         )
+        structural_coverage=None
+        if self.adapter.context.family=='mxfp8_bwd':
+            from .._bwd_search import backward_coverage
+            from ..kernels.mxfp8 import MXFP8Problem
+            w=self.adapter.context.workload
+            structural_coverage=backward_coverage(
+                [o.config for o in history.current if o.outcome.timing_eligible],
+                MXFP8Problem(w['m'],w['n'],w['k']))
         return ComposableTuningResult(
             config=best.config,
             median_ms=selected_score,
@@ -645,6 +653,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 schema=1, contract=self.effort_contract, attempted_trials=resumed_active+evaluated,
                 context_id=self.adapter.context.identifier, session_id=session_id,
                 backward_coordinate_revision=self.adapter.context.tags.get('runtime_backward_coordinate_revision'),
+                structural_coverage=structural_coverage,
                 finalist_rounds=(len(decision['confirmation']['rounds']) if decision and
                     decision.get('confirmation') and decision['confirmation']['status']=='complete' else 0),
                 finalist_margin=self.finalist_margin, winner_decision=decision,

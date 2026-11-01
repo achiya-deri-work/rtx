@@ -5,6 +5,7 @@ from ._version import __version__
 
 _LAZY_EXPORTS = {
     "WorkspacePolicy": ("workspace", "WorkspacePolicy"),
+    "ExecutionResources": ("execution", "ExecutionResources"),
     "configure_workspace": ("workspace", "configure_workspace"),
     "workspace_report": ("workspace", "workspace_report"),
     "AutotunePolicy": ("autotune.effort", "AutotunePolicy"),
@@ -84,6 +85,8 @@ _LAZY_EXPORTS = {
     "MXFP8BwdMatmulConfig": ("fp8_bwd", "MXFP8BwdMatmulConfig"),
     "mxfp8_linear_backward": ("fp8_bwd", "mxfp8_linear_backward"),
     "clear_runtime_caches": ("runtime", "clear_runtime_caches"),
+    "retire_runtime_contexts": ("runtime", "retire_runtime_contexts"),
+    "runtime_memory_report": ("runtime", "runtime_memory_report"),
     "validate_runtime_environment": ("runtime", "validate_runtime_environment"),
     # Compatibility exports for the legacy production tuners.
     "CoordinateDescentPolicy": ("autotune", "CoordinateDescentPolicy"),
@@ -117,7 +120,8 @@ _LAZY_EXPORTS = {
 # Historical tuner symbols remain directly addressable for compatibility, but
 # new integrations should import them from ``rtx.autotune``.
 _STABLE_EXPORTS = (
-    "WorkspacePolicy", "configure_workspace", "workspace_report",
+    "WorkspacePolicy", "configure_workspace", "workspace_report", "ExecutionResources",
+    "retire_runtime_contexts", "runtime_memory_report",
     "AutotunePolicy",
     "MLPExecutionMix",
     "MXTensor", "MXFP8Tensor", "NVFP4Tensor", "LinearOperandState",

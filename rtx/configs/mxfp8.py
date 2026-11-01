@@ -102,9 +102,11 @@ class MXFP8QuantConfig:
             return "logical-transpose rows must contain full SMEM tiles"
         if self.transposed_tile_rows % (self.num_warps * self.quant_vec):
             return "transposed_tile_rows must be divisible by num_warps * quant_vec"
-        if k % SF_VEC_SIZE:
-            return "decomposed logical-transpose K must be divisible by 32"
-        if k % self.transposed_tile_k:
+        ragged_tail=(self.scale_layout=='row_major' and self.transposed_tile_k==32
+                     and self.transposed_load_engine=='register')
+        if k % SF_VEC_SIZE and not ragged_tail:
+            return "ragged logical-transpose K requires row-major scales and register-loaded 32-value tiles"
+        if k % self.transposed_tile_k and not ragged_tail:
             return "logical-transpose K must contain full SMEM tiles"
         if self.native_scale_store == "packed" and self.transposed_tile_k != 128:
             return "packed transposed native scales require tile_k=128"

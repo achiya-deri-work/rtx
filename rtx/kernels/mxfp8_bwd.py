@@ -85,7 +85,7 @@ class MXFP8BwdMatmulConfig:
                 return "unknown reduction strategy"
             if self.split_reduction not in (1, 2, 4, 8, 16, 32):
                 return "split_reduction must be 1, 2, 4, 8, 16, or 32"
-            if self.reduction_tile not in (0, 128, 256, 512, 1024, 2048, 4096):
+            if type(self.reduction_tile) is not int or self.reduction_tile < 0:
                 return "unsupported reduction tile"
             if self.workspace_epilogue not in (
                 "none",
@@ -190,6 +190,8 @@ class MXFP8BwdMatmulConfig:
             return None
         if self.quant_launches not in ("dual", "separate"):
             return "quant_launches must be dual or separate"
+        if problem.k%32 and self.quant_launches!='separate':
+            return "ragged decomposed reductions require separate quantizer launches"
         quant_b = self.resolved_quant_b()
         reason = (
             self.quant_a.transposed_rejection(problem.m, problem.k)

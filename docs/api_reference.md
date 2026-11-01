@@ -23,6 +23,22 @@ class WorkspacePolicy:
     partial_entries: int | None = None
 ```
 
+## `rtx.ExecutionResources`
+
+Stable runtime export; provider `rtx.execution.ExecutionResources`.
+
+[Source](../rtx/execution.py)
+
+Optional per-stream FP32 reduction arena and graph-safe retirement.
+
+```python
+class ExecutionResources:
+    def __init__(self, *, split_workspace_bytes=0)
+    def activate(self)
+    def retire(self, *, streams, device=None)
+    def stats(self)
+```
+
 ## `rtx.configure_workspace`
 
 Stable runtime export; provider `rtx.workspace.configure_workspace`.
@@ -1170,6 +1186,30 @@ Release cached launch workspaces retained by the Python frontends.
 
 ```python
 clear_runtime_caches(*, synchronize: bool=True, device=None, preserve_compiled: bool=False)
+```
+
+## `rtx.retire_runtime_contexts`
+
+Stable runtime export; provider `rtx.runtime.retire_runtime_contexts`.
+
+[Source](../rtx/runtime.py)
+
+Retire quiescent preparation-stream scratch without invalidating graphs.
+
+```python
+retire_runtime_contexts(*, streams, device=None, synchronize=True)
+```
+
+## `rtx.runtime_memory_report`
+
+Stable runtime export; provider `rtx.runtime.runtime_memory_report`.
+
+[Source](../rtx/runtime.py)
+
+Unique explicit cache, execution-owner and live-graph scratch storage.
+
+```python
+runtime_memory_report(*, include_allocator=False)
 ```
 
 ## `rtx.validate_runtime_environment`

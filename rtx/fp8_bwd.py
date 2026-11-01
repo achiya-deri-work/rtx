@@ -82,7 +82,7 @@ def compile_mxfp8_backward_quad_quant(*args, **kwargs):
 if TYPE_CHECKING:
     from .autotune import CoordinateDescentPolicy
 
-BWD_FRONTEND_REVISION = 4
+BWD_FRONTEND_REVISION = 5
 
 
 def _zero_tensor_async(tensor: torch.Tensor) -> None:
@@ -111,7 +111,7 @@ def _allocate_scales(
 
 def _scale_shape(rows, k, scale_layout):
     if scale_layout == "row_major":
-        return (rows, k // 32)
+        return (rows, (k+31)//32)
     tile_rows = 64 if scale_layout == "mma64" else 128
     return (rows // tile_rows, k // 128, 512)
 
@@ -121,7 +121,7 @@ def _serial_operand_views(dx_problem, dw_problem, dx_config, dw_config, device):
     within a GEMM. Both runners own views of the same storage for graph pins.
     """
     def shapes(p,c):
-        return ((p.m,p.k),(p.n,p.k),
+        return ((p.m,p.storage_k),(p.n,p.storage_k),
                 _scale_shape(p.m,p.k,c.quant_a.scale_layout),
                 _scale_shape(p.n,p.k,c.resolved_quant_b().scale_layout))
     left,right=[],[]
@@ -164,6 +164,11 @@ class _MatmulRunner:
             self.quant_b(source_b, self.quantized_b, self.scales_b)
 
     def matmul(self, out: torch.Tensor) -> None:
+        from .execution import workspace_guard
+        with workspace_guard(self.workspace):
+            self._matmul(out)
+
+    def _matmul(self, out: torch.Tensor) -> None:
         target = out
         if self.workspace is not None:
             if self.zero_workspace:
@@ -219,8 +224,10 @@ class _SplitFusedMatmulRunner:
         source_b: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
-        self.partial(source_a, source_b, self.workspace)
-        self.reducer(self.workspace, out)
+        from .execution import workspace_guard
+        with workspace_guard(self.workspace):
+            self.partial(source_a, source_b, self.workspace)
+            self.reducer(self.workspace, out)
 
 
 @dataclass(slots=True)
@@ -238,9 +245,11 @@ class _AtomicSplitFusedMatmulRunner:
         source_b: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
-        _zero_tensor_async(self.accumulator)
-        self.partial(source_a, source_b, self.accumulator)
-        self.converter(self.accumulator_flat, out)
+        from .execution import workspace_guard
+        with workspace_guard(self.accumulator):
+            _zero_tensor_async(self.accumulator)
+            self.partial(source_a, source_b, self.accumulator)
+            self.converter(self.accumulator_flat, out)
 
 
 @dataclass(slots=True)
@@ -350,13 +359,15 @@ def _build_matmul_runner(
     device: torch.device,
     compile_quantizer: bool = True,
     operands: tuple[torch.Tensor, ...] | None = None,
+    workspace_lane: str = 'ordered',
 ) -> _MatmulRunner | _FusedMatmulRunner | _SplitFusedMatmulRunner | _AtomicSplitFusedMatmulRunner:
+    from .execution import split_workspace
     if config.backend == "fused":
         if config.reduction == "split_fp32_workspace":
-            workspace = torch.empty(
+            workspace = split_workspace(
                 config.split_reduction * problem.m * problem.n,
-                dtype=torch.float32,
                 device=device,
+                lane=workspace_lane,
             )
             return _SplitFusedMatmulRunner(
                 compile_mxfp8_split_fwd(
@@ -379,12 +390,10 @@ def _build_matmul_runner(
                 workspace,
             )
         if config.reduction == "split_fp32_atomic":
-            accumulator = torch.empty(
-                problem.m,
-                problem.n,
-                dtype=torch.float32,
-                device=device,
-            )
+            flat = split_workspace(problem.m * problem.n, device, lane=workspace_lane)
+            accumulator = flat.view(problem.m, problem.n)
+            if hasattr(flat,'_rtx_workspace_lock'):
+                accumulator._rtx_workspace_lock=flat._rtx_workspace_lock
             return _AtomicSplitFusedMatmulRunner(
                 compile_mxfp8_atomic_split_fwd(
                     problem,
@@ -427,8 +436,8 @@ def _build_matmul_runner(
                 b_orientation=config.b_orientation,
             )
         )
-    a_shape = (problem.m, problem.k)
-    b_shape = (problem.n, problem.k)
+    a_shape = (problem.m, problem.storage_k)
+    b_shape = (problem.n, problem.storage_k)
     quant_b_config = config.resolved_quant_b()
     if operands is None:
         quantized_a = torch.empty(a_shape, dtype=torch.float8_e4m3fn, device=device)
@@ -467,14 +476,15 @@ def _build_matmul_runner(
     workspace = None
     reducer = None
     zero_workspace = False
+    packed_problem=MXFP8Problem(problem.m,problem.n,problem.storage_k)
     if config.reduction == "split_fp32_workspace":
-        workspace = torch.empty(
+        workspace = split_workspace(
             config.split_reduction * problem.m * problem.n,
-            dtype=torch.float32,
             device=device,
+            lane=workspace_lane,
         )
         gemm = compile_mxfp8_gemm(
-            problem,
+            packed_problem,
             config.gemm,
             split_reduction=config.split_reduction,
             reduction_tile=config.reduction_tile,
@@ -489,14 +499,14 @@ def _build_matmul_runner(
             persistent_waves=config.reduction_waves,
         )
     elif config.reduction == "split_fp32_atomic":
-        workspace = torch.empty(
+        workspace = split_workspace(
             problem.m * problem.n,
-            dtype=torch.float32,
             device=device,
+            lane=workspace_lane,
         )
         zero_workspace = True
         gemm = compile_mxfp8_gemm(
-            problem,
+            packed_problem,
             config.gemm,
             split_reduction=config.split_reduction,
             reduction_tile=config.reduction_tile,
@@ -513,14 +523,14 @@ def _build_matmul_runner(
         )
     elif config.reduction == "cluster_fp32":
         gemm = compile_mxfp8_gemm(
-            problem,
+            packed_problem,
             config.gemm,
             split_reduction=config.split_reduction,
             reduction_tile=config.reduction_tile,
             cluster_output=True,
         )
     else:
-        gemm = compile_mxfp8_gemm(problem, config.gemm)
+        gemm = compile_mxfp8_gemm(packed_problem, config.gemm)
     return _MatmulRunner(
         quant_launches=config.quant_launches,
         quant_a=quant_a_launcher,
@@ -557,6 +567,7 @@ def _build_bwd_runner(
         device=device,
         compile_quantizer=not use_quad,
         operands=dx_operands,
+        workspace_lane='dx' if config.stream_schedule == 'dual_stream' else 'ordered',
     )
     dw = _build_matmul_runner(
         problem=MXFP8Problem(problem.n, problem.k, problem.m),
@@ -564,6 +575,7 @@ def _build_bwd_runner(
         device=device,
         compile_quantizer=not use_quad,
         operands=dw_operands,
+        workspace_lane='dw' if config.stream_schedule == 'dual_stream' else 'ordered',
     )
     quad_quant = None
     if use_quad:

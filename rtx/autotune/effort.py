@@ -184,6 +184,15 @@ class ProgressiveBanditScheduler(AdaptiveBanditScheduler):
 def make_effort_autotuner(adapter,store,policy,*,progress=None,candidates=(),started_at=None):
     """Compose existing strategies/UCB. No new timing or persistence engine."""
     started_at=time.monotonic() if started_at is None else started_at
+    backward_seeds=[]
+    if (adapter.context.family=='mxfp8_bwd' and 'dw_backend' in adapter.axes
+        and any(v.get('dw',{}).get('backend')=='decomposed' for v in adapter.axes['dw_backend'])
+        and any(v.get('dw',{}).get('reduction')=='split_fp32_workspace' for v in adapter.axes.get('dw_reduction',()))):
+        from .._bwd_search import backward_structural_seeds
+        from ..kernels.mxfp8 import MXFP8Problem
+        w=adapter.context.workload
+        backward_seeds=backward_structural_seeds(MXFP8Problem(int(w['m']),int(w['n']),int(w['k'])),adapter.initial_config)
+        candidates=(*backward_seeds,*candidates)
     progressive = policy.search_schedule == 'progressive'
     planning_trials = 64 if progressive else policy.max_trials
     neighborhood_trials = policy.initial_neighborhood_trials or (2 if progressive else 0)
@@ -296,6 +305,14 @@ def make_effort_autotuner(adapter,store,policy,*,progress=None,candidates=(),sta
                     break
             if not progressed:
                 break
+    if backward_seeds:
+        # These complete execution families must be reached before local
+        # inactive-coordinate neighbors, including in predictor-guided runs.
+        protected=[Proposal(c,'structural_family') for c in backward_seeds
+                   if adapter.config_id(c)!=adapter.config_id(adapter.initial_config)
+                   and adapter.rejection(c) is None][:3]
+        ids={adapter.config_id(p.config) for p in protected}
+        coverage=protected+[p for p in coverage if adapter.config_id(p.config) not in ids]
     if prior is None and predictor is None and policy.max_trials>=16 and not progressive:
         from .cost_model import GradientBoostedCostModel
         strategies.append(CostModelGuidedSearch(model=GradientBoostedCostModel(n_estimators=16,ensembles=2),
