@@ -50,7 +50,7 @@ WeightMode = Literal["dynamic", "prequantized"]
 # This revision is part of every compiler-visible forward token. Increment it
 # whenever lowering/ABI behavior changes so AOTInductor cannot revive a stale
 # generated wrapper whose graph otherwise has identical tensor guards.
-MXFP8_FRONTEND_REVISION = 8
+MXFP8_FRONTEND_REVISION = 9
 
 
 def _normalize_mxfp8_backend(backend: MXFP8Backend) -> Literal[
@@ -184,6 +184,38 @@ DEFAULT_MXFP8_INFERENCE_CONFIG = MXFP8PrequantConfig(
     quant=MXFP8QuantConfig(),
     gemm=MXFP8GemmConfig(epilogue="direct", store_vec=1),
 )
+
+# These are existing kernel families, not relaxed native-layout validators or
+# padded BF16 operands. Keep the aligned default unchanged, then try native
+# 64-row scales and finally a masked row-major/direct-store schedule. The
+# autotuner still explores the complete legal layout/transport space.
+_DEFAULT_MXFP8_NATIVE64_CONFIG = replace(
+    DEFAULT_MXFP8_PREQUANT_CONFIG,
+    quant=replace(DEFAULT_MXFP8_PREQUANT_CONFIG.quant, scale_layout="mma64"),
+    weight_scale_layout="mma128",
+    gemm=replace(DEFAULT_MXFP8_PREQUANT_CONFIG.gemm, tile_m=64,
+                 atom_layout_m=2, stages=1, scale_layout="mma64x128"),
+)
+_DEFAULT_MXFP8_MASKED_CONFIG = replace(
+    DEFAULT_MXFP8_PREQUANT_CONFIG,
+    quant=replace(DEFAULT_MXFP8_PREQUANT_CONFIG.quant, scale_layout="row_major"),
+    gemm=replace(DEFAULT_MXFP8_PREQUANT_CONFIG.gemm, scale_layout="row_major",
+                 scale_role="consumers", epilogue="direct", store_vec=1),
+)
+
+
+def _default_dynamic_prequant_config(problem: MXFP8Problem) -> MXFP8PrequantConfig | None:
+    """Shape-compatible seed; one rejected native layout is not family rejection.
+
+    Explicit user configs are never rewritten. No GPU work, cache lookup,
+    padding/copy or import of the tuning engine occurs during this decision.
+    """
+    for candidate in (DEFAULT_MXFP8_PREQUANT_CONFIG,
+                      _DEFAULT_MXFP8_NATIVE64_CONFIG,
+                      _DEFAULT_MXFP8_MASKED_CONFIG):
+        if candidate.rejection(problem) is None:
+            return candidate
+    return None
 
 
 _CONFIGS: dict[str, MXFP8FwdConfig] = {}
@@ -2125,13 +2157,16 @@ def mxfp8_linear(
     x_2d = x.reshape(-1, x.shape[-1])
     _check_inputs(x_2d, weight)
     problem = MXFP8Problem(x_2d.shape[0], weight.shape[0], x_2d.shape[1])
-    selected_prequant = prequant_config or DEFAULT_MXFP8_PREQUANT_CONFIG
+    selected_prequant = prequant_config or _default_dynamic_prequant_config(problem)
     use_prequant = backend == "materialized" or (
         backend == "auto"
         and config is None
+        and selected_prequant is not None
         and selected_prequant.rejection(problem) is None
     )
     if use_prequant:
+        if selected_prequant is None:
+            raise RuntimeError(f"materialized MXFP8 backend has no legal portable seed for {problem}")
         rejection = selected_prequant.rejection(problem)
         if rejection is not None:
             raise RuntimeError(
@@ -2141,7 +2176,7 @@ def mxfp8_linear(
         if prequant_config is not None or mode == "off":
             key = (
                 _DEFAULT_MXFP8_PREQUANT_KEY
-                if prequant_config is None
+                if selected_prequant == DEFAULT_MXFP8_PREQUANT_CONFIG
                 else _intern_prequant_config(selected_prequant)
             )
         else:
@@ -2688,6 +2723,17 @@ class MXFP8Linear(nn.Module):
             leading_shape = x.shape[:-1]
             x_2d = x.reshape(-1, self.in_features)
             _check_inputs(x_2d, self.weight)
+            problem = MXFP8Problem(x_2d.shape[0], self.out_features, self.in_features)
+            if self.prequant_config is None and DEFAULT_MXFP8_PREQUANT_CONFIG.rejection(problem) is not None:
+                # The constructor has no activation shape. Resolve an implicit
+                # shape-compatible key in the shared functional path rather
+                # than submitting its aligned-only constructor seed.
+                return mxfp8_linear(
+                    x, self.weight, config=self.config, autotune=self.autotune,
+                    tuning_policy=self.tuning_policy, autotune_cache_dir=self.autotune_cache_dir,
+                    backend=self.backend, prequant_config=self.prequant_config,
+                    backward_config=self.backward_config,
+                )
             if torch.is_grad_enabled() and (
                 x_2d.requires_grad or self.weight.requires_grad
             ):
@@ -2747,10 +2793,11 @@ class MXFP8Linear(nn.Module):
             else:
                 state = "dynamic"
                 problem = MXFP8Problem(m, self.out_features, k)
-                candidate = self.prequant_config or DEFAULT_MXFP8_PREQUANT_CONFIG
+                candidate = self.prequant_config or _default_dynamic_prequant_config(problem)
                 materialized = self.backend == "materialized" or (
                     self.backend == "auto"
                     and self.config is None
+                    and candidate is not None
                     and candidate.rejection(problem) is None
                 )
                 backend = "materialized" if materialized else "fused"

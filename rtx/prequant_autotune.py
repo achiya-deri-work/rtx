@@ -1036,12 +1036,10 @@ def load_cached_mxfp8_prequant_config(
 
 def _legal_default_prequant_config(problem: MXFP8Problem) -> MXFP8PrequantConfig:
     """Use an existing legal baseline without changing quantization policy."""
-    if DEFAULT_MXFP8_PREQUANT_CONFIG.rejection(problem) is None:
-        return DEFAULT_MXFP8_PREQUANT_CONFIG
-    for updates in PREQUANT_SEARCH_SPACE['layout_transport']:
-        candidate = update_prequant_config(DEFAULT_MXFP8_PREQUANT_CONFIG, updates)
-        if candidate.gemm.scale_layout == 'row_major' and candidate.rejection(problem) is None:
-            return candidate
+    from .fp8 import _default_dynamic_prequant_config
+    candidate = _default_dynamic_prequant_config(problem)
+    if candidate is not None:
+        return candidate
     raise RuntimeError(f'no legal default prequant configuration for {problem}')
 
 

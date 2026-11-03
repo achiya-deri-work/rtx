@@ -9,7 +9,7 @@ from typing import Literal
 
 
 Preparation = Literal["fused", "stage_a", "stage_b", "staged"]
-PREPARATION_REVISION = 3
+PREPARATION_REVISION = 4
 
 
 def preparation_selection_enabled(policy):

@@ -26,6 +26,27 @@ def decomposed_leg(leg, problem):
         reuse_operand='none', tile_locality='raster')
 
 
+def native_decomposed_leg(leg, problem):
+    """Existing native layouts with orientation-aware quantizer tiles.
+
+    A half-128 row extent can use MMA64 SFA and MMA128 SFB when N/K
+    permit it. Keep each operand's numerical policy; never relax the native
+    reduction-axis or transpose-layout contracts.
+    """
+    from .fp8 import _default_dynamic_prequant_config
+    seed = _default_dynamic_prequant_config(problem)
+    if seed is None or seed.gemm.scale_layout == 'row_major':
+        return None
+    def quant(config, rows, layout):
+        return replace(config, scale_layout=layout, native_scale_store='scalar',
+            transposed_tile_rows=max(32, math.gcd(128, rows)))
+    candidate = replace(decomposed_leg(leg, problem),
+        quant_a=quant(leg.quant_a, problem.m, seed.quant.scale_layout),
+        quant_b=quant(leg.resolved_quant_b(), problem.n, seed.resolved_weight_quant().scale_layout),
+        gemm=seed.gemm)
+    return candidate if candidate.implementation_rejection(problem) is None else None
+
+
 def split_leg(leg, length, parts):
     if parts == 1:
         return replace(leg, reduction='full_fp32', split_reduction=1,
@@ -61,6 +82,13 @@ def backward_structural_seeds(problem, initial):
     if combined is not None:
         seeds.remove(combined)
         seeds.insert(1,combined)
+    native_dx = native_decomposed_leg(base.dx, dx_problem)
+    if native_dx is not None and seeds:
+        candidate = replace(seeds[0], dx=native_dx)
+        if candidate.implementation_rejection(problem) is None and candidate not in seeds:
+            # Reach native dX + split materialized dW inside small budgets,
+            # retaining the row-major and fused alternatives as candidates.
+            seeds.insert(1,candidate)
     # Storage policy is a real axis, including the partial-call topology used
     # by recomputed MLPs. Never activate aliasing for overlapping/quad schedules.
     for current in tuple(seeds):
@@ -89,6 +117,10 @@ def backward_search_space(problem, axes):
             payload=bwd_config_to_dict(replace(DEFAULT_FUSED_MXFP8_BWD_CONFIG,**{name:leg}))[name]
             payload['quant_b']=dict(payload['quant_a'])
             result[backend_key]=unique((*result[backend_key], {name:payload}))
+            native=native_decomposed_leg(getattr(DEFAULT_FUSED_MXFP8_BWD_CONFIG,name),p)
+            if native is not None:
+                payload=bwd_config_to_dict(replace(DEFAULT_FUSED_MXFP8_BWD_CONFIG,**{name:native}))[name]
+                result[backend_key]=unique((*result[backend_key], {name:payload}))
         reduction_key=f'{name}_reduction'
         if reduction_key in result and any(v.get(name,{}).get('reduction')=='split_fp32_workspace' for v in result[reduction_key]):
             moves=[]

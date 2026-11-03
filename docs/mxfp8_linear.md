@@ -22,6 +22,22 @@ The default uses `backend="auto"` and `autotune=None`. Auto selects the
 materialized dynamic quantize-once pipeline when legal and otherwise the fused
 kernel. Cache mode loads a compatible verified winner without benchmarking.
 
+Materialized eligibility is checked across existing scale-layout families,
+not just the aligned portable configuration. Full 128-row shapes retain the
+native MMA128 seed. Compatible 64-row-aligned shapes can start from native
+MMA64 activation scales / MMA128 weight scales; other tails use an existing
+masked row-major/direct-store seed. This does not pad BF16 activations or
+change E4M3/E8M0 quantization. Each seed still passes the normal legality
+checks. Explicit schedules are never silently rewritten.
+
+These are starting configurations, not universal performance winners.
+Autotuning retains the independent transport, tile, buffering and layout
+choices. Optional preparation selection also measures fused versus
+materialized execution. Backward opening trials include native-scale dX
+with split FP32 dW when legal, alongside row-major and fused alternatives.
+See the [half-tile dispatch qualification](mxfp8_row_alignment_qualification_20261103.md)
+for measured application impact, numerical coverage and remaining limitations.
+
 ## Constructor
 
 ```python

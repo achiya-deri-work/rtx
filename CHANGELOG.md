@@ -5,6 +5,12 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Remove the dynamic MXFP8 half-128-row dispatch cliff: consider existing
+  native MMA64/MMA128 and masked row-major materialized seeds before falling
+  back to fused execution. Preserve explicit configs, native legality and
+  quantization numerics; no padded BF16 operands are introduced. Add native
+  dX to backward opening coverage and invalidate affected search/frontend
+  identities (forward frontend 9, preparation 4, backward search 29).
 - Make scratch ownership automatic with ordinary default-mode `torch.compile`:
   retain compiled working sets beyond the runner LRU, share compatible ordered
   split workspaces, exclude cold tuning trials, and retire duplicate graph
