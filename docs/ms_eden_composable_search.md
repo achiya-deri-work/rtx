@@ -53,6 +53,43 @@ tiles and stages, scale movement, locality, persistence and split reduction.
 Register caps/allocation axes are excluded from this structural study.
 SM-count-derived grid candidates supplement fixed grid sizes.
 
+### Captured-model orchestration refinement
+
+`backward_pipeline="paired_dw_first"` couples dW caller-stream ownership with
+caller-first submission, overlapping dX on the side stream. It launches the
+same kernels and consumes the same independent RNG draws as `paired`, with
+the same explicit joins and storage recording. It adds no profiling events.
+Pipeline/design context revisions 4/7 isolate the expanded search domain.
+
+The new `make_ms_eden_model_adapter` and `MSEdenModelSchedule` in `rtx.autotune`
+refine per-shape orchestration using a complete compiled-model evaluator.
+They compose with the existing orchestrator, UCB scheduler, residual store and
+search strategies. Batch, sequence, model contract, base designs, device and
+source environment participate in identity. Kernel designs stay fixed while
+the model-level objective selects stream ownership per projection. No runtime
+winner/default is published implicitly.
+
+For the 206M SiTU study:
+
+```bash
+python -m benchmarks.refine_ms_eden_model \
+  --study autotune_reports/precision200m_fresh_tuned_20261028 \
+  --output path/to/new-model-refinement --batch 72 --trials 8 --seconds 900
+```
+
+Each candidate runs in a fresh process. Numerical completion, dispatch,
+initialization/data/source provenance, memory headroom and timing stationarity
+are checked before it can win. A separate 64-update confirmation precedes
+writing the reusable `designs.json`. That file can be supplied to
+`benchmarks.train_precision20m --ms-eden-designs` before compilation; tuning
+is never inserted into timed training steps.
+
+`benchmarks.study_precision200m_tuned` now runs this stage after isolated
+component tuning and before final training (`--model-trials` and
+`--model-seconds` control effort). `preparation.json` includes refinement cost
+and explicitly excludes it from training time. This decoder study adapter is
+not an automatic public first-hit tuning policy for arbitrary models.
+
 Native `mma128` scales currently require 128x128x128 tiles. Optional
 row-major scales enable larger legal tiles, including 256x128 and 128x256.
 Coupled seeds cross layout, epilogue, warp-arrangement and scale-ownership

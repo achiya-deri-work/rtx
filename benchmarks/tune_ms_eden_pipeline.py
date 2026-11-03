@@ -23,7 +23,7 @@ def preset(name):
     base = MSEdenPipelineSchedule()
     if name == "baseline":
         return base
-    if name in ("paired", "operand_paired"):
+    if name in ("paired", "paired_dw_first", "operand_paired"):
         return replace(base, backward_pipeline=name)
     if name == "staged":
         return replace(base, dx=replace(base.dx, amax_reduction="staged"), dw=replace(base.dw, amax_reduction="staged"))
@@ -41,7 +41,7 @@ def candidates(adapter, pool_size):
     intermediate would be rejected. Never enumerate a Cartesian product.
     """
     seeds = [adapter.initial_config, preset("paired"), preset("staged"),
-             preset("buffered2"), preset("buffered3")]
+             preset("buffered2"), preset("paired_dw_first"), preset("buffered3")]
     base = adapter.initial_config
     paired = replace(base, backward_pipeline="paired")
     # Keep the historical first seeds, but do not spend a small paired search
@@ -167,7 +167,7 @@ def parser():
     p.add_argument("--min-batch-ms", type=float, default=2.)
     p.add_argument("--warmup-ms", type=float, default=3000.)
     p.add_argument("--seed", type=int, default=941)
-    p.add_argument("--initial-preset", choices=("baseline", "paired", "operand_paired", "staged", "buffered2", "buffered3"), default="baseline")
+    p.add_argument("--initial-preset", choices=("baseline", "paired", "paired_dw_first", "operand_paired", "staged", "buffered2", "buffered3"), default="baseline")
     p.add_argument("--initial-json", help="serialized MSEdenPipelineSchedule, overrides preset")
     p.add_argument("--refine", action="store_true", help="spend remaining cumulative budget instead of compatible cache hit")
     p.add_argument("--dry-run", action="store_true", help="print candidates and axes without CUDA or filesystem writes")

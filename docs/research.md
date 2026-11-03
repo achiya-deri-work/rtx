@@ -4,6 +4,11 @@ For using the library, start with the [manual](README.md). These pages are
 evidence and experimental design, not a second API. Dated results apply to
 their saved source/device/protocol; older pending-work statements are historical.
 
+For the retained NVFP4 backward work, start with the
+[consolidated research index](nvfp4_research.md): experimental interfaces,
+kernel studies, model-context scheduling, completed training evidence and
+reproduction commands.
+
 ## Autotuning
 
 - [Qualification matrix](autotune_qualification_matrix.md) and [engineering acceptance audit](first_hit_completion_audit.md).

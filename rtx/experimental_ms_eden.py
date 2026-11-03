@@ -12,6 +12,7 @@ import torch
 
 from .autotune.posthoc import PosthocPreparationSchedule,check_preparation_copy_alignment
 from .configs.nvfp4 import NVFP4ScaleConfig
+from .autotune.ms_eden_pipeline import BACKWARD_PIPELINES
 
 _FORWARD_POLICIES={mode:NVFP4ScaleConfig(tensor_scale_mode=mode) for mode in ("power2","exact","exact_four_over_six")}
 
@@ -304,15 +305,15 @@ def _operand_streams(device,caller):
 
 def _paired_contract(dy,x,weight,dx_signs,dx_a,dx_b,dw_signs,dw_a,dw_b,
                      dx_schedule_json,dw_schedule_json,dx_seeded,dw_seeded,pipeline):
-    if pipeline not in ("serial","paired","operand_paired"):
-        raise ValueError("pipeline must be serial, paired, or operand_paired")
+    if pipeline not in BACKWARD_PIPELINES:
+        raise ValueError(f"pipeline must be one of {BACKWARD_PIPELINES}")
     dx=_contract(dy,weight,dx_signs,dx_a,dx_b,"dx",dx_schedule_json,seeded=dx_seeded)
     dw=_contract(dy,x,dw_signs,dw_a,dw_b,"dw",dw_schedule_json,seeded=dw_seeded)
     torch._check(x.shape[1]==weight.shape[1])
     return dx,dw
 
 
-def _launch_paired(run_dx,run_dw,live_dw,device):
+def _launch_paired(run_dx,run_dw,live_dw,device,*,caller_first=False):
     caller=torch.cuda.current_stream(device)
     entry=_paired_stream(device,caller)
     if entry is None:
@@ -326,9 +327,12 @@ def _launch_paired(run_dx,run_dw,live_dw,device):
         try:
             for value in live_dw:
                 value.record_stream(side)
+            if caller_first:
+                run_dx()
             with torch.cuda.stream(side):
                 run_dw()
-            run_dx()
+            if not caller_first:
+                run_dx()
         finally:
             # Also join on launch failure before any storage can die.
             caller.wait_stream(side)
@@ -392,6 +396,11 @@ def _paired_gradient(dy:torch.Tensor,x:torch.Tensor,weight:torch.Tensor,
                                              seed=dw_a if dw_seeded else None)
         if pipeline=="serial":
             run_dx(); run_dw()
+        elif pipeline=="paired_dw_first":
+            # dW owns the caller stream and is submitted before side-stream dX.
+            # This is a coupled ownership/submission choice, not just a reversed
+            # host launch order. All side-owned dX storage is recorded explicitly.
+            _launch_paired(run_dw,run_dx,live_dx,dy.device,caller_first=True)
         elif pipeline=="operand_paired":
             _launch_operand_paired(run_dx,run_dw,live_dx,live_dw,dy.device)
         else:
@@ -627,7 +636,7 @@ class _ExperimentalLinear(torch.autograd.Function):
                 if ctx.needs_input_grad[1] else None)
             return (dx,dw)+(None,)*11
         x,weight = ctx.saved_tensors
-        if (ctx.backward_pipeline in ("paired","operand_paired") and all(ctx.needs_input_grad[:2])
+        if (ctx.backward_pipeline in ("paired","paired_dw_first","operand_paired") and all(ctx.needs_input_grad[:2])
                 and ctx.dx_policy==ctx.dw_policy=="ms_eden"):
             dx,dw=_random_paired_gradient(dy,x,weight,ctx.dx_schedule_json,
                                           ctx.dw_schedule_json,ctx.backward_pipeline)
@@ -711,6 +720,8 @@ def ms_eden_linear(x, weight, *, schedule_json="{}",source_policy="original_bf16
     and consume no RNG, regardless of their selected policy.
     Opt-in backward_pipeline='paired' overlaps the two original-BF16 MS-EDEN
     legs on caller/side streams without changing their independent RNG draws.
+    'paired_dw_first' assigns dW to the caller stream and submits it before
+    side-stream dX. This changes graph scheduling, not arithmetic or RNG draws.
     'operand_paired' additionally overlaps each leg's two operand preparations
     on three bounded, caller-owned side streams; it changes no kernel math.
     Mixed-policy, packed-source and partial-gradient calls retain serial paths.
@@ -730,8 +741,8 @@ def ms_eden_linear(x, weight, *, schedule_json="{}",source_policy="original_bf16
     This is not an unbiasedness guarantee: sparse-input conditional error is
     documented in operand_preparation_plan.md. Not a default or stable API.
     """
-    if backward_pipeline not in ("serial","paired","operand_paired"):
-        raise ValueError("backward_pipeline must be serial, paired, or operand_paired")
+    if backward_pipeline not in BACKWARD_PIPELINES:
+        raise ValueError(f"backward_pipeline must be one of {BACKWARD_PIPELINES}")
     if source_policy not in ("original_bf16","forward_current_roundtrip_bf16"):
         raise ValueError("unknown experimental source policy")
     if dx_policy not in ("ms_eden","mxfp8") or dw_policy not in ("ms_eden","mxfp8"):

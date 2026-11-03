@@ -15,6 +15,12 @@ from rtx.autotune.ms_eden_design import (
 from rtx.autotune.ms_eden_pipeline import MSEdenPipelineSchedule
 
 
+def ownership_seeds(anchor):
+    """Protect the coupled ownership choice within small structural budgets."""
+    return [replace(anchor,finalizer='separate',schedule=replace(anchor.schedule,
+        backward_pipeline=pipeline)) for pipeline in ('paired','paired_dw_first')]
+
+
 def implementation_seeds(schedule):
     """Seed distinct implementations so coupled legality cannot strand search."""
     seeds = []
@@ -239,6 +245,8 @@ def main(argv=None):
         except (RuntimeError, ValueError, OSError) as error:
             return TrialOutcome("runtime_error", error=str(error))
     adapter.evaluator = safe_evaluate
+    if not args.confirm_only and args.coverage=='implementation':
+        seeds=[seeds[0],*ownership_seeds(seeds[0]),*seeds[1:]]
     if args.allow_row_major and not args.confirm_only:
         seeds.extend(layout_seeds(adapter, seeds[0]))
     seeds = [s for s in seeds if adapter.rejection(s) is None]

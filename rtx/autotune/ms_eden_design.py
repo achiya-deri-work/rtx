@@ -149,7 +149,7 @@ def make_ms_eden_design_adapter(shape, evaluator, *, initial=None, **kwargs):
             tma_tile_rows=config.tma_tile_rows, row_transform=config.row_transform))
 
     return DiscreteKernelAdapter(
-        context=KernelContext("ms_eden_design_research", 6, base.context.workload,
+        context=KernelContext("ms_eden_design_research", 7, base.context.workload,
             device=base.context.device, environment=base.context.environment,
             tags={"pipeline_context": base.context.identifier, "automatic_promotion": False}),
         initial_config=initial, axes={**axes, **IMPLEMENTATIONS},

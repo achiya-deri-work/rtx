@@ -53,6 +53,7 @@ class PrecisionProjection(nn.Module):
         self.weight=original.weight
         self.mode=mode
         self.backward_pipeline=backward_pipeline
+        self.backward_config=rtx.DEFAULT_MXFP8_BWD_CONFIG
         self.shape=(m,original.out_features,original.in_features)
         self.scale_config=rtx.NVFP4ScaleConfig(tensor_scale_mode="exact")
         self.forward_config=replace(preferred_jit_row_region_config(rtx.NVFP4Problem(*self.shape)),
@@ -86,7 +87,7 @@ class PrecisionProjection(nn.Module):
             out=rtx.nvfp4_linear(flat,self.weight,scaling="jit_row_region",autotune="off",
                 dynamic_config=self.forward_config,
                 scale_config=self.scale_config,
-                backward_config=rtx.DEFAULT_MXFP8_BWD_CONFIG)
+                backward_config=self.backward_config)
         else:
             from rtx.experimental_ms_eden import ms_eden_linear
             out=ms_eden_linear(flat,self.weight,source_policy="original_bf16",
@@ -101,7 +102,9 @@ def model_config(args):
         hidden_size=args.width,intermediate_size=args.intermediate,
         num_attention_heads=args.heads,dtype=torch.bfloat16,
         linear=LinearSpec(precision="bf16"),tie_word_embeddings=True,
-        initializer_range=.02,residual_init_multiplier=2.,attention_dropout=0.)
+        initializer_range=.02,residual_init_multiplier=2.,attention_dropout=0.,
+        mlp_activation=getattr(args,"mlp_activation","silu"),
+        situ_beta=getattr(args,"situ_beta",4.),situ_linear_beta=getattr(args,"situ_linear_beta",25.))
 
 
 def build_model(config,mode,batch,sm_count=1,producer_load=None,producer_blocks=None,
@@ -147,6 +150,32 @@ def _load_unique_map(path):
     if not isinstance(raw,dict) or not raw:
         raise ValueError("schedule map must be a nonempty object")
     return raw
+
+
+def apply_projection_configs(model, args):
+    """Install explicit configs before compilation, never tune in measured steps."""
+    from rtx.nvfp4_inference_autotune import dynamic_config_from_dict
+    from rtx.bwd_autotune import bwd_config_from_dict
+    modules=[m for m in model.modules() if isinstance(m,PrecisionProjection)]
+    required={','.join(map(str,m.shape)) for m in modules}
+    for argument,attribute,decode in (
+        ('forward_configs','forward_config',dynamic_config_from_dict),
+        ('mxfp8_backward_configs','backward_config',bwd_config_from_dict),
+    ):
+        path=getattr(args,argument,None)
+        if path is None:
+            continue
+        if args.mode=='mxfp8' or (argument=='mxfp8_backward_configs' and args.mode!='nvfp4_mxfp8'):
+            raise ValueError(f'{argument} incompatible with {args.mode}')
+        raw=_load_unique_map(path)
+        if set(raw)!=required:
+            raise ValueError(f'{argument} must exactly cover model shapes')
+        configs={key:decode(value) for key,value in raw.items()}
+        for m in modules:
+            selected=configs[','.join(map(str,m.shape))]
+            if argument=='forward_configs' and selected.tensor_scale_mode!='exact':
+                raise ValueError('training comparison requires exact FP32 regional scales')
+            setattr(m,attribute,selected)
 
 
 def load_schedule_map(path):
@@ -305,6 +334,9 @@ def parser():
     p.add_argument("--mode",choices=MODES,required=True)
     p.add_argument("--sku",default="")
     p.add_argument("--attention",choices=("flash","math"),default="flash")
+    p.add_argument("--mlp-activation",choices=("silu","situ"),default="silu")
+    p.add_argument("--situ-beta",type=float,default=4.)
+    p.add_argument("--situ-linear-beta",type=float,default=25.)
     p.add_argument("--cpu-threads",type=int,default=4)
     for name,default in (("steps",2048),("batch",16),("sequence",256),("layers",8),
         ("width",512),("intermediate",1024),("heads",8),("seed",941),
@@ -329,12 +361,16 @@ def parser():
                    help="optional fused uniform RNG; changes random sequence, not precision policy")
     p.add_argument("--ms-eden-producer-signs",choices=("reload","register"),
                    help="optional exact register reuse of the fixed Hadamard signs")
-    p.add_argument("--ms-eden-backward-pipeline",choices=("serial","paired","operand_paired"),default="serial",
+    p.add_argument("--ms-eden-backward-pipeline",choices=("serial","paired","paired_dw_first","operand_paired"),default="serial",
                    help="experimental FP4 backward overlap: paired gradients or four operand preparations; default serial")
     p.add_argument("--ms-eden-schedules",type=Path,
                    help="JSON map of canonical M,N,K to dx/dw/backward_pipeline; exact model coverage required")
     p.add_argument("--ms-eden-designs",type=Path,
                    help="exact per-shape MSEdenDesign map; shared loader/finalizer and exact model coverage required")
+    p.add_argument("--forward-configs",type=Path,
+                   help="freshly tuned NVFP4 dynamic configs by canonical M,N,K; exact model coverage")
+    p.add_argument("--mxfp8-backward-configs",type=Path,
+                   help="freshly tuned MXFP8 backward configs by canonical M,N,K; exact model coverage")
     p.add_argument("--ms-eden-research-variant",choices=("retained","tma_dual"),default="retained",
                    help="opt-in TMA XOR5 plus dual finalization; requires an explicit schedule map")
     return p
@@ -469,6 +505,7 @@ def _run_validated(args):
                           args.ms_eden_producer_load,args.ms_eden_producer_blocks,
                           args.ms_eden_rng_mode,args.ms_eden_producer_signs,args.ms_eden_backward_pipeline,
                           args.ms_eden_schedule_map)
+        apply_projection_configs(model, args)
         initial_hash=parameter_hash(model)
         model.cuda()
         if model.embed_tokens.weight is not model.lm_head.weight:
@@ -493,6 +530,9 @@ def _run_validated(args):
             initial_weights_sha256=initial_hash,corpus_sha256=corpus.sha256,
             validation_offsets_sha256=corpus.validation_sha256)
         identity.update(ms_eden_identity_overrides(args))
+        for name in ('forward_configs','mxfp8_backward_configs'):
+            if getattr(args,name,None) is not None:
+                identity[name]=_load_unique_map(getattr(args,name))
         step=0
         training_wall=0.
         prior_end_to_end=0.
@@ -515,7 +555,8 @@ def _run_validated(args):
             resume=str(args.resume) if args.resume else None,
             precision=dict(matrix_parameters="BF16",normalization_parameters="FP32",
                 norm_reductions="FP32",rope="FP32",residual_add="FP32 then BF16",
-                swiglu="BF16",loss="FP32",grad_norm="FP32",attention_qkv="BF16",
+                swiglu="BF16" if config.mlp_activation=="silu" else "SiTU FP32 then BF16",
+                loss="FP32",grad_norm="FP32",attention_qkv="BF16",
                 attention_softmax="FP32 statistics/exponentiation; BF16 probability cast for FLASH PV",
                 cudagraphs=args.cudagraphs),
             wall_contract="Synchronized training blocks include data movement and optimizer; exclude compilation, validation, checkpoint, logging and outside-block checks.")
@@ -649,6 +690,9 @@ def _run_validated(args):
             finite=all(bool(p.isfinite().all()) for p in model.parameters())
             emit("result",step=step,tokens=step*args.batch*args.sequence,training_wall_s=training_wall,
                 end_to_end_wall_s=elapsed(),validation_loss=last_validation,finite_parameters=finite,
+                peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+                peak_reserved_bytes=torch.cuda.max_memory_reserved(),
+                device_total_bytes=props.total_memory,
                 interrupted=interrupted[0])
             if not finite:
                 raise RuntimeError("nonfinite final parameters")

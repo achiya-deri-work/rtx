@@ -44,7 +44,7 @@ def test_pipeline_immutable_serialization_and_component_updates():
 
 def test_policy_rejection_and_component_axes_are_composed():
     adapter = make_ms_eden_pipeline_adapter((512, 512, 512), lambda _: evidence())
-    assert adapter.axes["backward_pipeline"] == ("serial", "paired", "operand_paired")
+    assert adapter.axes["backward_pipeline"] == ("serial", "paired", "paired_dw_first", "operand_paired")
     assert "dx.producer_stages" in adapter.axes and "dw.gemm:gemm_geometry" in adapter.axes
     assert "dx.rng_mode" not in adapter.axes
     initial = adapter.initial_config

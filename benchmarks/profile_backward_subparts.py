@@ -230,7 +230,7 @@ def main():
                    help='public only: scoped compiler RNG combo fusion, no runtime default changes')
     p.add_argument('--preparation-variant', choices=('retained', 'compact', 'compact_fma', 'tma_xor5_1', 'tma_columns_1'),
                    default='retained', help='public only: research producer, never a runtime default')
-    p.add_argument('--backward-pipeline',choices=('serial','paired'),default='serial')
+    p.add_argument('--backward-pipeline',choices=('serial','paired','paired_dw_first'),default='serial')
     p.add_argument('--graph-batch',type=int,choices=(1,8),default=1)
     p.add_argument('--scale-finalizer',choices=('retained','dual_both'),default='retained',
                    help='public only: match the research fused scale-finalizer topology')

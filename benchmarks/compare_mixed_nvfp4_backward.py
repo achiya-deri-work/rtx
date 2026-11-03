@@ -41,7 +41,7 @@ def parser():
     p.add_argument("--schedule-json",default="{}")
     p.add_argument("--dx-schedule-json")
     p.add_argument("--dw-schedule-json")
-    p.add_argument("--backward-pipeline",choices=("serial","paired","operand_paired"),default="serial")
+    p.add_argument("--backward-pipeline",choices=("serial","paired","paired_dw_first","operand_paired"),default="serial")
     p.add_argument("--mxfp8-config-json",help="serialized MXFP8BwdConfig; omitted means repository default")
     p.add_argument("--output",required=True)
     p.add_argument("--worker",action="store_true",help=argparse.SUPPRESS)

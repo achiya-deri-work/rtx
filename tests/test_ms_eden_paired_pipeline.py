@@ -22,7 +22,7 @@ def inputs(device="meta"):
             torch.empty(dy.numel()//16,device=device),torch.empty(x.numel()//16,device=device))
 
 
-@pytest.mark.parametrize("pipeline",["serial","paired","operand_paired"])
+@pytest.mark.parametrize("pipeline",["serial","paired","paired_dw_first","operand_paired"])
 def test_fake_and_fullgraph_metadata(pipeline):
     args=inputs()
     def fn(*values):
@@ -69,7 +69,7 @@ def test_rng_consumption_matches_independent_serial(monkeypatch,dx_seeded,dw_see
     (False,True,"ms_eden","ms_eden"),(True,True,"mxfp8","ms_eden"),
     (True,True,"ms_eden","mxfp8"),
 ])
-@pytest.mark.parametrize("pipeline",["paired","operand_paired"])
+@pytest.mark.parametrize("pipeline",["paired","paired_dw_first","operand_paired"])
 def test_pair_admission_and_partial_fallback(monkeypatch,need_x,need_w,dx_policy,dw_policy,pipeline):
     import rtx.fp4 as fp4
     monkeypatch.setattr(fp4,"nvfp4_linear",lambda x,w,**kw:x@w.T)
@@ -104,7 +104,8 @@ def test_invalid_pipeline_and_incompatible_shapes():
 
 
 @pytest.mark.parametrize("failure",[None,"dx","dw"])
-def test_stream_fork_join_and_lifetime_even_on_failure(monkeypatch,failure):
+@pytest.mark.parametrize("caller_first",[False,True])
+def test_stream_fork_join_and_lifetime_even_on_failure(monkeypatch,failure,caller_first):
     calls=[]
     class Stream:
         def __init__(self,name):
@@ -131,12 +132,13 @@ def test_stream_fork_join_and_lifetime_even_on_failure(monkeypatch,failure):
             raise RuntimeError(phase)
     if failure:
         with pytest.raises(RuntimeError,match=failure):
-            eden._launch_paired(lambda:run("dx"),lambda:run("dw"),[Storage(),Storage()],None)
+            eden._launch_paired(lambda:run("dx"),lambda:run("dw"),[Storage(),Storage()],None,caller_first=caller_first)
     else:
-        eden._launch_paired(lambda:run("dx"),lambda:run("dw"),[Storage(),Storage()],None)
+        eden._launch_paired(lambda:run("dx"),lambda:run("dw"),[Storage(),Storage()],None,caller_first=caller_first)
     assert calls[:3]==[("wait","side","caller"),"record","record"]
     assert calls[-1]==("wait","caller","side")
-    assert calls.index("dw")<calls.index("dx") if failure!="dw" else "dx" not in calls
+    first,second=("dx","dw") if caller_first else ("dw","dx")
+    assert calls.index(first)<calls.index(second) if failure!=first else second not in calls
 
 
 def test_side_stream_cache_is_bounded_and_capture_isolated(monkeypatch):
@@ -203,9 +205,20 @@ requires_cuda=pytest.mark.skipif(os.environ.get("RTX_RUN_PAIRED_CUDA")!="1",
                                reason="requires exclusive authorized SM12x GPU")
 
 
+@pytest.fixture(autouse=True)
+def isolated_cuda_stream_cache(request):
+    if request.node.name.startswith('test_cuda_') and os.environ.get('RTX_RUN_PAIRED_CUDA')=='1':
+        torch.cuda.synchronize()
+        torch._dynamo.reset()
+        eden._PAIRED_STREAMS.clear()
+        eden._OPERAND_STREAMS.clear()
+    yield
+
+
 @requires_cuda
+@pytest.mark.parametrize("pipeline",["paired","paired_dw_first"])
 @pytest.mark.parametrize("dx_seeded,dw_seeded",list(itertools.product((False,True),repeat=2)))
-def test_cuda_fixed_rng_serial_pair_capture_and_opcheck(dx_seeded,dw_seeded):
+def test_cuda_fixed_rng_serial_pair_capture_and_opcheck(dx_seeded,dw_seeded,pipeline):
     args=list(inputs("cuda"))
     for value in args[:3]:
         value.normal_()
@@ -219,11 +232,11 @@ def test_cuda_fixed_rng_serial_pair_capture_and_opcheck(dx_seeded,dw_seeded):
             args[b]=args[a]
     kwargs=dict(dx_seeded=dx_seeded,dw_seeded=dw_seeded)
     serial=eden.ms_eden_paired_gradient(*args,pipeline="serial",**kwargs)
-    paired=eden.ms_eden_paired_gradient(*args,pipeline="paired",**kwargs)
+    paired=eden.ms_eden_paired_gradient(*args,pipeline=pipeline,**kwargs)
     for a,b in zip(serial,paired):
         torch.testing.assert_close(a,b,atol=0,rtol=0)
-    torch.library.opcheck(eden._paired_gradient,(*args,"{}","{}",dx_seeded,dw_seeded,"paired"))
-    compiled=torch.compile(lambda *v:eden.ms_eden_paired_gradient(*v,pipeline="paired",**kwargs),fullgraph=True)
+    torch.library.opcheck(eden._paired_gradient,(*args,"{}","{}",dx_seeded,dw_seeded,pipeline))
+    compiled=torch.compile(lambda *v:eden.ms_eden_paired_gradient(*v,pipeline=pipeline,**kwargs),fullgraph=True)
     stream=torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -243,9 +256,10 @@ def test_cuda_fixed_rng_serial_pair_capture_and_opcheck(dx_seeded,dw_seeded):
 
 
 @requires_cuda
+@pytest.mark.parametrize("pipeline",["paired","paired_dw_first"])
 @pytest.mark.parametrize("compiled",[False,True])
 @pytest.mark.parametrize("checkpointed",[False,True])
-def test_cuda_public_same_draw_checkpoint_and_allocation_growth(compiled,checkpointed):
+def test_cuda_public_same_draw_checkpoint_and_allocation_growth(compiled,checkpointed,pipeline):
     from torch.utils.checkpoint import checkpoint
     from tests.cache_memory_checks import wait_for_cuda_allocation_cleanup
     x=torch.randn(128,128,device="cuda",dtype=torch.bfloat16,requires_grad=True)
@@ -263,7 +277,7 @@ def test_cuda_public_same_draw_checkpoint_and_allocation_growth(compiled,checkpo
             out.backward(dy)
             return out,x.grad,w.grad
         return run
-    baseline,candidate=evaluate("serial"),evaluate("paired")
+    baseline,candidate=evaluate("serial"),evaluate(pipeline)
     torch.manual_seed(3456)
     serial=baseline()
     expected_state=torch.cuda.get_rng_state()
@@ -290,7 +304,8 @@ def test_cuda_public_same_draw_checkpoint_and_allocation_growth(compiled,checkpo
 
 
 @requires_cuda
-def test_cuda_independent_caller_streams_concurrent_captures():
+@pytest.mark.parametrize("pipeline",["paired","paired_dw_first"])
+def test_cuda_independent_caller_streams_concurrent_captures(pipeline):
     from concurrent.futures import ThreadPoolExecutor
     args=list(inputs("cuda"))
     for value in args[:3]:
@@ -304,14 +319,14 @@ def test_cuda_independent_caller_streams_concurrent_captures():
     for stream in streams:
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            eden.ms_eden_paired_gradient(*args,pipeline="paired")
+            eden.ms_eden_paired_gradient(*args,pipeline=pipeline)
         stream.synchronize()
     barrier=threading.Barrier(2)
     def capture(stream):
         graph=torch.cuda.CUDAGraph()
         barrier.wait()
         with torch.cuda.graph(graph,stream=stream,capture_error_mode="thread_local"):
-            output=eden.ms_eden_paired_gradient(*args,pipeline="paired")
+            output=eden.ms_eden_paired_gradient(*args,pipeline=pipeline)
         return graph,output
     with ThreadPoolExecutor(max_workers=2) as pool:
         bundles=list(pool.map(capture,streams))

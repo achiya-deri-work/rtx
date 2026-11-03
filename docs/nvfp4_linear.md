@@ -457,6 +457,15 @@ supported. Eager and `torch.compile(fullgraph=True)` are tested.
 
 Experimental overlap is opt-in: `backward_pipeline="paired"` schedules dX and
 dW on joined CUDA streams for original-BF16, two-gradient MS-EDEN execution.
+`backward_pipeline="paired_dw_first"` instead makes dW the caller-stream
+owner, submits its launch chain first, then runs dX on the joined side stream.
+Ownership and submission order are one coupled schedule choice; reversing only
+the host call order is not equivalent. No timer/event-marker nodes, additional
+GPU arithmetic, RNG changes or precision changes are introduced. The same
+bounded stream cache, side-storage lifetime recording and exception-safe join
+apply. This choice is exposed in the experimental autotuner, not enabled as a
+universal default. For captured multi-layer workloads, use model-context
+refinement rather than assuming an isolated GEMM/backward winner transfers.
 Partial/mixed-policy backwards retain their individual paths. Warm the actual
 caller stream before CUDA graph capture. Independent preparation schedules
 also expose `producer_async_copy` and `producer_stages` (1/2/3); asynchronous

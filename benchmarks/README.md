@@ -3,6 +3,12 @@
 These scripts are development tools, not public Python APIs. Run them from the
 repository root so imports and output paths are predictable.
 
+NVFP4 backward and matched SiTU decoder studies are indexed in
+[the consolidated research guide](../docs/nvfp4_research.md). These opt-in
+MS-EDEN/prototype tools do not change stable `NVFP4Linear`'s MXFP8 backward.
+Use `tools/qualify_nvfp4_research.sh` for the bounded GPU correctness smoke,
+not a performance or convergence claim.
+
 | Script | Purpose |
 | --- | --- |
 | `train_decoder.py` | Resumable byte-level TinyStories BF16/MXFP8/NVFP4-delayed/NVFP4-block decoder comparison |

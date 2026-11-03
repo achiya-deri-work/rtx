@@ -29,6 +29,7 @@ from .ask_tell import (
     TrialResponse,
 )
 from .audit import audit_bundles
+from .ms_eden_model import MSEdenModelSchedule, make_ms_eden_model_adapter
 from .calibration import calibrate_device
 from .core import (
     ComposableTuningResult,
@@ -187,6 +188,8 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "MSEdenModelSchedule",
+    "make_ms_eden_model_adapter",
     "AccuracySelectionResult",
     "select_accuracy_policy",
     "AutotunePolicy",

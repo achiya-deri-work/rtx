@@ -13,6 +13,7 @@ from .core import DiscreteKernelAdapter, KernelContext, stable_id
 from .outcomes import TrialOutcome
 from .posthoc import PosthocPreparationSchedule, make_posthoc_preparation_adapter
 
+BACKWARD_PIPELINES = ("serial", "paired", "paired_dw_first", "operand_paired")
 
 def _baseline(phase):
     return PosthocPreparationSchedule(producer_threads=128, producer_blocks=256,
@@ -23,13 +24,20 @@ def _baseline(phase):
 
 @dataclass(frozen=True)
 class MSEdenPipelineSchedule:
+    """Independent kernel schedules plus captured-graph orchestration.
+
+    ``paired`` submits side-stream dW before caller-stream dX.
+    ``paired_dw_first`` submits caller-stream dW before side-stream dX.
+    Neither changes RNG consumption, quantization or accumulator precision.
+    Choose with application-context timing; neither is universally faster.
+    """
     backward_pipeline: str = "serial"
     dx: PosthocPreparationSchedule = field(default_factory=lambda: _baseline("dx"))
     dw: PosthocPreparationSchedule = field(default_factory=lambda: _baseline("dw"))
 
     def __post_init__(self):
-        if self.backward_pipeline not in ("serial", "paired", "operand_paired"):
-            raise ValueError("backward_pipeline must be serial, paired, or operand_paired")
+        if self.backward_pipeline not in BACKWARD_PIPELINES:
+            raise ValueError(f"backward_pipeline must be one of {BACKWARD_PIPELINES}")
         for phase in ("dx", "dw"):
             value = getattr(self, phase)
             if isinstance(value, dict):
@@ -143,7 +151,7 @@ def make_ms_eden_pipeline_adapter(shape, evaluator, *, device=None, environment=
         return (row_components[phase] if allow_row_major and schedule.gemm.scale_layout == "row_major"
                 else components[phase])
     initial = initial or MSEdenPipelineSchedule()
-    axes = {"backward_pipeline": ("serial", "paired", "operand_paired")}
+    axes = {"backward_pipeline": BACKWARD_PIPELINES}
     for phase, component in components.items():
         if allow_row_major:
             axes[f"{phase}.scale_layout"] = ("mma128", "row_major")
@@ -182,13 +190,14 @@ def make_ms_eden_pipeline_adapter(shape, evaluator, *, device=None, environment=
                 return reason
         return None
     def features(config):
-        result = {"pipeline_side_streams":3 if config.backward_pipeline=="operand_paired" else int(config.backward_pipeline=="paired")}
+        result = {"pipeline_side_streams":3 if config.backward_pipeline=="operand_paired" else int(config.backward_pipeline.startswith("paired")),
+                  "pipeline_dw_caller_first":int(config.backward_pipeline=="paired_dw_first")}
         for phase, component in components.items():
             schedule = getattr(config, phase)
             result.update({f"{phase}.{key}": value for key, value in component_for(phase, schedule).extra_features_fn(schedule).items()})
         return result
     return DiscreteKernelAdapter(
-        context=KernelContext("ms_eden_pipeline_research", 3, dict(zip(("m", "n", "k"), shape)),
+        context=KernelContext("ms_eden_pipeline_research", 4, dict(zip(("m", "n", "k"), shape)),
             device=device or {}, environment=environment or {}, tags=dict(
                 source="original_bf16", forward="unchanged_exact_jit_row_region", rng="explicit_public",
                 policy="shared_sign_hadamard128_e8m4_rtz_eden_scale_sr",

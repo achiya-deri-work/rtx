@@ -5,6 +5,11 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Consolidate opt-in MS-EDEN backward research, caller-first dW scheduling,
+  model-context UCB refinement, guarded preparation prototypes and matched
+  SiTU decoder tools/tests. Preserve MXFP8 backward as the stable NVFP4 default;
+  retain negative experiments and completed training evidence separately.
+
 - Add experimental `NVFP4MLP` / `nvfp4_mlp`: fused FP32 SiTU gate/up,
   packed MXFP8 hidden storage, native NVFP4 forward projections and fully
   recomputed MXFP8 backward. Include explicit BF16 hidden policy, first-hit

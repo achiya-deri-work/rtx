@@ -75,6 +75,9 @@ class DecoderConfig:
     gradient_checkpointing: bool = False
     initializer_range: float = 0.02
     residual_init_multiplier: float = 2.0
+    mlp_activation: Literal["silu", "situ"] = "silu"
+    situ_beta: float = 4.0
+    situ_linear_beta: float = 25.0
     dtype: torch.dtype = torch.bfloat16
     linear: LinearSpec = field(default_factory=LinearSpec)
 
@@ -102,6 +105,10 @@ class DecoderConfig:
             raise ValueError("initializer_range must be positive")
         if self.residual_init_multiplier <= 0.0:
             raise ValueError("residual_init_multiplier must be positive")
+        if self.mlp_activation not in ("silu", "situ"):
+            raise ValueError("mlp_activation must be silu or situ")
+        if any(not math.isfinite(v) or v <= 0 for v in (self.situ_beta, self.situ_linear_beta)):
+            raise ValueError("SiTU caps must be finite and positive")
         if self.linear.precision != "bf16" and self.dtype is not torch.bfloat16:
             raise TypeError("MXFP8/NVFP4 transformer projections require BF16 weights")
 
@@ -346,8 +353,20 @@ class CausalSelfAttention(nn.Module):
         return self.out_proj(attended)
 
 
+def situ_glu(gate: Tensor, up: Tensor, beta: float = 4.0, linear_beta: float = 25.0) -> Tensor:
+    """Kimi-K3 SiTU-GLU formula; FP32 arithmetic, original-gate sigmoid.
+
+    Reference: https://huggingface.co/moonshotai/Kimi-K3/blob/main/modeling_kimi_linear.py
+    Both soft caps and their product are evaluated before the activation downcast.
+    """
+    g, u = gate.float(), up.float()
+    gate_factor = beta * torch.tanh(g / beta) * torch.sigmoid(g)
+    up_factor = linear_beta * torch.tanh(u / linear_beta)
+    return (gate_factor * up_factor).to(gate.dtype)
+
+
 class SwiGLU(nn.Module):
-    """SwiGLU with a fused gate/up projection and low-precision linear policy."""
+    """Fused gate/up projection with configurable SwiGLU or SiTU-GLU."""
 
     def __init__(
         self,
@@ -364,6 +383,9 @@ class SwiGLU(nn.Module):
             device=device,
             dtype=config.dtype,
         )
+        self.mlp_activation = config.mlp_activation
+        self.situ_beta = config.situ_beta
+        self.situ_linear_beta = config.situ_linear_beta
         self.down_proj = _make_linear(
             config.intermediate_size,
             config.hidden_size,
@@ -381,6 +403,8 @@ class SwiGLU(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        if self.mlp_activation == "situ":
+            return self.down_proj(situ_glu(gate, up, self.situ_beta, self.situ_linear_beta))
         return self.down_proj(F.silu(gate) * up)
 
 

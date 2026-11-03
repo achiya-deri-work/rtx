@@ -16,7 +16,7 @@ the [generated reference](api_reference.md) owns exact signatures and defaults.
 | Convert a model for training or PTQ | [Model conversion](model_conversion.md) |
 | Calibrate NVFP4 and select numerical policies | [Quantization policy](quantization_policy.md) |
 | Review measured NVFP4 strengths, weaknesses and external recipes | [Broad evaluation, 2026-10-23](nvfp4_broad_evaluation_20261023.md) |
-| Experiment with MS-EDEN backward and structural tuning | [Consolidated research status](ms_eden_composable_search.md) |
+| Experiment with MS-EDEN backward and structural tuning | [Consolidated research](nvfp4_research.md) · [Search architecture](ms_eden_composable_search.md) |
 | Choose dynamic, packed-weight or fully packed inference | [Inference](inference.md) |
 | Understand precision | [Training](training.md) · [Formats](formats.md) |
 | Configure effort and cache reuse/refinement | [First-hit autotuning](first_hit_autotuning.md) |
@@ -44,6 +44,8 @@ singleton failure is recorded in [numerical qualification](mxfp8_mlp_numerics.md
 
 ## Development and evidence
 
+- [Consolidated NVFP4 backward/training research](nvfp4_research.md): retained
+  experiments, model-context scheduling, training tools and qualification limits.
 - [Development](development.md), [autotuner framework](../rtx/autotune/README.md),
   [manifest catalogue](../autotune_manifests/README.md), [benchmarks](../benchmarks/README.md).
 - [Research and qualification index](research.md): experiments and historical

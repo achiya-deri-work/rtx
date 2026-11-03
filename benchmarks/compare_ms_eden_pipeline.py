@@ -196,7 +196,7 @@ def compare(shape, output, candidate_overrides=None, *, dx_overrides=None,
     shape = shape_value(",".join(map(str, shape)))
     if not 4 <= rounds <= 64 or replays < 1 or min_batch_ms < 2 or warmup_ms < 0:
         raise ValueError("require 4..64 rounds, positive replays, batch>=2ms, nonnegative warmup")
-    if pipeline not in ("serial", "paired", "operand_paired") or not scopes or set(scopes) - {"backward", "total"}:
+    if pipeline not in ("serial", "paired", "paired_dw_first", "operand_paired") or not scopes or set(scopes) - {"backward", "total"}:
         raise ValueError("invalid pipeline or timing scopes")
     if baseline_policy not in ("fp4_fp4", "stable_mxfp8"):
         raise ValueError("invalid baseline policy")
@@ -337,7 +337,7 @@ def parser():
     p.add_argument("--candidate-json", default="{}", help="explicit schedule changes; default is identity")
     p.add_argument("--candidate-dx-json", default="{}")
     p.add_argument("--candidate-dw-json", default="{}")
-    p.add_argument("--candidate-pipeline", choices=("serial", "paired", "operand_paired"), default="serial")
+    p.add_argument("--candidate-pipeline", choices=("serial", "paired", "paired_dw_first", "operand_paired"), default="serial")
     p.add_argument("--baseline-policy", choices=("fp4_fp4", "stable_mxfp8"), default="fp4_fp4")
     p.add_argument("--mxfp8-config-json", help="stable baseline MXFP8BwdConfig; omitted means repository default (recorded in output)")
     p.add_argument("--rounds", type=int, default=10)
