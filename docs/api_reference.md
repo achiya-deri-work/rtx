@@ -381,6 +381,69 @@ class MXFP8MLPConfig:
     def from_json(cls, text)
 ```
 
+## `rtx.NVFP4MLP`
+
+Explicit feature/compatibility export; provider `rtx.fp4_mlp.NVFP4MLP`.
+
+[Source](../rtx/fp4_mlp.py)
+
+Recomputed SiTU GLU MLP, NVFP4 forward / MXFP8 backward.
+
+```python
+class NVFP4MLP(torch.nn.Module):
+    def __init__(self, in_features, hidden_features, out_features=None, *, activation='situ', config=DEFAULT_NVFP4_MLP_CONFIG, device=None, dtype=torch.bfloat16, autotune='off', tuning_policy=None, autotune_cache_dir=None, training_mix=None, inference_mix=None)
+    def reset_parameters(self)
+    def forward(self, x)
+    def configure_shape_(self, example_x, *, config=None)
+    def policy_for(self, example_x)
+    def autotune_(self, example_x, **kwargs)
+    def export_tuning_spec(self, path=None)
+    def require_cached_(self)
+    def from_linears(cls, gate, up, down, *, config=DEFAULT_NVFP4_MLP_CONFIG, **kwargs)
+    def extra_repr(self)
+```
+
+## `rtx.NVFP4MLPConfig`
+
+Explicit feature/compatibility export; provider `rtx.configs.nvfp4_mlp.NVFP4MLPConfig`.
+
+[Source](../rtx/configs/nvfp4_mlp.py)
+
+SiTU numerical policy and independent forward/backward schedules.
+
+```python
+class NVFP4MLPConfig:
+    gate_up: NVFP4DynamicConfig = field(default_factory=_projection)
+    down: NVFP4DynamicConfig = field(default_factory=_down_projection)
+    gate_backward: MXFP8BwdConfig | None = None
+    down_backward: MXFP8BwdConfig | None = None
+    beta: float = 4.0
+    linear_beta: float = 25.0
+    backward_overlap: bool = False
+    glu_epilogue: str = 'registers'
+    glu_store_vec: int = 2
+    glu_scratch_swizzle: str = 'none'
+    hidden_dtype: str = 'mxfp8'
+    hidden_quant_vec: int = 4
+    def rejection(self, m, k, h, o)
+    def to_dict(self)
+    def to_json(self)
+    def from_json(cls, text)
+    def from_dict(cls, values)
+```
+
+## `rtx.nvfp4_mlp`
+
+Explicit feature/compatibility export; provider `rtx.fp4_mlp.nvfp4_mlp`.
+
+[Source](../rtx/fp4_mlp.py)
+
+NVFP4 SiTU forward, recomputed first-order MXFP8 backward; BF16 I/O.
+
+```python
+nvfp4_mlp(x, gate_up_weight, down_weight, *, activation='situ', config=DEFAULT_NVFP4_MLP_CONFIG)
+```
+
 ## `rtx.MLPCandidate`
 
 Explicit feature/compatibility export; provider `rtx.deployment.MLPCandidate`.

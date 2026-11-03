@@ -149,11 +149,15 @@ they own captured resources and retire duplicate preparation scratch automatical
 - `MXFP8MLP`: two-kernel forward, packed MXFP8 hidden connection, BF16 output,
   fully recomputed first-order backward. Supports `from_linears`, explicit
   `autotune_`, and revisioned JSON policies. [Guide](docs/mxfp8_mlp.md).
+- `NVFP4MLP`: fused FP32 SiTU gate/up epilogue, NVFP4 projections and recomputed
+  MXFP8 backward, with an on-chip packed MXFP8 hidden connection. The current
+  materialized path uses four CUDA launches, not two. [Guide](docs/nvfp4_mlp.md).
 
 GLU/MLP default to tuning off. Opt into per-shape first-hit tuning with
 `autotune="balanced"`, `tuning_policy=rtx.AutotunePolicy(...)`, and
 `autotune_cache_dir=...`, or use explicit `autotune_` before compile/capture.
-Automatic MLP selection currently requires MXFP8 precision; GLU remains forward-only.
+Automatic `MXFP8MLP` selection requires its MXFP8 precision policy; `NVFP4MLP`
+has its own whole-workload tuner. GLU remains forward-only.
 These feature APIs are not in the stable wildcard-export surface.
 **Known blocker:** the optional packed-down MLP schedule faults on
 M=K=H=O=1; the conservative default passes. Read the

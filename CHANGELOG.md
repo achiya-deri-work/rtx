@@ -5,6 +5,10 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Add experimental `NVFP4MLP` / `nvfp4_mlp`: fused FP32 SiTU gate/up,
+  packed MXFP8 hidden storage, native NVFP4 forward projections and fully
+  recomputed MXFP8 backward. Include explicit BF16 hidden policy, first-hit
+  effort budgets, durable UCB tuning, immutable plans and bounded owned scratch.
 - Remove the dynamic MXFP8 half-128-row dispatch cliff: consider existing
   native MMA64/MMA128 and masked row-major materialized seeds before falling
   back to fused execution. Preserve explicit configs, native legality and

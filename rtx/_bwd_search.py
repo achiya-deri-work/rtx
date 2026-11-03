@@ -58,6 +58,23 @@ def split_leg(leg, length, parts):
         gemm=replace(leg.gemm,epilogue='direct',epilogue_stages=1,store_vec=1,tiles_per_cta=1))
 
 
+def materialized_bwd_seed(problem,initial,parts=1):
+    """Complete legal dX/dW family, including native dX and masked reductions.
+
+    A composite operator must be able to enter both legs together: changing
+    only one projection's backward can leave another dominant fused fallback.
+    This is a starting candidate, not a timing winner or relaxed validator.
+    """
+    dx_problem=MXFP8Problem(problem.m,problem.k,problem.n)
+    dw_problem=MXFP8Problem(problem.n,problem.k,problem.m)
+    dx=native_decomposed_leg(initial.dx,dx_problem) or decomposed_leg(initial.dx,dx_problem)
+    dw=decomposed_leg(initial.dw,dw_problem)
+    dw=split_leg(dw,problem.m,parts)
+    candidate=replace(initial,dx=dx,dw=dw,quant_schedule='per_matmul',stream_schedule='single',
+                      execution_order='dx_first',operand_storage='separate')
+    return candidate if candidate.implementation_rejection(problem) is None else None
+
+
 def backward_structural_seeds(problem, initial):
     """Reserve useful alternatives to underfilled unsplit dW, never a winner."""
     dw_problem = MXFP8Problem(problem.n,problem.k,problem.m)

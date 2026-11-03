@@ -35,8 +35,10 @@ are separate choices.
 - [MXFP8GLU](mxfp8_glu.md): paired projection and activation, BF16/MXFP8 output,
   forward only.
 - [MXFP8MLP](mxfp8_mlp.md): packed hidden connection with recomputed backward.
+- [NVFP4MLP](nvfp4_mlp.md): on-chip FP32 SiTU, NVFP4 forward and recomputed
+  MXFP8 backward; packed MXFP8 hidden storage by default, BF16 optional.
 
-Both default to tuning off, with opt-in first-hit selection. They remain explicit
+These default to tuning off, with opt-in first-hit selection. They remain explicit
 imports, outside the stable wildcard surface. The optional packed-down MLP
 singleton failure is recorded in [numerical qualification](mxfp8_mlp_numerics.md).
 

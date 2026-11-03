@@ -558,12 +558,17 @@ class MXFP8GemmKernel:
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(self.glu and not self.glu_interleaved_operands):
+            hidden_rows=self.problem.n//2
+            if cutlass.const_expr(self.problem.n//2==1):
+                # Keep the logical H axis in a singleton GLU's descriptor,
+                # just as physical singleton operands retain their TMA rank.
+                hidden_rows=cute.size(qw,mode=[0])//2
             qw = cute.make_tensor(qw.iterator, cute.make_layout(
-                ((2, self.problem.n // 2), self.problem.k),
-                stride=((self.problem.n // 2 * self.problem.k, self.problem.k), 1)))
+                ((2, hidden_rows), self.problem.k),
+                stride=((hidden_rows * self.problem.k, self.problem.k), 1)))
             sw = cute.make_tensor(sw.iterator, cute.make_layout(
-                ((2, self.problem.n // 2), self.problem.k // 32),
-                stride=((self.problem.n // 2 * (self.problem.k // 32), self.problem.k // 32), 1)))
+                ((2, hidden_rows), self.problem.k // self.sf_vec_size),
+                stride=((hidden_rows * (self.problem.k // self.sf_vec_size), self.problem.k // self.sf_vec_size), 1)))
         self._setup_static_layouts()
         cfg = self.config
         tma_x, tma_x_tensor = cpasync.make_tiled_tma_atom(

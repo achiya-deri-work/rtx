@@ -308,7 +308,7 @@ class NVFP4QuantKernel:
     @cute.jit
     def _quantize_task(
         self,
-        src: cute.Tensor,
+        src,
         quantized_packed: cute.Tensor,
         scales: cute.Tensor,
         tensor_scale: Float32,
@@ -324,11 +324,20 @@ class NVFP4QuantKernel:
         values_bf16 = [BFloat16(0.0)] * cfg.values_per_lane
         values_per_load = cfg.load_bits // BFloat16.width
         loads_per_lane = cfg.values_per_lane // values_per_load
-        src_row = src[row, None]
+        if cutlass.const_expr(isinstance(src,tuple)):
+            src_row=src[0][row,None]
+            source_scale=Float32(src[1][row,k_base//32])
+        else:
+            src_row=src[row,None]
         for load_idx in cutlass.range_constexpr(loads_per_lane):
             value_base = load_idx * values_per_load
             global_k_base = k_base + value_base
-            if cutlass.const_expr(values_per_load == 1):
+            if cutlass.const_expr(isinstance(src,tuple)):
+                for vec in cutlass.range_constexpr(values_per_load):
+                    scalar_k=global_k_base+vec
+                    if scalar_k<self.k:
+                        values_bf16[value_base+vec]=BFloat16(Float32(src_row[scalar_k])*source_scale)
+            elif cutlass.const_expr(values_per_load == 1):
                 if global_k_base < self.k:
                     values_bf16[value_base] = src_row[global_k_base]
             else:
@@ -852,7 +861,7 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
     @cute.jit
     def __call__(
         self,
-        x: cute.Tensor,
+        x,
         weight: cute.Tensor,
         qx: cute.Tensor,
         qw: cute.Tensor,
@@ -974,7 +983,7 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
     @cute.jit
     def _quantize_region(
         self,
-        src: cute.Tensor,
+        src,
         packed: cute.Tensor,
         scales: cute.Tensor,
         row_begin: Int32,
@@ -1009,7 +1018,7 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
     @cute.jit
     def _observe_and_quantize_cached_region(
         self,
-        src: cute.Tensor,
+        src,
         packed: cute.Tensor,
         scales: cute.Tensor,
         row_begin: Int32,
@@ -1050,13 +1059,27 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
                     scale_block * NVFP4_SF_VEC_SIZE
                     + lane_in_scale * cfg.values_per_lane
                 )
-                src_row = src[output_row, None]
+                if cutlass.const_expr(isinstance(src,tuple)):
+                    src_row = src[0][output_row,None]
+                    source_scale=Float32(src[1][output_row,k_base//32])
+                else:
+                    src_row = src[output_row,None]
                 values_per_load = cfg.load_bits // BFloat16.width
                 loads_per_lane = cfg.values_per_lane // values_per_load
                 for load_idx in cutlass.range_constexpr(loads_per_lane):
                     value_base = load_idx * values_per_load
                     global_k_base = k_base + value_base
-                    if cutlass.const_expr(values_per_load == 1):
+                    if cutlass.const_expr(isinstance(src,tuple)):
+                        # Packed MXFP8 MLP input: decode directly to this
+                        # CTA's existing BF16 register cache, never GMEM.
+                        for vec in cutlass.range_constexpr(values_per_load):
+                            scalar_k=global_k_base+vec
+                            if scalar_k<self.k:
+                                value=BFloat16(Float32(src_row[scalar_k])*source_scale)
+                                cached[iteration*cfg.values_per_lane+value_base+vec]=value
+                                local_region_amax=cute.arch.fmax(local_region_amax,
+                                    cute.abs(Float32(value)),nan=True)
+                    elif cutlass.const_expr(values_per_load == 1):
                         if global_k_base < self.k:
                             value = src_row[global_k_base]
                             cached[
@@ -1302,7 +1325,7 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
     @cute.jit
     def _quantize_region_warp(
         self,
-        src: cute.Tensor,
+        src,
         packed: cute.Tensor,
         scales: cute.Tensor,
         row_begin: Int32,
@@ -1333,7 +1356,7 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
     @cute.kernel
     def jit_region_warp_dual_kernel(
         self,
-        x: cute.Tensor,
+        x,
         weight: cute.Tensor,
         qx: cute.Tensor,
         qw: cute.Tensor,
@@ -1390,7 +1413,7 @@ class NVFP4JITRegionDualQuantKernel(NVFP4DualQuantKernel):
     @cute.kernel
     def jit_region_dual_kernel(
         self,
-        x: cute.Tensor,
+        x,
         weight: cute.Tensor,
         qx: cute.Tensor,
         qw: cute.Tensor,
