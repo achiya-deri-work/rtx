@@ -25,6 +25,9 @@ not a performance or convergence claim.
 | `benchmark_mxfp8_bwd.py` | Fused and quantize-once full/workspace/atomic, persistent split-FP32, ordinary and one-BF16-load shared-G quad quantization, dual-stream, wide-CTA, and TMA/cp.async clustered operand-reuse backward families |
 | `tune_composable_prequant.py` | Composable learned/global plus local forward tuning |
 | `tune_composable_bwd.py` | Composable MXFP8 backward tuning |
+| `qualify_mxfp8_long_mlp.py` | Complete long/narrow MLP tuning, recipe checks and paired qualification; optional steady-state tracing |
+| `qualify_long_linear_bwd.py` | Numerical-policy-pinned complete linear backward tuning and calibrated racing |
+| `compare_long_narrow_revisions.py` | Isolated previous/current source workers, common CUDA-graph warmup and alternating qualification |
 | `verify_composable_bwd.py` | Independent backward winner verification and racing |
 | `tune_mxfp8_native_quant.py` | Standalone native quantizer coordinate sweep |
 | `tune_mxfp8_native_gemm.py` | Standalone prequantized GEMM coordinate sweep |

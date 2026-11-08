@@ -349,6 +349,20 @@ explicit compatible configuration with
 `replace(config, gradient_quantization="recompute")`; incompatible training
 configurations fail rather than silently changing their schedule.
 
+`gradient_quantization="recompute_both"` additionally emits the independent
+token-axis derivative quantization for gate dW. It requires
+`hidden_quantization="recompute"`, M divisible by 32, separate row-major
+gate-dW quantization and disjoint gate operand storage. It preserves BF16
+derivative rounding but neither writes nor allocates a BF16 derivative tensor
+on the all-gradient path. Partial-gradient requests keep the existing paths.
+The shared tuner compares both shared-memory layouts via
+`gradient_transpose_path`; it does not force the new path or a winning tile.
+Existing tile, load, pipeline, scale-owner and buffering controls still apply.
+Graph-based MLP measurements use a bounded, approximately 200 ms warmup before
+samples; search namespace 44 invalidates earlier measurement/search evidence.
+See [long/narrow qualification](long_narrow_qualification_20261108.md) for
+matched previous/current 5090 results and laptop tradeoffs.
+
 This is not a new default. At M11712/256/768/256, the recorded selected-direct
 comparison gains about 1.2% F+B, with unchanged warm peak/residency but
 16.85 MiB higher cold peak. The compiler-visible combined operator can retain

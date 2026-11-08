@@ -956,9 +956,30 @@ def _resolve_bwd_runner(
 def _bwd_runner_from_context(context):
     """One validated context, shared stream-keyed ownership for paired callers."""
     problem, config_key, config, grad_output_c, x_c, weight_c = context
-    stream = torch.cuda.current_stream(x_c.device)
+    runner=_cached_bwd_runner(problem,config_key,config,x_c.device)
+    return problem, runner, grad_output_c, x_c, weight_c
+
+
+def _bwd_runner_for_shape(problem,config_key,device):
+    """Internal prequantized producer: no BF16 gradient placeholder allocation.
+
+    The caller validates source tensors/device and fully produces both packed
+    gradient orientations before consuming this runner. Runtime tuning requests
+    require real gradients and are deliberately unsupported at this boundary.
+    """
+    config=_CONFIGS.get(config_key)
+    if config is None:
+        raise RuntimeError('shape-only runner requires an explicit backward configuration')
+    reason=config.implementation_rejection(problem)
+    if reason is not None:
+        raise RuntimeError(f'MXFP8 backward configuration cannot run: {reason}')
+    return _cached_bwd_runner(problem,config_key,config,device)
+
+
+def _cached_bwd_runner(problem,config_key,config,device):
+    stream = torch.cuda.current_stream(device)
     runner_key = (
-        x_c.device.index,
+        device.index,
         int(stream.cuda_stream),
         problem.m,
         problem.n,
@@ -970,9 +991,9 @@ def _bwd_runner_from_context(context):
         with _LOCK:
             runner = _RUNNERS.get(runner_key)
             if runner is None:
-                runner = _build_bwd_runner(problem, config, x_c.device)
+                runner = _build_bwd_runner(problem, config, device)
                 _RUNNERS[runner_key] = runner
-    return problem, runner, grad_output_c, x_c, weight_c
+    return runner
 
 
 @persistent_scratch

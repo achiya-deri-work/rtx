@@ -28,6 +28,7 @@ Acceptance does not mean ML cannot help or every shape is optimized.
 ## GLU/MLP and numerics
 
 - [Long-token balanced backward qualification](balanced_backward_qualification_20261108.md).
+- [Long/narrow producer-quantization and cross-revision qualification](long_narrow_qualification_20261108.md).
 - [GLU historical benchmarks](mxfp8_glu_history.md) and [MLP historical qualification](mxfp8_mlp_history.md).
 - [First-hit ownership](mlp_first_hit_plan_contract.md) and [effort qualification](mlp_first_hit_effort_qualification.md).
 - [Stress tests](mxfp8_mlp_numerics.md), [divergence](mxfp8_mlp_divergence.md), [TorchAO parity](mxfp8_mlp_recipe_parity.md).

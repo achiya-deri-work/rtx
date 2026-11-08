@@ -5,6 +5,12 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Add autotunable `gradient_quantization="recompute_both"` for recomputed
+  MXFP8 MLPs: emit independent dX/dW FP8 derivatives on-chip, eliminating the
+  BF16 derivative allocation and global round trip. Preserve numerical
+  policies, partial-gradient fallbacks and automatic scratch ownership.
+  Add calibrated graph warmup and invalidate MLP tuning with revision 44.
+
 - Add opt-in balanced K-tile partitioning and 64/128-way FP32 workspace
   reduction for decomposed MXFP8 backward. Expand shared linear/MLP search
   with hardware-aware compound dW schedules, preserve numerical operand

@@ -35,6 +35,13 @@ class MXFP8MLPConfig:
     independent transpose-axis quantization. Used when both X and gate-weight
     gradients are requested; partial requests use the original paths. Cold peak
     may increase even when warmed residency does not. Default is ``'separate'``.
+    ``gradient_quantization='recompute_both'`` also independently quantizes the
+    BF16-rounded derivative along tokens into gate-dW scratch. It requires
+    recomputed hidden, M divisible by 32, disjoint gate operands and separate
+    row-major gate-dW quantizers with matching arithmetic/rounding. The full
+    all-gradient path neither allocates nor writes a BF16 derivative tensor;
+    partial requests retain the original paths. Shared-memory layout, tiles,
+    scale ownership and buffering remain autotuner choices, not fixed winners.
     ``hidden_quantization='recompute'`` additionally emits independently
     leading-axis-quantized hidden values into down-dW scratch, skipping the
     BF16 hidden output. Requires the gradient-recompute path, M divisible by
@@ -86,8 +93,8 @@ class MXFP8MLPConfig:
             raise ValueError("backward_recompute must be joint or two_pass")
         if self.joint_output_storage not in ("packed","separate"):
             raise ValueError('joint_output_storage must be packed or separate')
-        if self.gradient_quantization not in ('separate','recompute'):
-            raise ValueError('gradient_quantization must be separate or recompute')
+        if self.gradient_quantization not in ('separate','recompute','recompute_both'):
+            raise ValueError('gradient_quantization must be separate, recompute or recompute_both')
         if self.hidden_quantization not in ('separate','recompute'):
             raise ValueError('hidden_quantization must be separate or recompute')
         if not isinstance(self.backward_overlap,bool):
@@ -336,7 +343,7 @@ def _derivative_launch(x,weight,grad_h,activation,config_key):
 
 
 def _run_derivative(x,weight,grad_h,activation,policy,out,hidden_out=None,gradient_out=None,hidden_quant_out=None,
-                    hidden_quant_policy=None):
+                    hidden_quant_policy=None,gradient_transpose_out=None):
     with torch.cuda.device(x.device):
         if policy.recompute_backend == "prequant":
             from .kernels.mxfp8_glu_prequant import build_prequant_glu_runner
@@ -346,8 +353,11 @@ def _run_derivative(x,weight,grad_h,activation,policy,out,hidden_out=None,gradie
                 aux=(aux,*gradient_out)
             if hidden_quant_out is not None:
                 aux=(aux,*hidden_quant_out)
+            if gradient_transpose_out is not None:
+                aux=(aux,*gradient_transpose_out)
             gradient_policy=('fp32','fp32')
             hidden_policy=('fp32','fp32')
+            gradient_transpose_policy=('fp32','fp32')
             if gradient_out is not None or hidden_quant_out is not None:
                 from .fp8_bwd import _default_bwd_config
                 if gradient_out is not None:
@@ -358,13 +368,19 @@ def _run_derivative(x,weight,grad_h,activation,policy,out,hidden_out=None,gradie
                     if hidden_quant_policy is None:
                         raise ValueError('hidden quantization requires its resolved down dW policy')
                     hidden_policy=hidden_quant_policy
+            if gradient_transpose_out is not None:
+                gate=policy.gate_backward or _default_bwd_config(MXFP8Problem(x.shape[0],weight.shape[0],x.shape[1]))
+                qa=gate.dw.quant_a
+                gradient_transpose_policy=(qa.quant_math,qa.quant_amax)
             runner=build_prequant_glu_runner(x,weight,out,aux,recompute,
                         activation,"mxfp8",bind_inputs=False,derivative=True,
                         emit_hidden=policy.backward_recompute=="joint",
                         separate_hidden=hidden_out is not None,
                         emit_gradient_quant=gradient_out is not None,
                         emit_hidden_quant=hidden_quant_out is not None,
-                        gradient_quant_policy=gradient_policy,hidden_quant_policy=hidden_policy)
+                        gradient_quant_policy=gradient_policy,hidden_quant_policy=hidden_policy,
+                        emit_gradient_transpose_quant=gradient_transpose_out is not None,
+                        gradient_transpose_quant_policy=gradient_transpose_policy)
             runner(x,weight,out,aux)
         else:
             from .kernels.mxfp8_mlp import compile_glu_derivative
@@ -418,6 +434,14 @@ def _gradient_quant_rejection(policy,m,k,h):
             or (qa.quant_math,qa.quant_amax) not in (('fp32','fp32'),('bf16x2','bf16_bits'))
             or qa.scale_rounding!=policy.recompute.gemm.scale_rounding):
         return 'recompute gradient quantization requires serial dX-first separate row-major dX quantization with a supported (fp32/fp32 or bf16x2/bf16_bits) policy and matching rounding'
+    if policy.gradient_quantization=='recompute_both':
+        qa=gate.dw.quant_a
+        if (policy.hidden_quantization!='recompute' or m%32
+                or gate.operand_storage!='separate' or gate.dw.backend!='decomposed'
+                or gate.dw.quant_launches!='separate' or qa.scale_layout!='row_major'
+                or (qa.quant_math,qa.quant_amax) not in (('fp32','fp32'),('bf16x2','bf16_bits'))
+                or qa.scale_rounding!=policy.recompute.gemm.scale_rounding):
+            return 'both-orientation recompute quantization requires recomputed hidden, M divisible by 32 and disjoint separate row-major gate dW operands with matching numerical policy'
     return None
 
 
@@ -439,20 +463,24 @@ def _prepare_recomputed_gate_bwd(x,weight,grad_h,activation,config_key,gate_key)
     return runner,dp2,xc,wc,hidden
 
 
-def _consume_recomputed_gate_bwd(prepared):
+def _consume_recomputed_gate_bwd(prepared,*,gradient_transpose_quantized=False):
     runner,dp2,xc,wc,hidden=prepared
     dx=torch.empty_like(xc);dw=torch.empty_like(wc)
     runner.dx.quant_b(wc,runner.dx.quantized_b,runner.dx.scales_b)
     runner.dx.matmul(dx)
     # dW still independently quantizes BF16 dP along the leading reduction
     # dimension. Serial operand reuse may overwrite dX scratch only now.
-    runner.dw(dp2,xc,dw)
+    if gradient_transpose_quantized:
+        runner.dw.quant_b(xc,runner.dw.quantized_b,runner.dw.scales_b)
+        runner.dw.matmul(dw)
+    else:
+        runner.dw(dp2,xc,dw)
     return dx,dw,hidden
 
 
 def _hidden_quant_rejection(policy,m,k,h,o):
     if policy.hidden_quantization=='separate':return None
-    if policy.gradient_quantization!='recompute':
+    if policy.gradient_quantization not in ('recompute','recompute_both'):
         return 'hidden recompute quantization requires recompute gradient quantization'
     reason=_gradient_quant_rejection(policy,m,k,h)
     if reason:return reason
@@ -469,10 +497,10 @@ def _hidden_quant_rejection(policy,m,k,h,o):
 
 def _prepare_recomputed_all_bwd(x,weight,grad_h,dy,down,activation,config_key,gate_key,down_key):
     """Internal all-gradient proposal; no BF16 hidden allocation or retention."""
-    from .fp8_bwd import _resolve_bwd_runner,_partial_bwd_runner_from_context,_MatmulRunner,_resolve_bwd_context
+    from .fp8_bwd import _resolve_bwd_runner,_partial_bwd_runner_from_context,_MatmulRunner,_resolve_bwd_context,_bwd_runner_for_shape
     policy=_parse(config_key)
     m,k=x.shape;h=weight.shape[0]//2
-    if policy.gradient_quantization!='recompute':
+    if policy.gradient_quantization not in ('recompute','recompute_both'):
         raise ValueError('all-gradient recompute requires recompute gradient quantization')
     reason=_gradient_quant_rejection(policy,m,k,h)
     if reason:raise ValueError(reason)
@@ -488,19 +516,31 @@ def _prepare_recomputed_all_bwd(x,weight,grad_h,dy,down,activation,config_key,ga
     # grad_h supplies shape metadata only to the down runner resolver. Never
     # retain it in the prepared state or pass it to the hidden quantizer.
     down_runner,dyc,_,downc=_partial_bwd_runner_from_context(down_context,'dw')
-    dp=x.new_empty((2*m,h))
-    _,gate,dp2,xc,wc=_resolve_bwd_runner(dp.view(m,2*h),x,weight,gate_key)
+    both=policy.gradient_quantization=='recompute_both'
+    if both:
+        _validate(x,weight,down,activation)
+        if grad_h.shape!=(m,h):
+            raise ValueError('recomputed gradient shape mismatch')
+        gate=_bwd_runner_for_shape(MXFP8Problem(m,2*h,k),gate_key,x.device)
+        xc,wc=x,weight
+        # The derivative output is unused when both quantized orientations are
+        # produced. Match its small fake ABI with dH, which is never overwritten.
+        dp,dp2=grad_h,None
+    else:
+        dp=x.new_empty((2*m,h))
+        _,gate,dp2,xc,wc=_resolve_bwd_runner(dp.view(m,2*h),x,weight,gate_key)
     assert isinstance(gate.dx,_MatmulRunner) and isinstance(down_runner,_MatmulRunner)
     _run_derivative(xc,wc,grad_h,activation,policy,dp,grad_h,
         (gate.dx.quantized_a.view(2*m,h),gate.dx.scales_a.view(2*m,h//32)),
         (down_runner.quantized_b,down_runner.scales_b),
-        hidden_quant_policy=(qb.quant_math,qb.quant_amax))
-    return (gate,dp2,xc,wc,None),down_runner,dyc,downc
+        hidden_quant_policy=(qb.quant_math,qb.quant_amax),
+        gradient_transpose_out=(gate.dw.quantized_a,gate.dw.scales_a) if both else None)
+    return (gate,dp2,xc,wc,None),down_runner,dyc,downc,both
 
 
 def _consume_recomputed_all_bwd(prepared):
-    gate,runner,dy,down=prepared
-    dx,dgate,_=_consume_recomputed_gate_bwd(gate)
+    gate,runner,dy,down,both=prepared
+    dx,dgate,_=_consume_recomputed_gate_bwd(gate,gradient_transpose_quantized=both)
     ddown=torch.empty_like(down)
     runner.quant_a(dy,runner.quantized_a,runner.scales_a)
     runner.matmul(ddown)

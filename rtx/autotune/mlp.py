@@ -23,7 +23,7 @@ from ..mlp import DEFAULT_MLP_CONFIG,MLP_CONFIG_REVISION,_parse,_validate,mxfp8_
 # Revision 39 admits policy-preserving BF16x2/bits fused backward quantization.
 # Older searches rejected these candidates; do not reuse their coverage or
 # runtime winner namespace as evidence for this expanded implementation set.
-MLP_AUTOTUNE_REVISION = 42
+MLP_AUTOTUNE_REVISION = 44
 from ..configs.glu import normalize_glu_config,glu_rejection,prequant_recompute_rejection
 from ..kernels.mxfp8 import FWD_SEARCH_SPACE,MXFP8Problem,normalize_fwd_config
 
@@ -213,9 +213,9 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
     if phase=="train":
         axes["backward_recompute"]=("joint","two_pass")
         axes['joint_output_storage']=('packed','separate')
-        axes['gradient_quantization']=('separate','recompute')
+        axes['gradient_quantization']=('separate','recompute','recompute_both')
         if precision=='mxfp8':
-            axes['gradient_quantization_path']=('separate','recompute')
+            axes['gradient_quantization_path']=('separate','recompute','recompute_both')
             axes['hidden_quantization']=('separate','recompute')
             axes['hidden_quantization_path']=('separate','recompute')
         axes["backward_overlap"]=(False,True)
@@ -270,8 +270,29 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
     for group in ("cooperative_gemm","down_gemm","recompute_gemm"):
         if any(name.startswith(group+".") for name in axes):
             axes[f"{group}.layout_transport"]=PREQUANT_SEARCH_SPACE["layout_transport"]
+    if precision=='mxfp8' and phase=='train':
+        # Joint structural moves cross the legality prerequisites in one step.
+        # For long-token contexts, compare both SMEM layouts inside the fixed
+        # two-trial anchor neighborhood; neither is an installed default.
+        transpose={'gradient_transpose_path':('none','xor_16b')}
+        axes=({**transpose,**axes} if m>=32768 else {**axes,**transpose})
 
     def update(c,axis,value):
+        if axis=='gradient_transpose_path':
+            c=update(c,'gradient_quantization_path','recompute_both')
+            return replace(c,recompute=replace(c.recompute,
+                gemm=replace(c.recompute.gemm,glu_scratch_swizzle=value)))
+        if axis=='gradient_quantization_path' and value=='recompute_both':
+            from ..mlp import _gradient_quant_rejection,_hidden_quant_rejection
+            ready=replace(c,gradient_quantization='recompute_both',hidden_quantization='recompute')
+            if (_gradient_quant_rejection(ready,m,k,h) is None
+                    and _hidden_quant_rejection(ready,m,k,h,o) is None):
+                return ready
+            c=update(c,'hidden_quantization_path','recompute')
+            gate=materialized_dw_config(c.gate_backward)
+            gate=replace(gate,operand_storage='separate',
+                dw=replace(gate.dw,quant_launches='separate'))
+            return replace(c,gradient_quantization='recompute_both',gate_backward=gate)
         if axis=='hidden_quantization_path':
             if value=='separate':return replace(c,hidden_quantization='separate')
             c=update(c,'gradient_quantization_path','recompute')
@@ -419,9 +440,14 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
     # candidates instead of accumulating one working set per proposal.
     evaluation_stream=torch.cuda.Stream(device=x.device)
     def measure(graph,errors,compile_ms,reused):
+        graph_warmup=None
         with torch.cuda.stream(prepared['stream']):
             if measurement_mode == 'outer_capture':
-                graph.replay()
+                # Count-only warmup left short/narrow laptop workloads at
+                # different boost states after compilation. Reuse the bounded
+                # time-calibrated graph warmup, outside every timing sample.
+                from .preparation_runtime import _warm_measurement_graph
+                graph_warmup=_warm_measurement_graph(graph)
             else:
                 graph()
         timings=[]
@@ -443,6 +469,7 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
                                           "measurement_mode":measurement_mode,
                                           "execution_mix":mix.contract(),
                                           "timing_unit":"complete_workload_ms",
+                                          "graph_warmup":graph_warmup,
                                           "prepared_benchmark_reused":reused})
 
     def evaluate(c):
@@ -525,7 +552,8 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
                               tags={"warmup":warmup,"samples":samples,"calls_per_sample":calls_per_sample,
                                     "capture_warmup":"candidate_leaves_evaluator_stream_v3","compile":"fullgraph_static",
                                     "measurement_mode":measurement_mode,"execution_contract_revision":1,
-                                    "structural_seed_revision":8,
+                                    "graph_warmup_ms":200. if measurement_mode=='outer_capture' else None,
+                                    "structural_seed_revision":10,
                                     "recompute_pipeline_search_revision":1,
                                     **({'execution_mix':mix.contract()} if execution_mix is not None else {}),
                                     "gradient_probe":"normal_seed1729"}),
@@ -547,6 +575,11 @@ def _materialized_backward_leg(current, leg, rows):
     scale_vec=gcd(original.gemm.scale_load_vec,original.gemm.tile_k//32)
     gemm=replace(original.gemm,scale_layout="row_major",
                  scale_role="consumers",scale_load_vec=scale_vec)
+    if gemm.tile_m==64 and gemm.stages==1:
+        # A native one-stage/TMA schedule cannot switch to the quarantined
+        # row-major consumer variant. Preserve its tile/stage count and use
+        # the supported producer owner; both owners/stages remain tuneable.
+        gemm=replace(gemm,scale_role='producer')
     if leg=="dx":
         # Token rows may not fill an M tile; TMA stores require full tiles.
         gemm=replace(gemm,epilogue="direct",store_vec=1)
@@ -646,10 +679,19 @@ def mlp_structural_seeds(adapter,precision,phase):
             # The coupled update retains arithmetic/scale policies and supplies
             # the required layouts. Normal legality filtering still applies.
             prepared=adapter.update_fn(base,'hidden_quantization_path','recompute')
+            both=adapter.update_fn(base,'gradient_quantization_path','recompute_both')
             if long_reduction:
                 opening.insert(1,prepared)
+                opening.insert(1,both)
+                if base.hidden_quantization=='recompute' and base.gradient_quantization in ('recompute','recompute_both'):
+                    # A baseline already fusing two preparations should spend
+                    # its bounded structural prefix comparing both layouts of
+                    # the third. The unchanged baseline is measured first.
+                    opening=[adapter.update_fn(base,'gradient_transpose_path',swizzle)
+                             for swizzle in ('none','xor_16b')]+opening
             else:
                 opening.append(prepared)
+                opening.append(both)
             seeds.append(adapter.update_fn(base,'gradient_quantization_path','recompute'))
         # Coupled narrow schedules must be reachable without accepting a
         # sequence of illegal tile/warp/buffering intermediate configurations.

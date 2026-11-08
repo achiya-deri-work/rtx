@@ -85,6 +85,48 @@ class GLURecomputeDerivative(MXFP8GLUKernel):
                 write_only_types=[Int16],read_only_args=[value1*inv,value0*inv])
 
     @cute.jit
+    def _gradient_transpose_quant_epilogue(self,source,quantized,scales,block_m,block_n,tidx):
+        """Quantize rounded derivatives along tokens, not dX's feature axis.
+
+        Consume shared derivatives before scratch reuse. The two orientations
+        have independent scales and bytes; no global transpose is materialized.
+        """
+        cfg=self.config
+        width=cfg.tile_n//2
+        storage_m=((self.problem.m+31)//32)*32
+        for group in cutlass.range(cute.ceil_div(cfg.tile_m*cfg.tile_n,4*cfg.num_threads),unroll=1):
+            idx=(tidx+group*cfg.num_threads)*4
+            col,row=idx//cfg.tile_m,idx%cfg.tile_m
+            gm=block_m*cfg.tile_m+row
+            gh=block_n*width+col%width
+            output_row=gh+(col//width)*(self.problem.n//2)
+            vals=cute.make_rmem_tensor((4,),Float32)
+            maximum=Float32(0)
+            maximum_bits=Int32(0)
+            for v in cutlass.range_constexpr(4):
+                value=Float32(0)
+                if col<cfg.tile_n and gh<self.problem.n//2 and gm+v<self.problem.m:
+                    value=Float32(source[row+v,col])
+                vals[v]=value
+                if cutlass.const_expr(self.gradient_transpose_quant_policy[1]=='bf16_bits'):
+                    maximum_bits=cutlass.max(maximum_bits,Int32(BFloat16(value).bitcast(Uint16))&Int32(0x7fff))
+                else:
+                    maximum=cute.arch.fmax(maximum,cute.abs(value),nan=True)
+            if cutlass.const_expr(self.gradient_transpose_quant_policy[1]=='bf16_bits'):
+                maximum=Float32(Uint16(maximum_bits).bitcast(BFloat16))
+            amax=self._warp_amax(maximum,8,cute.arch.lane_idx())
+            scale,inv=self._scale_from_amax(amax)
+            word=Uint32(0)
+            for pair in cutlass.range_constexpr(2):
+                packed=self._backward_quant_pair(vals[2*pair],vals[2*pair+1],inv,self.gradient_transpose_quant_policy[0])
+                word|=Uint32(packed.bitcast(Uint16))<<(16*pair)
+            if col<cfg.tile_n and gh<self.problem.n//2 and gm<storage_m:
+                ptr=cute.recast_ptr(quantized.iterator+output_row*storage_m+gm,dtype=Uint32)
+                ptr[0]=word
+                if cute.arch.lane_idx()%8==0:
+                    scales[output_row,gm//32]=scale
+
+    @cute.jit
     def _hidden_quant_epilogue(self,scratch,quantized,scales,block_m,block_n,tidx):
         """Forward-rounded hidden -> independent leading-axis block quantization.
 
@@ -165,6 +207,9 @@ class GLURecomputeDerivative(MXFP8GLUKernel):
     @cute.jit
     def _glu_epilogue(self,storage,accumulators,coordinates,out,grad_h,
                       block_m,block_n,tidx,tma_out,tma_out_tensor,out_layout,work_slot):
+        if cutlass.const_expr(self.emit_gradient_transpose_quant):
+            gradient_transpose_quant,gradient_transpose_scales=grad_h[1],grad_h[2]
+            grad_h=grad_h[0]
         if cutlass.const_expr(self.emit_hidden_quant):
             hidden_quant,hidden_scales=grad_h[1],grad_h[2]
             grad_h=grad_h[0]
@@ -202,8 +247,11 @@ class GLURecomputeDerivative(MXFP8GLUKernel):
         if cutlass.const_expr(self.emit_hidden and not self.warp_quant and self.config.glu_grad_store=="exchange"):
             # Same bytes as H's FP32 scratch; the lifetimes are separated by
             # CTA barriers. Use a flat BF16 view for a coalesced dP writeout.
-            grad_scratch=cute.make_tensor(cute.recast_ptr(scratch.iterator,dtype=BFloat16),
-                                         cute.make_layout((self.config.tile_m,self.config.tile_n),stride=(self.config.tile_n,1)))
+            gradient_layout=cute.make_layout((self.config.tile_m,self.config.tile_n),stride=(self.config.tile_n,1))
+            if cutlass.const_expr(self.emit_gradient_transpose_quant and self.config.glu_scratch_swizzle=='xor_16b'):
+                gradient_layout=cute.make_composed_layout(
+                    cute.make_swizzle(3,3,self.gradient_transpose_swizzle),0,gradient_layout)
+            grad_scratch=cute.make_tensor(cute.recast_ptr(scratch.iterator,dtype=BFloat16),gradient_layout)
         if cutlass.const_expr(self.config.glu_grad_load == "prefetch"):
             gradients=cute.make_rmem_tensor((cute.size(accumulators)//2,),Float32)
             gradients.fill(Float32(0))
@@ -266,15 +314,16 @@ class GLURecomputeDerivative(MXFP8GLUKernel):
                 gr=block_m*cfg.tile_m+lr
                 gc=block_n*cfg.tile_n//2+lc%(cfg.tile_n//2)
                 out_row=2*gr+lc//(cfg.tile_n//2)
-                if lr<cfg.tile_m and gr<self.problem.m and gc<self.problem.n//2:
-                    if gc+1<self.problem.n//2 and (out_row*(self.problem.n//2)+gc)%2==0:
-                        word=Uint32(grad_scratch[lr,lc].bitcast(Uint16))|(Uint32(grad_scratch[lr,lc+1].bitcast(Uint16))<<16)
-                        ptr=cute.recast_ptr(out.iterator+out_row*(self.problem.n//2)+gc,dtype=Uint32)
-                        ptr[0]=word
-                    else:
-                        out[out_row,gc]=grad_scratch[lr,lc]
-                        if gc+1<self.problem.n//2:
-                            out[out_row,gc+1]=grad_scratch[lr,lc+1]
+                if cutlass.const_expr(not self.emit_gradient_transpose_quant):
+                    if lr<cfg.tile_m and gr<self.problem.m and gc<self.problem.n//2:
+                        if gc+1<self.problem.n//2 and (out_row*(self.problem.n//2)+gc)%2==0:
+                            word=Uint32(grad_scratch[lr,lc].bitcast(Uint16))|(Uint32(grad_scratch[lr,lc+1].bitcast(Uint16))<<16)
+                            ptr=cute.recast_ptr(out.iterator+out_row*(self.problem.n//2)+gc,dtype=Uint32)
+                            ptr[0]=word
+                        else:
+                            out[out_row,gc]=grad_scratch[lr,lc]
+                            if gc+1<self.problem.n//2:
+                                out[out_row,gc+1]=grad_scratch[lr,lc+1]
             if cutlass.const_expr(self.emit_gradient_quant):
                 # Quantize the *rounded BF16* derivatives, before these bytes
                 # are reused for hidden reconstruction. Each eight-lane group
@@ -311,6 +360,9 @@ class GLURecomputeDerivative(MXFP8GLUKernel):
                         ptr[0]=word
                         if cute.arch.lane_idx()%8==0:
                             gradient_scales[out_row,gc//32]=scale
+            if cutlass.const_expr(self.emit_gradient_transpose_quant):
+                self._gradient_transpose_quant_epilogue(grad_scratch,gradient_transpose_quant,
+                    gradient_transpose_scales,block_m,block_n,tidx)
             cute.arch.sync_threads()
             if tidx<cfg.num_mma_warps*32:
                 for i in cutlass.range_constexpr(cute.size(products)):
@@ -392,6 +444,7 @@ def compile_glu_derivative(problem,config,activation,emit_hidden=False):
     kernel.emit_hidden=emit_hidden
     kernel.emit_gradient_quant=False
     kernel.emit_hidden_quant=False
+    kernel.emit_gradient_transpose_quant=False
     kernel.separate_hidden=False
     kernel.glu_scratch_elems = config.tile_m*config.tile_n//2 if emit_hidden else 0
     if kernel.warp_quant:
@@ -414,13 +467,15 @@ class PrequantGLURecomputeDerivative(MXFP8PrequantGLUKernel):
     _backward_quant_pair = GLURecomputeDerivative._backward_quant_pair
     _glu_epilogue = GLURecomputeDerivative._glu_epilogue
     _hidden_quant_epilogue = GLURecomputeDerivative._hidden_quant_epilogue
+    _gradient_transpose_quant_epilogue = GLURecomputeDerivative._gradient_transpose_quant_epilogue
 
 
 @lru_cache(maxsize=128)
 def compile_prequant_glu_derivative(problem,config,activation,emit_hidden=False,separate_hidden=False,
                                    emit_gradient_quant=False,emit_hidden_quant=False,
-                                   gradient_quant_policy=('fp32','fp32'),hidden_quant_policy=('fp32','fp32')):
-    for policy in (gradient_quant_policy,hidden_quant_policy):
+                                   gradient_quant_policy=('fp32','fp32'),hidden_quant_policy=('fp32','fp32'),
+                                   emit_gradient_transpose_quant=False,gradient_transpose_quant_policy=('fp32','fp32')):
+    for policy in (gradient_quant_policy,hidden_quant_policy,gradient_transpose_quant_policy):
         if len(policy)!=2 or policy[0] not in ('fp32','bf16x2') or policy[1] not in ('fp32','bf16_bits'):
             raise ValueError('unsupported backward quantization policy')
     if emit_hidden_quant and (not emit_hidden or not separate_hidden or config.tile_m%32 or config.tile_n%64
@@ -429,6 +484,9 @@ def compile_prequant_glu_derivative(problem,config,activation,emit_hidden=False,
     if emit_gradient_quant and (not emit_hidden or config.glu_grad_store!='exchange'
                                 or problem.n%64 or config.tile_n%64):
         raise ValueError('gradient quantization requires joint exchange recompute and complete 32-value branch blocks')
+    if emit_gradient_transpose_quant and (not emit_gradient_quant or not emit_hidden_quant
+                                          or problem.m%32 or config.tile_m%32):
+        raise ValueError('both-orientation gradient quantization requires aligned joint gradient/hidden quantization')
     if separate_hidden and not emit_hidden:
         raise ValueError('separate hidden storage requires joint recomputation')
     from ..configs.glu import prequant_recompute_rejection
@@ -444,6 +502,9 @@ def compile_prequant_glu_derivative(problem,config,activation,emit_hidden=False,
     kernel.emit_hidden=emit_hidden
     kernel.emit_gradient_quant=emit_gradient_quant
     kernel.emit_hidden_quant=emit_hidden_quant
+    kernel.emit_gradient_transpose_quant=emit_gradient_transpose_quant
+    kernel.gradient_transpose_quant_policy=gradient_transpose_quant_policy
+    kernel.gradient_transpose_swizzle=config.tile_n.bit_length()-2
     kernel.gradient_quant_policy=gradient_quant_policy
     kernel.hidden_quant_policy=hidden_quant_policy
     kernel.separate_hidden=separate_hidden
@@ -458,13 +519,16 @@ def compile_prequant_glu_derivative(problem,config,activation,emit_hidden=False,
     out=fake(BFloat16,((2*problem.m+7)//8)*8+problem.m,h) if emit_hidden else fake(BFloat16,problem.m,problem.n)
     dh=fake(BFloat16,problem.m,h)
     if separate_hidden:
-        out=fake(BFloat16,2*problem.m,h)
+        out=fake(BFloat16,problem.m if emit_gradient_transpose_quant else 2*problem.m,h)
         dh=(dh,fake(BFloat16,problem.m,h))
     if emit_gradient_quant:
         dh=(dh,fake(Float8E4M3FN,2*problem.m,h),fake(Float8E8M0FNU,2*problem.m,h//32))
     if emit_hidden_quant:
         storage_m=(problem.m+31)//32*32
         dh=(dh,fake(Float8E4M3FN,h,storage_m),fake(Float8E8M0FNU,h,storage_m//32))
+    if emit_gradient_transpose_quant:
+        storage_m=(problem.m+31)//32*32
+        dh=(dh,fake(Float8E4M3FN,problem.n,storage_m),fake(Float8E8M0FNU,problem.n,storage_m//32))
     stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile(kernel,x,w,sx,sw,out,dh,stream,
                         options="--enable-tvm-ffi --opt-level 3 "

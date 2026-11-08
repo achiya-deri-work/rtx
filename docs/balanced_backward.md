@@ -58,7 +58,8 @@ so that a small budget can discover preparation savings without more splits.
 
 Uniform default fields are omitted from canonical backward dictionaries, and
 old JSON schedules continue to load with uniform semantics. Search/runtime
-identities are updated: backward search 30, backward frontend 6, MLP search 42.
+identities are updated: backward search 30, backward frontend 6, MLP search 44
+(including the later both-orientation recompute expansion).
 Do not transplant winners from another device, source or application fixture.
 
 ## Qualification and deployment boundary
