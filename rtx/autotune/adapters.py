@@ -1485,7 +1485,9 @@ def make_mxfp8_bwd_adapter(
     from .._bwd_search import backward_search_space
     selected_axes = backward_search_space(problem, BWD_SEARCH_SPACE if axes is None else axes)
     axis_values = {name: tuple(values) for name, values in selected_axes.items()}
-    unknown = set(axis_values).difference(BWD_SEARCH_SPACE)
+    # Shape-derived compound axes are produced by backward_search_space,
+    # rather than pretending one static payload covers all reduction lengths.
+    unknown = set(axis_values).difference(set(BWD_SEARCH_SPACE)|{'dw_balanced'})
     if unknown:
         raise ValueError(f"unknown backward tuning axes: {sorted(unknown)}")
 

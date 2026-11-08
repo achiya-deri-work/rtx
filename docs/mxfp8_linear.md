@@ -35,6 +35,8 @@ Autotuning retains the independent transport, tile, buffering and layout
 choices. Optional preparation selection also measures fused versus
 materialized execution. Backward opening trials include native-scale dX
 with split FP32 dW when legal, alongside row-major and fused alternatives.
+Long/narrow backward tuning also exposes [balanced K-tile partitions](balanced_backward.md)
+and bounded 64/128-way FP32 workspace candidates; these are not forced defaults.
 See the [half-tile dispatch qualification](mxfp8_row_alignment_qualification_20261103.md)
 for measured application impact, numerical coverage and remaining limitations.
 

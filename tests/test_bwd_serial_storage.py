@@ -12,6 +12,10 @@ from rtx.kernels.mxfp8_bwd import DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG a
 def test_serial_storage_legacy_identity_and_search():
     legacy=asdict(BASE)
     del legacy['operand_storage']
+    # Reconstruct the pre-partition schema rather than adding a new default
+    # field to the legacy fixture through today's dataclass definition.
+    for leg in ('dx','dw'):
+        del legacy[leg]['split_partition']
     assert bwd_config_to_dict(BASE)==legacy
     assert bwd_config_from_dict(legacy)==BASE
     move={'operand_storage':'serial_reuse'}

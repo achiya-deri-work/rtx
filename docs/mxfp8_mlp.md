@@ -274,6 +274,10 @@ See [historical measurements and qualification](mxfp8_mlp_history.md).
 
 ## Qualification and remaining release gates
 
+Long/narrow training search includes [balanced backward partitions](balanced_backward.md),
+independent projection splits and compound geometry proposals. They compete
+with existing recompute preparation and overlap choices using complete-MLP cost.
+
 See [historical measurements and qualification](mxfp8_mlp_history.md).
 # Joint recomputation output storage
 

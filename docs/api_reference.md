@@ -1212,6 +1212,7 @@ class MXFP8BwdMatmulConfig:
     reduction: str = 'full_fp32'
     split_reduction: int = 1
     reduction_tile: int = 0
+    split_partition: str = 'uniform'
     workspace_epilogue: str = 'none'
     reduction_threads: int = 256
     reduction_vector: int = 4

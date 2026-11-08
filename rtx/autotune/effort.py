@@ -191,7 +191,8 @@ def make_effort_autotuner(adapter,store,policy,*,progress=None,candidates=(),sta
         from .._bwd_search import backward_structural_seeds
         from ..kernels.mxfp8 import MXFP8Problem
         w=adapter.context.workload
-        backward_seeds=backward_structural_seeds(MXFP8Problem(int(w['m']),int(w['n']),int(w['k'])),adapter.initial_config)
+        backward_seeds=backward_structural_seeds(MXFP8Problem(int(w['m']),int(w['n']),int(w['k'])),
+            adapter.initial_config,sm_count=adapter.context.device.get('multiprocessor_count'))
         candidates=(*backward_seeds,*candidates)
     progressive = policy.search_schedule == 'progressive'
     planning_trials = 64 if progressive else policy.max_trials

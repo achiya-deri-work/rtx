@@ -23,6 +23,7 @@ the [generated reference](api_reference.md) owns exact signatures and defaults.
 | Compile and use graphs, streams and caches | [Execution](execution.md) |
 | Retire warmup scratch and share reduction workspaces safely | [Execution resources](execution_resources.md) |
 | Collect datasets and deploy winners | [Autotuning operations](autotuning.md) |
+| Tune long-token weight gradients | [Balanced backward](balanced_backward.md) |
 | Diagnose errors and limitations | [Troubleshooting](troubleshooting.md) · [Runtime contract](runtime_contract.md) |
 
 Linears replace **bias-free** nn.Linear under the documented dtype/device

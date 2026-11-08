@@ -58,7 +58,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 29
+KERNEL_REVISION = 30
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -751,6 +751,7 @@ def _matmul_from_dict(value: Mapping[str, object]) -> MXFP8BwdMatmulConfig:
         reduction=str(value.get("reduction", "full_fp32")),
         split_reduction=int(value.get("split_reduction", 1)),
         reduction_tile=int(value.get("reduction_tile", 0)),
+        split_partition=str(value.get('split_partition','uniform')),
         workspace_epilogue=str(value.get("workspace_epilogue", "none")),
         reduction_threads=int(value.get("reduction_threads", 256)),
         reduction_vector=int(value.get("reduction_vector", 4)),
@@ -768,6 +769,9 @@ def bwd_config_to_dict(config: MXFP8BwdConfig) -> dict[str, object]:
     # Keep existing default identities compatible with archived configurations.
     if value['operand_storage'] == 'separate':
         del value['operand_storage']
+    for leg in ('dx','dw'):
+        if value[leg]['split_partition']=='uniform':
+            del value[leg]['split_partition']
     return value
 
 
@@ -828,6 +832,10 @@ def _update_matmul(
         reduction=str(updates.get("reduction", config.reduction)),
         split_reduction=int(updates.get("split_reduction", config.split_reduction)),
         reduction_tile=int(updates.get("reduction_tile", config.reduction_tile)),
+        split_partition=str(updates.get('split_partition',
+            'uniform' if updates.get('reduction')=='full_fp32' or updates.get('backend')=='fused'
+            or updates.get('reduction_tile',0)>0
+            else config.split_partition)),
         workspace_epilogue=str(
             updates.get("workspace_epilogue", config.workspace_epilogue)
         ),
@@ -1336,7 +1344,8 @@ class BwdCoordinateDescentTuner:
                 )
             best_score = float(first.median_ms)
             from ._bwd_search import backward_structural_seeds
-            structural=(backward_structural_seeds(self.evaluator.problem, initial)
+            structural=(backward_structural_seeds(self.evaluator.problem, initial,
+                        sm_count=getattr(getattr(self.database,'fingerprint',None),'multiprocessor_count',None))
                         if 'dw_backend' in self.axes and 'dw_reduction' in self.axes else [])
             for candidate in structural[:3]:
                 if (time.monotonic()-self.started >= self.policy.time_budget_s or

@@ -31,7 +31,7 @@ class MXFP8WorkspaceReduceKernel:
         vector: int,
         persistent_waves: int,
     ) -> None:
-        if min(m, n) <= 0 or split not in (1, 2, 4, 8, 16, 32):
+        if min(m, n) <= 0 or split not in (1, 2, 4, 8, 16, 32, 64, 128):
             raise ValueError("invalid split-reduction shape")
         if algorithm not in ("serial", "tree", "persistent_tree"):
             raise ValueError(f"invalid workspace reduction {algorithm!r}")
@@ -85,14 +85,14 @@ class MXFP8WorkspaceReduceKernel:
             for lane in cutlass.range_constexpr(self.vector):
                 index = base + lane
                 if index < elements:
-                    values = [Float32(0.0)] * self.split
-                    for part in cutlass.range_constexpr(self.split):
-                        values[part] = workspace[part * elements + index]
                     if cutlass.const_expr(self.algorithm == "serial"):
                         total = Float32(0.0)
                         for part in cutlass.range_constexpr(self.split):
-                            total += values[part]
+                            total += workspace[part * elements + index]
                     else:
+                        values = [Float32(0.0)] * self.split
+                        for part in cutlass.range_constexpr(self.split):
+                            values[part] = workspace[part * elements + index]
                         width = self.split
                         for _level in cutlass.range_constexpr(
                             int(math.log2(self.split))

@@ -82,7 +82,7 @@ def compile_mxfp8_backward_quad_quant(*args, **kwargs):
 if TYPE_CHECKING:
     from .autotune import CoordinateDescentPolicy
 
-BWD_FRONTEND_REVISION = 5
+BWD_FRONTEND_REVISION = 6
 
 
 def _zero_tensor_async(tensor: torch.Tensor) -> None:
@@ -488,6 +488,7 @@ def _build_matmul_runner(
             config.gemm,
             split_reduction=config.split_reduction,
             reduction_tile=config.reduction_tile,
+            split_partition=config.split_partition,
         )
         reducer = compile_mxfp8_workspace_reduce(
             problem.m,
@@ -674,6 +675,9 @@ def _intern_bwd_config(config: MXFP8BwdConfig) -> str:
     value = asdict(config)
     if value['operand_storage'] == 'separate':
         del value['operand_storage']
+    for leg in ('dx','dw'):
+        if value[leg]['split_partition']=='uniform':
+            del value[leg]['split_partition']
     payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
     key = f"bwd-v{BWD_FRONTEND_REVISION}:{payload}"
     with _LOCK:

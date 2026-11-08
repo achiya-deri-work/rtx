@@ -33,7 +33,7 @@ def resolved(config,m,k,h,o):
 
 
 def backward_openings(config,m,k,h,o):
-    from .._bwd_search import materialized_bwd_seed
+    from .._bwd_search import materialized_bwd_seed,balanced_dw_candidates
     from ..kernels.mxfp8 import MXFP8Problem
     result=[]
     for gp,dp in ((4,4),(1,1),(2,2),(8,8),(16,16),(32,32),(4,8),(8,4)):
@@ -41,6 +41,12 @@ def backward_openings(config,m,k,h,o):
         down=materialized_bwd_seed(MXFP8Problem(m,o,h),config.down_backward,dp)
         if gate is not None and down is not None:
             result.append(replace(config,gate_backward=gate,down_backward=down))
+    gates=balanced_dw_candidates(MXFP8Problem(m,2*h,k),config.gate_backward)
+    downs=balanced_dw_candidates(MXFP8Problem(m,o,h),config.down_backward)
+    for gate,down in zip(gates,downs):
+        candidate=replace(config,gate_backward=gate,down_backward=down)
+        if candidate.rejection(m,k,h,o) is None:
+            result.append(candidate)
     return result
 
 

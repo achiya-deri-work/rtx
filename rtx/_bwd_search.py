@@ -19,7 +19,7 @@ def decomposed_leg(leg, problem):
         atom_layout_m=4, atom_layout_n=2, stages=2,
         scale_layout='row_major', scale_role='producer', epilogue='direct',
         epilogue_stages=1, store_vec=1, tiles_per_cta=1, tile_locality='raster')
-    return replace(leg, backend='decomposed', quant_launches='separate',
+    return replace(leg, backend='decomposed', quant_launches='separate', split_partition='uniform',
         quant_a=quant, quant_b=None, gemm=gemm, reduction='full_fp32',
         split_reduction=1, reduction_tile=0, workspace_epilogue='none',
         tile_scheduler='static', persistent_waves=1, tiles_per_cta=1,
@@ -47,13 +47,14 @@ def native_decomposed_leg(leg, problem):
     return candidate if candidate.implementation_rejection(problem) is None else None
 
 
-def split_leg(leg, length, parts):
+def split_leg(leg, length, parts, *, partition='uniform'):
     if parts == 1:
         return replace(leg, reduction='full_fp32', split_reduction=1,
-                       reduction_tile=0, workspace_epilogue='none')
+                       reduction_tile=0, workspace_epilogue='none',split_partition='uniform')
     alignment = leg.gemm.tile_k if leg.backend=='decomposed' else leg.fused.bf16_tile_k
     return replace(leg, reduction='split_fp32_workspace', split_reduction=parts,
-        reduction_tile=reduction_chunk(length,parts,alignment),workspace_epilogue='serial',
+        reduction_tile=0 if partition=='balanced' else reduction_chunk(length,parts,alignment),
+        split_partition=partition,workspace_epilogue='serial',
         fused=replace(leg.fused,epilogue='direct',epilogue_stages=1,store_vec=1),
         gemm=replace(leg.gemm,epilogue='direct',epilogue_stages=1,store_vec=1,tiles_per_cta=1))
 
@@ -75,7 +76,45 @@ def materialized_bwd_seed(problem,initial,parts=1):
     return candidate if candidate.implementation_rejection(problem) is None else None
 
 
-def backward_structural_seeds(problem, initial):
+def balanced_dw_candidates(problem,initial,sm_count=None):
+    """Bounded long/narrow schedules; never a forced winner or precision change.
+
+    Balanced partitions distribute complete K tiles with at most one tile of
+    imbalance. The masked last tile retains every original logical element.
+    Independent output geometry and split count are coupled proposals so a
+    local search need not traverse empty-partition or illegal-geometry states.
+    """
+    if problem.m<=4096 or problem.n*problem.k>262144:
+        return []
+    p=MXFP8Problem(problem.n,problem.k,problem.m)
+    leg=decomposed_leg(initial.dw,p)
+    qb=replace(initial.dw.resolved_quant_b(),scale_layout='row_major',native_scale_store='scalar',
+        transposed_tile_rows=leg.quant_a.transposed_tile_rows,transposed_tile_k=32,
+        transposed_load_engine='register')
+    leg=replace(leg,quant_b=None if qb==leg.quant_a else qb)
+    choices=[]
+    for tm,tn,am,an in ((128,128,4,2),(64,64,2,2),(64,128,2,2),(128,64,4,2)):
+        geometry=replace(leg,gemm=replace(leg.gemm,tile_m=tm,tile_n=tn,
+            atom_layout_m=am,atom_layout_n=an,persistent_waves=0))
+        for parts in (2,4,8,16,32,64,128):
+            if parts*problem.n*problem.k*4>128*1024**2:
+                continue
+            candidate=replace(initial,dw=split_leg(geometry,problem.m,parts,partition='balanced'),
+                quant_schedule='per_matmul',stream_schedule='single',execution_order='dx_first',
+                operand_storage='separate')
+            if candidate.implementation_rejection(problem) is None:
+                choices.append(candidate)
+    if sm_count:
+        # One/two/four device waves are proposals, not occupancy predictions.
+        def rank(c):
+            g=c.dw.gemm
+            ctas=((p.m+g.tile_m-1)//g.tile_m)*((p.n+g.tile_n-1)//g.tile_n)*c.dw.split_reduction
+            return (ctas<sm_count,min(abs(math.log2(ctas/(sm_count*w))) for w in (1,2,4)))
+        choices.sort(key=rank)
+    return choices
+
+
+def backward_structural_seeds(problem, initial, *, sm_count=None):
     """Reserve useful alternatives to underfilled unsplit dW, never a winner."""
     dw_problem = MXFP8Problem(problem.n,problem.k,problem.m)
     dx_problem = MXFP8Problem(problem.m,problem.k,problem.n)
@@ -113,7 +152,13 @@ def backward_structural_seeds(problem, initial):
             candidate=replace(current,operand_storage=storage)
             if candidate.implementation_rejection(problem) is None and candidate not in seeds:
                 seeds.append(candidate)
-    return seeds
+    balanced=balanced_dw_candidates(problem,initial,sm_count)
+    if sm_count and problem.m>=32768 and balanced:
+        dx=native_decomposed_leg(base.dx,dx_problem) or decomposed_leg(base.dx,dx_problem)
+        complete=replace(balanced[0],dx=dx)
+        if complete.implementation_rejection(problem) is None:
+            seeds.insert(1,complete)
+    return seeds+balanced
 
 
 def backward_search_space(problem, axes):
@@ -151,6 +196,23 @@ def backward_search_space(problem, axes):
                         fused=dict(epilogue='direct',epilogue_stages=1,store_vec=1),
                         gemm=dict(epilogue='direct',epilogue_stages=1,store_vec=1,tiles_per_cta=1))})
             result[reduction_key]=unique((*result[reduction_key],*moves))
+    if ('dw_backend' in result and 'dw_reduction' in result
+            and any(v.get('dw',{}).get('backend')=='decomposed' for v in result['dw_backend'])
+            and any(v.get('dw',{}).get('reduction')=='split_fp32_workspace' for v in result['dw_reduction'])):
+        moves=[]
+        for c in balanced_dw_candidates(problem,DEFAULT_FUSED_MXFP8_BWD_CONFIG):
+            payload=bwd_config_to_dict(c)
+            # These compound moves change transport/scheduling, not the user's
+            # quantization arithmetic, amax policy or scale-rounding contract.
+            for qname in ('quant_a','quant_b'):
+                q=payload['dw'][qname] or dict(payload['dw']['quant_a'])
+                for numeric in ('quant_math','quant_amax','scale_rounding'):
+                    q.pop(numeric,None)
+                payload['dw'][qname]=q
+            payload.pop('dx')
+            moves.append(payload)
+        if moves:
+            result['dw_balanced']=unique(moves)
     return result
 
 
@@ -160,6 +222,8 @@ def active_backward_dict(config):
     result=asdict(config.normalized())
     for name in ('dx','dw'):
         leg=result[name]
+        if leg['split_partition']=='uniform':
+            leg.pop('split_partition')
         inactive=('quant_a','quant_b','quant_launches','gemm') if leg['backend']=='fused' else ('fused',)
         for key in inactive:
             leg.pop(key,None)
@@ -177,6 +241,7 @@ def backward_coverage(configs, problem):
             leg=getattr(config,name)
             tile=leg.fused if leg.backend=='fused' else leg.gemm
             row=dict(backend=leg.backend,reduction=leg.reduction,parts=leg.split_reduction,
+                split_partition=leg.split_partition,
                 tile_m=tile.tile_m,tile_n=tile.tile_n,
                 grid_ctas=((m+tile.tile_m-1)//tile.tile_m)*((n+tile.tile_n-1)//tile.tile_n)*leg.split_reduction)
             if row not in result[name]:result[name].append(row)

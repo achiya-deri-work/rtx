@@ -19,7 +19,8 @@ class DocumentationTests(unittest.TestCase):
                "nvfp4_broad_evaluation_20261023","runtime_contract",
                "mxfp8_linear","nvfp4_linear","mxfp8_glu","mxfp8_mlp",
                "mxfp8_mlp_numerics","troubleshooting","research",
-               "first_hit_autotuning","mxfp8_glu_history","mxfp8_mlp_history")
+               "first_hit_autotuning","mxfp8_glu_history","mxfp8_mlp_history",
+               "balanced_backward","balanced_backward_qualification_20261108")
         pages=[ROOT/"README.md",*(ROOT/f"docs/{name}.md" for name in names)]
         for page in pages:
             for target in re.findall(r"\]\(([^)]+)\)",page.read_text()):

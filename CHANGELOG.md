@@ -5,6 +5,12 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Add opt-in balanced K-tile partitioning and 64/128-way FP32 workspace
+  reduction for decomposed MXFP8 backward. Expand shared linear/MLP search
+  with hardware-aware compound dW schedules, preserve numerical operand
+  policies and legacy uniform semantics, and invalidate affected tuning
+  namespaces (backward search 30/frontend 6, MLP search 42).
+
 - Consolidate opt-in MS-EDEN backward research, caller-first dW scheduling,
   model-context UCB refinement, guarded preparation prototypes and matched
   SiTU decoder tools/tests. Preserve MXFP8 backward as the stable NVFP4 default;

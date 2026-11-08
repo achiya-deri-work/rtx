@@ -54,6 +54,7 @@ class MXFP8GemmKernel:
         atomic_output: bool = False,
         cluster_output: bool = False,
         use_pdl: bool = False,
+        split_partition: str = "uniform",
     ):
         if problem.k % config.tile_k:
             # Qdata TMA naturally zero-fills a short K tile. Scale vectors are
@@ -112,11 +113,16 @@ class MXFP8GemmKernel:
         self.config = config
         self.split_reduction = split_reduction
         self.reduction_tile = reduction_tile
+        self.split_partition = split_partition
         self.atomic_output = atomic_output
         self.cluster_output = cluster_output
         self.use_pdl = use_pdl
         if split_reduction < 1:
             raise ValueError("split_reduction must be positive")
+        if split_partition not in ('uniform','balanced'):
+            raise ValueError('unknown split partition')
+        if split_partition == 'balanced' and (split_reduction == 1 or atomic_output or cluster_output):
+            raise ValueError('balanced split requires FP32 workspace output')
         if split_reduction == 1 and (
             reduction_tile != 0 or atomic_output or cluster_output
         ):
@@ -132,13 +138,17 @@ class MXFP8GemmKernel:
                 raise ValueError("split-K and multi-output persistence are independent")
             if cluster_output and split_reduction not in (2, 4, 8):
                 raise ValueError("SM120 CTA clusters support split counts 2, 4, or 8")
-            if reduction_tile <= 0 or reduction_tile % config.tile_k:
-                raise ValueError("reduction_tile must be a positive tile-K multiple")
-            if not (
-                (split_reduction - 1) * reduction_tile < problem.k
-                <= split_reduction * reduction_tile
-            ):
-                raise ValueError("split count/tile must cover K without an empty slice")
+            if split_partition == 'balanced':
+                if reduction_tile != 0 or split_reduction > (problem.k+config.tile_k-1)//config.tile_k:
+                    raise ValueError('balanced split requires zero chunk and nonempty K-tile ranges')
+            else:
+                if reduction_tile <= 0 or reduction_tile % config.tile_k:
+                    raise ValueError("reduction_tile must be a positive tile-K multiple")
+                if not (
+                    (split_reduction - 1) * reduction_tile < problem.k
+                    <= split_reduction * reduction_tile
+                ):
+                    raise ValueError("split count/tile must cover K without an empty slice")
         self.tile_shape_mnk = (config.tile_m, config.tile_n, config.tile_k)
         self.m_tiles = (problem.m + config.tile_m - 1) // config.tile_m
         self.n_tiles = (problem.n + config.tile_n - 1) // config.tile_n
@@ -1341,12 +1351,16 @@ class MXFP8GemmKernel:
             first_k_tile = Int32(0)
             final_k_tile = Int32(num_k_tiles)
             if cutlass.const_expr(self.split_reduction > 1):
-                reduction_tiles = self.reduction_tile // cfg.tile_k
-                first_k_tile = split_id * reduction_tiles
-                final_k_tile = cutlass.min(
-                    first_k_tile + reduction_tiles,
-                    num_k_tiles,
-                )
+                if cutlass.const_expr(self.split_partition == 'balanced'):
+                    first_k_tile = (split_id * num_k_tiles) // self.split_reduction
+                    final_k_tile = ((split_id+1) * num_k_tiles) // self.split_reduction
+                else:
+                    reduction_tiles = self.reduction_tile // cfg.tile_k
+                    first_k_tile = split_id * reduction_tiles
+                    final_k_tile = cutlass.min(
+                        first_k_tile + reduction_tiles,
+                        num_k_tiles,
+                    )
             for k_tile in cutlass.range(
                 first_k_tile,
                 final_k_tile,
@@ -2124,6 +2138,7 @@ def compile_mxfp8_gemm(
     reduction_tile: int = 0,
     atomic_output: bool = False,
     cluster_output: bool = False,
+    split_partition: str = "uniform",
 ):
     kernel = MXFP8GemmKernel(
         problem,
@@ -2132,6 +2147,7 @@ def compile_mxfp8_gemm(
         reduction_tile=reduction_tile,
         atomic_output=atomic_output,
         cluster_output=cluster_output,
+        split_partition=split_partition,
     )
     qx = cute.runtime.make_fake_tensor(
         Float8E4M3FN,

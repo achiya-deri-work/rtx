@@ -22,7 +22,14 @@ from ..configs import MXFP8GemmConfig, MXFP8QuantConfig
 
 @dataclass(frozen=True, slots=True)
 class MXFP8BwdMatmulConfig:
-    """Logical source layouts, quantizers, GEMM, and reduction for one gradient."""
+    """Logical source layouts, quantizers, GEMM, and reduction for one gradient.
+
+    ``split_partition='uniform'`` preserves fixed ``reduction_tile`` chunks.
+    ``'balanced'`` distributes K tiles across nonempty ranges with at most
+    one tile of imbalance, derives ranges internally and requires a zero
+    reduction_tile. Balanced execution is limited to decomposed FP32 workspace
+    reduction; 64/128-way splits do not enable fused/atomic/cluster modes.
+    """
 
     a_orientation: str = "row"
     b_orientation: str = "transpose"
@@ -51,6 +58,7 @@ class MXFP8BwdMatmulConfig:
     reduction: str = "full_fp32"
     split_reduction: int = 1
     reduction_tile: int = 0
+    split_partition: str = "uniform"
     workspace_epilogue: str = "none"
     reduction_threads: int = 256
     reduction_vector: int = 4
@@ -75,6 +83,12 @@ class MXFP8BwdMatmulConfig:
             return "B orientation must be row or transpose"
         if self.backend not in ("fused", "decomposed"):
             return "backend must be fused or decomposed"
+        if self.split_partition not in ("uniform", "balanced"):
+            return "split_partition must be uniform or balanced"
+        if self.split_partition == "balanced" and (
+            self.backend != "decomposed" or self.reduction != "split_fp32_workspace"
+        ):
+            return "balanced partitions require decomposed FP32 workspace reduction"
         if self.backend == "fused":
             if self.reduction not in (
                 "full_fp32",
@@ -237,8 +251,10 @@ class MXFP8BwdMatmulConfig:
             "cluster_fp32",
         ):
             return "unknown reduction strategy"
-        if self.split_reduction not in (1, 2, 4, 8, 16, 32):
-            return "split_reduction must be 1, 2, 4, 8, 16, or 32"
+        if self.split_reduction not in (1, 2, 4, 8, 16, 32, 64, 128):
+            return "decomposed split_reduction must be a power of two up to 128"
+        if self.split_reduction > 32 and self.reduction != 'split_fp32_workspace':
+            return "large splits require decomposed FP32 workspace reduction"
         # Packed GEMM accepts any nonnegative tile-K multiple; restricting
         # chunks to powers of two makes many long ragged reductions unreachable.
         if type(self.reduction_tile) is not int or self.reduction_tile < 0:
@@ -284,13 +300,19 @@ class MXFP8BwdMatmulConfig:
                     return "cluster reduction requires 2, 4, or 8 CTAs"
                 if self.workspace_epilogue != "none":
                     return "cluster reduction does not use a workspace epilogue"
-            if not (
-                (self.split_reduction - 1) * self.reduction_tile < problem.k
-                <= self.split_reduction * self.reduction_tile
-            ):
-                return "split count/tile must cover K without an empty partition"
-            if self.reduction_tile % self.gemm.tile_k:
-                return "reduction tile must be divisible by GEMM tile_k"
+            if self.split_partition == "balanced":
+                if self.reduction_tile != 0:
+                    return "balanced partitions derive their ranges; reduction_tile must be zero"
+                if self.split_reduction > (problem.k+self.gemm.tile_k-1)//self.gemm.tile_k:
+                    return "balanced partitions require at least one K tile per split"
+            else:
+                if not (
+                    (self.split_reduction - 1) * self.reduction_tile < problem.k
+                    <= self.split_reduction * self.reduction_tile
+                ):
+                    return "split count/tile must cover K without an empty partition"
+                if self.reduction_tile % self.gemm.tile_k:
+                    return "reduction tile must be divisible by GEMM tile_k"
             if self.gemm.epilogue != "direct" or self.gemm.store_vec != 1:
                 return "decomposed split/cluster reduction requires direct GEMM output"
             if self.gemm.tiles_per_cta != 1:
