@@ -5,6 +5,11 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Add `VirtualLayer`: named, independent 2D projection Parameters for Muon,
+  backed by a contiguous physical allocation and a differentiable zero-copy
+  packed view. Support QKV, SwiGLU gate/up and expert-bank layouts, fullgraph compilation,
+  checkpoint loading, meta materialization and device/dtype conversion.
+
 - Add autotunable `gradient_quantization="recompute_both"` for recomputed
   MXFP8 MLPs: emit independent dX/dW FP8 derivatives on-chip, eliminating the
   BF16 derivative allocation and global round trip. Preserve numerical

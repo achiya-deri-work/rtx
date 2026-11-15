@@ -13,6 +13,7 @@ the [generated reference](api_reference.md) owns exact signatures and defaults.
 | Task | Canonical guide |
 |---|---|
 | Use the linear layers | [MXFP8Linear](mxfp8_linear.md) · [NVFP4Linear](nvfp4_linear.md) |
+| Keep QKV/expert optimizer matrices separate but physically packed | [Virtual layers](virtual_layers.md) |
 | Convert a model for training or PTQ | [Model conversion](model_conversion.md) |
 | Calibrate NVFP4 and select numerical policies | [Quantization policy](quantization_policy.md) |
 | Review measured NVFP4 strengths, weaknesses and external recipes | [Broad evaluation, 2026-10-23](nvfp4_broad_evaluation_20261023.md) |

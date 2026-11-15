@@ -7,6 +7,24 @@ Configuration listings show locally declared fields; inherited fields follow the
 `rtx.__version__` is the package version. Stable below means wildcard-export membership,
 not a declaration that this development checkout is a released 1.0 build.
 
+## `rtx.VirtualLayer`
+
+Stable runtime export; provider `rtx.virtual.VirtualLayer`.
+
+[Source](../rtx/virtual.py)
+
+Pack bias-free projections without merging their optimizer parameters.
+
+```python
+class VirtualLayer(nn.Module):
+    def __init__(self, projections: Mapping[str, nn.Module], *, packed_shape: Sequence[int] | None=None)
+    def repack_(self)
+    def validate(self)
+    def weight(self)
+    def forward(self, x: torch.Tensor)
+    def extra_repr(self)
+```
+
 ## `rtx.WorkspacePolicy`
 
 Stable runtime export; provider `rtx.workspace.WorkspacePolicy`.

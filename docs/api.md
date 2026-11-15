@@ -17,6 +17,7 @@ linear input or constructor combination.
 | API | Purpose |
 |---|---|
 | `MXFP8Linear`, `mxfp8_linear` | Dynamic/AOT-weight/fully packed MXFP8; [guide](mxfp8_linear.md) |
+| `VirtualLayer` | Separate logical 2D Parameters over one zero-copy packed weight; [guide](virtual_layers.md) |
 | `NVFP4Linear`, `nvfp4_linear` | NVFP4 forward, MXFP8 backward; [guide](nvfp4_linear.md) |
 | `quantize_mxfp8`, `quantize_nvfp4` | Explicit BF16-to-packed conversion; [formats](formats.md) |
 | `convert_to_mxfp8_training`, `convert_to_nvfp4_training` | Preserve BF16 parameters while replacing linears |

@@ -4,6 +4,7 @@ from ._version import __version__
 
 
 _LAZY_EXPORTS = {
+    "VirtualLayer": ("virtual", "VirtualLayer"),
     "WorkspacePolicy": ("workspace", "WorkspacePolicy"),
     "ExecutionResources": ("execution", "ExecutionResources"),
     "configure_workspace": ("workspace", "configure_workspace"),
@@ -123,6 +124,7 @@ _LAZY_EXPORTS = {
 # Historical tuner symbols remain directly addressable for compatibility, but
 # new integrations should import them from ``rtx.autotune``.
 _STABLE_EXPORTS = (
+    "VirtualLayer",
     "WorkspacePolicy", "configure_workspace", "workspace_report", "ExecutionResources",
     "retire_runtime_contexts", "runtime_memory_report",
     "AutotunePolicy",
