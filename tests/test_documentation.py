@@ -20,7 +20,10 @@ class DocumentationTests(unittest.TestCase):
                "mxfp8_linear","nvfp4_linear","mxfp8_glu","mxfp8_mlp",
                "mxfp8_mlp_numerics","troubleshooting","research",
                "first_hit_autotuning","mxfp8_glu_history","mxfp8_mlp_history",
-               "balanced_backward","balanced_backward_qualification_20261108","virtual_layers")
+               "balanced_backward","balanced_backward_qualification_20261108","virtual_layers",
+               "balanced_router","balanced_router_qualification_20261115",
+               "balanced_router_cute_autotune_20261115","balanced_moe",
+               "balanced_moe_mxfp8_20261115","balanced_moe_speedup_20261115")
         pages=[ROOT/"README.md",*(ROOT/f"docs/{name}.md" for name in names)]
         for page in pages:
             for target in re.findall(r"\]\(([^)]+)\)",page.read_text()):

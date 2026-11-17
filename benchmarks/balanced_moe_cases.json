@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "description": "Initial BalancedMoE qualification workloads, not kernel legality or dispatch rules",
+  "token_counts": [128, 512, 2000],
+  "cases": [
+    {"id": "d384_e24_k6_h128", "d_model": 384, "num_shared_experts": 1, "shared_hidden_dim": 256, "num_experts": 24, "top_k": 6, "expert_hidden_dim": 128},
+    {"id": "d384_e32_k4_h128", "d_model": 384, "num_shared_experts": 1, "shared_hidden_dim": 256, "num_experts": 32, "top_k": 4, "expert_hidden_dim": 128},
+    {"id": "d512_e64_k8_h128", "d_model": 512, "num_shared_experts": 1, "shared_hidden_dim": 384, "num_experts": 64, "top_k": 8, "expert_hidden_dim": 128},
+    {"id": "d768_e48_k6_h256", "d_model": 768, "num_shared_experts": 1, "shared_hidden_dim": 512, "num_experts": 48, "top_k": 6, "expert_hidden_dim": 256}
+  ]
+}

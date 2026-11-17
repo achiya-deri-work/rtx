@@ -5,6 +5,40 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Move bound BalancedMoE expert allocation/views outside the launch-only
+  mutation op, with typed liveness-planned scratch and immutable backward
+  selections. Transition real-input first-hit tuning to an ordinary compiled
+  hot path. Add autotunable original-token input quantization/reuse and compact
+  capacity seeds that preserve aligned dW TMA stores; report host, GPU and
+  measured traffic effects separately.
+
+- Add experimental `BalancedRouter`: FP32 sigmoid affinities, native saved-state
+  Sinkhorn forward/backward, detached GPU-controlled fixed-K QB/repair and
+  differentiable mixture weights. Preserve dummy padding and exact scheduled
+  capacity without a caller workspace/prepare API. CuTe radix/direct quota and
+  quantile kernels use cuda-python graph control, not NVCC/CUB production builds.
+  Integrate bounded shared UCB tuning, residual journals and revision-safe
+  first-hit winners.
+
+- Add experimental MXFP8 `BalancedMoE`, separate optimizer-visible expert banks,
+  one ordinary shared SwiGLU, grouped forward/recomputed backward and a real
+  H=128 on-chip MXFP8 hidden handoff with autotunable down buffering. Integrate
+  shared UCB/residual/winner infrastructure, first-hit fullgraph checks and
+  independent numerical/memory tests. Expert performance is not yet competitive
+  with compiled batched BF16; NVFP4 experts remain out of scope.
+
+- Add quantize-once grouped MXFP8 experts with fused multi-operand preparation,
+  coalesced logical-transpose quantization, native-scale TMA candidates and
+  optional joint hidden/both-gradient-orientation recomputation. Keep all
+  implementation families in shared UCB tuning, with a stage-aware local arm,
+  independent numerical gates after fast replay, and bounded automatic scratch.
+  Add independently selectable cooperative operand loads, asynchronous batched
+  BF16 TMA output stores and expert-local physical capacity padding; preserve
+  progressive 8-to-16-trial resumption. Start new MoE schedules from prepared
+  execution instead of the slower initial fused-quantization baseline.
+  Expose batch-aware quantizer grids with exact-byte equivalence tests; retain
+  standalone-grid scheduling when it measures faster.
+
 - Add `VirtualLayer`: named, independent 2D projection Parameters for Muon,
   backed by a contiguous physical allocation and a differentiable zero-copy
   packed view. Support QKV, SwiGLU gate/up and expert-bank layouts, fullgraph compilation,

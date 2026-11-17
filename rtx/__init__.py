@@ -5,6 +5,11 @@ from ._version import __version__
 
 _LAZY_EXPORTS = {
     "VirtualLayer": ("virtual", "VirtualLayer"),
+    "BalancedRouter": ("routing", "BalancedRouter"),
+    "BalancedMoE": ("moe", "BalancedMoE"),
+    "MXFP8MoEConfig": ("moe", "MXFP8MoEConfig"),
+    "MXFP8PreparedMoEConfig": ("configs.moe", "MXFP8PreparedMoEConfig"),
+    "mxfp8_routed_experts": ("moe", "mxfp8_routed_experts"),
     "WorkspacePolicy": ("workspace", "WorkspacePolicy"),
     "ExecutionResources": ("execution", "ExecutionResources"),
     "configure_workspace": ("workspace", "configure_workspace"),

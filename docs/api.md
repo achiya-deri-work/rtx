@@ -18,6 +18,9 @@ linear input or constructor combination.
 |---|---|
 | `MXFP8Linear`, `mxfp8_linear` | Dynamic/AOT-weight/fully packed MXFP8; [guide](mxfp8_linear.md) |
 | `VirtualLayer` | Separate logical 2D Parameters over one zero-copy packed weight; [guide](virtual_layers.md) |
+| `BalancedRouter` | Experimental fixed-K/equal-capacity routing metadata, not expert execution; [guide](balanced_router.md) |
+| `BalancedMoE`, `mxfp8_routed_experts` | Experimental MXFP8 fine-grained/shared SwiGLU with fully recomputed experts; [guide](balanced_moe.md) |
+| `MXFP8MoEConfig`, `MXFP8PreparedMoEConfig` | Independent expert execution, preparation and transport schedules |
 | `NVFP4Linear`, `nvfp4_linear` | NVFP4 forward, MXFP8 backward; [guide](nvfp4_linear.md) |
 | `quantize_mxfp8`, `quantize_nvfp4` | Explicit BF16-to-packed conversion; [formats](formats.md) |
 | `convert_to_mxfp8_training`, `convert_to_nvfp4_training` | Preserve BF16 parameters while replacing linears |
@@ -50,6 +53,8 @@ training precision policy or run inside compiled forwards.
 | `MXFP8Linear`, `NVFP4Linear` | Environment override, otherwise balanced | Forward/backward and operand states have separate contexts |
 | `MXFP8GLU` | Off | Opt-in balanced; forward only, configured backend |
 | `MXFP8MLP` | Off | Opt-in balanced; automatic selection requires MXFP8 precision |
+| `BalancedRouter` | Balanced unless a config is explicit | Training/inference routing contexts; joint forward/backward execution search |
+| `BalancedMoE` | Balanced unless an expert config is explicit | Separate whole-routed-expert, router and shared contexts; MXFP8 only |
 
 Use [first-hit autotuning](first_hit_autotuning.md) for the example and effort
 ladder. `reuse`/`refine` are `cache_behavior` policy values, not `autotune`

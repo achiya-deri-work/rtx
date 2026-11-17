@@ -153,6 +153,13 @@ class MXFP8LinearFwdKernel:
         self.nvfp4 = nvfp4
         self.glu = False
         self.a_prequantized = False
+        # Optional uniform expert batch. Ordinary linears retain the identical
+        # rank-two path; grouped launchers set these immutable fields before
+        # compilation. Batch coordinates are descriptor modes, not extra GEMMs
+        # launched from Python, and a TMA tail cannot cross expert boundaries.
+        self.batch_count = 1
+        self.batch_out_shape = (problem.m, problem.n)
+        self.batch_aux_shape = None
         self.full_scalar_tiles = (
             config.scalar_bounds == "auto" and config.load_engine == "scalar"
             and a_orientation == "row" and b_orientation == "row"
@@ -522,6 +529,18 @@ class MXFP8LinearFwdKernel:
                     stride=(1, self.problem.n),
                 ),
             )
+        if cutlass.const_expr(self.batch_count > 1):
+            a_k = self.problem.storage_k if self.a_prequantized else self.problem.k
+            a_layout = cute.make_layout((self.problem.m, a_k), stride=(a_k, 1))
+            if cutlass.const_expr(self.a_orientation == "transpose"):
+                a_layout = cute.make_layout((self.problem.m, self.problem.k), stride=(1, self.problem.m))
+            b_layout = weight.layout
+            if cutlass.const_expr(not self.glu and self.b_orientation == "row"):
+                b_layout = cute.make_layout((self.problem.n, self.problem.k), stride=(self.problem.k, 1))
+            x = cute.make_tensor(x.iterator, cute.append(a_layout,
+                cute.make_layout(self.batch_count, stride=self.problem.m*a_k)))
+            weight = cute.make_tensor(weight.iterator, cute.append(b_layout,
+                cute.make_layout(self.batch_count, stride=self.problem.n*self.problem.k)))
         # Layout/MMA objects are IR values and must be constructed while CuTe is
         # tracing this JIT entry point (not in the plain-Python constructor).
         self._setup_static_layouts()
@@ -533,18 +552,20 @@ class MXFP8LinearFwdKernel:
         bf16_b_stage_layout = cute.slice_(
             self.bf16_b_smem_layout, (None, None, 0)
         )
-        tma_atom_x, tma_tensor_x = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(),
-            x,
-            bf16_a_stage_layout,
-            (cfg.tile_m, cfg.bf16_tile_k),
-        )
-        tma_atom_weight, tma_tensor_weight = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(),
-            weight,
-            bf16_b_stage_layout,
-            (cfg.tile_n, cfg.bf16_tile_k),
-        )
+        if cutlass.const_expr(cfg.load_engine == "tma"):
+            tma_atom_x, tma_tensor_x = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(), x, bf16_a_stage_layout,
+                (cfg.tile_m, cfg.bf16_tile_k))
+            tma_atom_weight, tma_tensor_weight = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(), weight, bf16_b_stage_layout,
+                (cfg.tile_n, cfg.bf16_tile_k))
+        else:
+            # These arguments are dead in non-TMA mainloops. Do not impose
+            # tensor-map alignment/swizzle constraints on scalar/cp.async
+            # logical transpose views merely to construct unused descriptors.
+            tma_atom_x = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16)
+            tma_atom_weight = tma_atom_x
+            tma_tensor_x, tma_tensor_weight = x, weight
         out_stage_layout = cute.slice_(
             self.out_smem_layout, (None, None, 0)
         )
@@ -556,12 +577,12 @@ class MXFP8LinearFwdKernel:
                         self.problem.m*(self.problem.n//2 if self.glu_tma_store else self.problem.n)),
             ),
         )
-        tma_atom_out, tma_tensor_out = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
-            out_tma_view,
-            out_stage_layout,
-            (cfg.tile_m, cfg.tile_n//2 if self.glu_tma_store else cfg.tile_n),
-        )
+        if cutlass.const_expr(cfg.epilogue == "tma" or self.glu_tma_store):
+            tma_atom_out, tma_tensor_out = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(), out_tma_view, out_stage_layout,
+                (cfg.tile_m, cfg.tile_n//2 if self.glu_tma_store else cfg.tile_n))
+        else:
+            tma_atom_out, tma_tensor_out = tma_atom_x, out_tma_view
         cp_async_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
             BFloat16,
@@ -752,7 +773,7 @@ class MXFP8LinearFwdKernel:
         # compile-time schedule choices without padding the edge group.
         m_tiles = (self.problem.m + cfg.tile_m - 1) // cfg.tile_m
         n_tiles = (self.problem.n + cfg.tile_n - 1) // cfg.tile_n
-        grid = (self.grid_ctas, 1, 1)
+        grid = (self.grid_ctas, 1, self.batch_count)
         kernel = self.kernel(
             x,
             weight,
@@ -1026,6 +1047,18 @@ class MXFP8LinearFwdKernel:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane_idx = cute.arch.lane_idx()
         linear_tile, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.batch_count > 1):
+            _, _, expert = cute.arch.block_idx()
+            x = x[None, None, expert]
+            weight = weight[None, None, expert]
+            tma_tensor_x = tma_tensor_x[None, None, expert]
+            tma_tensor_weight = tma_tensor_weight[None, None, expert]
+            out = cute.make_tensor(out.iterator + expert*math.prod(self.batch_out_shape),
+                cute.make_layout(self.batch_out_shape, stride=(self.batch_out_shape[1], 1)))
+            if cutlass.const_expr(self.batch_aux_shape is not None):
+                x_tensor_scale = cute.make_tensor(
+                    x_tensor_scale.iterator + expert*math.prod(self.batch_aux_shape),
+                    cute.make_layout(self.batch_aux_shape, stride=(self.batch_aux_shape[1], 1)))
         m_tiles = cute.ceil_div(self.problem.m, cfg.tile_m)
         n_tiles = cute.ceil_div(self.problem.n, cfg.tile_n)
         output_scale = Float32(1.0)

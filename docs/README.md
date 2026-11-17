@@ -39,13 +39,27 @@ are separate choices.
 - [MXFP8MLP](mxfp8_mlp.md): packed hidden connection with recomputed backward.
 - [NVFP4MLP](nvfp4_mlp.md): on-chip FP32 SiTU, NVFP4 forward and recomputed
   MXFP8 backward; packed MXFP8 hidden storage by default, BF16 optional.
+- [BalancedRouter](balanced_router.md): experimental fixed-K/equal-capacity
+  routing; CuTe saved-state Sinkhorn and detached GPU QB/repair, with bounded
+  shared first-hit autotuning.
+- [BalancedMoE](balanced_moe.md): experimental MXFP8 routed/shared SwiGLU,
+  prepared/staged/on-chip expert families and recomputed backward; performance work remains.
 
-These default to tuning off, with opt-in first-hit selection. They remain explicit
+The GLU/MLP APIs default to tuning off, with opt-in first-hit selection. Feature APIs remain explicit
 imports, outside the stable wildcard surface. The optional packed-down MLP
 singleton failure is recorded in [numerical qualification](mxfp8_mlp_numerics.md).
 
 ## Development and evidence
 
+- [BalancedMoE measured fixes](balanced_moe_fixes_20261117.md): compiler-visible
+  expert storage, quantize-once input reuse and bounded compact-capacity search.
+- [BalancedMoE profiling](balanced_moe_profile_20261117.md): per-launch timing,
+  measured DRAM/L2/occupancy, token scaling, graph dispatch and pipeline A/Bs.
+- [BalancedMoE speed study](balanced_moe_speedup_20261115.md): expert/whole-layer
+  results, autotunable preparation/transport/output stores, and remaining BF16 gaps.
+
+- [BalancedMoE design](balanced_moe_design.md): fixed-K/equal-capacity routing,
+  packed expert banks, implemented MXFP8 families and remaining execution plan.
 - [Consolidated NVFP4 backward/training research](nvfp4_research.md): retained
   experiments, model-context scheduling, training tools and qualification limits.
 - [Development](development.md), [autotuner framework](../rtx/autotune/README.md),

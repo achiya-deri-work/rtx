@@ -25,6 +25,111 @@ class VirtualLayer(nn.Module):
     def extra_repr(self)
 ```
 
+## `rtx.BalancedRouter`
+
+Explicit feature/compatibility export; provider `rtx.routing.BalancedRouter`.
+
+[Source](../rtx/routing.py)
+
+FP32 sigmoid affinities -> Sinkhorn -> detached QB/repair -> soft weights.
+
+```python
+class BalancedRouter(nn.Module):
+    def __init__(self, d_model: int, num_experts: int, *, top_k: int=8, router_dim: int=64, sinkhorn_iterations: int=5, dual_iterations: int=5, repair_rounds: int=64, rms_epsilon: float=1e-06, padding: str='minimal', backend: str='auto', sinkhorn_config: SinkhornKernelConfig | None=None, config: RoutingKernelConfig | None=None, autotune: str | None=None, tuning_policy=None, autotune_cache_dir=None, device=None, dtype=torch.bfloat16)
+    def reset_parameters(self)
+    def log_affinities(self, x)
+    def transport(self, x)
+    def autotune_(self, x, *, tuning_policy=None, output_dir=None, phase='train', progress=None)
+    def forward(self, x)
+    def extra_repr(self)
+```
+
+## `rtx.BalancedMoE`
+
+Explicit feature/compatibility export; provider `rtx.moe.BalancedMoE`.
+
+[Source](../rtx/moe.py)
+
+Experimental balanced MXFP8 SwiGLU experts plus ordinary shared SwiGLU.
+
+```python
+class BalancedMoE(nn.Module):
+    def __init__(self, d_model, num_experts, expert_hidden_features, *, top_k, shared_hidden_features, num_shared_experts=1, router_dim=64, config=None, backend='mxfp8', autotune=None, shared_config=None, tuning_policy=None, autotune_cache_dir=None, router_options=None, device=None, dtype=torch.bfloat16)
+    def reset_expert_parameters(self)
+    def forward(self, x)
+    def autotune_experts_(self, x, *, route=None, phase='train', tuning_policy=None, output_dir=None, progress=None)
+```
+
+## `rtx.MXFP8MoEConfig`
+
+Explicit feature/compatibility export; provider `rtx.moe.MXFP8MoEConfig`.
+
+[Source](../rtx/moe.py)
+
+Independent expert GEMM and movement schedules; not a routing policy.
+
+```python
+class MXFP8MoEConfig:
+    gate_up: MXFP8GLUConfig = field(default_factory=_gate_default)
+    down: MXFP8FwdConfig = field(default_factory=_linear_default)
+    recompute: MXFP8GLUConfig = field(default_factory=_gate_default)
+    down_dx: MXFP8FwdConfig = field(default_factory=_linear_default)
+    down_dw: MXFP8FwdConfig = field(default_factory=_linear_default)
+    gate_dx: MXFP8FwdConfig = field(default_factory=_linear_default)
+    gate_dw: MXFP8FwdConfig = field(default_factory=_linear_default)
+    movement_threads: int = 128
+    gather_mode: str = 'warp'
+    family: str = 'grouped_prepared'
+    onchip_down_stages: int = 1
+    onchip_pipeline: str = 'serial'
+    prepared: MXFP8PreparedMoEConfig = field(default_factory=MXFP8PreparedMoEConfig)
+    def to_dict(self)
+    def from_dict(cls, values)
+```
+
+## `rtx.MXFP8PreparedMoEConfig`
+
+Explicit feature/compatibility export; provider `rtx.configs.moe.MXFP8PreparedMoEConfig`.
+
+[Source](../rtx/configs/moe.py)
+
+```python
+class MXFP8PreparedMoEConfig:
+    quant: MXFP8QuantConfig = field(default_factory=_quant)
+    gate_up: MXFP8GLUGemmConfig = field(default_factory=_glu)
+    down: MXFP8GemmConfig = field(default_factory=_linear)
+    recompute: MXFP8GLUGemmConfig = field(default_factory=_glu)
+    down_dx: MXFP8GemmConfig = field(default_factory=_linear)
+    down_dw: MXFP8GemmConfig = field(default_factory=_linear)
+    gate_dx: MXFP8GemmConfig = field(default_factory=_linear)
+    gate_dw: MXFP8GemmConfig = field(default_factory=_linear)
+    transpose_mode: str = 'staged'
+    backward_preparation: str = 'separate'
+    transports: tuple[str, ...] = ('tma',) * 7
+    capacity_multiple: int = 1
+    quant_grid: str = 'operand'
+    input_preparation: str = 'gather_bf16'
+    def schedules(self)
+    def to_dict(self)
+    def physical_capacity(self, logical)
+    def with_transport(self, stage, transport)
+    def with_scale_layout(self, layout)
+    def from_dict(cls, values)
+    def rejection(self, problems, phase='train')
+```
+
+## `rtx.mxfp8_routed_experts`
+
+Explicit feature/compatibility export; provider `rtx.moe.mxfp8_routed_experts`.
+
+[Source](../rtx/moe.py)
+
+Experimental routed SwiGLU sum in FP32, ready for shared addition.
+
+```python
+mxfp8_routed_experts(x, gate_up_weight, down_weight, route, *, config=DEFAULT_MOE_CONFIG, autotune='off', tuning_policy=None, autotune_cache_dir=None)
+```
+
 ## `rtx.WorkspacePolicy`
 
 Stable runtime export; provider `rtx.workspace.WorkspacePolicy`.

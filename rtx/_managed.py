@@ -211,7 +211,8 @@ def install():
             result = post_compile(compiled, *args, **kwargs)
             source = getattr(compiled, 'source_code', '') or ''
             target = compiled.current_callable
-            if (target is not None and ('_rtx_' in source or 'torch.ops.rtx.' in source)
+            if (target is not None and ('_rtx_' in source or 'torch.ops.rtx.' in source
+                                       or 'torch.ops.rtx_routing.' in source)
                     and not getattr(target, '_rtx_compiled_resources', False)):
                 owner = ManagedResources()
 

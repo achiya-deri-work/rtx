@@ -47,6 +47,10 @@ dependencies are listed under the `vision` extra in `pyproject.toml`; they are
 not required for linear execution. Benchmarks, docs, tests and manifests live
 in the checkout and are not installed as Python runtime packages in the wheel.
 
+The experimental [BalancedRouter](balanced_router.md) uses CUDA Python graph
+APIs qualified with `cuda-python==13.3.1`. Install `.[routing]` to ensure those
+bindings. Its production kernels are CuTe DSL; they require no NVCC/CCCL build.
+
 ## Verify before tuning
 
 ```bash

@@ -77,6 +77,9 @@ class MXFP8GemmKernel:
         self.glu_tma_store = False
         self.glu_store_stages = 1
         self.glu_interleaved_operands = False
+        self.batch_count = 1
+        self.batch_output_shape = None
+        self.batch_extra_shape = None
         self.glu_scratch_elems = 0
         self.sf_dtype = Float8E8M0FNU
         self.sf_vec_size = SF_VEC_SIZE
@@ -579,6 +582,13 @@ class MXFP8GemmKernel:
             sw = cute.make_tensor(sw.iterator, cute.make_layout(
                 ((2, hidden_rows), self.problem.k // self.sf_vec_size),
                 stride=((hidden_rows * (self.problem.k // self.sf_vec_size), self.problem.k // self.sf_vec_size), 1)))
+        if cutlass.const_expr(self.batch_count > 1):
+            qx=cute.make_tensor(qx.iterator,cute.make_layout(
+                (self.problem.m,self.problem.k,self.batch_count),
+                stride=(self.problem.k,1,self.problem.m*self.problem.k)))
+            qw=cute.make_tensor(qw.iterator,cute.make_layout(
+                (self.problem.n,self.problem.k,self.batch_count),
+                stride=(self.problem.k,1,self.problem.n*self.problem.k)))
         self._setup_static_layouts()
         cfg = self.config
         tma_x, tma_x_tensor = cpasync.make_tiled_tma_atom(
@@ -611,7 +621,7 @@ class MXFP8GemmKernel:
             out_view = cute.make_tensor(
                 out.iterator,
                 cute.make_layout(
-                    (self.problem.m, self.problem.n//2 if self.glu_tma_store else self.problem.n, 1),
+                    (self.problem.m, self.problem.n//2 if self.glu_tma_store else self.problem.n, self.batch_count),
                     stride=(self.problem.n//2 if self.glu_tma_store else self.problem.n, 1,
                             self.problem.m*(self.problem.n//2 if self.glu_tma_store else self.problem.n)),
                 ),
@@ -712,6 +722,13 @@ class MXFP8GemmKernel:
                 sw.iterator,
                 cute.make_layout((cute.size(sw),), stride=(1,)),
             )
+            if cutlass.const_expr(self.batch_count > 1):
+                a_count=self.problem.m*self.problem.k//self.sf_vec_size
+                b_count=self.problem.n*self.problem.k//self.sf_vec_size
+                sx_flat=cute.make_tensor(sx.iterator,cute.make_layout(
+                    (a_count,self.batch_count),stride=(1,a_count)))
+                sw_flat=cute.make_tensor(sw.iterator,cute.make_layout(
+                    (b_count,self.batch_count),stride=(1,b_count)))
             tma_sx, tma_sx_tensor = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileG2SOp(),
                 sx_flat,
@@ -735,7 +752,7 @@ class MXFP8GemmKernel:
             )
             if cutlass.const_expr(self.cluster_output):
                 launch.launch(
-                    grid=(self.grid_ctas, 1, 1),
+                    grid=(self.grid_ctas, 1, self.batch_count),
                     block=(cfg.num_threads, 1, 1),
                     cluster=(self.split_reduction, 1, 1),
                     stream=stream,
@@ -743,7 +760,7 @@ class MXFP8GemmKernel:
                 )
             else:
                 launch.launch(
-                    grid=(self.grid_ctas, 1, 1),
+                    grid=(self.grid_ctas, 1, self.batch_count),
                     block=(cfg.num_threads, 1, 1),
                     stream=stream,
                     use_pdl=self.use_pdl,
@@ -761,7 +778,7 @@ class MXFP8GemmKernel:
             )
             if cutlass.const_expr(self.cluster_output):
                 launch.launch(
-                    grid=(self.grid_ctas, 1, 1),
+                    grid=(self.grid_ctas, 1, self.batch_count),
                     block=(cfg.num_threads, 1, 1),
                     cluster=(self.split_reduction, 1, 1),
                     stream=stream,
@@ -769,7 +786,7 @@ class MXFP8GemmKernel:
                 )
             else:
                 launch.launch(
-                    grid=(self.grid_ctas, 1, 1),
+                    grid=(self.grid_ctas, 1, self.batch_count),
                     block=(cfg.num_threads, 1, 1),
                     stream=stream,
                     use_pdl=self.use_pdl,
@@ -805,6 +822,26 @@ class MXFP8GemmKernel:
         out_layout: cute.ComposedLayout,
     ):
         cfg = self.config
+        expert=Int32(0)
+        if cutlass.const_expr(self.batch_count > 1):
+            _,_,expert=cute.arch.block_idx()
+            qx,qw=qx[None,None,expert],qw[None,None,expert]
+            tma_x_tensor=tma_x_tensor[None,None,expert]
+            tma_w_tensor=tma_w_tensor[None,None,expert]
+            if cutlass.const_expr(cfg.scale_role=='tma'):
+                tma_sx_tensor=tma_sx_tensor[None,expert]
+                tma_sw_tensor=tma_sw_tensor[None,expert]
+            blocks=self.problem.k//self.sf_vec_size
+            sx=cute.make_tensor(sx.iterator+expert*self.problem.m*blocks,
+                cute.make_layout((self.problem.m,blocks),stride=(blocks,1)))
+            sw=cute.make_tensor(sw.iterator+expert*self.problem.n*blocks,
+                cute.make_layout((self.problem.n,blocks),stride=(blocks,1)))
+            out=cute.make_tensor(out.iterator+expert*self.batch_output_shape[0]*self.batch_output_shape[1],
+                cute.make_layout(self.batch_output_shape,stride=(self.batch_output_shape[1],1)))
+            if cutlass.const_expr(self.batch_extra_shape is not None):
+                output_scale=cute.make_tensor(output_scale.iterator+
+                    expert*self.batch_extra_shape[0]*self.batch_extra_shape[1],
+                    cute.make_layout(self.batch_extra_shape,stride=(self.batch_extra_shape[1],1)))
         if cutlass.const_expr(self.cooperative_quant):
             self._cooperative_quantize(qx,qw,sx,sw,output_scale)
             output_scale=output_scale[0]
@@ -1305,7 +1342,7 @@ class MXFP8GemmKernel:
                     tma_out_tensor,
                     (cfg.tile_m, cfg.tile_n),
                     (None, None, None),
-                )[(None, None, block_m, block_n, 0)]
+                )[(None, None, block_m, block_n, expert)]
                 g_out_tma = cute.zipped_divide(
                     g_out_tma, (cfg.tile_m, cfg.tile_n)
                 )

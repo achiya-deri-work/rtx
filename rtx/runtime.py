@@ -419,7 +419,7 @@ def clear_runtime_caches(*, synchronize: bool = True, device=None,
             for index in range(torch.cuda.device_count()):
                 torch.cuda.synchronize(index)
     released: dict[str, object] = {}
-    for module_name in ("fp8", "fp8_bwd", "fp4", "glu", "mlp", "fp4_mlp"):
+    for module_name in ("fp8", "fp8_bwd", "fp4", "glu", "mlp", "fp4_mlp", "routing", "autotune.moe"):
         module = import_module(f".{module_name}", __package__)
         clear = getattr(module, "_clear_runtime_caches", None)
         if clear is not None:
@@ -442,7 +442,8 @@ def runtime_cache_stats() -> dict[str, dict[str, object]]:
     import sys
     result = {}
     for name in ('fp8', 'fp8_bwd', 'fp4', 'glu', 'mlp', '_mlp_autotune',
-                 'fp4_mlp', '_nvfp4_mlp_autotune'):
+                 'fp4_mlp', '_nvfp4_mlp_autotune', '_routing_hard', '_routing_autotune',
+                 '_moe_execution'):
         module = sys.modules.get(f'rtx.{name}')
         if module is not None:
             for key, value in tuple(vars(module).items()):

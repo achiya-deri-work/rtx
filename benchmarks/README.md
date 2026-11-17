@@ -15,6 +15,10 @@ not a performance or convergence claim.
 | `run_decoder_four_mode.sh` | Exact 460.8M-token four-mode release convergence/runtime launcher |
 | `run_decoder_batch64_autotune.sh` | Two bounded 12-minute searches plus verification, winner installation, and batch-24/64 model races |
 | `benchmark_mxfp8_frontend.py` | End-to-end `torch.compile` MXFP8 frontend benchmark |
+| `benchmark_balanced_moe.py` | Correctness-gated whole routed-expert tuning versus batched compiled BF16; optional same-CuTe-router complete-layer comparison, no NVFP4 |
+| `profile_moe.py` / `run_moe_profile_study.py` | Frozen-schedule MoE phases, token scaling, host versus graph timing, real-route profiler fixtures and controlled structural A/Bs |
+| `analyze_moe_profile.py` | CPU-only correlated Torch/Systems timelines, Compute counters and ordinary timing/variant CSV exports; [diagnosis and reproduction](../docs/balanced_moe_profile_20261117.md) |
+| `benchmark_moe_execution.py` / `benchmark_moe_input_reuse.py` | Matched-source ABBA compiled-host versus outer-graph latency, independent gradient checks and quantize-once traffic A/Bs; [measured fixes](../docs/balanced_moe_fixes_20261117.md) |
 | `benchmark_nvfp4_end_to_end.py` | Production backend paired forward-plus-MXFP8-backward layer benchmark |
 | `benchmark_nvfp4_frontend.py` | Paired fullgraph dynamic-forward latency and normalized numerical-error comparison against MXFP8 |
 | `validate_nvfp4_convergence.py` | Controlled BF16/current/rowwise-JIT/delayed/exact scale-policy convergence study |
@@ -203,3 +207,40 @@ per-kernel CPU/CUDA breakdown while investigating launch overhead.
 
 Use `benchmark_mxfp8_bwd.py --reuse-sweep` for paired races across the legal
 128x256 and 256x128 dW reuse basins, BF16 stage counts, and register budgets.
+
+## Balanced routing
+
+For expert preparation attribution, `benchmark_moe_prepared.py` compares the
+previous selected configuration, quantize-once execution, and compiled batched
+BF16 with identical routes. `--joint-backward`, `--native-scales`,
+`--transpose-mode`, `--glu-quant-vec`, `--linear-transport`,
+`--weight-epilogue`, and `--all-tma-outputs` expose implementation A/Bs, not hidden
+runtime dispatch overrides. `benchmark_balanced_moe.py --whole-layer` includes
+the router/shared path; tune those with `--auxiliary-effort` or freeze exact
+matching configs with `--auxiliary-study`. `--config-study` carries forward a
+verified expert seed instead of restarting each optimization wave from defaults.
+Do not present expert-only forward wins as complete training-step wins.
+
+`benchmark_balanced_router.py` measures warmed CUDA-graph phase timings and
+whole forward/backward, optionally running bounded shared tuning with
+`--tune quick|balanced|thorough|extensive`. `qualify_balanced_router.py` performs
+alternating same-input A/B qualification of the resulting configs, retaining
+unstable results rather than promoting them. See
+[the router guide](../docs/balanced_router.md). Optional CUDA/CUB reference
+sources are isolated in [routing_reference](routing_reference/README.md), never
+imported by production RTX.
+
+`compare_balanced_router_torch.py` compares against BiMoE's unchanged standalone
+`router.py`, selecting its Torch Sinkhorn5/QB5/fixed-repair64 path. Both sides
+use fullgraph compilation and CUDA graph replay; inference and training have
+separate bounded autotuning contexts. Exact metadata and every gradient are
+checked before alternating measurements. For example:
+
+```bash
+PYTHONPATH=. python benchmarks/compare_balanced_router_torch.py \
+  --baseline-source /path/to/BiMoE/bidirectional_mixture_of_experts/router.py \
+  --output autotune_reports/balanced_router_vs_torch/results.json
+```
+
+Add `--cases benchmarks/balanced_moe_cases.json` for the initial 12-case
+BalancedMoE suite. This driver measures routing only, not shared/expert FFNs.

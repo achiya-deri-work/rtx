@@ -392,6 +392,14 @@ class MXFP8FwdConfig:
         if self.schedule == "three_role" and self.quantizer_warps % 4:
             return "three-role quantizers must occupy complete warpgroups"
         if self.schedule in ("warp_specialized", "three_role"):
+            requested_registers = 32 * (
+                self.num_mma_warps * self.consumer_registers
+                + self.producer_warps * self.producer_registers
+                + (self.quantizer_warps * self.quantizer_registers
+                   if self.schedule == "three_role" else 0)
+            )
+            if requested_registers > 65536:
+                return "setmaxregister role budgets exceed the SM120 per-CTA register file"
             # A decrease cannot request more registers than the initial CTA
             # allocation can possibly supply. The 800-thread/96-register
             # quantizer case faults with cudaErrorIllegalInstruction on SM120.

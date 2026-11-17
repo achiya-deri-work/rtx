@@ -134,6 +134,12 @@ class GLURecomputeDerivative(MXFP8GLUKernel):
         BF16 hidden tensor is written to GMEM by this path.
         """
         cfg=self.config
+        # The grouped joint-preparation path also needs the forward-oriented
+        # bytes for reconstructing expert outputs and routing-weight gradients.
+        # Emit those exact converter results, not a BF16 decode/requantization.
+        if cutlass.const_expr(getattr(self,'emit_forward_hidden_quant',False)):
+            forward_quant,forward_scales=quantized[1],quantized[2]
+            quantized=quantized[0]
         width=cfg.tile_n//2
         iterations=cute.ceil_div(cfg.tile_m*width,cfg.num_threads*cfg.glu_quant_vec)
         rounded_values=cute.make_rmem_tensor((iterations*cfg.glu_quant_vec,),BFloat16)
@@ -158,6 +164,12 @@ class GLURecomputeDerivative(MXFP8GLUKernel):
                 packed=nvvm.inline_ptx_hl(
                     "cvt.rn.satfinite.e4m3x2.f32 {$w0}, {$r0}, {$r1};",
                     write_only_types=[Int16],read_only_args=[values[v1]*inv,values[v0]*inv])
+                if cutlass.const_expr(getattr(self,'emit_forward_hidden_quant',False)):
+                    if row<cfg.tile_m and gr<self.problem.m and gc+v0<self.problem.n//2:
+                        for half in cutlass.range_constexpr(min(2,cfg.glu_quant_vec)):
+                            forward_quant[gr,gc+v0+half]=Uint8(packed>>(8*half)).bitcast(Float8E4M3FN)
+                        if pair==0 and cute.arch.lane_idx()%(32//cfg.glu_quant_vec)==0:
+                            forward_scales[gr,gc//32]=scale
                 for half in cutlass.range_constexpr(min(2,cfg.glu_quant_vec)):
                     rounded=Uint8(packed>>(8*half)).bitcast(Float8E4M3FN)
                     rounded_values[i*cfg.glu_quant_vec+v0+half]=BFloat16(Float32(rounded)*Float32(scale))
