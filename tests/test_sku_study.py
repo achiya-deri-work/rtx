@@ -71,6 +71,10 @@ class SKUStudyTests(unittest.TestCase):
             self.assertEqual(len(report["winner_transfer"]), 2)
             self.assertTrue((root / "report/study.json").is_file())
             self.assertTrue((root / "report/study.md").is_file())
+            markdown=(root / "report/study.md").read_text()
+            self.assertIn("2 SKU profile(s)",markdown)
+            self.assertIn("| small_gpu | 40 | n/a | n/a | n/a | n/a | n/a |",markdown)
+            self.assertNotIn("Only three SKUs",markdown)
 
 
 if __name__ == "__main__":

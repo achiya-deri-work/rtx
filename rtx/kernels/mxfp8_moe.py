@@ -91,11 +91,13 @@ def compile_grouped_glu(experts, problem, config, derivative=False):
 
 
 class RoutedMovement:
-    def __init__(self, n, d, e, c, k, threads, kind, gather_mode='flat',storage_c=0):
+    def __init__(self, n, d, e, c, k, threads, kind, gather_mode='flat',storage_c=0,
+                 mask_invalid_extra=False):
         self.n,self.d,self.e,self.c,self.k = n,d,e,c,k
         self.threads,self.kind = threads,kind
         self.gather_mode=gather_mode
         self.storage_c=storage_c or c
+        self.mask_invalid_extra=mask_invalid_extra
 
     @cute.jit
     def __call__(self, source, ids, inverse, weights, extra, out, auxiliary, stream):
@@ -182,7 +184,12 @@ class RoutedMovement:
                     if cutlass.const_expr(self.kind!='route_grad'):
                         out[slot,col] = BFloat16(dy*weight)
                     if cutlass.const_expr(self.kind!='slot_dy'):
-                        total += dy*Float32(extra[slot,col])
+                        if cutlass.const_expr(not self.mask_invalid_extra):
+                            total += dy*Float32(extra[slot,col])
+                        elif valid!=0:
+                            # An invalid slot may name an uncomputed GEMM row.
+                            # Multiplication by zero would still read its bytes.
+                            total += dy*Float32(extra[slot,col])
             for level in cutlass.range_constexpr(5):
                 total += cute.arch.shuffle_sync_bfly(total,16>>level)
             if cutlass.const_expr(self.kind!='slot_dy'):
@@ -191,7 +198,8 @@ class RoutedMovement:
 
 
 @lru_cache(maxsize=128)
-def compile_movement(n,d,e,c,k,threads,kind,gather_mode='flat',storage_c=0):
+def compile_movement(n,d,e,c,k,threads,kind,gather_mode='flat',storage_c=0,
+                     mask_invalid_extra=False):
     if threads not in (64,128,256,512) or kind not in ('gather','combine','dx','slot_grad','slot_dy','route_grad'):
         raise ValueError('Invalid grouped movement configuration')
     if gather_mode not in ('flat','warp'):raise ValueError('Unknown gather ownership')
@@ -206,6 +214,6 @@ def compile_movement(n,d,e,c,k,threads,kind,gather_mode='flat',storage_c=0):
                 n if kind in ('combine','dx') else e*cs,d)
     aux = _fake(Float32,e,c)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    return cute.compile(RoutedMovement(n,d,e,c,k,threads,kind,gather_mode,cs),
+    return cute.compile(RoutedMovement(n,d,e,c,k,threads,kind,gather_mode,cs,mask_invalid_extra),
                         source,ids,inverse,weights,extra,out,aux,stream,
                         options='--enable-tvm-ffi --opt-level 3')

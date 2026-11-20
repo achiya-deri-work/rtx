@@ -149,7 +149,7 @@ class MXFP8GemmConfig:
     scale_layout: Literal[
         "row_major", "mma64", "mma128", "mma64x128"
     ] = "row_major"
-    epilogue: Literal["direct", "tma"] = "tma"
+    epilogue: Literal["direct", "tma", "hybrid"] = "tma"
     epilogue_stages: int = 1
     store_vec: int = 4
     maxrregcount: int = 255
@@ -295,8 +295,8 @@ class MXFP8GemmConfig:
                 and problem.k % 128 == 0
             ):
                 return "TMA scale transport requires a compatible native layout"
-        if self.epilogue not in ("direct", "tma"):
-            return "epilogue must be direct or tma"
+        if self.epilogue not in ("direct", "tma", "hybrid"):
+            return "epilogue must be direct, tma or hybrid"
         if self.epilogue_stages not in (1, 2, 3, 4):
             return "epilogue_stages must be one of 1, 2, 3, 4"
         if self.epilogue == "direct" and self.epilogue_stages != 1:
@@ -309,6 +309,13 @@ class MXFP8GemmConfig:
             problem.m % self.tile_m or problem.n % self.tile_n
         ):
             return "TMA epilogue requires full M/N tiles"
+        if self.epilogue == "hybrid":
+            if self.native_operand_bits != 8:
+                return "Hybrid output stores currently require MXFP8"
+            if problem.n % 8:
+                return "Hybrid TMA output requires a 16-byte-aligned BF16 row stride"
+            if problem.m < self.tile_m or problem.n < self.tile_n:
+                return "Hybrid output stores require at least one full interior tile"
         for label, registers in (
             ("producer", self.producer_registers),
             ("consumer", self.consumer_registers),
@@ -333,7 +340,7 @@ class MXFP8GemmConfig:
         ) * (self.tile_k // self.scale_vector_size)
         out_bytes = (
             self.epilogue_stages * self.tile_m * self.tile_n * 2
-            if self.epilogue == "tma"
+            if self.epilogue in ("tma", "hybrid")
             else 0
         )
         launch_bytes = (

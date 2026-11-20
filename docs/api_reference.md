@@ -35,12 +35,12 @@ FP32 sigmoid affinities -> Sinkhorn -> detached QB/repair -> soft weights.
 
 ```python
 class BalancedRouter(nn.Module):
-    def __init__(self, d_model: int, num_experts: int, *, top_k: int=8, router_dim: int=64, sinkhorn_iterations: int=5, dual_iterations: int=5, repair_rounds: int=64, rms_epsilon: float=1e-06, padding: str='minimal', backend: str='auto', sinkhorn_config: SinkhornKernelConfig | None=None, config: RoutingKernelConfig | None=None, autotune: str | None=None, tuning_policy=None, autotune_cache_dir=None, device=None, dtype=torch.bfloat16)
+    def __init__(self, d_model: int, num_experts: int, *, top_k: int=8, router_dim: int=64, sinkhorn_iterations: int=5, dual_iterations: int=5, repair_rounds: int=64, rms_epsilon: float=1e-06, padding: str='minimal', backend: str='auto', sinkhorn_config: SinkhornKernelConfig | None=None, config: RoutingKernelConfig | None=None, autotune: str | None=None, tuning_policy=None, autotune_cache_dir=None, affinity_layout: str='auto', device=None, dtype=torch.bfloat16)
     def reset_parameters(self)
     def log_affinities(self, x)
     def transport(self, x)
-    def autotune_(self, x, *, tuning_policy=None, output_dir=None, phase='train', progress=None)
-    def forward(self, x)
+    def autotune_(self, x, *, cu_seqlens=None, tuning_policy=None, output_dir=None, phase='train', progress=None)
+    def forward(self, x, *, cu_seqlens=None)
     def extra_repr(self)
 ```
 
@@ -56,8 +56,11 @@ Experimental balanced MXFP8 SwiGLU experts plus ordinary shared SwiGLU.
 class BalancedMoE(nn.Module):
     def __init__(self, d_model, num_experts, expert_hidden_features, *, top_k, shared_hidden_features, num_shared_experts=1, router_dim=64, config=None, backend='mxfp8', autotune=None, shared_config=None, tuning_policy=None, autotune_cache_dir=None, router_options=None, device=None, dtype=torch.bfloat16)
     def reset_expert_parameters(self)
-    def forward(self, x)
-    def autotune_experts_(self, x, *, route=None, phase='train', tuning_policy=None, output_dir=None, progress=None)
+    def reset_parameters(self)
+    def extra_repr(self)
+    def forward(self, x, *, cu_seqlens=None)
+    def autotune_(self, x, *, cu_seqlens=None, effort=None, tuning_policy=None, output_dir=None, phase='train')
+    def autotune_experts_(self, x, *, cu_seqlens=None, route=None, phase='train', tuning_policy=None, output_dir=None, progress=None)
 ```
 
 ## `rtx.MXFP8MoEConfig`
@@ -79,6 +82,12 @@ class MXFP8MoEConfig:
     gate_dw: MXFP8FwdConfig = field(default_factory=_linear_default)
     movement_threads: int = 128
     gather_mode: str = 'warp'
+    combine_reduce_engine: str = 'scalar'
+    dx_reduce_engine: str = 'scalar'
+    combine_vector_width: int = 4
+    dx_vector_width: int = 4
+    combine_lanes_per_token: int = 32
+    dx_lanes_per_token: int = 32
     family: str = 'grouped_prepared'
     onchip_down_stages: int = 1
     onchip_pipeline: str = 'serial'
@@ -109,12 +118,52 @@ class MXFP8PreparedMoEConfig:
     capacity_multiple: int = 1
     quant_grid: str = 'operand'
     input_preparation: str = 'gather_bf16'
+    transpose_warp_tokens: int = 8
+    transpose_warp_raster: str = 'features'
+    down_dw_splits: int = 1
+    gate_dw_splits: int = 1
+    dw_reduce_threads: int = 128
+    dw_reduce_vector: int = 4
+    route_gradient_epilogue: str = 'separate'
+    forward_engine: str = 'packed'
+    dy_preparation: str = 'materialized'
+    joint_recompute_engine: str = 'legacy'
+    active_prefix: bool = False
+    gate_dw_engine: str = 'packed'
+    down_dw_engine: str = 'packed'
+    gate_dw_reuse_axis: str = 'n'
+    down_dw_reuse_axis: str = 'n'
+    gate_dw_reuse_tiles: int = 2
+    down_dw_reuse_tiles: int = 2
+    indexed_dw_token_lanes: int = 8
+    indexed_dw_gather_pairs: int = 1
+    indexed_dw_producer_warps: int = 0
+    route_gradient_loader: str = 'accumulator'
+    route_gradient_gemm: MXFP8GemmConfig | None = None
+    joint_recompute_gradient_warps: int = 3
+    forward_glu_engine: str = 'legacy'
+    weight_preparation: str = 'separate'
+    weight_tile_rows: int = 32
+    weight_tile_cols: int = 64
+    weight_load_values: int = 4
+    weight_store_bits: int = 32
+    weight_warps: int = 4
+    weight_raster: str = 'features'
+    bounded_gather: bool = False
+    bounded_dy: bool = False
+    bounded_xt: bool = False
+    forward_row_layout: str = 'original'
+    compact_pool_count: int = 0
     def schedules(self)
     def to_dict(self)
     def physical_capacity(self, logical)
     def with_transport(self, stage, transport)
+    def with_short_dw(self, stage, tile_k)
     def with_scale_layout(self, layout)
     def from_dict(cls, values)
+    def active_prefix_rejection(self, phase='train')
+    def bounded_preparation_rejection(self, phase='train')
+    def compact_forward_rejection(self, shape)
     def rejection(self, problems, phase='train')
 ```
 
@@ -210,6 +259,8 @@ class AutotunePolicy:
     initial_neighborhood_trials: int = 0
     local_anchor_tolerance: float = 0.0
     prior_artifact: str | None = None
+    prior_search: str = 'hybrid'
+    region_coverage: bool = True
     predictor_artifact: str | None = None
     predictor_heads: tuple[str, ...] = ('residual', 'mlp')
     allow_research_prior: bool = False
@@ -991,7 +1042,7 @@ class MXFP8GemmConfig:
     scale_cache: Literal['default', 'ca', 'cg', 'cs'] = 'default'
     scale_role: Literal['consumers', 'producer', 'tma'] = 'consumers'
     scale_layout: Literal['row_major', 'mma64', 'mma128', 'mma64x128'] = 'row_major'
-    epilogue: Literal['direct', 'tma'] = 'tma'
+    epilogue: Literal['direct', 'tma', 'hybrid'] = 'tma'
     epilogue_stages: int = 1
     store_vec: int = 4
     maxrregcount: int = 255

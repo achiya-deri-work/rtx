@@ -21,12 +21,16 @@ class _VirtualWeight(torch.autograd.Function):
     """Alias the allocation, but give every logical leaf its own gradient."""
 
     @staticmethod
-    def forward(ctx, shape, *parameters):
+    def forward(ctx, shape, storage, *parameters):
         ctx.shapes = tuple(p.shape for p in parameters)
         # Original Parameters keep their identities/version counters after
         # packing. Check every leaf's version, not just the first alias.
         ctx.save_for_backward(*parameters)
-        return parameters[0].as_strided(shape, _strides(shape))
+        # The compiler must see the full logical span as an input. Extending
+        # parameters[0] with as_strided is valid on the real shared allocation,
+        # but Inductor's subprocess autotuner recreates only that small slice
+        # and then launches the packed GEMM beyond its allocation.
+        return storage.view(shape)
 
     @staticmethod
     def backward(ctx, gradient):
@@ -38,7 +42,7 @@ class _VirtualWeight(torch.autograd.Function):
             size = shape.numel()
             result.append(flat.narrow(0, offset, size).view(shape))
             offset += size
-        return None, *result
+        return None, None, *result
 
 
 class VirtualLayer(nn.Module):
@@ -94,8 +98,9 @@ class VirtualLayer(nn.Module):
         self.packed_shape = shape
         self._shapes = tuple(tuple(p.shape) for p in parameters)
         self._offsets = tuple(sum(p.numel() for p in parameters[:i]) for i in range(len(parameters)))
-        # Plain references, not extra registered parameters/buffers. The leaves
-        # own the allocation. State dicts contain only logical projection keys.
+        # A non-persistent full-span alias makes compiler/autotuner allocation
+        # extents explicit. No extra allocation or optimizer/state-dict entry.
+        self.register_buffer('_packed_storage', None, persistent=False)
         self._owned_parameters: tuple[nn.Parameter, ...] = ()
         self.repack_()
         self.register_load_state_dict_post_hook(_restore_packing_after_load)
@@ -155,6 +160,7 @@ class VirtualLayer(nn.Module):
             flat.narrow(0, offset, p.numel()).copy_(p.detach().reshape(-1))
         for p, offset in zip(parameters, self._offsets):
             p.data = flat.narrow(0, offset, p.numel()).view(p.shape)
+        self._packed_storage = base
         self._owned_parameters = parameters
         return self
 
@@ -162,12 +168,19 @@ class VirtualLayer(nn.Module):
         """Check physical layout without synchronization or reading tensor data."""
         parameters = self._logical_parameters()
         first = parameters[0]
+        storage = self._packed_storage
+        if (storage is None or tuple(storage.shape) != self.packed_shape
+                or storage.device != first.device or storage.dtype != first.dtype
+                or not storage.is_contiguous() or storage.storage_offset() != 0):
+            raise RuntimeError('Virtual storage changed; call repack_() before compilation')
         for p, owner, shape, offset in zip(parameters, self._owned_parameters, self._shapes, self._offsets):
             if (p is not owner or tuple(p.shape) != shape or p.device != first.device
                     or p.dtype != first.dtype or not p.is_contiguous() or p.storage_offset() != offset):
                 raise RuntimeError("Virtual packing changed; move the owner or call repack_() before compilation")
         if first.device.type != 'meta':
             address = first.untyped_storage().data_ptr()
+            if storage.untyped_storage().data_ptr() != address:
+                raise RuntimeError('Virtual storage was replaced; call repack_() before compilation')
             if any(p.untyped_storage().data_ptr() != address for p in parameters):
                 raise RuntimeError("Virtual storage was replaced; call repack_() before compilation")
 
@@ -184,7 +197,12 @@ class VirtualLayer(nn.Module):
                 raise RuntimeError("Virtual packing changed; call repack_() outside compilation")
         if not torch.compiler.is_compiling():
             self.validate()
-        return _VirtualWeight.apply(self.packed_shape, *parameters)
+        if not torch.is_grad_enabled() or not any(p.requires_grad for p in parameters):
+            # No bank-weight adjoint is needed. A logical full-span alias
+            # avoids Dynamo's no-grad custom-Function ctx argument rebinding;
+            # frozen weights still participate normally in an input adjoint.
+            return self._packed_storage.view(self.packed_shape)
+        return _VirtualWeight.apply(self.packed_shape, self._packed_storage, *parameters)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Torch reference execution; RTX kernels consume ``self.weight``."""
@@ -211,6 +229,7 @@ class VirtualLayer(nn.Module):
         flat = base.reshape(-1)
         converted = {id(p):flat.narrow(0, offset, p.numel()).view(p.shape)
                      for p, offset in zip(parameters, self._offsets)}
+        converted[id(self._packed_storage)] = base
         def transform(tensor):
             return converted[id(tensor)] if id(tensor) in converted else fn(tensor)
         result = super()._apply(transform, recurse=recurse)

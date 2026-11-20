@@ -40,6 +40,92 @@ def test_storage_parameter_identity_and_existing_initialization():
     torch.testing.assert_close(layer.weight[6:8],before[1]+7)
 
 
+def test_full_span_alias_is_nonpersistent_and_never_an_extra_parameter():
+    layer=make_layer()
+    storage=layer._packed_storage
+    assert tuple(storage.shape)==layer.packed_shape
+    assert storage.numel()==sum(p.numel() for p in layer.parameters())
+    assert storage.data_ptr()==layer.weight.data_ptr()
+    assert not storage.requires_grad
+    assert len(tuple(layer.parameters()))==3
+    assert '_packed_storage' not in layer.state_dict()
+    layer.float();layer.validate()
+    assert layer._packed_storage.data_ptr()==layer.weight.data_ptr()
+
+
+def test_compile_exposes_full_span_storage_without_weight_copy():
+    layer=make_layer(dtype=torch.float32,bank=True)
+    x=torch.randn(3,5,4)
+    graphs=[]
+    def backend(graph,inputs):
+        graphs.append(graph)
+        return graph.forward
+    actual=torch.compile(layer,backend=backend,fullgraph=True,dynamic=False)(x)
+    assert len(graphs)==1
+    storage=[n.meta['example_value'] for n in graphs[0].graph.nodes
+             if n.op=='placeholder' and '_packed_storage' in n.name]
+    assert len(storage)==1 and tuple(storage[0].shape)==layer.packed_shape
+    assert not any('cat' in str(n.target) or 'clone' in str(n.target)
+                   for n in graphs[0].graph.nodes if n.op=='call_function')
+    torch.testing.assert_close(actual,layer(x))
+
+
+@pytest.fixture
+def isolated_compile_variants():
+    # These independent static-mode cases must not exhaust the default
+    # per-code-object recompile cap for subsequent, unrelated tests.
+    torch.compiler.reset()
+    yield
+    torch.compiler.reset()
+
+
+@pytest.mark.parametrize('mode',['no_grad','inference','frozen'])
+@pytest.mark.parametrize('bank',[False,True])
+def test_compile_without_bank_weight_adjoint_keeps_zero_copy(mode,bank,isolated_compile_variants):
+    layer=make_layer(dtype=torch.float32,bank=bank)
+    if mode=='frozen':layer.requires_grad_(False)
+    x=torch.randn((3,5,4) if bank else (5,4),requires_grad=mode=='frozen')
+    fn=torch.compile(layer,backend='aot_eager',fullgraph=True,dynamic=False)
+    context=torch.no_grad() if mode=='no_grad' else torch.inference_mode() if mode=='inference' else torch.enable_grad()
+    with context:
+        actual=fn(x);expected=layer(x)
+        torch.testing.assert_close(actual,expected)
+        assert layer.weight.data_ptr()==layer._packed_storage.data_ptr()
+        if mode=='frozen':
+            torch.testing.assert_close(torch.autograd.grad(actual.sum(),x)[0],
+                                       torch.autograd.grad(expected.sum(),x)[0])
+    with torch.no_grad():layer['v'].weight.add_(.1)
+    with context:torch.testing.assert_close(fn(x),layer(x))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA required for Inductor subprocess autotuning')
+@pytest.mark.parametrize('bank',[False,True])
+def test_cuda_virtual_subprocess_autotune_uses_full_storage(bank):
+    from torch.utils.checkpoint import checkpoint
+    torch.manual_seed(827)
+    layer=VirtualLayer({str(i):nn.Linear(128,128,bias=False,device='cuda',dtype=torch.bfloat16)
+                        for i in range(4)},packed_shape=(4,128,128) if bank else None)
+    reference=copy.deepcopy(layer.projections)
+    x=torch.randn((4,64,128) if bank else (64,128),device='cuda',dtype=torch.bfloat16,requires_grad=True)
+    xr=x.detach().clone().requires_grad_()
+    def call(value):return checkpoint(layer,value,use_reentrant=True)
+    fn=torch.compile(call,fullgraph=True,dynamic=False,options={'max_autotune':True,
+        'autotune_in_subproc':True,'triton.cudagraphs':False})
+    actual=fn(x)
+    expected=(torch.stack([reference[str(i)](xr[i]) for i in range(4)]) if bank
+              else torch.cat([m(xr) for m in reference.values()],dim=-1))
+    dy=torch.randn_like(actual)
+    grads=torch.autograd.grad(actual,(x,*layer.parameters()),dy)
+    refs=torch.autograd.grad(expected,(xr,*reference.parameters()),dy)
+    # BF16 accumulation order may differ between selected GEMM backends.
+    for a,b in zip((actual,*grads),(expected,*refs)):
+        assert bool(a.isfinite().all())
+        torch.testing.assert_close(a,b,rtol=.03,atol=.08)
+    with torch.no_grad():layer['3'].weight.add_(.01)
+    assert bool(fn(x).isfinite().all())
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize('bank',[False,True])
 @pytest.mark.parametrize('compiled',[False,True])
 def test_output_all_gradients_and_changed_parameters(bank,compiled):
@@ -219,7 +305,7 @@ def test_all_parameter_gradcheck_and_reentrant_checkpoint():
     from torch.utils.checkpoint import checkpoint
     layer = VirtualLayer({'a':nn.Linear(2,2,bias=False,dtype=torch.float64),
                           'b':nn.Linear(2,1,bias=False,dtype=torch.float64)})
-    assert torch.autograd.gradcheck(lambda *p:_VirtualWeight.apply(layer.packed_shape,*p),
+    assert torch.autograd.gradcheck(lambda *p:_VirtualWeight.apply(layer.packed_shape,layer._packed_storage,*p),
                                    tuple(layer.parameters()))
     x = torch.randn(2,2,dtype=torch.float64,requires_grad=True)
     checkpoint(layer,x,use_reentrant=True).sum().backward()

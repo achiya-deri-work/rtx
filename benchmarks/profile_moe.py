@@ -148,15 +148,34 @@ def retarget_auxiliary(aux,tokens):
         dw=bwd['dw']
         if dw['reduction'] not in ('split_fp32_workspace','split_fp32_atomic'):continue
         before=dict(dw)
-        if dw.get('split_partition','fixed')=='balanced':
-            tile=dw['gemm']['tile_k'];dw['split_reduction']=min(dw['split_reduction'],(tokens+tile-1)//tile)
+        macro=dw.get('gemm',{}).get('tile_k',128)
+        if dw.get('split_partition','uniform')=='balanced':
+            limit=min(dw['split_reduction'],(tokens+macro-1)//macro)
+            dw['split_reduction']=1<<(max(1,limit).bit_length()-1)
         else:
-            tile=dw['reduction_tile'];dw['split_reduction']=(tokens+tile-1)//tile
+            tile=dw['reduction_tile'] or macro
+            required=(tokens+tile-1)//tile
+            max_split=128 if dw['reduction']=='split_fp32_workspace' and dw.get('backend','decomposed')=='decomposed' else 32
+            if required<=max_split and required&(required-1)==0:
+                dw['split_reduction']=required
+            elif dw['reduction']=='split_fp32_workspace' and dw.get('backend','decomposed')=='decomposed':
+                # Ragged lengths often need 29 fixed chunks, but native
+                # splits must be powers of two. Balanced tile partitions
+                # preserve FP32 accumulation without empty trailing slices.
+                limit=min(128,(tokens+macro-1)//macro,1<<(required-1).bit_length())
+                dw.update(split_partition='balanced',split_reduction=1<<(max(1,limit).bit_length()-1),reduction_tile=0)
+            else:
+                # Atomic/fused engines retain uniform chunks. Find a legal
+                # power-of-two coverage, not an arbitrary rounded count.
+                for split in (32,16,8,4,2,1):
+                    chunk=(tokens+split*macro-1)//(split*macro)*macro
+                    if (split-1)*chunk<tokens<=split*chunk:
+                        dw.update(split_reduction=split,reduction_tile=chunk);break
         if dw['split_reduction']==1:
-            dw.update(reduction='full_fp32',reduction_tile=0,workspace_epilogue='none')
+            dw.update(reduction='full_fp32',reduction_tile=0,workspace_epilogue='none',split_partition='uniform')
         if dw!=before:
-            changes.append(dict(stage=name,old={k:before.get(k) for k in ('reduction','split_reduction','reduction_tile')},
-                                new={k:dw.get(k) for k in ('reduction','split_reduction','reduction_tile')}))
+            changes.append(dict(stage=name,old={k:before.get(k) for k in ('reduction','split_reduction','reduction_tile','split_partition')},
+                                new={k:dw.get(k) for k in ('reduction','split_reduction','reduction_tile','split_partition')}))
     return aux,changes
 
 

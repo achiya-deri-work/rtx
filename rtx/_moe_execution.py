@@ -31,6 +31,7 @@ class Builder:
     def __init__(self, shape, config, phase):
         self.shape,self.config,self.phase=shape,config,phase
         self.buffers=[];self.steps=[];self.outputs=[]
+        self.active_capacity=None
 
     def tensor(self,shape,dtype=torch.bfloat16,*,output=False):
         ref=len(self.buffers)
@@ -47,11 +48,31 @@ class Builder:
         n,d,e,c,k,h=self.shape
         cs=self.config.prepared.physical_capacity(c) if self.config.family=='grouped_prepared' else c
         placeholder=out if kind in ('gather','slot_dy') else source
+        arguments=(source,-4,-6,-5,placeholder if extra is None else extra,out,
+                   -5 if auxiliary is None else auxiliary)
+        if kind in ('combine','dx') and getattr(self.config,kind+'_reduce_engine')=='token':
+            self.step('mxfp8_moe_token_reduce','compile_token_reduce',
+                      (n,d,e,c,k,self.config.movement_threads,kind,cs,
+                       getattr(self.config,kind+'_vector_width'),
+                       getattr(self.config,kind+'_lanes_per_token')),arguments)
+            return
+        mask=(True,) if self.active_capacity is not None and kind=='route_grad' else ()
         self.step('mxfp8_moe','compile_movement',
                   (n,d,e,c,k,self.config.movement_threads,kind,
-                   self.config.gather_mode if kind=='gather' else 'flat',cs),
-                  (source,-4,-6,-5,placeholder if extra is None else extra,out,
-                   -5 if auxiliary is None else auxiliary))
+                   self.config.gather_mode if kind=='gather' else 'flat',cs,*mask),
+                  arguments)
+
+    def prepare_active_capacity(self):
+        n,_,e,c,k,_=self.shape
+        self.active_capacity=self.tensor((1,),torch.int32)
+        self.step('mxfp8_moe_active','compile_active_prefix',(n,e,c,k),(-6,self.active_capacity))
+
+    def recompute_alignment(self):
+        p=self.config.prepared
+        # TMA reads full row tiles up to the static descriptor boundary.
+        # Produce each consumer's complete last tile (not merely real rows).
+        route_rows=(p.route_gradient_gemm or p.down).tile_m if p.route_gradient_epilogue=='fused' else 1
+        return math.lcm(p.recompute.tile_m,p.down.tile_m,p.gate_dx.tile_m,route_rows)
 
     def prepare(self,operands):
         # operands: (reference, batch_count, source_rows, source_cols,
@@ -67,7 +88,7 @@ class Builder:
             packed.append(self.tensor((batches*rows,width),torch.float8_e4m3fn))
             scales.append(self.tensor((batches*rows,width//32),torch.uint8))
         self.step('mxfp8_moe_buffers','compile_expert_quant',
-                  (e,tuple(specs),p.quant,p.transpose_mode,p.quant_grid),
+                  (e,tuple(specs),p.quant,p.transpose_mode,p.quant_grid,p.transpose_warp_tokens,p.transpose_warp_raster),
                   (sources[0],tuple(sources),tuple(packed),tuple(scales)))
         return tuple(zip(packed,scales))
 
@@ -76,17 +97,60 @@ class Builder:
         return (self.tensor((e*rows,width),torch.float8_e4m3fn),
                 self.tensor((e*rows,width//32),torch.uint8))
 
+    def prepare_backward_weights(self):
+        n,d,e,_,_,h=self.shape;p=self.config.prepared
+        from .configs.moe_backward import backward_weight_quant_rejection
+        why=backward_weight_quant_rejection(n,d,e,h,p.quant,p.quant_grid,p.weight_tile_rows,
+            p.weight_tile_cols,p.weight_load_values,p.weight_store_bits,p.weight_warps,p.weight_raster)
+        if why:raise ValueError(f'Illegal paired weight preparation: {why}')
+        width=(d+31)//32*32
+        qx=(self.tensor((n,width),torch.float8_e4m3fn),self.tensor((n,width//32),torch.uint8))
+        qgu,qd,qdt,qgut=self.pair(2*h,d),self.pair(d,h),self.pair(h,d),self.pair(d,2*h)
+        self.step('mxfp8_moe_weight_quant','compile_backward_weight_quant',
+            (n,d,e,h,p.quant,p.quant_grid,p.weight_tile_rows,p.weight_tile_cols,p.weight_load_values,
+             p.weight_store_bits,p.weight_warps,p.weight_raster),
+            (-1,-2,-3,*qx,*qgu,*qd,*qdt,*qgut))
+        return qx,qgu,qd,qdt,qgut
+
     def gemm(self,a,b,out,stage,m,n,k,kind='linear',aux=None):
         from .kernels.mxfp8 import MXFP8Problem
         p=self.config.prepared
         transport=p.transports[('gate_up','down','recompute','down_dx','down_dw','gate_dx','gate_dw').index(stage)]
-        self.step('mxfp8_moe_buffers','compile_expert_packed_gemm',
-                  (self.shape[2],MXFP8Problem(m,n,k),getattr(p,stage),kind,transport),
-                  (a[0],b[0],a[1],b[1],out,out if aux is None else aux))
+        split=getattr(p,stage+'_splits',1)
+        if stage in ('gate_dw','down_dw') and getattr(p,stage+'_engine')=='persistent':
+            active=(True,) if self.active_capacity is not None else ()
+            prefix=(self.active_capacity,) if self.active_capacity is not None else ()
+            self.step('mxfp8_moe_persistent_dw','compile_persistent_dw',
+                (self.shape[2],MXFP8Problem(m,n,k),getattr(p,stage),
+                 getattr(p,stage+'_reuse_axis'),getattr(p,stage+'_reuse_tiles'),*active),
+                (a[0],b[0],a[1],b[1],out,*prefix))
+            return
+        target=out
+        if split>1:
+            target=self.tensor((self.shape[2]*split*m,n),torch.float32)
+        prefix_parameters=prefix_arguments=()
+        if self.active_capacity is not None:
+            if stage in ('down_dw','gate_dw'):
+                prefix_parameters=(0,True)
+            elif stage in ('gate_up','down','down_dx','gate_dx'):
+                alignment=(p.down.tile_m if stage=='gate_up' else
+                           self.recompute_alignment() if stage=='down_dx' else 1)
+                prefix_parameters=(alignment,False)
+            if prefix_parameters:
+                prefix_arguments=(self.active_capacity,)
+        parameters=(self.shape[2],MXFP8Problem(m,n,k),getattr(p,stage),kind,transport,split,*prefix_parameters)
+        if stage=='gate_up' and p.forward_glu_engine!='legacy':
+            parameters=(self.shape[2],MXFP8Problem(m,n,k),getattr(p,stage),kind,transport,split,
+                        *(prefix_parameters or (0,False)),p.forward_glu_engine)
+        self.step('mxfp8_moe_buffers','compile_expert_packed_gemm',parameters,
+                  (a[0],b[0],a[1],b[1],target,target if aux is None else aux,*prefix_arguments))
+        if split>1:
+            self.step('mxfp8_moe_prepared','compile_expert_dw_reduce',
+                (self.shape[2],m,n,split,p.dw_reduce_threads,p.dw_reduce_vector),(target,out))
 
     def forward_operands(self,copy_bf16):
         n,d,e,c,k,h=self.shape;p=self.config.prepared;cs=p.physical_capacity(c)
-        once=getattr(p,'input_preparation','gather_bf16')=='quantize_once'
+        once=p.input_preparation!='gather_bf16'
         gathered=self.tensor((e*cs,d)) if copy_bf16 or not once else -1
         if once:
             global_x,qgu,qd=self.prepare(((-1,1,n,d,'row',False,True),
@@ -98,16 +162,23 @@ class Builder:
                 (-2,e,2*h,d,'row',True,False),(-3,e,d,h,'row',False,False)))
         return gathered,qx,qgu,qd
 
-    def gather_packed(self,global_x,gathered,copy_bf16):
+    def gather_packed(self,global_x,gathered,copy_bf16,emit_index=False):
         n,d,e,c,k,h=self.shape;p=self.config.prepared;cs=p.physical_capacity(c)
         qx=self.pair(cs,d)
+        extra=parameters=()
+        if p.bounded_gather:
+            if self.phase=='forward':parameters=(p.down.tile_m,p.gate_up.tile_m,(),False)
+            else:parameters=(self.recompute_alignment(),p.recompute.tile_m,
+                             (p.down_dw.tile_k,p.gate_dw.tile_k),not (p.bounded_dy and p.bounded_xt))
+            extra=(self.active_capacity,)
         self.step('mxfp8_moe_buffers','compile_packed_input_gather',
-                  (n,d,e,c,k,cs,self.config.movement_threads,p.quant.scale_layout,copy_bf16),
-                  (global_x[0],global_x[1],-1,-4,-6,qx[0],qx[1],gathered if copy_bf16 else -1))
+                  (n,d,e,c,k,cs,self.config.movement_threads,p.quant.scale_layout,copy_bf16,emit_index,*parameters),
+                  (global_x[0],global_x[1],-1,-4,-6,qx[0],qx[1],gathered if copy_bf16 or emit_index else -1,*extra))
         return qx
 
-    def projections(self,qx,qgu,qd):
-        n,d,e,c,k,h=self.shape;p=self.config.prepared;cs=p.physical_capacity(c)
+    def projections(self,qx,qgu,qd,capacity=None):
+        n,d,e,c,k,h=self.shape;p=self.config.prepared
+        cs=p.physical_capacity(c) if capacity is None else capacity
         qh=self.pair(cs,h)
         self.gemm(qx,qgu,qh[0],'gate_up',cs,2*h,(d+31)//32*32,'glu',qh[1])
         down_scales=qh[1]
@@ -120,12 +191,74 @@ class Builder:
         self.gemm((qh[0],down_scales),qd,out,'down',cs,d,(h+31)//32*32)
         return out,qh
 
+    def compact_forward(self):
+        from ._moe_compact_layout import compact_forward_capacity
+        n,d,e,c,k,h=self.shape;p=self.config.prepared
+        cc=compact_forward_capacity(n,p.compact_pool_count,e,k,p.physical_capacity(c),
+                                    math.lcm(32,p.gate_up.tile_m,p.down.tile_m))
+        global_x,qgu,qd=self.prepare(((-1,1,n,d,'row',False,True),
+            (-2,e,2*h,d,'row',True,False),(-3,e,d,h,'row',False,False)))
+        original_to_compact=self.tensor((e,c),torch.int32)
+        compact_to_original=self.tensor((e,cc),torch.int32)
+        counts=self.tensor((e,),torch.int32)
+        self.step('mxfp8_moe_compact','compile_compact_route',(n,e,c,k,cc),
+                  (-4,-6,original_to_compact,compact_to_original,counts))
+        qx=self.pair(cc,d)
+        self.active_capacity=self.tensor((1,),torch.int32)
+        self.step('mxfp8_moe_compact','compile_compact_gather',
+                  (n,d,e,c,cc,self.config.movement_threads),
+                  (*global_x,-4,compact_to_original,counts,*qx,self.active_capacity))
+        out,_=self.projections(qx,qgu,qd,cc)
+        result=self.tensor((n,d),torch.float32,output=True)
+        self.step('mxfp8_moe_compact','compile_compact_combine',
+                  (n,d,e,c,k,cc,self.config.movement_threads,self.config.combine_reduce_engine,
+                   self.config.combine_vector_width,self.config.combine_lanes_per_token),
+                  (out,-6,-5,original_to_compact,result))
+        return self
+
     def build(self):
-        if self.config.family!='grouped_prepared':return self.legacy()
+        from .configs.moe_backward import token_reduce_rejection
+        if reason:=token_reduce_rejection(self.config,self.shape,self.phase):
+            raise ValueError(f'Illegal movement plan: {reason}')
+        if self.config.family!='grouped_prepared':
+            p=self.config.prepared
+            if p.bounded_gather or p.bounded_dy or p.bounded_xt or p.forward_row_layout!='original':
+                raise ValueError('New preparation/layout policies require the prepared expert family')
+            return self.legacy()
         n,d,e,c,k,h=self.shape;p=self.config.prepared;cs=p.physical_capacity(c)
+        if reason:=p.bounded_preparation_rejection('forward' if self.phase=='forward' else 'train'):
+            raise ValueError(f'Illegal bounded preparation plan: {reason}')
+        if reason:=p.compact_forward_rejection(self.shape):
+            raise ValueError(f'Illegal compact forward plan: {reason}')
+        if p.forward_glu_engine!='legacy':
+            from .autotune.moe import problems
+            if reason:=p.rejection(problems(self.shape),'forward'):
+                raise ValueError(f'Illegal forward GLU plan: {reason}')
+        if self.phase!='forward' and (p.gate_dw_engine!='packed' or p.down_dw_engine!='packed'
+                or p.route_gradient_gemm is not None or p.route_gradient_loader!='accumulator'
+                or p.joint_recompute_engine=='split_warp' or p.weight_preparation!='separate'):
+            # Explicit autotune='off' policies must obey the same static
+            # contracts as tuner proposals, before any scratch is allocated.
+            from .autotune.moe import problems
+            if reason:=p.rejection(problems(self.shape),'train'):
+                raise ValueError(f'Illegal backward ownership plan: {reason}')
+        if p.active_prefix:
+            reason=p.active_prefix_rejection(self.phase)
+            if reason:raise ValueError(f'Illegal active-prefix plan: {reason}')
+            if self.phase!='forward' or p.forward_row_layout!='compact':self.prepare_active_capacity()
         if self.phase=='forward':
-            _,qx,qgu,qd=self.forward_operands(False)
-            out,_=self.projections(qx,qgu,qd)
+            if p.forward_row_layout=='compact':return self.compact_forward()
+            if p.forward_engine=='onchip':
+                from .kernels.mxfp8 import MXFP8Problem
+                gathered=self.tensor((e*cs,d));self.movement(-1,gathered,'gather')
+                out=self.tensor((e*cs,d))
+                self.step('mxfp8_moe_onchip','compile_onchip_experts',
+                    (e,MXFP8Problem(cs,2*h,d),self.config.gate_up,self.config.down,d,
+                     self.config.onchip_down_stages,self.config.onchip_pipeline),
+                    (gathered,-2,out,-3,-3,-3,-3))
+            else:
+                _,qx,qgu,qd=self.forward_operands(False)
+                out,_=self.projections(qx,qgu,qd)
             result=self.tensor((n,d),torch.float32,output=True)
             self.movement(out,result,'combine')
             return self
@@ -210,16 +343,45 @@ class Builder:
         from .kernels.mxfp8 import MXFP8Problem
         n,d,e,c,k,h=self.shape;p=self.config.prepared;cs=p.physical_capacity(c)
         # Keep the selected separate/joint policy independent from input reuse.
-        gathered=self.tensor((e*cs,d))
-        slot_dy=self.tensor((e*cs,d))
-        if getattr(p,'input_preparation','gather_bf16')=='quantize_once':
-            global_x,qgu,qd,qdt,qgut=self.prepare(((-1,1,n,d,'row',False,True),
-                (-2,e,2*h,d,'row',True,False),(-3,e,d,h,'row',False,False),
-                (-3,e,d,h,'transpose',False,False),(-2,e,2*h,d,'transpose',False,False)))
-            qx=self.gather_packed(global_x,gathered,True)
-            self.movement(-7,slot_dy,'slot_dy')
-            qdy,qdyt,qxt=self.prepare(((slot_dy,e,cs,d,'row',False,False),
-                (slot_dy,e,cs,d,'transpose',False,False),(gathered,e,cs,d,'transpose',False,False)))
+        indexed=p.input_preparation=='indexed_transpose'
+        gathered=self.tensor((e*cs,1),torch.int32) if indexed else self.tensor((e*cs,d))
+        slot_dy=self.tensor((e*cs,d)) if p.dy_preparation=='materialized' else -1
+        if p.input_preparation!='gather_bf16':
+            if p.weight_preparation=='dual_orientation':
+                global_x,qgu,qd,qdt,qgut=self.prepare_backward_weights()
+            else:
+                global_x,qgu,qd,qdt,qgut=self.prepare(((-1,1,n,d,'row',False,True),
+                    (-2,e,2*h,d,'row',True,False),(-3,e,d,h,'row',False,False),
+                    (-3,e,d,h,'transpose',False,False),(-2,e,2*h,d,'transpose',False,False)))
+            qx=self.gather_packed(global_x,gathered,not indexed,indexed)
+            operands=((slot_dy,e,cs,d,'row',False,False),(slot_dy,e,cs,d,'transpose',False,False))
+            if p.dy_preparation=='materialized':self.movement(-7,slot_dy,'slot_dy')
+            if indexed:
+                if p.dy_preparation!='materialized':
+                    qdy,qdyt=self.pair(cs,d),self.pair(d,cs)
+                    args=(-7,gathered,-5,qdy[0],qdy[1],qdyt[0],qdyt[1])
+                    module,symbol='mxfp8_moe_dy','compile_routed_dy_quant'
+                    if p.dy_preparation=='fused_all':
+                        qxt=self.pair(d,cs);args=(*args,-1,qxt[0],qxt[1])
+                        module,symbol='mxfp8_moe_backward_quant','compile_routed_backward_quant'
+                    bounded=()
+                    if p.bounded_dy:
+                        bounded=(self.recompute_alignment(),p.down_dw.tile_k,p.down_dx.tile_m)
+                        args=(*args,self.active_capacity)
+                    self.step(module,symbol,
+                        (n,d,e,c,cs,p.quant,p.transpose_warp_tokens,p.transpose_warp_raster,p.quant_grid,*bounded),
+                        args)
+                else:qdy,qdyt=self.prepare(operands)
+                if p.dy_preparation!='fused_all' and p.gate_dw_engine!='indexed':
+                    qxt=self.pair(d,cs)
+                    bounded=(p.gate_dw.tile_k,) if p.bounded_xt else ()
+                    args=(-1,gathered,qxt[0],qxt[1])
+                    if p.bounded_xt:args=(*args,self.active_capacity)
+                    self.step('mxfp8_moe_warp_quant','compile_indexed_expert_transpose',
+                        (n,d,e,cs,p.quant,p.transpose_warp_tokens,p.transpose_warp_raster,p.quant_grid,*bounded),
+                        args)
+            else:
+                qdy,qdyt,qxt=self.prepare((*operands,(gathered,e,cs,d,'transpose',False,False)))
         else:
             self.movement(-1,gathered,'gather');self.movement(-7,slot_dy,'slot_dy')
             qx,qgu,qd,qdt,qdy,qdyt,qgut,qxt=self.prepare(((gathered,e,cs,d,'row',False,False),
@@ -229,20 +391,56 @@ class Builder:
                 (gathered,e,cs,d,'transpose',False,False)))
         dh=self.tensor((e*cs,h));self.gemm(qdy,qdt,dh,'down_dx',cs,h,(d+31)//32*32)
         qh,qht,qp,qpt=self.pair(cs,h),self.pair(h,cs),self.pair(cs,2*h),self.pair(2*h,cs)
+        if self.active_capacity is None:
+            self.joint_recompute(dh,qx,qgu,qh,qht,qp,qpt,p,cs,e,d,h)
+        else:
+            alignment=self.recompute_alignment()
+            self.joint_recompute(dh,qx,qgu,qh,qht,qp,qpt,p,cs,e,d,h,self.active_capacity,alignment)
+            # Quantizer and MXFP8 MMA reduction tiles have different
+            # granularities. Scrub only the skipped slice that a final K tile
+            # will read; every later K tile is omitted by both dW kernels.
+            if any(alignment%x for x in (p.down_dw.tile_k,p.gate_dw.tile_k)):
+                self.step('mxfp8_moe_active','compile_initialize_reduction_tail',
+                    (e,cs,h,alignment,p.down_dw.tile_k,p.gate_dw.tile_k),
+                    (self.active_capacity,*qht,*qpt))
+        dw_route=self.tensor((e,c),torch.float32,output=True)
+        if p.route_gradient_epilogue=='fused':
+            route_gemm=p.route_gradient_gemm or p.down
+            columns=(d+route_gemm.tile_n-1)//route_gemm.tile_n
+            partials=self.tensor((e*cs,columns),torch.float32)
+            prefix=() if self.active_capacity is None else (self.active_capacity,)
+            active=() if self.active_capacity is None else (True,)
+            self.step('mxfp8_moe_route_epilogue','compile_expert_route_gradient',
+                (n,e,c,k,MXFP8Problem(cs,d,h),route_gemm,indexed,
+                 self.active_capacity is not None,p.route_gradient_loader),
+                (qh[0],qd[0],qh[1],qd[1],partials,gathered if indexed else -4,-6,-7,*prefix))
+            self.step('mxfp8_moe_route_epilogue','compile_route_gradient_reduce',
+                (e,c,cs,columns,self.config.movement_threads,*active),(partials,dw_route,*prefix))
+        else:
+            out=self.tensor((e*cs,d));self.gemm(qh,qd,out,'down',cs,d,h)
+            self.movement(-7,out,'route_grad',out,dw_route)
+        ddown=self.tensor((e*d,h),output=True);self.gemm(qdyt,qht,ddown,'down_dw',d,h,cs)
+        dxg=self.tensor((e*cs,d));self.gemm(qp,qgut,dxg,'gate_dx',cs,d,2*h)
+        dgu=self.tensor((e*2*h,d),output=True)
+        if p.gate_dw_engine=='indexed':
+            self.step('mxfp8_moe_indexed_dw','compile_indexed_gate_dw',
+                (n,e,MXFP8Problem(2*h,d,cs),p.gate_dw,p.quant,
+                 p.indexed_dw_token_lanes,p.indexed_dw_gather_pairs,p.indexed_dw_producer_warps),
+                (qpt[0],qpt[1],-1,gathered,dgu))
+        else:self.gemm(qpt,qxt,dgu,'gate_dw',2*h,d,cs)
+        dx=self.tensor((n,d),output=True);self.movement(dxg,dx,'dx')
+        self.outputs=[dx,dgu,ddown,dw_route];return self
+
+    def joint_recompute(self,dh,qx,qgu,qh,qht,qp,qpt,p,cs,e,d,h,active_capacity=None,active_m_alignment=0):
+        from .kernels.mxfp8 import MXFP8Problem
         # Same-dtype shape aliases are constructed by the wrapper, not launchers.
         qp_view=self.alias(qp[0],(e*2*cs,h));sp_view=self.alias(qp[1],(e*2*cs,h//32))
         aux=(dh,qh[0],qh[1],qht[0],qht[1],qp_view,sp_view,qpt[0],qpt[1])
+        if active_capacity is not None:aux=(*aux,active_capacity)
         self.step('mxfp8_moe_buffers','compile_expert_joint_recompute',
-            (e,MXFP8Problem(cs,2*h,(d+31)//32*32),p.recompute,p.quant),
+            (e,MXFP8Problem(cs,2*h,(d+31)//32*32),p.recompute,p.quant,p.joint_recompute_engine,
+             active_m_alignment,p.joint_recompute_gradient_warps),
             (qx[0],qgu[0],qx[1],qgu[1],dh,aux))
-        out=self.tensor((e*cs,d));self.gemm(qh,qd,out,'down',cs,d,h)
-        dw_route=self.tensor((e,c),torch.float32,output=True)
-        self.movement(-7,out,'route_grad',out,dw_route)
-        ddown=self.tensor((e*d,h),output=True);self.gemm(qdyt,qht,ddown,'down_dw',d,h,cs)
-        dxg=self.tensor((e*cs,d));self.gemm(qp,qgut,dxg,'gate_dx',cs,d,2*h)
-        dgu=self.tensor((e*2*h,d),output=True);self.gemm(qpt,qxt,dgu,'gate_dw',2*h,d,cs)
-        dx=self.tensor((n,d),output=True);self.movement(dxg,dx,'dx')
-        self.outputs=[dx,dgu,ddown,dw_route];return self
 
     def alias(self,reference,shape):
         if not hasattr(self,'aliases'):self.aliases={}

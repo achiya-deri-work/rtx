@@ -97,7 +97,12 @@ def _tag_pool_owners(value,pool):
             for child in item:visit(child)
         elif hasattr(item,'__rtx_resources__'):
             visit(item.__rtx_resources__)
-    visit(value)
+    try:
+        visit(value)
+    finally:
+        # The recursive closure itself must not keep a MemPool alive until
+        # cyclic GC; its native destructor is unsafe during CUDA capture.
+        del visit
 
 
 def retire_scratch_pools(streams,devices):

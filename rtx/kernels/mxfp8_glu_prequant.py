@@ -36,16 +36,20 @@ class MXFP8PrequantGLUKernel(MXFP8GemmKernel):
 
 
 @lru_cache(maxsize=128)
-def compile_prequant_glu(problem, config, activation="silu", output_format="bf16"):
+def compile_prequant_glu(problem, config, activation="silu", output_format="bf16", *, _byte_scales=False):
     kernel = MXFP8PrequantGLUKernel(problem,config,activation,output_format)
+    scale_dtype = Uint8 if _byte_scales else Float8E8M0FNU
+    if _byte_scales:
+        from ._mxfp8_byte_scales import ByteGemm
+        kernel = ByteGemm(kernel)
     def fake(dtype,rows,cols):
         return cute.runtime.make_fake_tensor(dtype,(rows,cols),stride=(cols,1),assumed_align=16)
     qx,qw = fake(Float8E4M3FN,problem.m,problem.k),fake(Float8E4M3FN,problem.n,problem.k)
     def scales(rows,layout):
         if layout == "row_major":
-            return fake(Float8E8M0FNU,rows,problem.k//32)
+            return fake(scale_dtype,rows,problem.k//32)
         tile_rows = 64 if layout == "mma64" else 128
-        return cute.runtime.make_fake_tensor(Float8E8M0FNU,(rows//tile_rows,problem.k//128,512),
+        return cute.runtime.make_fake_tensor(scale_dtype,(rows//tile_rows,problem.k//128,512),
                                              stride=(problem.k//128*512,512,1),assumed_align=16)
     sx = scales(problem.m,"mma64" if config.scale_layout=="mma64x128" else config.scale_layout)
     sw = scales(problem.n,"mma128" if config.scale_layout=="mma64x128" else config.scale_layout)

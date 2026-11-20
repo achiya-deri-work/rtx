@@ -17,9 +17,32 @@ import sys
 import time
 from typing import Mapping, Sequence, TextIO
 
+from .outcomes import is_fatal_device_context_error
+
 
 WATCHDOG_CHILD_ENV = "RTX_AUTOTUNE_WATCHDOG_CHILD"
 STALL_EXIT_CODE = 75
+DEVICE_FAULT_EXIT_CODE = 76
+TIMEOUT_EXIT_CODE = 124
+
+
+def _stop_process_group(process: subprocess.Popen, grace_s: float) -> None:
+    """Own the entire isolated group, including a compiler's CUDA workers."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=grace_s)
+    except subprocess.TimeoutExpired:
+        pass
+    # The immediate child can exit before a sticky/ignoring grandchild. Never
+    # leave that grandchild running merely because process.wait() succeeded.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
 
 
 def _process_tree_cpu_ticks(root_pid: int) -> int | None:
@@ -68,13 +91,17 @@ def supervise_command(
     terminate_grace_s: float = 10.0,
     environment: Mapping[str, str] | None = None,
     output: TextIO | None = None,
+    wall_timeout_s: float | None = None,
+    abort_on_device_fault: bool = True,
+    cwd: str | os.PathLike | None = None,
 ) -> int:
     """Run ``command`` and kill its process group after prolonged silence.
 
     Output is streamed unchanged.  Output or increasing process-tree CPU time
     is a heartbeat; active-but-silent work still has a separate hard ceiling.
-    The returned exit code is 75 after a watchdog kill so callers can resume
-    from append-only residuals in a fresh process.
+    Return 75 for a stall, 124 for the optional wall limit, or 76 for a sticky
+    device fault, even if an inner autotuner catches it and exits successfully.
+    Device faults stop the whole owned process group, not just its parent.
     """
 
     if active_stall_timeout_s is None:
@@ -83,6 +110,7 @@ def supervise_command(
         stall_timeout_s <= 0
         or active_stall_timeout_s <= 0
         or terminate_grace_s <= 0
+        or (wall_timeout_s is not None and wall_timeout_s <= 0)
     ):
         raise ValueError("watchdog durations must be positive")
     sink = sys.stdout if output is None else output
@@ -97,6 +125,7 @@ def supervise_command(
         bufsize=0,
         env=env,
         start_new_session=True,
+        cwd=cwd,
     )
     assert process.stdout is not None
     selector = selectors.DefaultSelector()
@@ -106,6 +135,8 @@ def supervise_command(
     last_cpu_ticks = _process_tree_cpu_ticks(process.pid)
     last_activity_notice = last_output
     pending = bytearray()
+    started = last_output
+    fault_tail = ""
 
     def emit(data: bytes) -> None:
         if not data:
@@ -113,12 +144,30 @@ def supervise_command(
         sink.write(data.decode("utf-8", errors="replace"))
         sink.flush()
 
+    def device_fault(data: bytes) -> bool:
+        nonlocal fault_tail
+        text = fault_tail + data.decode("utf-8", errors="replace")
+        fault_tail = text[-8192:]
+        return abort_on_device_fault and is_fatal_device_context_error(text)
+
     try:
         while process.poll() is None:
+            if wall_timeout_s is not None and time.monotonic()-started >= wall_timeout_s:
+                emit(bytes(pending))
+                pending.clear()
+                emit(f"WATCHDOG wall limit {wall_timeout_s:.1f}s; terminating process group pid={process.pid}\n".encode())
+                _stop_process_group(process, terminate_grace_s)
+                return TIMEOUT_EXIT_CODE
             ready = selector.select(timeout=min(1.0, stall_timeout_s))
             if ready:
                 chunk = os.read(process.stdout.fileno(), 65536)
                 if chunk:
+                    if device_fault(chunk):
+                        emit(bytes(pending)+chunk)
+                        pending.clear()
+                        emit(f"WATCHDOG fatal CUDA device fault; terminating process group pid={process.pid}\n".encode())
+                        _stop_process_group(process, terminate_grace_s)
+                        return DEVICE_FAULT_EXIT_CODE
                     pending.extend(chunk)
                     last_output = time.monotonic()
                     last_activity = last_output
@@ -126,6 +175,10 @@ def supervise_command(
                         line, _, pending = pending.partition(b"\n")
                         emit(line + b"\n")
                     continue
+            # The parent may have exited while select waited on a pipe still
+            # held by its compiler worker. That is cleanup, not a stall.
+            if process.poll() is not None:
+                break
             now = time.monotonic()
             cpu_ticks = _process_tree_cpu_ticks(process.pid)
             cpu_active = (
@@ -163,31 +216,36 @@ def supervise_command(
                     f"terminating process group pid={process.pid}\n"
                 ).encode()
             )
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=terminate_grace_s)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            _stop_process_group(process, terminate_grace_s)
             if pending:
                 emit(bytes(pending))
             return STALL_EXIT_CODE
+        # A successful parent can leave an autotuner subprocess holding the
+        # pipe open. Bound cleanup and drain only bytes already available.
+        status = int(process.returncode or 0)
+        _stop_process_group(process, terminate_grace_s)
+        os.set_blocking(process.stdout.fileno(), False)
         remainder = process.stdout.read()
         if remainder:
             pending.extend(remainder)
+        fault = device_fault(remainder or b"")
         if pending:
             emit(bytes(pending))
-        return int(process.returncode or 0)
+        if fault:
+            emit(b"WATCHDOG fatal CUDA device fault in final child output\n")
+            return DEVICE_FAULT_EXIT_CODE
+        return status
     finally:
         selector.close()
         if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=terminate_grace_s)
+            _stop_process_group(process, terminate_grace_s)
         process.stdout.close()
 
 
 __all__ = [
     "STALL_EXIT_CODE",
+    "DEVICE_FAULT_EXIT_CODE",
+    "TIMEOUT_EXIT_CODE",
     "WATCHDOG_CHILD_ENV",
     "supervise_command",
 ]

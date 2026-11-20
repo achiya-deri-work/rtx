@@ -1,9 +1,10 @@
-"""Fixed-K policy reference extracted unchanged from the BiMoE handoff.
+"""Fixed-K policy reference extracted from the BiMoE handoff.
 
 Source: routing-research-port-20261111/bidirectional_mixture_of_experts/router.py
 SHA256: f4872cd1f3df5b320bedb526e666415c8b59130560b080d84195ac43d35fada7
 Only the regular no-fallback pipeline is included; no expert dependency.
 This is a transparent Torch reference, not a claim of handwritten CUDA kernels.
+Selected-softmax backward centers upstreams to avoid FP32 cancellation.
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ def sigmoid_router_log_affinities(
     score_bias: torch.Tensor,
     *,
     rms_epsilon: float,
+    _affine=None,
 ) -> torch.Tensor:
     """Compute stable FP32 log-sigmoid affinities."""
     if x.ndim != 2:
@@ -47,8 +49,32 @@ def sigmoid_router_log_affinities(
     normalized_tokens = _rms_normalize(token_latents, rms_epsilon)
     normalized_experts = _rms_normalize(expert_tokens, rms_epsilon)
     logits = F.linear(normalized_tokens, normalized_experts)
+    if _affine is not None:
+        return _affine(logits, logit_scale, score_bias)
     logits = logits * logit_scale.float().exp() + score_bias.float()
     return F.logsigmoid(logits)
+
+
+class _SelectedSoftmax(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, values):
+        probabilities = values.softmax(dim=-1)
+        ctx.save_for_backward(probabilities)
+        return probabilities
+
+    @staticmethod
+    def backward(ctx, gradient):
+        (probabilities,) = ctx.saved_tensors
+        # J * 1 = 0. Remove the common component before reduction rather
+        # than subtracting two nearly equal O(1) values after reduction.
+        # All operations remain visible to AOTAutograd/Inductor.
+        centered = gradient - gradient[..., :1]
+        return probabilities * (centered - (probabilities * centered).sum(-1, keepdim=True))
+
+
+def selected_softmax(values):
+    """Selected-expert softmax with a cancellation-resistant saved adjoint."""
+    return _SelectedSoftmax.apply(values)
 
 
 def padded_token_count(num_tokens: int, num_experts: int, top_k: int) -> int:
@@ -395,7 +421,7 @@ def routing_metadata(
     token_ids = torch.arange(scheduled_tokens, device=log_transport.device)
     token_ids = token_ids[:, None].expand(scheduled_tokens, top_k)
     selected_log_weights = log_transport.gather(1, expert_assignments)
-    selected_weights = F.softmax(selected_log_weights, dim=1)
+    selected_weights = selected_softmax(selected_log_weights)
     real_assignment = token_ids < num_real_tokens
     selected_weights = selected_weights * real_assignment.to(selected_weights.dtype)
 

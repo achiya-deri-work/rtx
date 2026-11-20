@@ -92,6 +92,15 @@ def _reset():
     torch.compiler.reset()
 
 
+def test_namespace_clear_preserves_unrelated_bindings():
+    selection.bind_selected((4,8),'cuda:0','routing:policy',True,'router')
+    selection.bind_selected((4,8),'cuda:0','expert-policy',True,'expert')
+    assert selection.clear_selection_cells(namespace='routing:')==1
+    assert selection.bound_config((4,8),'cuda:0','expert-policy',True)=='expert'
+    assert selection.bound_config((4,8),'cuda:0','routing:policy',True) is None
+    with pytest.raises(TypeError):selection.clear_selection_cells(namespace=1)
+
+
 def test_compiled_cell_transitions_once_and_other_shapes_do_not_invalidate():
     compiled = []
 
@@ -110,6 +119,21 @@ def test_compiled_cell_transitions_once_and_other_shapes_do_not_invalidate():
     assert _COLD_CALLS == [(4,), (8,)]
     assert 'rtx_selection_test.cold' in compiled[0].code
     assert 'rtx_selection_test.cold' not in compiled[1].code
+
+
+def test_multiple_policy_bindings_in_one_trace_do_not_read_a_stale_dictionary_snapshot():
+    frames=[]
+    def backend(graph,_inputs):frames.append(graph);return graph.forward
+    compiled=torch.compile(lambda x:_dispatch(x,'first')+_dispatch(x,'second'),
+                           fullgraph=True,dynamic=False,backend=backend)
+    x=torch.randn(4)
+    torch.testing.assert_close(compiled(x),x*4)
+    torch.testing.assert_close(compiled(x),x*4)
+    torch.testing.assert_close(compiled(x),x*4)
+    assert len(frames)==2
+    assert _COLD_CALLS==[(4,),(4,)]
+    assert 'rtx_selection_test.cold' in frames[0].code
+    assert 'rtx_selection_test.cold' not in frames[1].code
 
 
 def test_bound_plan_is_immutable_and_saved_metadata_survives_eviction(monkeypatch):

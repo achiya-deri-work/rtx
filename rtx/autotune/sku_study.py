@@ -17,7 +17,7 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from .core import Observation, canonical_json
-from .pretrained import load_offline_observations
+from .pretrained import load_offline_observations, _device_key, _shape_group_key
 
 
 def _category(features: Mapping[str, float], prefix: str) -> str | None:
@@ -54,7 +54,7 @@ def _decoded(value: str) -> object:
 
 
 def _sku(item: Observation[object]) -> str:
-    return _category(item.features, "context.device.sku.sku_family=") or "unknown"
+    return _device_key(item)
 
 
 def _regime(item: Observation[object]) -> str:
@@ -64,19 +64,17 @@ def _regime(item: Observation[object]) -> str:
 def _workload(item: Observation[object]) -> tuple[object, ...]:
     features = item.features
     return (
-        item.family,
-        item.kernel_revision,
-        int(features.get("context.workload.m", 0)),
-        int(features.get("context.workload.n", 0)),
-        int(features.get("context.workload.k", 0)),
+        *_shape_group_key(item),
         _regime(item),
+        _category(features, "context.workload.phase=") or "unknown",
         _category(features, "context.tags.scale_policy=") or "unknown",
         _category(features, "context.tags.operand_state=") or "unknown",
     )
 
 
 def _m_region(item: Observation[object]) -> str:
-    m = int(item.features.get("context.workload.m", 0))
+    m = int(item.features.get("context.workload.tokens",
+            item.features.get("context.workload.total_tokens",item.features.get("context.workload.m",0))))
     if m <= 128:
         return "launch_floor"
     if m <= 1024:
@@ -112,6 +110,10 @@ def _device_profiles(rows: Sequence[Observation[object]]) -> list[dict[str, obje
         "context.device.properties.shared_memory_per_multiprocessor",
         "context.device.properties.clock_rate_khz",
         "context.device.total_memory",
+        "context.device.memory_bus_width_bits",
+        "context.device.l2_cache_size",
+        "context.device.regs_per_multiprocessor",
+        "context.device.shared_memory_per_multiprocessor",
         "context.device.calibration.measured_dram_bandwidth_gbps",
         "context.device.calibration.measured_l2_copy_bandwidth_gbps",
         "context.device.calibration.measured_mxfp8_quant_bandwidth_gbps",
@@ -143,7 +145,7 @@ def _coordinate_effects(
     seed: int,
     minimum_contexts: int,
 ) -> list[dict[str, object]]:
-    successful = [item for item in rows if item.successful and item.score > 0]
+    successful = [item for item in rows if item.outcome.timing_eligible]
     context_logs: dict[str, list[float]] = defaultdict(list)
     context_best: dict[str, float] = {}
     for item in successful:
@@ -259,7 +261,7 @@ def _winner_transfer(rows: Sequence[Observation[object]]) -> list[dict[str, obje
         tuple[str, tuple[object, ...]], dict[str, dict[str, float]]
     ] = defaultdict(lambda: defaultdict(dict))
     for item in rows:
-        if item.successful and item.score > 0:
+        if item.outcome.timing_eligible:
             bucket = catalogs[(_sku(item), _workload(item))][item.context_id]
             bucket[item.config_id] = min(bucket.get(item.config_id, math.inf), item.score)
 
@@ -420,16 +422,20 @@ def _markdown(report: Mapping[str, object]) -> str:
         "| SKU | SMs | Bus | Theoretical BW | L2 | Measured DRAM | Native MXFP8 |",
         "|---|---:|---:|---:|---:|---:|---:|",
     ]
+    def hardware_value(item, key, decimals=0):
+        value = item.get(key)
+        return "n/a" if value is None or float(value) <= 0 else f"{float(value):.{decimals}f}"
+
     for item in report["device_profiles"]:
         lines.append(
-            "| {sku} | {sm:.0f} | {bus:.0f} | {tbw:.1f} | {l2:.0f} | {dram:.1f} | {mx:.1f} |".format(
+            "| {sku} | {sm} | {bus} | {tbw} | {l2} | {dram} | {mx} |".format(
                 sku=item["sku"],
-                sm=item.get("multiprocessor_count", 0),
-                bus=item.get("sku.memory_bus_width_bits", 0),
-                tbw=item.get("sku.theoretical_memory_bandwidth_gbps", 0),
-                l2=item.get("properties.l2_cache_size", 0),
-                dram=item.get("calibration.measured_dram_bandwidth_gbps", 0),
-                mx=item.get("calibration.measured_native_mxfp8_gemm_tflops", 0),
+                sm=hardware_value(item,"multiprocessor_count"),
+                bus=hardware_value(item,"sku.memory_bus_width_bits"),
+                tbw=hardware_value(item,"sku.theoretical_memory_bandwidth_gbps",1),
+                l2=hardware_value(item,"properties.l2_cache_size"),
+                dram=hardware_value(item,"calibration.measured_dram_bandwidth_gbps",1),
+                mx=hardware_value(item,"calibration.measured_native_mxfp8_gemm_tflops",1),
             )
         )
     lines.extend(["", "## Winner transfer", "", "| Source | Target | Coverage | Median regret | P90 regret | Within 2% |", "|---|---|---:|---:|---:|---:|"])
@@ -491,7 +497,7 @@ def _markdown(report: Mapping[str, object]) -> str:
             "",
             "## Interpretation limits",
             "",
-            "Only three SKUs are present. Continuous correlations with SM count, bus width, or bandwidth are therefore hypotheses, not identified hardware laws. Coordinate effects are context-adjusted observational associations; the parent-linked conditional rules and held-out winner-transfer replay are stronger evidence. Adaptive search also over-samples promising neighborhoods, so support and confidence are reported rather than treating frequency as causality.",
+            f"This dataset contains {len(report['device_profiles'])} SKU profile(s). Missing hardware measurements are n/a, not physical zeros. Continuous correlations with SM count, bus width, or bandwidth are hypotheses, not identified hardware laws; one SKU cannot establish cross-SKU transfer. Coordinate effects are context-adjusted observational associations; parent-linked conditional rules and held-out winner-transfer replay provide stronger evidence where available. Adaptive search also over-samples promising neighborhoods, so support and confidence are reported rather than treating frequency as causality.",
             "",
         ]
     )

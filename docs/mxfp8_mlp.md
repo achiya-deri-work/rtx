@@ -164,6 +164,17 @@ It retains the MXFP8 hidden boundary and existing backward recipe; weights are
 requantized on every invocation. It is an autotuner choice, not a default
 replacement or a guarantee of improvement on small shapes.
 
+Prepared forward exposes its output, MXFP8 hidden and typed scratch allocation
+to the caller's compiled graph. One private mutation operator performs only
+the selected launches; scale-byte reinterpretation is a CuTe pointer/layout
+operation, not eager Torch tensor math. Forced, cold-selected and bound paths
+use the same implementation and save only the original BF16 operands for
+recomputed backward. No private CUDA graph or caller-managed workspace is added.
+For short reduction workloads, eight-trial coverage compares on-chip,
+gate-only prepared and gate+down prepared forward with matched backward,
+including an unsplit direct-dW alternative. This prevents backward variants
+from consuming the budget without ever testing another forward family.
+
 Experimental `down_backend="prequant"` quantizes the BF16 down weight once per
 invocation in a separate kernel, then consumes the packed MXFP8 hidden directly
 with a packed GEMM. `down_quant` and `down_gemm` control this path. It supports
@@ -171,6 +182,27 @@ native on-chip and prequantized gate execution, including logical tails. It
 requires row-major, infinity-rounded scales. It adds a launch and transient
 packed weights/scales, trading these costs against repeated tile-local weight
 quantization. Weights are never reused across invocations or optimizer updates.
+
+Packed GEMMs offer three independent output-store schedules:
+`epilogue="direct"`, `"tma"` and `"hybrid"`. Pure TMA requires complete output
+tiles. Hybrid uses TMA on complete interior tiles and masked direct stores
+only on the final M/N boundary tiles, preserving the exact logical tensor
+shape without padding or a copy. It requires a 16-byte-aligned BF16 row stride
+and at least one interior tile. This applies equally to a standalone MLP and
+the ordinary shared MLP inside MoE; sequence boundaries are not inputs to it.
+The autotuner compares these stores together with legal tile/buffer and dW
+partition recipes. Split FP32 dW workspace outputs still require direct stores.
+This **hybrid output-store schedule** is unrelated to the hybrid-precision
+MLP recipe described above and does not change activation or gradient precision.
+See [qualification and limitations](mxfp8_hybrid_tails_20261119.md).
+
+First-hit complete backward proposals derive transpose-quantizer row tiles
+from each actually transposed operand extent. Half-aligned widths can therefore
+use legal 32/64-row tiles instead of being rejected by a fixed 128-row seed;
+row-oriented token counts do not constrain those transpose tiles. This is
+layout/coverage work, not an explicit BF16 transpose copy or a precision change.
+MLP winner revision 48 invalidates older results that omitted this family.
+See the [fresh progressive 8/16-trial qualification](mxfp8_moe_iteration2_20261119.md).
 
 Experimental `gate_backend="cooperative_prequant"` instead quantizes X, gate/up
 weights, and down weights once across a cooperatively launched grid. A grid

@@ -163,6 +163,41 @@ These feature APIs are not in the stable wildcard-export surface.
 M=K=H=O=1; the conservative default passes. Read the
 [numerical stress report](docs/mxfp8_mlp_numerics.md).
 
+## Balanced MoE
+
+`BalancedMoE` is an experimental MXFP8 SwiGLU MoE with one shared expert,
+fixed K distinct routed experts per token and equal scheduled expert loads:
+
+```python
+import torch
+import rtx
+
+moe = rtx.BalancedMoE(
+    384, 32, 320, top_k=4, shared_hidden_features=256, device="cuda",
+)
+model = torch.compile(moe, fullgraph=True, dynamic=False)
+x = torch.randn(8, 1024, 384, device="cuda", dtype=torch.bfloat16)
+y = model(x)  # BF16 [B,T,384] -> same shape; independent routing per sample
+y.float().square().mean().backward()
+```
+
+Tuning and cache reuse are automatic. Optional `autotune="quick"` reduces
+startup effort; `moe.autotune_(x, effort="thorough")` prepares all components
+before compilation. Packed inputs use `model(x, cu_seqlens=cu)` with 2D X.
+No caller scratch/stream management. [Layer guide](docs/balanced_moe.md) ·
+[Runnable training example](examples/balanced_moe.py) ·
+[Measured BF16 comparison](docs/mxfp8_bf16_broad_20261120.md).
+
+Inputs must be contiguous BF16. This remains experimental, not a general
+speedup over compiled BF16 MoE. **Known integration limitations:** cold
+first-hit tuning under `torch.inference_mode()` fails (use `torch.no_grad()`
+to warm the forward cache), and enclosing BF16 autocast currently breaks the
+router's FP32 contract even with BF16 input. Run this layer outside autocast
+for now. Device-only movement preserves its mixed-precision parameter recipe;
+whole-model `.bfloat16()` downcasts router scalars too. See the
+[application-side review](docs/balanced_moe_user_review_20261120.md) for tested
+checkpoint/cache workflows, startup behavior and exact reproductions.
+
 ## Evidence and development
 
 Low-precision implementation error, precision loss versus BF16, model

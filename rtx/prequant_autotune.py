@@ -52,7 +52,7 @@ except ImportError:  # pragma: no cover - Linux/CUDA is the supported target.
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_prequant_e2e"
-KERNEL_REVISION = 11
+KERNEL_REVISION = 12
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -287,11 +287,12 @@ PREQUANT_SEARCH_SPACE: dict[str, tuple[dict[str, object], ...]] = {
         *(
             {
                 "gemm": {
-                    "epilogue": "tma",
+                    "epilogue": epilogue,
                     "epilogue_stages": stages,
                     "store_vec": vector,
                 }
             }
+            for epilogue in ('tma','hybrid')
             for stages in (1, 2, 3, 4)
             for vector in (1, 2, 4)
         ),

@@ -46,19 +46,22 @@ def mixed_down_rejection(problem, config):
 
 
 @lru_cache(maxsize=128)
-def compile_mixed_down(problem, config):
+def compile_mixed_down(problem, config, *, _byte_scales=False):
     reason = mixed_down_rejection(problem,config)
     if reason:
         raise ValueError(reason)
     kernel = MXFP8LinearFwdKernel(problem,config)
     kernel.a_prequantized = True
+    if _byte_scales:
+        from ._mxfp8_byte_scales import ByteMixedDown
+        kernel = ByteMixedDown(kernel)
     width = (problem.k+31)//32*32
     def fake(dtype,rows,cols):
         return cute.runtime.make_fake_tensor(dtype,(rows,cols),stride=(cols,1),assumed_align=16)
     x = fake(Float8E4M3FN,problem.m,width)
     w = fake(BFloat16,problem.n,problem.k)
     out = fake(BFloat16,problem.m,problem.n)
-    scales = fake(Float8E8M0FNU,problem.m,width//32)
+    scales = fake(Uint8 if _byte_scales else Float8E8M0FNU,problem.m,width//32)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile(kernel,x,w,out,scales,scales,scales,scales,stream,
                         options="--enable-tvm-ffi --opt-level 3 "

@@ -3,6 +3,15 @@ import math
 import statistics
 
 
+class DeploymentQualificationError(RuntimeError):
+    """Failed incumbent validation, retaining evidence without promoting it."""
+
+    def __init__(self, decision):
+        self.decision = decision
+        super().__init__('deployment incumbent did not pass qualification; no safe promotion: '
+                         + repr(decision['failures']))
+
+
 def qualify_pair(incumbent, challenger, evaluate, *, rounds=6, margin=.01):
     """Alternate A/B order. A lower-tail paired speedup must clear the margin.
 
@@ -27,7 +36,9 @@ def qualify_pair(incumbent, challenger, evaluate, *, rounds=6, margin=.01):
             else:
                 samples[name].append(value)
     if len(samples['incumbent']) != rounds:
-        raise RuntimeError('deployment incumbent did not pass qualification; no safe promotion')
+        raise DeploymentQualificationError(dict(promoted=False, rounds=rounds,
+            margin=margin, samples_ms=samples, failures=failures,
+            reason='unqualified_incumbent'))
     speedups=[]
     promote=False
     aggregate_speedup=None

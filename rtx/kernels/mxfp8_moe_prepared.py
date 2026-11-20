@@ -8,7 +8,7 @@ from functools import lru_cache
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16,Float8E4M3FN,Float8E8M0FNU,Uint8
+from cutlass import BFloat16,Float8E4M3FN,Float8E8M0FNU,Float32,Uint8
 
 from .mxfp8_quant import MXFP8QuantKernel,MXFP8TransposedQuantKernel
 from .mxfp8_gemm import MXFP8GemmKernel
@@ -87,7 +87,7 @@ class ExpertTransposeOperand(MXFP8TransposedQuantKernel):
 
 
 class ExpertQuantPortfolio:
-    def __init__(self,experts,specs,config,transpose_mode,grid_mode):
+    def __init__(self,experts,specs,config,transpose_mode,grid_mode,warp_tokens=8,warp_raster='features'):
         if config.scale_layout not in ('row_major','mma128'):raise ValueError('Unsupported expert scale layout')
         self.experts,self.specs=experts,specs
         self.quantizers=[];self.offsets=[];offset=0
@@ -105,7 +105,10 @@ class ExpertQuantPortfolio:
             operand_config=replace(config,scale_layout='row_major',native_scale_store='scalar') if len(spec)==5 and batches==1 else config
             if orientation not in ('row','transpose') or (interleave and orientation!='row'):
                 raise ValueError('Invalid expert operand layout')
-            if orientation=='transpose' and transpose_mode=='staged' and operand_config.transposed_rejection(rows,k) is None:
+            if orientation=='transpose' and transpose_mode=='warp':
+                from .mxfp8_moe_warp_quant import ExpertWarpTransposeOperand
+                q=ExpertWarpTransposeOperand(rows,k,operand_config,warp_tokens,warp_raster)
+            elif orientation=='transpose' and transpose_mode=='staged' and operand_config.transposed_rejection(rows,k) is None:
                 q=ExpertTransposeOperand(rows,k,operand_config)
             else:
                 q=ExpertQuantOperand(rows,k,replace(operand_config,load_bits=16) if orientation=='transpose' else operand_config,
@@ -155,14 +158,14 @@ class ExpertQuantPortfolio:
 
 
 @lru_cache(maxsize=128)
-def compile_expert_quant(experts,specs,config,transpose_mode='staged',grid_mode='operand',_byte_scales=False):
+def compile_expert_quant(experts,specs,config,transpose_mode='staged',grid_mode='operand',warp_tokens=8,warp_raster='features',_byte_scales=False):
     """Quantize expert operands, optionally together with shared token rows.
 
     Four-field specs retain the original all-experts layout. A fifth batch
     extent makes work heterogeneous; an explicit singleton emits row-major
     scales, allowing original-token X to be routed after quantization.
     """
-    if transpose_mode not in ('direct','staged'):raise ValueError('Unknown transpose preparation mode')
+    if transpose_mode not in ('direct','staged','warp'):raise ValueError('Unknown transpose preparation mode')
     sources=[];quantized=[];scales=[]
     for spec in specs:
         rows,k,orientation,_=spec[:4]
@@ -170,12 +173,12 @@ def compile_expert_quant(experts,specs,config,transpose_mode='staged',grid_mode=
         sources.append(cute.runtime.make_fake_tensor(BFloat16,
             (batches*(rows if orientation=='row' else k),k if orientation=='row' else rows),
             stride=(k if orientation=='row' else rows,1),
-            assumed_align=2 if len(spec)==5 and batches==1 else 16))
+            assumed_align=2 if (len(spec)==5 and batches==1) or (transpose_mode=='warp' and orientation=='transpose') else 16))
         width=(k+31)//32*32
         quantized.append(_fake(Float8E4M3FN,batches*rows,width))
         scales.append(_fake(Uint8 if _byte_scales else Float8E8M0FNU,batches*rows,width//32))
     stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    kernel=ExpertQuantPortfolio(experts,specs,config,transpose_mode,grid_mode)
+    kernel=ExpertQuantPortfolio(experts,specs,config,transpose_mode,grid_mode,warp_tokens,warp_raster)
     if _byte_scales:
         from .mxfp8_moe_buffers import ByteQuantPortfolio
         kernel=ByteQuantPortfolio(kernel)
@@ -195,23 +198,44 @@ class TypedExpertScaleAux:
 
 
 @lru_cache(maxsize=128)
-def compile_expert_packed_gemm(experts,problem,config,kind='linear',transport='tma',typed_aux_scales=False,_byte_scales=False):
+def compile_expert_packed_gemm(experts,problem,config,kind='linear',transport='tma',typed_aux_scales=False,
+                              _byte_scales=False,split=1,active_m_alignment=0,active_k=False,glu_engine='legacy'):
     if config.scale_layout not in ('row_major','mma128'):
         raise ValueError('Batched packed GEMM requires row-major/native128 scales')
     if typed_aux_scales and kind!='glu':raise ValueError('Typed scale auxiliaries are only used by GLU')
     if typed_aux_scales and _byte_scales:raise ValueError('Scale auxiliary cannot be typed and byte-canonical together')
+    if type(active_m_alignment) is not int or active_m_alignment < 0 or type(active_k) is not bool:
+        raise ValueError('Active GEMM requires a nonnegative integer row alignment and a bool K flag')
+    active=active_m_alignment or active_k
+    if glu_engine!='legacy' and (kind!='glu' or active_k or split!=1 or transport!='tma'):
+        raise ValueError('Fragment GLU requires unsplit TMA forward with static K')
+    if active and (transport!='tma' or split!=1 or not _byte_scales or kind=='derivative'
+                   or config.scale_layout!='row_major' or (active_m_alignment and active_k)):
+        raise ValueError('Active-prefix GEMM requires byte-scale unsplit row-major TMA')
+    if active_m_alignment and (config.tiles_per_cta!=1 or config.persistent_waves):
+        raise ValueError('Active row GEMM requires a single tile per CTA')
     if kind=='linear':
         cls=MXFP8GemmKernel
         if transport=='cooperative':
-            from .mxfp8_moe_cooperative import CooperativeExpertGemm
-            cls=CooperativeExpertGemm
+            if config.tile_k in (32,64):
+                from .mxfp8_moe_short_dw import ShortReductionExpertDW
+                cls=ShortReductionExpertDW
+            else:
+                from .mxfp8_moe_cooperative import CooperativeExpertGemm
+                cls=CooperativeExpertGemm
         elif transport!='tma':raise ValueError('Unsupported packed transport')
-        kernel=cls(problem,config)
-        shape=(problem.m,problem.n);aux_shape=None
+        if split>1 and transport!='tma':raise ValueError('Split-K needs the TMA FP32 workspace engine')
+        kernel=cls(problem,config,split_reduction=split,split_partition='balanced' if split>1 else 'uniform') if transport=='tma' else cls(problem,config)
+        shape=(split*problem.m,problem.n);aux_shape=None
     elif kind in ('glu','derivative'):
+        if split!=1:raise ValueError('GLU cannot split its reduction before activation')
         if transport!='tma':raise ValueError('GLU currently requires TMA transport')
-        cls=MXFP8PrequantGLUKernel if kind=='glu' else PrequantGLURecomputeDerivative
-        kernel=cls(problem,config,'silu','mxfp8' if kind=='glu' else 'bf16')
+        if glu_engine!='legacy':
+            from .mxfp8_moe_glu_epilogue import ExpertFragmentGLU
+            kernel=ExpertFragmentGLU(problem,config,'silu','mxfp8',glu_engine)
+        else:
+            cls=MXFP8PrequantGLUKernel if kind=='glu' else PrequantGLURecomputeDerivative
+            kernel=cls(problem,config,'silu','mxfp8' if kind=='glu' else 'bf16')
         h=problem.n//2
         shape=(problem.m,(h+31)//32*32 if kind=='glu' else problem.n)
         aux_shape=(problem.m,shape[1]//32 if kind=='glu' else h)
@@ -223,11 +247,17 @@ def compile_expert_packed_gemm(experts,problem,config,kind='linear',transport='t
     else:raise ValueError('Unknown packed expert GEMM kind')
     kernel.batch_count=experts
     kernel.batch_output_shape=shape;kernel.batch_extra_shape=aux_shape
+    if active:
+        # Fragment GLU uses the common CTA-wide M guard before any pipeline
+        # or epilogue barriers. Keep whole output tiles through the rounded
+        # dependency extent so the downstream GEMM can read its final tile.
+        kernel.active_m_alignment=active_m_alignment
+        kernel.active_k=active_k
     qx=_fake(Float8E4M3FN,experts*problem.m,problem.k)
     qw=_fake(Float8E4M3FN,experts*problem.n,problem.k)
     sx=_fake(Uint8 if _byte_scales else Float8E8M0FNU,experts*problem.m,problem.k//32)
     sw=_fake(Uint8 if _byte_scales else Float8E8M0FNU,experts*problem.n,problem.k//32)
-    out=_fake(Float8E4M3FN if kind=='glu' else BFloat16,experts*shape[0],shape[1])
+    out=_fake(Float8E4M3FN if kind=='glu' else Float32 if split>1 else BFloat16,experts*shape[0],shape[1])
     aux_dtype=(Float8E8M0FNU if typed_aux_scales else Uint8) if kind=='glu' else BFloat16
     aux=out if aux_shape is None else _fake(aux_dtype,
                                           experts*aux_shape[0],aux_shape[1])
@@ -236,9 +266,52 @@ def compile_expert_packed_gemm(experts,problem,config,kind='linear',transport='t
     if _byte_scales:
         from .mxfp8_moe_buffers import BytePackedGemm
         kernel=BytePackedGemm(kernel)
-    return cute.compile(kernel,qx,qw,sx,sw,out,aux,stream,
+    extra=()
+    if active:
+        from .mxfp8_moe_active import fake_prefix
+        extra=(fake_prefix(),)
+    return cute.compile(kernel,qx,qw,sx,sw,out,aux,stream,*extra,
         options='--enable-tvm-ffi --opt-level 3 '
         f"--ptxas-options '-O3 --maxrregcount={config.maxrregcount}'")
+
+
+class ExpertDWReduce:
+    """Deterministic FP32 tree over [expert, split, M, N], one BF16 cast.
+
+    Experts never share a reduction. The wrapper/Inductor owns workspace;
+    this launcher allocates nothing and performs no Torch operations.
+    """
+    def __init__(self,e,m,n,split,threads,vector):
+        if split not in (2,4,8,16) or threads not in (64,128,256,512) or vector not in (1,2,4,8):
+            raise ValueError('Unsupported grouped weight-gradient reduction schedule')
+        self.e,self.elements,self.split,self.threads,self.vector=e,m*n,split,threads,vector
+
+    @cute.jit
+    def __call__(self,workspace,out,stream):
+        self.kernel(workspace,out).launch(grid=(cute.ceil_div(self.elements,self.threads*self.vector),1,self.e),
+            block=(self.threads,1,1),stream=stream)
+
+    @cute.kernel
+    def kernel(self,workspace,out):
+        block,_,expert=cute.arch.block_idx();thread=cute.arch.thread_idx()[0]
+        source=cute.make_tensor(workspace.iterator+expert*self.split*self.elements,cute.make_layout((self.split*self.elements,)))
+        destination=cute.make_tensor(out.iterator+expert*self.elements,cute.make_layout((self.elements,)))
+        for item in cutlass.range_constexpr(self.vector):
+            index=block*self.threads*self.vector+thread+item*self.threads
+            if index<self.elements:
+                values=[Float32(0)]*self.split
+                for part in cutlass.range_constexpr(self.split):values[part]=source[part*self.elements+index]
+                for level in cutlass.range_constexpr(self.split.bit_length()-1):
+                    for pair in cutlass.range_constexpr(self.split//(2<<level)):
+                        values[pair]=values[2*pair]+values[2*pair+1]
+                destination[index]=BFloat16(values[0])
+
+
+@lru_cache(maxsize=128)
+def compile_expert_dw_reduce(e,m,n,split,threads=128,vector=4):
+    return cute.compile(ExpertDWReduce(e,m,n,split,threads,vector),
+        _fake(Float32,e*split*m,n),_fake(BFloat16,e*m,n),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),options='--enable-tvm-ffi --opt-level 3')
 
 
 class ExpertJointRecompute(PrequantGLURecomputeDerivative):
@@ -254,8 +327,7 @@ class ExpertJointRecompute(PrequantGLURecomputeDerivative):
             cute.make_layout((rows,cols),stride=(cols,1)))
 
     @cute.jit
-    def _glu_epilogue(self,storage,accumulators,coordinates,out,aux,
-                      block_m,block_n,tidx,tma_out,tma_out_tensor,out_layout,work_slot):
+    def _local_joint_aux(self,aux):
         expert=cute.arch.block_idx()[2]
         m,n=self.problem.m,self.problem.n
         h=n//2
@@ -268,16 +340,38 @@ class ExpertJointRecompute(PrequantGLURecomputeDerivative):
         sp=self._local(aux[6],2*m,h//32,expert)
         qpt=self._local(aux[7],n,m,expert)
         spt=self._local(aux[8],n,m//32,expert)
-        nested=((((dh,dh),qp,sp),((qht,qh,sh)),sht),qpt,spt)
+        return dh,qh,sh,qht,sht,qp,sp,qpt,spt
+
+    @cute.jit
+    def _glu_epilogue(self,storage,accumulators,coordinates,out,aux,
+                      block_m,block_n,tidx,tma_out,tma_out_tensor,out_layout,work_slot):
+        dh,qh,sh,qht,sht,qp,sp,qpt,spt=self._local_joint_aux(aux)
+        nested=((((dh,dh),qp,sp),(qht,qh,sh),sht),qpt,spt)
         PrequantGLURecomputeDerivative._glu_epilogue(self,storage,accumulators,coordinates,out,nested,
             block_m,block_n,tidx,tma_out,tma_out_tensor,out_layout,work_slot)
 
 
 @lru_cache(maxsize=128)
-def compile_expert_joint_recompute(experts,problem,config,quant,_byte_scales=False):
-    if problem.m%32 or problem.n%64 or config.scale_layout!='row_major':
-        raise ValueError('Joint experts require 32-value blocks and row-major scales')
-    kernel=ExpertJointRecompute(problem,config,'silu','bf16')
+def compile_expert_joint_recompute(experts,problem,config,quant,_byte_scales=False,*,engine='legacy',
+                                   active_m_alignment=0,gradient_warps=3):
+    from ..configs.moe import joint_recompute_rejection
+    why=joint_recompute_rejection(problem,config,engine,gradient_warps)
+    if why:raise ValueError(why)
+    if engine=='split_warp' and active_m_alignment:
+        raise ValueError('Split recompute is currently qualified only for static capacity')
+    if active_m_alignment and (not _byte_scales or active_m_alignment%32
+            or config.tiles_per_cta!=1 or config.persistent_waves):
+        raise ValueError('Active joint recompute requires byte scales, block32 and one tile per CTA')
+    cls=ExpertJointRecompute
+    if engine=='split_warp':
+        from .mxfp8_moe_recompute_split import SplitWarpJointRecompute
+        cls=SplitWarpJointRecompute
+    elif engine!='legacy':
+        from .mxfp8_moe_recompute import OperandReuseJointRecompute,DualOperandJointRecompute
+        cls=OperandReuseJointRecompute if engine=='operand_reuse' else DualOperandJointRecompute
+    kernel=(cls(problem,config,'silu','bf16',gradient_warps=gradient_warps)
+            if engine=='split_warp' else cls(problem,config,'silu','bf16'))
+    kernel.active_m_alignment=active_m_alignment
     kernel.single_stage_recompute_handoff=True
     kernel.emit_hidden=True;kernel.separate_hidden=True
     kernel.emit_gradient_quant=True;kernel.emit_hidden_quant=True
@@ -286,7 +380,7 @@ def compile_expert_joint_recompute(experts,problem,config,quant,_byte_scales=Fal
     kernel.gradient_quant_policy=(quant.quant_math,quant.quant_amax)
     kernel.gradient_transpose_quant_policy=kernel.gradient_quant_policy
     kernel.hidden_quant_policy=kernel.gradient_quant_policy
-    kernel.glu_scratch_elems=config.tile_m*config.tile_n//2
+    if engine!='split_warp':kernel.glu_scratch_elems=config.tile_m*config.tile_n//2 if engine=='legacy' else 0
     kernel.batch_count=experts
     m,n,k=problem.m,problem.n,problem.k;h=n//2
     kernel.batch_output_shape=(m,h)
@@ -301,7 +395,10 @@ def compile_expert_joint_recompute(experts,problem,config,quant,_byte_scales=Fal
     stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     if _byte_scales:
         from .mxfp8_moe_buffers import ByteJointRecompute
-        kernel=ByteJointRecompute(kernel)
+        if active_m_alignment:
+            from .mxfp8_moe_active import fake_prefix
+            aux=(*aux,fake_prefix())
+        kernel=ByteJointRecompute(kernel,active=bool(active_m_alignment))
     return cute.compile(kernel,qx,qw,sx,sw,dh,aux,stream,
         options='--enable-tvm-ffi --opt-level 3 '
         f"--ptxas-options '-O3 --maxrregcount={config.maxrregcount}'")

@@ -57,6 +57,34 @@ class PortablePriorTests(unittest.TestCase):
         self.assertEqual(len(order),len(rows))
         self.assertFalse(prior._models)
 
+    def test_effort_retrieval_only_never_deserializes_a_model(self):
+        from unittest.mock import patch
+        from rtx.autotune.effort import AutotunePolicy,make_effort_autotuner
+        from rtx.autotune.store import InMemoryTuningStore
+        a,rows,document=self.make_prior();prior=FrozenPrior(document,research=True)
+        with patch.object(FrozenPrior,'load',return_value=prior):
+            engine=make_effort_autotuner(a,InMemoryTuningStore(),AutotunePolicy(
+                max_trials=8,search_schedule='progressive',candidate_mix='mixed',
+                prior_artifact='research',prior_search='retrieval',confirmation_repeats=0))
+            engine.tune()
+        self.assertFalse(prior._models)
+        self.assertNotIn('frozen_ranker',engine.strategies)
+
+    def test_retrieval_matches_normalized_target_id_not_historical_alias(self):
+        a,rows,document=self.make_prior();prior=FrozenPrior(document,research=True)
+        bundle=prior.bundle(a);donor=rows[-1]
+        bundle['winners']=[dict(config_id='historical-inactive-axis-id',
+            config=donor.serialized_config,features=donor.features)]
+        pool=[rows[0].config,donor.config]
+        self.assertEqual(prior.order(a,pool,policy='retrieval')[0],donor.config)
+        self.assertFalse(prior._models)
+
+    def test_sku_alias_is_not_a_predictor_feature(self):
+        values=prior_features({'context.device.sku.sku_family=geforce_rtx_5090':1,
+                              'context.device.memory_bus_width_bits':512})
+        self.assertFalse(any('sku_family' in key for key in values))
+        self.assertEqual(values['context.device.memory_bus_width_bits'],512)
+
     def test_staged_family_policy_is_lazy_and_retains_pool(self):
         from rtx.autotune.prior_policy import PriorStage,StagedPriorPolicy,FamilyPriorPolicy
         a,rows,document=self.make_prior();prior=FrozenPrior(document,research=True)

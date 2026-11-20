@@ -241,7 +241,7 @@ class PretrainedAutotuneTests(unittest.TestCase):
             )
             self.assertIn("toy@7", manifest["families"])
             self.assertEqual(len(manifest["artifact_id"]), 24)
-            self.assertEqual(manifest["trainer_revision"], 6)
+            self.assertEqual(manifest["trainer_revision"], 7)
             family = manifest["families"]["toy@7"]
             self.assertEqual(family["raw_rows"], len(observations) * 2)
             self.assertEqual(family["rows"], len(observations))

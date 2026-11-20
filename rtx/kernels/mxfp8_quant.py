@@ -623,6 +623,8 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
         lane_in_scale: Int32,
         scale_tile_rows: cutlass.Constexpr,
         packed_scale_smem: cute.Tensor,
+        direct_scale: cutlass.Constexpr = False,
+        valid_output=True,
     ):
         cfg = self.config
         lane_idx = cute.arch.lane_idx()
@@ -689,65 +691,69 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
             quantized_values[vec0] = q0
             if vec1 != vec0:
                 quantized_values[vec1] = q1
-        q_values_per_store = cfg.quant_store_bits // 8
-        q_store_count = cfg.quant_vec // q_values_per_store
-        quantized_row = quantized[global_row, None]
-        for store_idx in cutlass.range_constexpr(q_store_count):
-            vec_base = store_idx * q_values_per_store
-            if cutlass.const_expr(cfg.quant_store_bits == 8):
-                quantized_row[global_k + vec_base] = quantized_values[vec_base]
-            elif cutlass.const_expr(cfg.quant_store_bits == 16):
-                packed_q = Uint16(
-                    quantized_values[vec_base].bitcast(Uint8)
-                ) | (
-                    Uint16(quantized_values[vec_base + 1].bitcast(Uint8)) << 8
-                )
-                nvvm.inline_ptx_hl(
-                    "st.global.u16 [{$r0}], {$r1};",
-                    write_only_types=[],
-                    read_only_args=[
-                        quantized_row.iterator
-                        + quantized_row.layout(global_k + vec_base),
-                        packed_q,
-                    ],
-                )
-            else:
-                packed_q = (
-                    Int32(quantized_values[vec_base].bitcast(Uint8))
-                    | (
-                        Int32(
-                            quantized_values[vec_base + 1].bitcast(Uint8)
-                        )
-                        << 8
+        # Ragged fused emitters must still participate in the warp shuffles.
+        # Suppress only the out-of-bounds stores, not the scale reduction.
+        if valid_output:
+            q_values_per_store = cfg.quant_store_bits // 8
+            q_store_count = cfg.quant_vec // q_values_per_store
+            quantized_row = quantized[global_row, None]
+            for store_idx in cutlass.range_constexpr(q_store_count):
+                vec_base = store_idx * q_values_per_store
+                if cutlass.const_expr(cfg.quant_store_bits == 8):
+                    quantized_row[global_k + vec_base] = quantized_values[vec_base]
+                elif cutlass.const_expr(cfg.quant_store_bits == 16):
+                    packed_q = Uint16(
+                        quantized_values[vec_base].bitcast(Uint8)
+                    ) | (
+                        Uint16(quantized_values[vec_base + 1].bitcast(Uint8)) << 8
                     )
-                    | (
-                        Int32(
-                            quantized_values[vec_base + 2].bitcast(Uint8)
-                        )
-                        << 16
+                    nvvm.inline_ptx_hl(
+                        "st.global.u16 [{$r0}], {$r1};",
+                        write_only_types=[],
+                        read_only_args=[
+                            quantized_row.iterator
+                            + quantized_row.layout(global_k + vec_base),
+                            packed_q,
+                        ],
                     )
-                    | (
-                        Int32(
-                            quantized_values[vec_base + 3].bitcast(Uint8)
+                else:
+                    packed_q = (
+                        Int32(quantized_values[vec_base].bitcast(Uint8))
+                        | (
+                            Int32(
+                                quantized_values[vec_base + 1].bitcast(Uint8)
+                            )
+                            << 8
                         )
-                        << 24
+                        | (
+                            Int32(
+                                quantized_values[vec_base + 2].bitcast(Uint8)
+                            )
+                            << 16
+                        )
+                        | (
+                            Int32(
+                                quantized_values[vec_base + 3].bitcast(Uint8)
+                            )
+                            << 24
+                        )
                     )
-                )
-                nvvm.inline_ptx_hl(
-                    "st.global.u32 [{$r0}], {$r1};",
-                    write_only_types=[],
-                    read_only_args=[
-                        quantized_row.iterator
-                        + quantized_row.layout(global_k + vec_base),
-                        packed_q,
-                    ],
-                )
-        if lane_in_scale == 0:
-            packed_scale_smem[local_row, local_scale_block] = scale_e8m0
-            if cutlass.const_expr(cfg.transposed_tile_k == SF_VEC_SIZE):
-                self._store_transposed_scale(
-                    scales, global_row, scale_block, scale_e8m0, scale_tile_rows
-                )
+                    nvvm.inline_ptx_hl(
+                        "st.global.u32 [{$r0}], {$r1};",
+                        write_only_types=[],
+                        read_only_args=[
+                            quantized_row.iterator
+                            + quantized_row.layout(global_k + vec_base),
+                            packed_q,
+                        ],
+                    )
+            if lane_in_scale == 0:
+                if cutlass.const_expr(not direct_scale):
+                    packed_scale_smem[local_row, local_scale_block] = scale_e8m0
+                if cutlass.const_expr(direct_scale or cfg.transposed_tile_k == SF_VEC_SIZE):
+                    self._store_transposed_scale(
+                        scales, global_row, scale_block, scale_e8m0, scale_tile_rows
+                    )
 
     @cute.kernel
     def kernel(
@@ -1802,7 +1808,7 @@ def compile_mxfp8_quant(
     rows: int,
     k: int,
     config: MXFP8QuantConfig = MXFP8QuantConfig(),
-    *, interleave_rows: bool = False, source_alignment: int = 16,
+    *, interleave_rows: bool = False, source_alignment: int = 16, _byte_scales: bool = False,
 ):
     """Compile and cache a shape/config-specialized TVM-FFI launcher."""
 
@@ -1813,6 +1819,10 @@ def compile_mxfp8_quant(
     if interleave_rows and rows % 2:
         raise ValueError("paired quantization requires an even row count")
     kernel.glu_interleave = interleave_rows
+    scale_dtype = Uint8 if _byte_scales else Float8E8M0FNU
+    if _byte_scales:
+        from ._mxfp8_byte_scales import ByteQuant
+        kernel = ByteQuant(kernel)
     src = cute.runtime.make_fake_tensor(
         BFloat16,
         (rows, k),
@@ -1828,7 +1838,7 @@ def compile_mxfp8_quant(
     )
     if config.scale_layout == "row_major":
         scales = cute.runtime.make_fake_tensor(
-            Float8E8M0FNU,
+            scale_dtype,
             (rows, storage_k // SF_VEC_SIZE),
             stride=(storage_k // SF_VEC_SIZE, 1),
             assumed_align=16,
@@ -1840,7 +1850,7 @@ def compile_mxfp8_quant(
         # naturally aligned TMA transaction; offsets 504:512 are unused.
         tile_storage = 512
         scales = cute.runtime.make_fake_tensor(
-            Float8E8M0FNU,
+            scale_dtype,
             (rows // tile_rows, k // 128, tile_storage),
             stride=(k // 128 * tile_storage, tile_storage, 1),
             assumed_align=16,
@@ -1866,7 +1876,7 @@ def compile_mxfp8_dual_quant(
     k: int,
     config: MXFP8QuantConfig = MXFP8QuantConfig(),
     weight_scale_layout: str | None = None,
-    *, interleave_weight: bool = False, source_alignment: int = 16,
+    *, interleave_weight: bool = False, source_alignment: int = 16, _byte_scales: bool = False,
 ):
     """Compile one launcher that dynamically quantizes X and W together."""
 
@@ -1879,6 +1889,10 @@ def compile_mxfp8_dual_quant(
     if interleave_weight and weight_rows % 2:
         raise ValueError("paired quantization requires an even row count")
     kernel.glu_interleave = interleave_weight
+    scale_dtype = Uint8 if _byte_scales else Float8E8M0FNU
+    if _byte_scales:
+        from ._mxfp8_byte_scales import ByteDualQuant
+        kernel = ByteDualQuant(kernel)
 
     def fake(dtype, rows: int, columns: int):
         return cute.runtime.make_fake_tensor(
@@ -1896,10 +1910,10 @@ def compile_mxfp8_dual_quant(
 
     def fake_scales(rows: int, scale_layout: str):
         if scale_layout == "row_major":
-            return fake(Float8E8M0FNU, rows, storage_k // SF_VEC_SIZE)
+            return fake(scale_dtype, rows, storage_k // SF_VEC_SIZE)
         tile_rows = _native_scale_tile_rows(scale_layout)
         return cute.runtime.make_fake_tensor(
-            Float8E8M0FNU,
+            scale_dtype,
             (rows // tile_rows, k // 128, 512),
             stride=(k // 128 * 512, 512, 1),
             assumed_align=16,

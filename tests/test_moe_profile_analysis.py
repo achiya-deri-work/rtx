@@ -1,3 +1,5 @@
+import pytest
+
 from benchmarks.analyze_moe_profile import interval_union,summarize_trace,flatten_timing
 
 
@@ -41,6 +43,23 @@ def test_retarget_shared_split_partitions_is_explicit_and_nonmutating():
     assert large['shared']['config']['gate_backward']['dw']['split_reduction']==128
     assert len(changes)==1
     assert retarget_auxiliary({},128)==({},[])
+
+
+@pytest.mark.parametrize('tokens',[129,2003,7376,29504,40000,59008,131072])
+@pytest.mark.parametrize('reduction',['split_fp32_workspace','split_fp32_atomic'])
+def test_ragged_retarget_never_creates_non_power_of_two_or_empty_splits(tokens,reduction):
+    from benchmarks.profile_moe import retarget_auxiliary
+    dw=dict(backend='decomposed',reduction=reduction,reduction_tile=1024,split_reduction=8,
+        workspace_epilogue='tree' if reduction=='split_fp32_workspace' else 'none',gemm=dict(tile_k=128))
+    result,_=retarget_auxiliary(dict(shared=dict(config=dict(gate_backward=dict(dw=dw)))),tokens)
+    selected=result['shared']['config']['gate_backward']['dw'];split=selected['split_reduction']
+    assert 1<=split<=128 and split&(split-1)==0
+    if reduction=='split_fp32_atomic':assert split<=32
+    if selected.get('split_partition')=='balanced':
+        assert split<=(tokens+127)//128 and selected['reduction_tile']==0
+    elif split>1:
+        chunk=selected['reduction_tile']
+        assert chunk%128==0 and (split-1)*chunk<tokens<=split*chunk
 
 
 def test_ncu_units_and_missing_are_not_zero():

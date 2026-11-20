@@ -18,7 +18,16 @@ def quantize_decode(value):
 
 
 def _product(a,b):
-    return torch.bmm(a.double(),b.double().transpose(1,2)).float()
+    # The oracle is offline, but must fit alongside production buffers at
+    # long packed lengths. Converting every expert to FP64 simultaneously
+    # made correctness-gated tuning run out of memory before its first trial.
+    # Chunk only the independent batch axis: each dot product and its FP64
+    # reduction stay identical to the unchunked independent reference.
+    out=torch.empty((*a.shape[:-1],b.shape[-2]),device=a.device,dtype=torch.float32)
+    for expert in range(a.shape[0]):
+        out[expert:expert+1]=torch.bmm(a[expert:expert+1].double(),
+            b[expert:expert+1].double().transpose(1,2)).float()
+    return out
 
 
 @torch.no_grad()

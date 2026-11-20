@@ -58,7 +58,7 @@ except ImportError:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 KERNEL_NAME = "mxfp8_bwd_e2e"
-KERNEL_REVISION = 30
+KERNEL_REVISION = 31
 
 
 def _quant_vector_variants() -> tuple[dict[str, object], ...]:
@@ -360,7 +360,8 @@ def _matmul_axes(prefix: str) -> dict[str, tuple[dict[str, object], ...]]:
             for epilogue, stages, vector in (
                 ("direct", 1, 1),
                 *(
-                    ("tma", stages, vector)
+                    (epilogue, stages, vector)
+                    for epilogue in ('tma','hybrid')
                     for stages in (1, 2, 3, 4)
                     for vector in (1, 2, 4)
                 ),
@@ -795,9 +796,16 @@ def _update_matmul(
     gemm = asdict(config.gemm)
     fused_updates = dict(updates.get("fused", {}))  # type: ignore[arg-type]
     qa_updates = dict(updates.get("quant_a", {}))  # type: ignore[arg-type]
-    qb_updates = dict(updates.get("quant_b", {}))  # type: ignore[arg-type]
+    # Normalized compound schedules serialize quant_b=None to mean "inherit
+    # quant_a". This is a real reset, not an empty update of an old independent
+    # B quantizer; random-walk mixed pools encounter it during shared MLP tuning.
+    inherit_b = "quant_b" in updates and updates["quant_b"] is None
+    qb_updates = {} if inherit_b else dict(updates.get("quant_b", {}))  # type: ignore[arg-type]
     qa.update(qa_updates)
-    qb.update(qb_updates)
+    if inherit_b:
+        qb = dict(qa)
+    else:
+        qb.update(qb_updates)
     next_launches = str(updates.get("quant_launches", config.quant_launches))
     if next_launches == "dual":
         same_orientation = config.a_orientation == config.b_orientation

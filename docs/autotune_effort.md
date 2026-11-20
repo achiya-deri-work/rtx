@@ -57,20 +57,49 @@ selection, numerical checks and fresh-process no-retune reuse
 | MXFP8Linear / NVFP4Linear first hit | A balanced-mode runtime miss can tune on real inputs, including through `torch.compile(fullgraph=True)`, then cache the chosen configuration. | Focused linear CUDA tests exist; this is not a promise that every shape achieves near-optimal performance. |
 | Effort levels | Quick/balanced/thorough/extensive supply 8/16/32/64 trial caps. | Wall time is also bounded by a soft admission deadline; failures and abandoned attempts can consume the budget. |
 | Compatible cache hit | `cache_behavior="reuse"` reuses an existing winner; `"refine"` permits extending its evidence to a larger budget. | Search and measurement identities must match; a changed policy is not merely a larger budget. |
-| Progressive search | Explicit `search_schedule="progressive"` makes the proposal plan budget-independent and resumable. | Experimental; resume equivalence assumes identical observation/cost evidence, not identical noisy GPU measurements in separate runs. |
+| Progressive search | Named effort presets use progressive/mixed search; explicit `search_schedule="progressive"` also enables it. | Resume equivalence assumes identical observation/cost evidence, not identical noisy GPU measurements in separate runs. |
 | CUDA graph replay | Warm the required shapes and paths before capture. | A cold tuning miss inside capture is not a supported way to autotune. |
 | GLU | Explicit tuning and opt-in `autotune="balanced"` first-hit selection accept effort policies. | Forward-only; first-hit search stays within the configured backend. See the focused qualification below. |
 | Recomputed MLP | Explicit tuning and opt-in `autotune="balanced"` support first-hit selection of a forward-owned recomputation plan. | MXFP8 precision only for automatic selection; compiled replay follows the caller's compiler option. Local lifecycle/effort tests exist, not universal quality or software/device coverage. |
 | Learned priors and new opening controls | Priors remain opt-in; factorial opening controls live in research drivers. | No universal learned default or prediction-only hard pruning has been justified. |
 
-The public defaults are still legacy search, cache reuse and zero paired
-finalist rounds. The 8/16/32/64 labels describe investment, not guaranteed
+Direct `AutotunePolicy()` construction retains legacy search. Named
+`AutotunePolicy.preset(...)` levels now use progressive/mixed search; explicit
+legacy overrides remain supported. Cache reuse and zero paired finalist rounds
+remain defaults. The 8/16/32/64 labels describe investment, not guaranteed
 quality tiers. See [goal audit](autotune_goal_audit.md) for remaining release
 gates and [measured evidence](autotune_protected_prior_results.md) for both
 positive and negative results. Later sections describe experimental settings
 explicitly; they are not implicitly enabled by importing the library.
 The [qualification matrix](autotune_qualification_matrix.md) consolidates the
 acceptance tests and the remaining Torch 2.12.1/2.13.0 GPU execution checklist.
+
+### Shape-driven execution-region coverage
+
+The flat BalancedMoE router's progressive opening contrasts forward and
+backward ownership using workload geometry and SM count. It retains ordinary
+static legality, numerical checks and measured selection; it is not a forced
+schedule or a named-SKU lookup table. Short pools and unknown hardware do not
+receive this long-reduction opening. Packed routing remains independently
+protected. `region_coverage=False` supplies the ordinary-opening ablation.
+
+With an explicit compatible `prior_artifact`, `prior_search="retrieval"`
+skips learned ranking and model deserialization, `"ranker"` skips donor
+retrieval, and `"hybrid"` permits both. The default remains hybrid only when
+an artifact is supplied; no trained prior is installed automatically. Research
+artifacts still require `allow_research_prior=True`. Target-normalized donor
+identities and distinct-region preference avoid spending early slots on stale
+IDs or redundant schedules. See the [HOME study](autotune_region_opening_20261120.md)
+for whole-layer results, cold costs and qualification limits.
+
+Long, underfilled flat routing additionally exposes sharded FP32 columns and
+warp-local rows in the protected first-eight opening. Later `flat_transport`
+proposals couple coalescing, shard depth, row ownership and hard scheduling
+under the same UCB allocator. Anchors exclude unstable timing evidence and
+are frozen at completed eight-trial prefixes. Explicit opening reservations
+remain authoritative; no automatic phase-balancing experiment is enabled.
+The [follow-up cycle](autotune_cycle3_20261120.md) separates the improvement
+from a better implementation family from the smaller extra return on 32 trials.
 
 ### Composite-kernel evidence compatibility
 

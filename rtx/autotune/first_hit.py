@@ -30,7 +30,8 @@ def contract(context):
 def model_features(features):
     """Pre-compilation inputs only; never leak measured compiler resources."""
     return {k: v for k, v in portable_features(features).items()
-            if not any(word in k.lower() for word in
+            if not k.startswith('context.device.sku.sku_family')
+            and not any(word in k.lower() for word in
                        ("compiled", "measured_register", "spill", "ptxas", "telemetry"))
             and not (k.startswith("context.device.") and any(word in k.lower() for word in
                          ("compiler.","version", "device_index", "platform")))}

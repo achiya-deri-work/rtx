@@ -21,7 +21,7 @@ from .pretrained import ContextRankingModel, _observation_documents, _usable_for
 from .outcomes import TrialOutcome
 
 SCHEMA_VERSION = 1
-FEATURE_REVISION = 1
+FEATURE_REVISION = 2  # Strip offline SKU aliases; canonicalize target donor IDs.
 POLICY_NAMES = {'precision','activation','phase','silu_math','scaling','operand_state',
                 'outer_scale_scope','pass','scale_policy'}
 
@@ -40,8 +40,14 @@ def prior_features(features):
 
 
 def shape_distance(a,b):
+    axes=('m','n','k','h','o')
+    if 'context.workload.tokens' in b:
+        axes=('tokens','d_model','experts','capacity','top_k','hidden') if 'context.workload.capacity' in b else (
+            'tokens','d_model','experts','router_dim')
+    elif 'context.workload.total_tokens' in b:
+        axes=('total_tokens','sequences','experts','top_k')
     return sum(abs(math.log2(max(1,a.get('context.workload.'+k,1))/
-                              max(1,b.get('context.workload.'+k,1)))) for k in ('m','n','k','h','o'))
+                              max(1,b.get('context.workload.'+k,1)))) for k in axes)
 
 
 def aggregate(rows):
@@ -96,7 +102,7 @@ def train_bundle(rows, contract):
 
 class FrozenPrior:
     def __init__(self,document,*,research=False):
-        if document.get('schema_version')!=SCHEMA_VERSION or document.get('feature_revision')!=FEATURE_REVISION:
+        if document.get('schema_version')!=SCHEMA_VERSION or document.get('feature_revision') not in (1,FEATURE_REVISION):
             raise ValueError('unsupported portable prior schema/features')
         if not research and not document.get('deployment_enabled',False):
             raise ValueError('prior is research-only until prospective qualification')
@@ -105,6 +111,8 @@ class FrozenPrior:
     @classmethod
     def load(cls,path,**kwargs):
         path=Path(path)
+        from .collection_health import assert_healthy_path
+        assert_healthy_path(path)
         opener=gzip.open if path.suffix=='.gz' else open
         with opener(path,'rt') as stream:return cls(json.load(stream),**kwargs)
 
@@ -120,7 +128,16 @@ class FrozenPrior:
         for row in sorted(bundle['winners'],key=lambda r:shape_distance(r['features'],target)):
             try:candidates.append(adapter.deserialize(row['config']))
             except (ValueError,TypeError,KeyError):continue
-        return bounded_candidates(adapter,candidates,limit)
+        candidates=bounded_candidates(adapter,candidates,max(1,len(candidates)))
+        region=getattr(adapter,'region_fn',None)
+        if region:
+            first=[];rest=[];seen=set()
+            for c in candidates:
+                label=region(c)
+                if label in seen:rest.append(c)
+                else:seen.add(label);first.append(c)
+            candidates=[*first,*rest]
+        return candidates[:limit]
 
     def order(self,adapter,pool,*,policy='hybrid',seed=0,mix=(2,4,2),
               feasibility_penalty=.25,preparation_penalty=.05):
@@ -141,7 +158,14 @@ class FrozenPrior:
         ids=[adapter.config_id(c) for c in pool];positions={cid:i for i,cid in enumerate(ids)}
         retrieved=[]
         for r in sorted(bundle['winners'],key=lambda r:shape_distance(r['features'],adapter.context.features())):
-            i=positions.get(r['config_id'])
+            # A donor's historical ID is provenance, not its identity after
+            # target-shape normalization or a proved inactive-axis migration.
+            try:
+                candidate=adapter.deserialize(r['config'])
+                if adapter.rejection(candidate) is not None:continue
+                identifier=adapter.config_id(candidate)
+            except (ValueError,TypeError,KeyError):continue
+            i=positions.get(identifier)
             if i is not None and i not in retrieved:retrieved.append(i)
         # Short retrieval budgets need neither model deserialization nor
         # candidate feature extraction/prediction.

@@ -25,6 +25,7 @@ def _cases():
     from rtx.autotune.moe import structural_seeds
     onchip_shape=(128,128,8,32,2,128)
     onchip=next(cfg for cfg in structural_seeds(onchip_shape) if cfg.family=='grouped_onchip')
+    hybrid=replace(onchip,family='grouped_prepared',prepared=replace(base.prepared,forward_engine='onchip'))
     return [
         ('aligned',(32,128,4,16,2,64),base),
         ('ragged',(13,35,5,6,2,49),base),
@@ -33,6 +34,19 @@ def _cases():
         ('global',(32,128,4,16,2,64),replace(base,prepared=replace(p,input_preparation='quantize_once'))),
         ('global_native',(13,128,8,4,2,128),replace(base,prepared=replace(native,input_preparation='quantize_once'))),
         ('global_joint',(13,64,8,4,2,64),replace(base,prepared=replace(joint,input_preparation='quantize_once'))),
+        ('split_dw',(2048,128,8,512,2,128),replace(base,prepared=replace(p,
+            down_dw_splits=2,gate_dw_splits=4,transpose_mode='warp'))),
+        ('global_joint_split',(2048,128,8,512,2,128),replace(base,prepared=replace(joint,
+            down_dw_splits=4,gate_dw_splits=2,transpose_mode='warp',input_preparation='quantize_once'))),
+        ('fused_route',(2048,128,8,512,2,128),replace(base,prepared=replace(joint,
+            route_gradient_epilogue='fused',input_preparation='quantize_once'))),
+        ('indexed',(2048,128,8,512,2,128),replace(base,prepared=replace(joint,
+            route_gradient_epilogue='fused',input_preparation='indexed_transpose',transpose_mode='warp'))),
+        ('fused_dy',(194,128,8,64,2,128),replace(base,prepared=replace(joint,
+            route_gradient_epilogue='fused',input_preparation='indexed_transpose',transpose_mode='warp',dy_preparation='fused'))),
+        ('fused_all',(194,128,8,64,2,128),replace(base,prepared=replace(joint,
+            route_gradient_epilogue='fused',input_preparation='indexed_transpose',transpose_mode='warp',dy_preparation='fused_all'))),
+        ('hybrid_onchip',onchip_shape,hybrid),
         ('tma_outputs',(128,128,4,64,2,128),replace(base,prepared=tma)),
         ('staged_aligned',(32,128,4,16,2,64),replace(base,family='grouped_staged')),
         ('staged_ragged',(13,35,5,6,2,49),replace(base,family='grouped_staged')),
@@ -163,23 +177,36 @@ def _read_write(symbol,params,args):
     """Independent interpretation of each existing launch ABI."""
     if symbol=='compile_movement':
         kind=params[6]
-        read=[args[0],args[1],args[2],args[3]]
+        read=[args[0],args[1],args[2],args[3],*args[7:]]
         write=[args[5]]
         if kind in ('slot_grad','route_grad'):
             read.append(args[4]);write.append(args[6])
         return read,write
     if symbol=='compile_expert_quant':return [args[0],args[1]],[args[2],args[3]]
     if symbol=='compile_expert_packed_gemm':
-        read=list(args[:4]);write=[args[4]]
+        read=list(args[:4])+list(args[6:]);write=[args[4]]
         if params[3]=='glu':write.append(args[5])
         elif params[3]=='derivative':read.append(args[5])
         return read,write
+    if symbol=='compile_expert_dw_reduce':return [args[0]],[args[1]]
+    if symbol=='compile_expert_route_gradient':return list(args[:4])+list(args[5:]),[args[4]]
+    if symbol=='compile_route_gradient_reduce':return [args[0],*args[2:]],[args[1]]
+    if symbol=='compile_indexed_expert_transpose':return list(args[:2])+list(args[4:]),list(args[2:4])
+    if symbol=='compile_routed_dy_quant':return list(args[:3])+list(args[7:]),list(args[3:7])
+    if symbol=='compile_routed_backward_quant':return list(args[:3])+[args[7]],list(args[3:7])+list(args[8:])
     if symbol=='compile_dequant_hidden':return list(args[:2]),[args[2]]
     if symbol=='compile_native_hidden_scales':return [args[0]],[args[1]]
     if symbol=='compile_packed_input_gather':
-        return list(args[:5]),list(args[5:7])+([args[7]] if params[-1] else [])
+        return list(args[:5])+list(args[8:]),list(args[5:7])+([args[7]] if any(params[8:10]) else [])
+    if symbol=='compile_compact_route':return list(args[:2]),list(args[2:])
+    if symbol=='compile_compact_gather':return list(args[:5]),list(args[5:])
+    if symbol=='compile_compact_combine':return list(args[:4]),[args[4]]
+    if symbol=='compile_token_reduce':return list(args[:4]),[args[5]]
+    if symbol=='compile_active_prefix':return [args[0]],[args[1]]
+    if symbol=='compile_initialize_reduction_tail':return [args[0]],list(args[1:])
+    if symbol=='compile_persistent_dw':return list(args[:4])+list(args[5:]),[args[4]]
     if symbol=='compile_expert_joint_recompute':
-        return list(args[:5])+[args[5][0]],list(args[5][1:])
+        return list(args[:5])+[args[5][0]]+list(args[5][9:]),list(args[5][1:9])
     if symbol=='compile_grouped_linear':
         return list(args[:2])+([args[3]] if params[-1] else []),[args[2]]
     if symbol=='compile_grouped_glu':

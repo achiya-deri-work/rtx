@@ -350,10 +350,9 @@ class MLPCandidate:
         This is a point-in-time observation, not a lock, installation or freeze.
         """
         import torch
-        from ._mlp_autotune import _runtime_variant
+        from ._mlp_autotune import _mlp_runtime_winner_key
         from .autotune.execution_mix import MLPExecutionMix
-        from .autotune.mlp import MLP_AUTOTUNE_REVISION
-        from .autotune.winners import runtime_winner_key, load_runtime_winner
+        from .autotune.winners import load_runtime_winner
         from .kernels.mxfp8 import MXFP8Problem
         from .mlp import MXFP8MLPConfig
 
@@ -368,10 +367,8 @@ class MLPCandidate:
         mix_values = spec.get('execution_mixes', {}).get(self.phase)
         mix = None if mix_values is None else MLPExecutionMix(**mix_values)
         m, k, h, o = self.shape
-        key = runtime_winner_key('mxfp8_recompute_mlp', MXFP8Problem(m, 2*h, k),
-            device=device, kernel_revision=MLP_AUTOTUNE_REVISION,
-            variant=_runtime_variant(o, self.activation, self.phase == 'train',
-                                     spec['initial'], False, mix))
+        key = _mlp_runtime_winner_key(MXFP8Problem(m, 2*h, k), o, self.activation,
+            self.phase == 'train', spec['initial'], False, mix, device=device)
         # Same eligibility as require_cached_(): never increase effort or fall
         # back to the initial config. A missing/invalid winner is a coverage gap.
         selected = load_runtime_winner(key, MXFP8MLPConfig.from_dict,

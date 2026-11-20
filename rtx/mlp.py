@@ -196,6 +196,25 @@ def _validate(x,gate_up,down,activation):
         raise ValueError("down weight must be contiguous BF16 on the input CUDA device")
 
 
+@torch.compiler.assume_constant_result
+def _resolved_policy(key):
+    return _parse(key)
+
+
+@torch.compiler.assume_constant_result
+def _uses_prepared_forward(key):
+    from ._mlp_forward import uses_prepared_forward
+    return uses_prepared_forward(_parse(key))
+
+
+def _static_mlp(x, gu, down, activation, key):
+    """Run a known policy without hiding prepared forward scratch from AOT."""
+    if _uses_prepared_forward(key):
+        from ._mlp_forward import PreparedMLP
+        return PreparedMLP.apply(x, gu, down, activation, key)
+    return _mlp_op(x, gu, down, activation, key)
+
+
 @torch.library.custom_op("rtx::mxfp8_mlp",mutates_args=(),device_types="cuda")
 def _mlp_op(x:torch.Tensor,gate_up:torch.Tensor,down:torch.Tensor,
             activation:str,config_key:str)->torch.Tensor:
@@ -205,25 +224,13 @@ def _mlp_op(x:torch.Tensor,gate_up:torch.Tensor,down:torch.Tensor,
     return y
 
 
-def _run_prequant_down(q,scales,down,y,c):
-    """Quantize current down weights once; consume the already packed hidden."""
-    from .kernels.mxfp8_quant import compile_mxfp8_quant
-    from .kernels.mxfp8_gemm import compile_mxfp8_gemm
-    if (c.down_quant.scale_layout!='row_major' or c.down_gemm.scale_layout!='row_major'
-            or c.down_quant.scale_rounding!='infinity'):
-        raise ValueError('prequant down requires row-major infinity-rounded scales')
-    o,h=down.shape
-    width=q.shape[1]
-    reason=c.down_quant.rejection(o,h) or c.down_gemm.rejection(MXFP8Problem(q.shape[0],o,width))
-    if reason:
-        raise ValueError(reason)
-    qw=torch.empty((o,width),device=down.device,dtype=torch.float8_e4m3fn)
-    sw=torch.empty((o,width//32),device=down.device,dtype=torch.float8_e8m0fnu)
-    compile_mxfp8_quant(o,h,c.down_quant)(down,qw,sw)
-    compile_mxfp8_gemm(MXFP8Problem(q.shape[0],o,width),c.down_gemm)(q,qw,scales,sw,y)
-
-
-def _run_forward(x,gate_up,down,activation,c,y):
+def _run_forward(x,gate_up,down,activation,c,y,*,config_key=None):
+    from ._mlp_forward import forward as prepared_forward, uses_prepared_forward
+    if uses_prepared_forward(c):
+        # Cold selection/private replay already know the runtime key here.
+        # The launch-only contract is identical to the statically bound path.
+        prepared_forward(x,gate_up,down,activation,config_key or _config_key(c),out=y)
+        return
     _validate(x,gate_up,down,activation)
     from .runtime import validate_runtime_environment
     validate_runtime_environment()
@@ -238,21 +245,7 @@ def _run_forward(x,gate_up,down,activation,c,y):
     s=torch.empty((m,width//32),dtype=torch.uint8,device=x.device)
     with torch.cuda.device(x.device):
         sf=s.view(torch.float8_e8m0fnu)
-        if c.gate_backend == "prequant":
-            from .kernels.mxfp8_glu_prequant import build_prequant_glu_runner
-            if c.down_backend not in ("onchip","prequant"):
-                raise ValueError("prequant gate requires onchip or prequant down backend")
-            gate_config=replace(c.gate_prequant,gemm=replace(c.gate_prequant.gemm,
-                                glu_silu_math=c.gate_up.glu_silu_math))
-            first=build_prequant_glu_runner(x.view(m,k),gate_up,q,s,gate_config,
-                                           activation,"mxfp8",bind_inputs=False)
-            first(x.view(m,k),gate_up,q,s)
-            if c.down_backend=='prequant':
-                _run_prequant_down(q,sf,down,y.view(m,o),c)
-            else:
-                second=compile_mixed_down(MXFP8Problem(m,o,h),c.down)
-                second(q,down,y.view(m,o),sf,sf,sf,sf)
-        elif c.gate_backend == "cooperative_prequant":
+        if c.gate_backend == "cooperative_prequant":
             from .configs.glu import cooperative_glu_rejection
             reason=cooperative_glu_rejection(MXFP8Problem(m,2*h,k),c.gate_prequant.gemm)
             if reason:
@@ -299,11 +292,8 @@ def _run_forward(x,gate_up,down,activation,c,y):
         else:
             first=compile_mxfp8_glu(MXFP8Problem(m,2*h,k),c.gate_up,activation,"mxfp8")
             first(x.view(m,k),gate_up,q,s,s,s,s)
-            if c.down_backend=='prequant':
-                _run_prequant_down(q,sf,down,y.view(m,o),c)
-            else:
-                second=compile_mixed_down(MXFP8Problem(m,o,h),c.down)
-                second(q,down,y.view(m,o),sf,sf,sf,sf)
+            second=compile_mixed_down(MXFP8Problem(m,o,h),c.down)
+            second(q,down,y.view(m,o),sf,sf,sf,sf)
 
 
 @_mlp_op.register_fake
@@ -623,8 +613,9 @@ def _setup_context(ctx,inputs,output):
     x,gate_up,down,activation,key=inputs
     ctx.save_for_backward(x,gate_up,down)
     ctx.activation,ctx.key=activation,key
-    ctx.joint=_parse(key).backward_recompute=="joint"
-    ctx.overlap=_parse(key).backward_overlap
+    policy=_resolved_policy(key)
+    ctx.joint=policy.backward_recompute=="joint"
+    ctx.overlap=policy.backward_overlap
     ctx.keys=_backward_keys(key,x.numel()//x.shape[-1],x.shape[-1],gate_up.shape[0]//2,down.shape[0])
 
 
@@ -673,7 +664,7 @@ def _backward(ctx,grad_output,*,independent_outputs=False):
         # Down backward has consumed the two-pass hidden (or the joint shape
         # placeholder). dH owns its own necessary reference until recompute.
         del hidden
-        policy=_parse(ctx.key)
+        policy=_resolved_policy(ctx.key)
         if policy.hidden_quantization=='recompute' and need_x and need_gate and need_down:
             if independent_outputs:
                 prepared=_prepare_recomputed_all_bwd(x2,gate_up,dh,dy,down,ctx.activation,ctx.key,gate_key,down_key)
@@ -755,7 +746,7 @@ def mxfp8_mlp(x,gate_up_weight,down_weight,*,activation="silu",config=DEFAULT_ML
         shape=x.shape
         return recomputed_mlp(x.reshape(-1,shape[-1]),gate_up_weight,down_weight,
                               activation,config,precision).reshape(*shape[:-1],down_weight.shape[0])
-    return _mlp_op(x,gate_up_weight,down_weight,activation,_config_key(config))
+    return _static_mlp(x,gate_up_weight,down_weight,activation,_config_key(config))
 
 
 def _clear_runtime_caches(*, preserve_compiled=False):

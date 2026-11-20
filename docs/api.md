@@ -56,6 +56,13 @@ training precision policy or run inside compiled forwards.
 | `BalancedRouter` | Balanced unless a config is explicit | Training/inference routing contexts; joint forward/backward execution search |
 | `BalancedMoE` | Balanced unless an expert config is explicit | Separate whole-routed-expert, router and shared contexts; MXFP8 only |
 
+`BalancedMoE` accepts dense `[B,T,D]` with automatic independent pools, or
+packed `[N,D]` plus `cu_seqlens`. Its quick/thorough/extensive `autotune`
+shorthands normalize to bounded balanced search; other frontends retain their
+documented mode sets. Optional `moe.autotune_(x, effort="thorough")` prepares
+all components using the same caches, without changing existing gradients.
+No routing metadata or scratch management is needed by layer users.
+
 Use [first-hit autotuning](first_hit_autotuning.md) for the example and effort
 ladder. `reuse`/`refine` are `cache_behavior` policy values, not `autotune`
 modes. `quick`/`thorough`/`extensive` are policy presets, not module modes.

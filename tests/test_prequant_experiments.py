@@ -124,7 +124,11 @@ class PrequantExperimentTests(unittest.TestCase):
         problem = MXFP8Problem(64, 1536, 1536)
         config = _reference_prequant_config(problem)
         self.assertIsNone(config.rejection(problem))
-        self.assertEqual(config.gemm.scale_layout, "row_major")
+        # The stable default uses the dedicated native 64-row scale layout;
+        # requiring row_major was already stale on the pre-hybrid baseline.
+        self.assertEqual(config.gemm.scale_layout, "mma64x128")
+        self.assertEqual(config.quant.scale_layout, "mma64")
+        self.assertEqual(config.resolved_weight_quant().scale_layout, "mma128")
         regular = MXFP8Problem(128, 1536, 1536)
         self.assertEqual(
             _reference_prequant_config(regular),

@@ -1,4 +1,8 @@
-"""Opaque first-hit boundary; hot launchers never do eager CUDA tensor math."""
+"""Real-input cold selection and guarded static-policy router dispatch.
+
+Only cold/compatibility calls carry a CPU policy token. Bound Sinkhorn and
+hard-routing launches consume immutable scalar policy with visible allocation.
+"""
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from functools import lru_cache
@@ -23,12 +27,15 @@ def decode_token(values):
 
 
 def execution_config(token):
-    if token.device.type!='cpu' or token.dtype!=torch.int64 or token.shape!=(10,):
-        raise ValueError('Routing execution token must be CPU int64[10]; CUDA readback is forbidden')
+    from .routing import ROUTING_TOKEN_SIZE
+    sizes=(10,14,15,17,19,20,22,ROUTING_TOKEN_SIZE)
+    if token.device.type!='cpu' or token.dtype!=torch.int64 or token.ndim!=1 or token.numel() not in sizes:
+        raise ValueError(f'Routing execution token must be CPU int64 with length in {sizes}; CUDA readback is forbidden')
     return decode_token(tuple(token.tolist()))
 
 
 @lru_cache(maxsize=256)
+@torch.compiler.assume_constant_result
 def initial_config(spec):
     from .routing import RoutingKernelConfig
     return RoutingKernelConfig.from_dict(parse_spec(spec)['initial'])
@@ -45,8 +52,61 @@ def selection_spec(config,mode,policy,cache_dir,workload):
 
 
 @lru_cache(maxsize=256)
+@torch.compiler.assume_constant_result
 def parse_spec(value):
     return json.loads(value)
+
+
+@lru_cache(maxsize=256)
+@torch.compiler.assume_constant_result
+def _static_policy(spec):
+    return parse_spec(spec)['mode'],tuple(initial_config(spec).to_token())
+
+
+@lru_cache(maxsize=256)
+@torch.compiler.assume_constant_result
+def _decode_bound_config(key):
+    return tuple(json.loads(key))
+
+
+def binding_identity(scores,k,iterations,spec,training,real_tokens=-1):
+    """Namespaced scalar guard identity; no input values or CUDA readback."""
+    real_tokens=scores.shape[0] if real_tokens<0 else real_tokens
+    return (scores.shape[0],scores.shape[1],k,iterations,real_tokens),str(scores.device),'routing:'+spec,training
+
+
+def bind_selected_config(scores,k,iterations,spec,training,real_tokens,config):
+    from ._moe_selection import bind_selected
+    bind_selected(*binding_identity(scores,k,iterations,spec,training,real_tokens),
+                  json.dumps(config.to_token()))
+
+
+def publish_selected_config(scores,k,iterations,spec,training,real_tokens,config):
+    """Explicit refinement updates future calls, never a saved backward plan."""
+    from ._moe_selection import publish_selected
+    with _selection_lock:
+        _selections[(str(scores.device),tuple(scores.shape),spec,training,real_tokens)]=config
+        publish_selected(*binding_identity(scores,k,iterations,spec,training,real_tokens),
+                         json.dumps(config.to_token()))
+
+
+def dispatch_sinkhorn(scores,k,iterations,spec,training,real_tokens=-1):
+    """Actual-input cold selection, then static launch-only saved-state execution.
+
+    The returned policy is a CPU tensor only for the cold invocation. Once
+    bound it is immutable scalar metadata, consumed directly by hard routing.
+    """
+    mode,config=_static_policy(spec)
+    if mode!='off':
+        from ._moe_selection import bound_config
+        key=bound_config(*binding_identity(scores,k,iterations,spec,training,real_tokens))
+        if key is None:
+            out,_,token=selected_sinkhorn(scores,k,iterations,spec,training,real_tokens)
+            return out,token
+        config=_decode_bound_config(key)
+    from ._routing_execution import sinkhorn
+    out,_=sinkhorn(scores,k,iterations,config)
+    return out,config
 
 
 def _resolve(scores,spec_key,training,real_tokens=-1):
@@ -93,34 +153,36 @@ def _resolve(scores,spec_key,training,real_tokens=-1):
 @torch.library.custom_op('rtx_routing::selected_sinkhorn',mutates_args=(),device_types='cuda')
 def selected_sinkhorn(scores:torch.Tensor,k:int,iterations:int,spec:str,
                       training:bool,real_tokens:int=-1)->tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
-    from .routing import _run_sinkhorn_forward,_validate_sinkhorn
+    from .routing import _validate_sinkhorn
+    from ._routing_execution import run_forward
     _validate_sinkhorn(scores,k,iterations)
     if scores.dtype!=torch.float32 or not scores.is_contiguous():raise ValueError('Contiguous FP32 routing scores required')
     if 2*iterations*scores.numel()>=2**31:raise ValueError('Saved routing state exceeds native index range')
     with torch.cuda.device(scores.device):
         config=_resolve(scores,spec,training,real_tokens)
-        c=config.forward
-        out,history=_run_sinkhorn_forward(scores,k,iterations,c.threads,c.row_groups,c.column_groups)
+        out,history=run_forward(scores,k,iterations,tuple(config.to_token()))
         # Immutable CPU metadata is retained by autograd, never read from CUDA
         # and never looked up again in a mutable selection cache in backward.
         token=torch.tensor(config.to_token(),device='cpu',dtype=torch.int64)
+        bind_selected_config(scores,k,iterations,spec,training,real_tokens,config)
         return out,history,token
 
 
 @selected_sinkhorn.register_fake
 def _selected_fake(scores,k,iterations,spec,training,real_tokens=-1):
+    from .routing import ROUTING_TOKEN_SIZE
     return (torch.empty_like(scores),
             torch.empty(2*iterations*scores.numel(),device=scores.device,dtype=scores.dtype),
-            torch.empty(10,device='cpu',dtype=torch.int64))
+            torch.empty(ROUTING_TOKEN_SIZE,device='cpu',dtype=torch.int64))
 
 
 @torch.library.custom_op('rtx_routing::selected_sinkhorn_backward',mutates_args=(),device_types='cuda')
 def selected_sinkhorn_backward(gradient:torch.Tensor,history:torch.Tensor,token:torch.Tensor,
                                k:int,iterations:int)->torch.Tensor:
-    from .routing import RoutingKernelConfig,_run_sinkhorn_backward
-    c=execution_config(token).backward
+    from ._routing_execution import run_backward
+    c=execution_config(token)
     with torch.cuda.device(gradient.device):
-        return _run_sinkhorn_backward(gradient,history,k,iterations,c.threads,c.row_groups,c.column_groups)
+        return run_backward(gradient,history,k,iterations,tuple(c.to_token()))
 
 
 @selected_sinkhorn_backward.register_fake
@@ -150,7 +212,7 @@ def selected_hard(scores:torch.Tensor,token:torch.Tensor,k:int,qb_rounds:int,
     from ._routing_hard import hard_schedule
     c=execution_config(token)
     return hard_schedule(scores,k,qb_rounds,repair_rounds,c.segmented_quotas,owner_id,
-                         c.quota_threshold,c.qb_backend,c.qb_threads)
+                         c.quota_threshold,c.qb_backend,c.qb_threads,c.quota_cache_items,c.quota_threads,c.quota_early_exit)
 
 
 @selected_hard.register_fake
@@ -162,5 +224,7 @@ def _clear_runtime_caches(*,preserve_compiled=False):
     # A CPU-only choice is not scratch. Keep it when retiring cold candidate
     # buffers, but explicit full cache clearing can force a fresh disk lookup.
     if preserve_compiled:return {}
+    from ._moe_selection import clear_selection_cells
     n=len(_selections);_selections.clear()
-    return {'selections':n}
+    cells=clear_selection_cells(namespace='routing:')
+    return {'selections':n,'routing_selection_cells':cells}

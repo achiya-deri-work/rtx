@@ -137,7 +137,14 @@ def _observation_similarity(
 
     distance = 0.0
     dimensions = 0
-    for key in ("context.workload.m", "context.workload.n", "context.workload.k"):
+    axes=("m","n","k")
+    if 'context.workload.tokens' in active_features:
+        axes=('tokens','d_model','experts','capacity','top_k','hidden')
+    elif 'context.workload.total_tokens' in active_features:
+        axes=('total_tokens','sequences',
+              'experts' if 'context.workload.experts' in active_features else 'n',
+              'top_k' if 'context.workload.top_k' in active_features else 'k')
+    for key in ('context.workload.'+axis for axis in axes):
         left = _feature_number(observation, key)
         right = active_features.get(key)
         if left is None or right is None or left <= 0 or right <= 0:
@@ -206,7 +213,7 @@ class AdaptiveBanditScheduler:
         cost = self.cost_weight * math.log1p(
             observation_strategy_cost_s(observation) / self.cost_scale_s
         )
-        if not observation.successful:
+        if not observation.outcome.timing_eligible:
             return -0.20 - cost
         improvement = 0.0
         if math.isfinite(before) and observation.score > 0:
@@ -234,7 +241,7 @@ class AdaptiveBanditScheduler:
         self._decay(statistics)
         arm = statistics[arm_name]
         arm.pulls += 1
-        arm.successes += int(observation.successful)
+        arm.successes += int(observation.outcome.timing_eligible)
         arm.elapsed_s += observation_strategy_cost_s(observation)
         arm.reward_sum += reward
         arm.effective_pulls += 1.0
@@ -259,7 +266,7 @@ class AdaptiveBanditScheduler:
         )
         for observation in ordered:
             before = incumbents.get(observation.context_id, math.inf)
-            if observation.successful:
+            if observation.outcome.timing_eligible:
                 incumbents[observation.context_id] = min(before, observation.score)
             if observation.strategy not in statistics:
                 continue

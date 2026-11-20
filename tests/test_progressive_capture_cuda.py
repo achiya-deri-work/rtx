@@ -14,13 +14,13 @@ class ProgressiveCaptureCudaTests(unittest.TestCase):
     def setUp(self):
         torch.compiler.reset()
 
-    def _case(self,family,m,n,k,scaling=None):
+    def _case(self,family,m,n,k,scaling=None,policy=None):
         import rtx.prequant_autotune as mx
         import rtx.nvfp4_inference_autotune as nv
         import rtx.bwd_autotune as bwd
         from torch._inductor.compile_fx import compile_fx
         torch.manual_seed(1729)
-        policy=rtx.AutotunePolicy(max_trials=8,max_seconds=90,
+        policy=policy or rtx.AutotunePolicy(max_trials=8,max_seconds=90,
             search_schedule='progressive',cache_behavior='refine',
             confirmation_repeats=0,finalist_rounds=2,warmup=1,samples=3,calls_per_sample=2)
         with tempfile.TemporaryDirectory(prefix='rtx-progressive-capture-') as root:
@@ -93,6 +93,16 @@ class ProgressiveCaptureCudaTests(unittest.TestCase):
                 self.assertEqual(snapshots(),before)
 
     def test_mxfp8_aligned(self): self._case('mxfp8',128,128,256)
+
+    def test_named_quick_mxfp8_mixed_search(self):
+        self._case('mxfp8',128,128,256,policy=rtx.AutotunePolicy.preset('quick',
+            max_seconds=90,cache_behavior='refine',confirmation_repeats=0,
+            finalist_rounds=2,warmup=1,samples=3,calls_per_sample=2))
+
+    def test_named_quick_nvfp4_mixed_search(self):
+        self._case('nvfp4',128,128,256,policy=rtx.AutotunePolicy.preset('quick',
+            max_seconds=90,cache_behavior='refine',confirmation_repeats=0,
+            finalist_rounds=2,warmup=1,samples=3,calls_per_sample=2))
     def test_mxfp8_ragged(self): self._case('mxfp8',257,131,129)
     def test_nvfp4_aligned(self): self._case('nvfp4',128,128,256)
     def test_nvfp4_ragged(self): self._case('nvfp4',257,131,129)

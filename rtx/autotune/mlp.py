@@ -23,7 +23,12 @@ from ..mlp import DEFAULT_MLP_CONFIG,MLP_CONFIG_REVISION,_parse,_validate,mxfp8_
 # Revision 39 admits policy-preserving BF16x2/bits fused backward quantization.
 # Older searches rejected these candidates; do not reuse their coverage or
 # runtime winner namespace as evidence for this expanded implementation set.
-MLP_AUTOTUNE_REVISION = 44
+# Revision 49 opens legal, backward-matched prepared forwards when dW has too
+# few reduction panels for the existing 4/8-way family. Arithmetic is unchanged.
+# Revision 50 deduplicates unused on-chip gate schedules in prepared execution.
+MLP_AUTOTUNE_REVISION = 50
+MLP_INDEPENDENT_DW_OPENING_REVISION = 1
+_PREPARED_DW_PARTITIONS = (4,8)
 from ..configs.glu import normalize_glu_config,glu_rejection,prequant_recompute_rejection
 from ..kernels.mxfp8 import FWD_SEARCH_SPACE,MXFP8Problem,normalize_fwd_config
 
@@ -37,6 +42,7 @@ def _mlp_hardware(device):
 def mlp_geometry_features(config,m,k,h,o,profile,precision="mxfp8",phase="train"):
     """Pre-compile geometry estimates; never claim measured occupancy."""
     from .hardware import geometry_features
+    from .output_transport import row_store_features
     gate=config.gate_up if precision=="mxfp8" and config.gate_backend=="onchip" else config.gate_prequant.gemm
     down=config.down if precision=="mxfp8" and config.down_backend=="onchip" else config.down_gemm
     roles={"gate_up":(m,2*h if precision=="mxfp8" else h,k,gate,1),
@@ -56,6 +62,7 @@ def mlp_geometry_features(config,m,k,h,o,profile,precision="mxfp8",phase="train"
         ctas=((rows+schedule.tile_m-1)//schedule.tile_m)*((cols+schedule.tile_n-1)//schedule.tile_n)*split
         values=geometry_features(m=rows,n=cols,k=reduction,tile_m=schedule.tile_m,
             tile_n=schedule.tile_n,tile_k=schedule.tile_k,profile=profile,grid_ctas=ctas)
+        values.update(row_store_features(schedule,MXFP8Problem(rows,cols,reduction)))
         result.update({name+"."+key:value for key,value in values.items()})
     return result
 
@@ -71,7 +78,14 @@ def active_schedule(config,precision,phase):
         from .._mlp_precision import prequant_config
         result={"up":asdict(prequant_config(config)),"down":asdict(prequant_config(config,True))}
     else:
-        result={"gate_backend":c["gate_backend"],"gate_up":c["gate_up"],"down_backend":c["down_backend"]}
+        onchip_gate=(config.gate_backend=="onchip" or
+                     (phase=="train" and config.recompute_backend=="onchip"))
+        # Prepared forward/recompute read only this common numerical policy
+        # from gate_up. Its on-chip tile/load/quantizer coordinates otherwise
+        # do not execute: treating them as new programs starves active stages.
+        gate=(c["gate_up"] if onchip_gate else
+              {"glu_silu_math":config.gate_up.glu_silu_math})
+        result={"gate_backend":c["gate_backend"],"gate_up":gate,"down_backend":c["down_backend"]}
         if config.gate_backend=="cooperative_prequant":
             result.update(gate_prequant=c["gate_prequant"],cooperative_ctas_per_sm=c["cooperative_ctas_per_sm"])
         elif config.gate_backend=="prequant":
@@ -157,7 +171,8 @@ def reference(x,gu,down,dy,activation,precision="mxfp8"):
 
 def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT_MLP_CONFIG,
                      precision="mxfp8",warmup=3,samples=7,calls_per_sample=3,
-                     measurement_mode="outer_capture",_reference_cache=None,execution_mix=None):
+                     measurement_mode="outer_capture",_reference_cache=None,execution_mix=None,
+                     _calibrated_timing=None):
     mix=execution_mix if execution_mix is not None else (MLPExecutionMix() if phase=='train' else MLPExecutionMix(training_pairs=0,inference_forwards=1))
     if not isinstance(mix,MLPExecutionMix):
         raise TypeError('execution_mix must be MLPExecutionMix')
@@ -180,6 +195,10 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
     gp,dp=MXFP8Problem(m,2*h,k),MXFP8Problem(m,o,h)
     initial=replace(initial,gate_backward=initial.gate_backward or _default_bwd_config(gp),
                     down_backward=initial.down_backward or _default_bwd_config(dp))
+    hardware=_mlp_hardware(str(x.device))
+    dw_opening=(precision=='mxfp8' and phase=='train' and
+        mlp_independent_dw_opening(initial, m, k, h, o, hardware.get('multiprocessor_count')))
+    calibrated_timing=dw_opening if _calibrated_timing is None else _calibrated_timing
     if _reference_cache:
         dy,expected=_reference_cache['values']
     else:
@@ -451,18 +470,31 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
             else:
                 graph()
         timings=[]
-        for _ in range(samples):
-            a,b=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
+        timing_metadata={}
+        if calibrated_timing:
+            from .measurement import measure_cuda_batches,runtime_timing_metadata
             with torch.cuda.stream(prepared['stream']):
-                a.record()
-                if measurement_mode == 'outer_capture':
-                    graph.replay()
-                else:
-                    for _ in range(calls_per_sample):
-                        result=graph()
-                b.record()
-            b.synchronize()
-            timings.append(a.elapsed_time(b)/calls_per_sample)
+                captured=measurement_mode=='outer_capture'
+                timings,batching=measure_cuda_batches(graph.replay if captured else graph,
+                    device=x.device,samples=samples,calls_per_sample=1 if captured else calls_per_sample)
+            if captured:
+                # A single replay contains the requested number of steps.
+                timings=[v/calls_per_sample for v in timings]
+                batching['captured_steps_per_replay']=calls_per_sample
+            timing_metadata={**batching,**runtime_timing_metadata(timings)}
+        else:
+            for _ in range(samples):
+                a,b=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
+                with torch.cuda.stream(prepared['stream']):
+                    a.record()
+                    if measurement_mode == 'outer_capture':
+                        graph.replay()
+                    else:
+                        for _ in range(calls_per_sample):
+                            result=graph()
+                    b.record()
+                b.synchronize()
+                timings.append(a.elapsed_time(b)/calls_per_sample)
         return TrialOutcome("ok",median_ms=statistics.median(timings),timings_ms=timings,
             compile_ms=compile_ms,metadata={"relative_l2":errors,"phase":phase,
                                           "numerics":prepared['numerics'],
@@ -470,12 +502,14 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
                                           "execution_mix":mix.contract(),
                                           "timing_unit":"complete_workload_ms",
                                           "graph_warmup":graph_warmup,
+                                          **timing_metadata,
                                           "prepared_benchmark_reused":reused})
 
     def evaluate(c):
         started=time.monotonic()
         stage="compile"
         try:
+            from .._mlp_forward import uses_prepared_forward
             if prepared.get("config")==c:
                 stage="runtime"
                 return measure(prepared["graph"],prepared["errors"],0.0,True)
@@ -489,7 +523,7 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
                 capture_inputs=tuple(t.detach().requires_grad_() for t in (x,gu,down))
             def forward(*values):
                 return mxfp8_mlp(*values,activation=activation,config=c,precision=precision)
-            if measurement_mode in ('selected_direct','private_replay'):
+            if measurement_mode=='private_replay' or (measurement_mode=='selected_direct' and not uses_prepared_forward(c)):
                 from .._mlp_autotune import selected_mlp
                 spec=json.dumps(dict(mode='fixed',initial=c.to_dict()),sort_keys=True)
                 def forward(*values):
@@ -544,17 +578,19 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
             raise_if_fatal_device_context_error(exc)
             return TrialOutcome("compile_error" if stage=="compile" else "runtime_error",error=str(exc),compile_ms=(time.monotonic()-started)*1000)
 
-    hardware=_mlp_hardware(str(x.device))
     return DiscreteKernelAdapter(
         context=KernelContext("mxfp8_recompute_mlp",MLP_AUTOTUNE_REVISION,{"m":m,"k":k,"h":h,"o":o,"activation":activation,"phase":phase,
                                                       "precision":precision,"silu_math":initial.gate_up.glu_silu_math},
                               device=hardware,
                               tags={"warmup":warmup,"samples":samples,"calls_per_sample":calls_per_sample,
                                     "capture_warmup":"candidate_leaves_evaluator_stream_v3","compile":"fullgraph_static",
-                                    "measurement_mode":measurement_mode,"execution_contract_revision":1,
+                                    "measurement_mode":measurement_mode,"execution_contract_revision":2,
                                     "graph_warmup_ms":200. if measurement_mode=='outer_capture' else None,
-                                    "structural_seed_revision":10,
+                                    "structural_seed_revision":17,
+                                    "skip_discarded_pool_generation":True,
                                     "recompute_pipeline_search_revision":1,
+                                    **({'independent_dw_opening_revision':MLP_INDEPENDENT_DW_OPENING_REVISION}
+                                       if dw_opening else {}),
                                     **({'execution_mix':mix.contract()} if execution_mix is not None else {}),
                                     "gradient_probe":"normal_seed1729"}),
         initial_config=initial,axes=axes,config_id_fn=lambda c:stable_id(active_schedule(c,precision,phase)),serialize_fn=asdict,
@@ -600,6 +636,161 @@ def materialized_dw_config(current, rows=128):
 def materialized_dx_config(current, rows=128):
     """Materialize dX operands while retaining the current GEMM tile choice."""
     return _materialized_backward_leg(current,"dx",rows)
+
+
+def _materialized_pair(current, n, k):
+    from math import gcd
+    return materialized_dx_config(materialized_dw_config(current, max(32, gcd(128, n, k))),
+                                  max(32, gcd(128, k)))
+
+
+def _small_forward_opening(adapter):
+    """Pair forward backends before spending short reductions on split dW.
+
+    Use the actual token-axis tile of the complete materialized candidate.
+    This needs neither a device-specific cutoff nor the router's capacity.
+    """
+    w = adapter.context.workload
+    if w.get('precision') != 'mxfp8' or w.get('phase') != 'train':
+        return ()
+    m, k, h, o = (w[name] for name in ('m', 'k', 'h', 'o'))
+    base = adapter.initial_config
+    if base.gate_backend == base.down_backend == 'prequant':
+        # This path has no prepared-forward admission hole. Retain its
+        # bounded gradient-fusion and output-transport controls.
+        return ()
+    roles = (('gate_backward', 2*h, k), ('down_backward', o, h))
+    materialized = {role: _materialized_pair(getattr(base, role), n, width)
+                    for role, n, width in roles}
+    if all((m + b.dw.gemm.tile_k - 1)//b.dw.gemm.tile_k >= 4
+           for b in materialized.values()):
+        return ()
+
+    # Match a known/prepared backward verbatim; for a default on-chip anchor,
+    # try the existing joint recompute family with both avoidable passes gone.
+    # Fall back through row-only and the actual initial policy on ragged rows.
+    back = base
+    if base.recompute_backend == 'onchip':
+        for axis in ('hidden_quantization_path', 'gradient_quantization_path'):
+            candidate = adapter.update_fn(base, axis, 'recompute')
+            if adapter.rejection(candidate) is None:
+                back = candidate
+                break
+
+    # Keep a distinct unsplit direct-store dW schedule. No large partition
+    # sweep: final legality checks both logical transpose shapes and K panels.
+    direct = replace(base, **materialized, backward_overlap=False)
+    for role, _, _ in roles:
+        direct = adapter.update_fn(direct, f'{role}.dw_split_count', 1)
+
+    families = []
+    for anchor in (back, direct):
+        triplet = tuple(replace(anchor, gate_backend=gate, down_backend=down)
+                        for gate, down in (('onchip','onchip'), ('prequant','onchip'), ('prequant','prequant')))
+        if all(adapter.rejection(candidate) is None for candidate in triplet):
+            families.extend(triplet)
+    # An ineligible whole triplet does not prevent comparing the base with
+    # gate-only when down preparation is illegal (e.g. a narrow edge tile).
+    if not families:
+        control = replace(base, gate_backend='onchip', down_backend='onchip')
+        gate_only = replace(control, gate_backend='prequant')
+        if all(adapter.rejection(candidate) is None for candidate in (control, gate_only)):
+            families.extend((control, gate_only))
+    return tuple(families)
+
+
+def mlp_row_store_seeds(adapter,base,phase):
+    """Forward-only and combined DX recipes; never mutate FP32 dW stores."""
+    from .output_transport import row_store_candidates
+    w=adapter.context.workload
+    if base.down_backend!='prequant':return
+    result=base
+    roles=[('down_gemm',MXFP8Problem(w['m'],w['o'],w['h']))]
+    if phase=='train':
+        roles.extend((group,MXFP8Problem(w['m'],n,k)) for group,n,k in (
+            ('down_backward',w['h'],w['o']),('gate_backward',w['k'],2*w['h']))
+            if getattr(base,group).dx.backend=='decomposed')
+    forward=None
+    for role,problem in roles:
+        g=base.down_gemm if role=='down_gemm' else getattr(base,role).dx.gemm
+        for schedule in row_store_candidates(g,problem):
+            def change(config):
+                if role=='down_gemm':return replace(config,down_gemm=schedule)
+                b=getattr(config,role)
+                return replace(config,**{role:replace(b,dx=replace(b.dx,gemm=schedule))})
+            candidate=change(result)
+            if candidate!=result and adapter.rejection(candidate) is None:
+                result=candidate
+                if role=='down_gemm':forward=result
+                break
+    # Forward alone has whole-path evidence. Additional DX stores compete as
+    # a separate proposal rather than being silently treated as additive wins.
+    if forward is not None:yield forward
+    if result!=base and result!=forward:yield result
+
+
+def _dw_split_geometry(m, n, k, gemm, parts):
+    ctas = ((n + gemm.tile_m - 1)//gemm.tile_m)*((k + gemm.tile_n - 1)//gemm.tile_n)*parts
+    panels = (m + gemm.tile_k - 1)//gemm.tile_k
+    # Doubling the count adds precisely one incumbent's worth of partials.
+    fits = panels >= 8*parts and parts*n*k*4 <= 8*1024**2
+    return ctas, fits
+
+
+def mlp_independent_dw_opening(initial, m, k, h, o, sm_count):
+    """Cold aligned, underfilled prepared-family opportunity, no CUDA work."""
+    from ..fp8_bwd import _default_bwd_config
+
+    if (not sm_count or any(d%64 for d in (m,k,h,o))
+            or not initial.gate_backend==initial.down_backend==initial.recompute_backend=='onchip'):
+        return False
+    geometry=[]
+    for group,n,width in (('gate_backward',2*h,k),('down_backward',o,h)):
+        bwd=getattr(initial,group) or _default_bwd_config(MXFP8Problem(m,n,width))
+        # The stronger donor here is the existing second complete setup;
+        # materialization and split selection retain its dW GEMM tiles.
+        geometry.append(_dw_split_geometry(m,n,width,bwd.dw.gemm,_PREPARED_DW_PARTITIONS[-1]))
+    return all(fill<sm_count for fill,_ in geometry) and any(fits for _,fits in geometry)
+
+
+def mlp_independent_dw_seeds(adapter, anchor):
+    """One higher partition level per underfilled dW, on the same stored plan.
+
+    Split producers write a logical FP32 partial per output and partition.
+    Budget the added partials, not padded tile allocation, and require at
+    least four K panels per partition on average. CTAs estimate grid fill,
+    not occupancy; legality separately checks the shortest partition.
+    """
+    from .._bwd_search import split_leg
+
+    w = adapter.context.workload
+    sm_count = adapter.context.device.get('multiprocessor_count')
+    if not sm_count or anchor.down_gemm.epilogue != 'tma':
+        return ()
+    moves = []
+    for group, n, k in (('gate_backward', 2*w['h'], w['k']),
+                        ('down_backward', w['o'], w['h'])):
+        backward = getattr(anchor, group)
+        dw = backward.dw
+        if dw.backend != 'decomposed' or dw.reduction != 'split_fp32_workspace':
+            return ()
+        g = dw.gemm
+        parts = dw.split_reduction
+        ctas,fits = _dw_split_geometry(w['m'],n,k,g,parts)
+        if ctas >= sm_count:
+            # Keep the opening unchanged in the already-wide regime.
+            return ()
+        next_parts = 2*parts
+        if not fits:
+            continue
+        changed = split_leg(dw, w['m'], next_parts, partition=dw.split_partition)
+        # These are partition-only comparisons, not another epilogue move.
+        changed = replace(dw, split_reduction=changed.split_reduction,
+                          reduction_tile=changed.reduction_tile)
+        c = replace(anchor, **{group:replace(backward,dw=changed)})
+        if adapter.rejection(c) is None:
+            moves.append((ctas, c))
+    return tuple(c for _, c in sorted(moves, key=lambda x:x[0]))
 
 
 def mlp_structural_seeds(adapter,precision,phase):
@@ -654,13 +845,18 @@ def mlp_structural_seeds(adapter,precision,phase):
             # Complete execution families must be reachable without accepting
             # each intermediate materialization/quantization move separately.
             # These are candidates, never shape-independent kernel defaults.
+            # Transposed quantizers require complete row tiles, but token M
+            # is row-oriented in dX. Derive each tile from the operands that
+            # are actually transposed rather than silently rejecting half-
+            # aligned feature widths such as 576/320 with a fixed 128 tile.
+            w=adapter.context.workload
             complete=replace(recomputed,down_backend='prequant',
-                gate_backward=materialized_dx_config(materialized_dw_config(base.gate_backward)),
-                down_backward=materialized_dx_config(materialized_dw_config(base.down_backward)),
+                gate_backward=_materialized_pair(base.gate_backward,2*w['h'],w['k']),
+                down_backward=_materialized_pair(base.down_backward,w['o'],w['h']),
                 recompute=replace(recomputed.recompute,gemm=replace(recomputed.recompute.gemm,
                     tile_m=128,tile_n=64,atom_layout_m=4,atom_layout_n=2,
                     glu_grad_load='prefetch')))
-            for parts in (4,8):
+            for index,parts in enumerate(_PREPARED_DW_PARTITIONS):
                 candidate=complete
                 for group in ('gate_backward','down_backward'):
                     candidate=adapter.update_fn(candidate,f'{group}.dw_split_count',parts)
@@ -673,11 +869,12 @@ def mlp_structural_seeds(adapter,precision,phase):
                 else:
                     # Retain the established short/ragged 4/8-way complete
                     # opening before generic backward-only proposals.
-                    opening.insert(0 if parts==4 else 1,candidate)
+                    opening.insert(index,candidate)
             # Compete preparation fusion against more dW parallelism inside
             # the opening budget, not only after individual local-search moves.
             # The coupled update retains arithmetic/scale policies and supplies
             # the required layouts. Normal legality filtering still applies.
+            row_fused=adapter.update_fn(base,'gradient_quantization_path','recompute')
             prepared=adapter.update_fn(base,'hidden_quantization_path','recompute')
             both=adapter.update_fn(base,'gradient_quantization_path','recompute_both')
             if long_reduction:
@@ -690,9 +887,22 @@ def mlp_structural_seeds(adapter,precision,phase):
                     opening=[adapter.update_fn(base,'gradient_transpose_path',swizzle)
                              for swizzle in ('none','xor_16b')]+opening
             else:
+                # A fully prepared incumbent already paid for independent
+                # backward quantizers. Compare its smallest pass-elimination
+                # move within the two protected structural proposals, even
+                # when ragged M makes hidden/both-axis emission unavailable.
+                # Retain the established 4/8-family opening for on-chip bases.
+                if base.gate_backend==base.down_backend==base.recompute_backend=='prequant':
+                    # Already-prepared shared FFNs should compare eliminated
+                    # passes before compiling near-identical split grids.
+                    # Alignment/legality below retain row-only fusion for
+                    # ragged M; this never changes a numerical policy.
+                    opening[:0]=[both,row_fused]
+                else:
+                    opening.append(row_fused)
                 opening.append(prepared)
                 opening.append(both)
-            seeds.append(adapter.update_fn(base,'gradient_quantization_path','recompute'))
+            seeds.append(row_fused)
         # Coupled narrow schedules must be reachable without accepting a
         # sequence of illegal tile/warp/buffering intermediate configurations.
         for move in ((128,"tma",2,2),(256,"scalar",1,2),(256,"tma",2,4)):
@@ -712,17 +922,128 @@ def mlp_structural_seeds(adapter,precision,phase):
             row=adapter.update_fn(base,f"{group}.dx_materialized_rows",64)
             seeds.append(replace(row,**{group:replace(getattr(row,group),quant_schedule="per_matmul")}))
             seeds.append(adapter.update_fn(base,f"{group}.dw_split_count",2))
+    if precision=='mxfp8' and phase=='train':
+        # Do not couple the two weight-gradient grids by default. Adjacent
+        # split counts are existing search coordinates, not inferred winners;
+        # reserve nearby one-leg proposals after the protected family opening.
+        # A 4/4 incumbent can therefore reach 4/8 without first accepting 8/8.
+        for group in ('gate_backward','down_backward'):
+            parts=getattr(base,group).dw.split_reduction
+            for count in sorted({max(1,parts//2),min(128,parts*2)}-{parts}):
+                if count in (1,2,4,8,16,32,64,128):
+                    opening.append(adapter.update_fn(base,f'{group}.dw_split_count',count))
+    if precision=='mxfp8':
+        # Cold public users start on-chip. Rebase stores on the first complete
+        # legal prepared family, not only on a previously selected winner.
+        prepared=base if base.down_backend=='prequant' else next((c for c in opening+seeds
+            if c.gate_backend==c.down_backend=='prequant'
+            and (phase!='train' or c.recompute_backend=='prequant')
+            and adapter.rejection(c) is None),None)
+        if prepared is not None:
+            stores=list(mlp_row_store_seeds(adapter,prepared,phase))
+            prefix=list(stores)
+            if phase=='train' and stores:
+                # Cross output transport with another existing complete dW
+                # plan. Comparing only A/direct, B/direct and A/TMA can miss
+                # B/TMA even when both 8 and 16 trials agree on A/TMA.
+                # Donor plans come from the established structural families,
+                # not a fixed split count or a per-device winner table.
+                for donor in opening+seeds:
+                    if not donor.gate_backend==donor.down_backend==donor.recompute_backend=='prequant':continue
+                    partition=lambda c:tuple((getattr(c,g).dw.split_reduction,
+                        getattr(c,g).dw.split_partition,getattr(c,g).dw.reduction_tile)
+                        for g in ('gate_backward','down_backward'))
+                    if partition(donor)==partition(prepared):continue
+                    candidate=prepared
+                    for group in ('gate_backward','down_backward'):
+                        before=getattr(prepared,group);dw=getattr(donor,group).dw
+                        # Preserve the anchor's quantizers and every non-dW
+                        # leg while transferring partition/geometry choices.
+                        if dw.backend!=before.dw.backend:break
+                        dw=replace(before.dw,split_reduction=dw.split_reduction,
+                            split_partition=dw.split_partition,reduction_tile=dw.reduction_tile,
+                            reduction=dw.reduction)
+                        candidate=replace(candidate,**{group:replace(before,dw=dw)})
+                    else:
+                        if candidate==prepared or adapter.rejection(candidate) is not None:continue
+                        alternatives=list(mlp_row_store_seeds(adapter,candidate,phase))
+                        if alternatives:
+                            prefix.append(alternatives[-1])
+                            if prepared==base:
+                                # The direct A control is already trial one.
+                                # Use its spare slot for an independent-leg
+                                # partition control rather than coupling both
+                                # weight-gradient grids in every proposal.
+                                for group in ('down_backward','gate_backward'):
+                                    one=replace(prepared,**{group:getattr(candidate,group)})
+                                    if one!=prepared and adapter.rejection(one) is None:
+                                        prefix.append(one);break
+                            elif mlp_independent_dw_opening(base,
+                                    *(adapter.context.workload[d] for d in ('m','k','h','o')),
+                                    adapter.context.device.get('multiprocessor_count')):
+                                independent=mlp_independent_dw_seeds(adapter,alternatives[-1])
+                                if independent:
+                                    # Two stored partition controls, one-leg
+                                    # challengers, the two direct fallbacks.
+                                    # Keep the old forward-only store in the
+                                    # tail and leave trial eight to UCB.
+                                    prefix=[stores[-1],alternatives[-1],*independent,
+                                            prepared,candidate,*stores[:-1]]
+                                    break
+                            prefix.extend((prepared,candidate))
+                            break
+                row=adapter.update_fn(prepared,'gradient_quantization_path','recompute')
+                if adapter.rejection(row) is None:prefix.append(row)
+            opening[:0]=prefix
     unique=[]
     # Budgeted search uses only two structural opening proposals. Spend them
     # on complete, distinct execution schedules, not partial materialization
     # moves that cannot reveal the combined benefit. Invalid shapes are filtered.
-    for candidate in [*opening,*seeds]:
+    for candidate in [*_small_forward_opening(adapter),*opening,*seeds]:
         if candidate == base or candidate in unique:
             continue
         if hasattr(adapter,'rejection') and adapter.rejection(candidate) is not None:
             continue
         unique.append(candidate)
     return unique
+
+
+def make_mlp_tuner(adapter,store,policy,*,progress=None,candidates=(),started_at=None):
+    """Shared engine, with complete output-transport recipes before local moves."""
+    from .effort import make_effort_autotuner
+    from .core import Proposal
+    candidates=tuple(candidates)
+    tuner=make_effort_autotuner(adapter,store,policy,progress=progress,
+                              candidates=candidates,started_at=started_at)
+    ranked=any(name=='frozen_ranker' or name.startswith('portable_') for name in tuner.strategies)
+    if (adapter.context.workload.get('precision')=='mxfp8'
+            and not ranked and not policy.initial_neighborhood_trials
+            and policy.exploration_trials==1 and not policy.baseline_trials):
+        coverage=list(tuner.coverage_proposals)
+        if policy.max_trials>=8:
+            # A cold on-chip schedule can be an order of magnitude slower.
+            # Do not waste its small budget on almost-identical on-chip
+            # neighbors before comparing complete packed families and their
+            # direct controls. Leave one of eight trials to ordinary UCB.
+            protected=[];seen={adapter.config_id(adapter.initial_config)}
+            for c in (*_small_forward_opening(adapter), *candidates):
+                key=adapter.config_id(c)
+                if key not in seen and adapter.rejection(c) is None:
+                    protected.append(Proposal(c,'structural'));seen.add(key)
+                if len(protected)==6:break
+            for proposal in coverage:
+                if len(protected)>=6:break
+                key=adapter.config_id(proposal.config)
+                if key not in seen:
+                    protected.append(proposal);seen.add(key)
+            tuner.coverage_proposals=tuple(protected)
+        else:
+            tuner.coverage_proposals=tuple([p for p in coverage if p.strategy=='structural']+
+                                           [p for p in coverage if p.strategy!='structural'])
+        if tuner.checkpoint_key is not None:
+            tuner.checkpoint_key=stable_id(dict(shared=tuner.checkpoint_key,prepared_opening_revision=6,
+                coverage=[adapter.config_id(p.config) for p in tuner.coverage_proposals]))
+    return tuner
 
 
 @tuning_resources
@@ -777,7 +1098,7 @@ def tune_mxfp8_mlp(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT_M
         store=ResidualTuningStore(store_root,transfer_root=output_dir)
         seeds=mlp_structural_seeds(adapter,precision,phase)
         def finish(result):
-            from .deployment_qualification import qualify_pair
+            from .deployment_qualification import DeploymentQualificationError, qualify_pair
             if not qualification_rounds:
                 return result
             baseline=adapter.initial_config if qualification_incumbent is None else qualification_incumbent
@@ -790,13 +1111,28 @@ def tune_mxfp8_mlp(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT_M
             qualification_started=time.monotonic()
             challenger=result.config
             contenders={}
+            calibrated=bool(adapter.context.tags.get('independent_dw_opening_revision'))
             for c in (baseline,result.config):
                 contenders[c]=make_mlp_adapter(x,gu,down,activation=activation,phase=phase,
                     initial=c,precision=precision,warmup=warmup,samples=samples,
                     calls_per_sample=calls_per_sample,measurement_mode=measurement_mode,
-                    _reference_cache=reference_cache,execution_mix=execution_mix)
-            selected,decision=qualify_pair(baseline,result.config,
-                lambda c:contenders[c].evaluate(c),rounds=qualification_rounds,margin=qualification_margin)
+                    _reference_cache=reference_cache,execution_mix=execution_mix,_calibrated_timing=calibrated)
+            def evaluate(c):
+                outcome=contenders[c].evaluate(c)
+                if calibrated and outcome.successful and not outcome.timing_eligible:
+                    return replace(outcome,status='runtime_error',error='nonstationary deployment timing')
+                return outcome
+            try:
+                selected,decision=qualify_pair(baseline,result.config,evaluate,
+                    rounds=qualification_rounds,margin=qualification_margin)
+            except DeploymentQualificationError as error:
+                import uuid
+                path=store_root/f'deployment-qualification-failed-{uuid.uuid4().hex}.json'
+                with path.open('x') as stream:
+                    json.dump(dict(error.decision, incumbent=baseline.to_dict(),
+                        challenger=challenger.to_dict(),
+                        elapsed_s=time.monotonic()-qualification_started),stream,indent=2)
+                raise
             result.config=selected
             result.median_ms=decision['median_ms']
             decision.update(incumbent=baseline.to_dict(),challenger=challenger.to_dict(),
@@ -816,7 +1152,7 @@ def tune_mxfp8_mlp(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT_M
                 json.dump(result.winner_decision,stream,indent=2)
             return result
         if tuning_policy is not None:
-            return finish(make_effort_autotuner(adapter,store,tuning_policy,progress=progress,candidates=[*portfolio,*seeds],started_at=tuning_started).tune())
+            return finish(make_mlp_tuner(adapter,store,tuning_policy,progress=progress,candidates=[*portfolio,*seeds],started_at=tuning_started).tune())
         if search=="balanced":
             from .first_hit import FirstHitPolicy,FrozenRanker,tune_first_hit
             ranker=None if ranker_path is None else FrozenRanker.load(ranker_path)

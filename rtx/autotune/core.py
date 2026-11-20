@@ -201,6 +201,8 @@ class DiscreteKernelAdapter(Generic[ConfigT]):
     evaluator: Callable[[ConfigT], TrialOutcome]
     rejection_fn: Callable[[ConfigT], tuple[str, str] | None]
     extra_features_fn: Callable[[ConfigT], Mapping[str, float]] | None = None
+    opening_fn: Callable[[], Sequence[Proposal[ConfigT]]] | None = None
+    region_fn: Callable[[ConfigT], str] | None = None
     _context_feature_cache: FeatureMap = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -398,7 +400,8 @@ def evaluate_proposal(
         parent_config_id=proposal.parent_config_id,
         coordinate=proposal.coordinate,
         coordinate_value=proposal.coordinate_value,
-        metadata=proposal.metadata,
+        metadata={**proposal.metadata,**({'execution_region':adapter.region_fn(proposal.config)}
+                    if getattr(adapter,'region_fn',None) else {})},
     )
 
 

@@ -1,11 +1,19 @@
 """Capture ownership and cache inventory. No CUDA initialization at import."""
 from functools import wraps
-from threading import RLock
+import gc
+import sys
+from threading import Condition, RLock, get_ident
 import weakref
 
 _lock = RLock()
+_capture_gate = Condition(_lock)
 _caches = weakref.WeakValueDictionary()
 _graphs = weakref.WeakKeyDictionary()
+_captures = {}
+_capture_leases = {}
+_lease_gc_counts = None
+_pending_owners = {}
+_retiring_thread = None
 _installed = False
 
 
@@ -20,24 +28,123 @@ def caches():
 
 
 def _release_graph(owners, device):
-    # CUDA graph execution is asynchronous even after its Python graph dies.
-    # Keep allocations pinned through completion, not merely graph destruction.
+    if owners:
+        # Automatic GC can reach a weak finalizer while this very thread
+        # snapshots the weak graph registry. Queue then, without running CUDA
+        # operations under the outer registry lock.
+        may_drain = not _lock._is_owned()
+        with _lock:
+            _pending_owners.setdefault(device, []).append(owners)
+        if may_drain:
+            _drain_graph_retirements()
+
+
+def _collection_counts():
+    return tuple(generation['collections'] for generation in gc.get_stats())
+
+
+def _lease_graph(graph):
+    global _lease_gc_counts
+    if not _capture_leases:
+        _lease_gc_counts = _collection_counts() if gc.isenabled() else None
+    _capture_leases[id(graph)] = graph
+
+
+def _drop_capture_leases(leases, previous):
+    leases.clear()
+    if previous is not None and gc.isenabled():
+        current = _collection_counts()
+        if current != previous:
+            # A cycle deemed reachable only because of a lease can be
+            # promoted during capture. Retry the missed collection now,
+            # not inside CUDA capture and not on every graph entrance.
+            generation = 1 if current[1:] == previous[1:] and sys.version_info < (3, 14) else 2
+            gc.collect(generation)
+
+
+def _drain_graph_retirements():
+    """Claim the safe boundary under lock; execute retirement without it."""
+    global _retiring_thread
+    with _lock:
+        if _captures or _retiring_thread is not None or not (_capture_leases or _pending_owners):
+            return
+        _retiring_thread = get_ident()
+    _retire_graph_data()
+
+
+def _retire_graph_data():
+    """Retire with exclusive access to the capture boundary, not the mutex."""
+    global _capture_leases, _lease_gc_counts, _retiring_thread
     import torch
+
+    with _lock:
+        leases, _capture_leases = _capture_leases, {}
+        previous, _lease_gc_counts = _lease_gc_counts, None
+    failed = {}
+
+    def finish():
+        global _retiring_thread
+        for device, groups in failed.items():
+            _pending_owners.setdefault(device, []).extend(groups)
+        _retiring_thread = None
+        _capture_gate.notify_all()
+
     try:
-        if owners and torch.cuda.is_initialized():
-            torch.cuda.synchronize(device)
+        # Native GraphExecDestroy can invalidate an unrelated CUDA capture.
+        # Drop peer leases only after capture_end; their weak finalizers can
+        # add pin groups to the same retirement batch.
+        _drop_capture_leases(leases, previous)
+        while True:
+            with _capture_gate:
+                if not _pending_owners:
+                    finish()
+                    return
+                device, groups = _pending_owners.popitem()
+            try:
+                if torch.cuda.is_initialized():
+                    # Replay can use a stream other than the capture stream.
+                    # A device barrier here (never in replay) covers them all.
+                    torch.cuda.synchronize(device)
+            except BaseException as error:
+                # Completion was not proved. Retain pins and retry at the
+                # next safe boundary rather than swallowing and freeing them.
+                failed.setdefault(device, []).extend(groups)
+                if not isinstance(error, Exception):
+                    raise
+            else:
+                for owners in groups:
+                    owners.clear()
+    except BaseException:
+        with _capture_gate:
+            finish()
+        raise
+
+
+def _wait_for_retirement():
+    # A CUDA capture cannot start during a pending device barrier/destruction.
+    # Waiting releases the mutex, including for concurrent finalizer enqueue.
+    if _retiring_thread == get_ident():
+        raise RuntimeError('cannot start CUDA graph capture during graph retirement')
+    _capture_gate.wait_for(lambda: _retiring_thread is None)
+
+
+def _capture_still_open(stream):
+    """An exceptional begin/end need not have closed the native capture."""
+    try:
+        from cuda.bindings import driver
+        error, status = driver.cuStreamIsCapturing(stream.cuda_stream)
+        return bool(error) or status != driver.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_NONE
     except Exception:
-        # During interpreter/driver teardown there can be no further replay.
-        pass
-    owners.clear()
+        # Do not issue a device barrier when the stream state is unknown.
+        return True
 
 
 def install_graph_resource_tracking():
     """Attach RTX scratch to public CUDAGraph capture/reset lifetime.
 
     Installed on the first CUDA runner warmup. This also covers Inductor Graph
-    Trees, which use this same public capture API. No replay or launch hook,
-    and no global graph lifetime strong reference, is introduced.
+    Trees, which use this same public capture API. Peer graph leases exist only
+    during tracked capture, and no replay or launch hook is introduced.
     """
     global _installed
     with _lock:
@@ -49,51 +156,94 @@ def install_graph_resource_tracking():
         graph_type = torch.cuda.CUDAGraph
         begin, end, reset = graph_type.capture_begin, graph_type.capture_end, graph_type.reset
 
+        def finish_capture(graph):
+            scope = getattr(graph, '_rtx_capture_scope', None)
+            try:
+                if scope is not None:
+                    graph._rtx_resource_owners.update(graph._rtx_current_owners)
+                    try:
+                        scope.__exit__(None, None, None)
+                    finally:
+                        del graph._rtx_capture_scope, graph._rtx_current_owners
+            finally:
+                with _lock:
+                    _captures.pop(id(graph), None)
+                    if _captures:
+                        _lease_graph(graph)
+                _drain_graph_retirements()
+
         @wraps(begin)
         def capture_begin(graph, *args, **kwargs):
             from .runtime import retain_runtime_resources
+            stream = torch.cuda.current_stream()
+            _drain_graph_retirements()
+            with _capture_gate:
+                _wait_for_retirement()
+                if id(graph) in _captures:
+                    raise RuntimeError('CUDA graph capture has already started')
+                # Snapshot existing tracked graphs before the CUDA begin call.
+                # Their native destruction is unsafe even if they have no RTX
+                # pins. The weak registry is unchanged outside the boundary.
+                for peer in tuple(_graphs):
+                    if peer is not graph:
+                        _lease_graph(peer)
+                _captures[id(graph)] = stream
+                pins = getattr(graph, '_rtx_resource_owners', None)
+                if pins is None:
+                    pins = graph._rtx_resource_owners = {}
+                    graph._rtx_resource_finalizer = weakref.finalize(
+                        graph, _release_graph, pins, stream.device.index
+                    )
+                _graphs[graph] = pins
             # Start ownership before capture; private-pool references are CPU
             # objects and do not enqueue GPU work.
-            scope = retain_runtime_resources()
-            owners = scope.__enter__()
-            device = torch.cuda.current_device()
             try:
-                result = begin(graph, *args, **kwargs)
+                scope = retain_runtime_resources()
+                graph._rtx_current_owners = scope.__enter__()
+                graph._rtx_capture_scope = scope
+                return begin(graph, *args, **kwargs)
             except BaseException:
-                scope.__exit__(*__import__('sys').exc_info())
+                if not _capture_still_open(stream):
+                    finish_capture(graph)
                 raise
-            graph._rtx_capture_scope = scope
-            # Recapture/reset is explicit; preserve any earlier pins until reset.
-            pins = getattr(graph, '_rtx_resource_owners', None)
-            if pins is None:
-                pins = graph._rtx_resource_owners = {}
-                graph._rtx_resource_finalizer = weakref.finalize(graph, _release_graph, pins, device)
-            graph._rtx_current_owners = owners
-            with _lock:
-                _graphs[graph] = pins
-            return result
 
         @wraps(end)
         def capture_end(graph, *args, **kwargs):
+            with _lock:
+                stream = _captures.get(id(graph))
             try:
-                return end(graph, *args, **kwargs)
-            finally:
-                scope = getattr(graph, '_rtx_capture_scope', None)
-                if scope is not None:
-                    graph._rtx_resource_owners.update(graph._rtx_current_owners)
-                    scope.__exit__(None, None, None)
-                    del graph._rtx_capture_scope, graph._rtx_current_owners
+                result = end(graph, *args, **kwargs)
+            except BaseException:
+                if stream is not None and not _capture_still_open(stream):
+                    finish_capture(graph)
+                raise
+            if stream is not None:
+                finish_capture(graph)
+            return result
 
         @wraps(reset)
         def graph_reset(graph, *args, **kwargs):
-            result = reset(graph, *args, **kwargs)
-            finalizer = getattr(graph, '_rtx_resource_finalizer', None)
-            if finalizer is not None:
-                finalizer()
-                del graph._rtx_resource_finalizer, graph._rtx_resource_owners
-                with _lock:
-                    _graphs.pop(graph, None)
-            return result
+            global _retiring_thread
+            with _capture_gate:
+                already_retiring = _retiring_thread == get_ident()
+                if not already_retiring:
+                    _wait_for_retirement()
+                if _captures:
+                    raise RuntimeError('reset CUDA graphs outside active CUDA graph capture')
+                if not already_retiring:
+                    _retiring_thread = get_ident()
+            try:
+                result = reset(graph, *args, **kwargs)
+                finalizer = getattr(graph, '_rtx_resource_finalizer', None)
+                if finalizer is not None:
+                    finalizer()
+                    del graph._rtx_resource_finalizer, graph._rtx_resource_owners
+                    with _lock:
+                        _graphs.pop(graph, None)
+                return result
+            finally:
+                if not already_retiring:
+                    _retire_graph_data()
 
         graph_type.capture_begin, graph_type.capture_end, graph_type.reset = capture_begin, capture_end, graph_reset
         _installed = True
@@ -101,7 +251,8 @@ def install_graph_resource_tracking():
 
 def graph_resources():
     with _lock:
-        return tuple(dict(pins) for pins in _graphs.values())
+        pending = (pins for groups in _pending_owners.values() for pins in groups)
+        return tuple(dict(pins) for pins in (*_graphs.values(), *pending))
 
 
 def _stream_context(key):

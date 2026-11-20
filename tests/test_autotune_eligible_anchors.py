@@ -7,6 +7,22 @@ from rtx.autotune.strategies import CoordinateLocalSearch, RandomSearch
 from tests.test_autotune_coverage import Config, adapter
 
 
+def test_bandit_unstable_success_cannot_earn_speed_reward_or_set_resume_incumbent():
+    from rtx.autotune.bandit import AdaptiveBanditScheduler,ArmStatistics
+    policy=AdaptiveBanditScheduler(cost_weight=0)
+    def row(score,eligible):
+        return SimpleNamespace(outcome=TrialOutcome('ok',median_ms=score,metadata={
+            'sampling':{'collection':{'stationary':eligible}}}),score=score,successful=True,
+            metadata={},elapsed_s=.1,context_id='shape',strategy='random',
+            features={},finished_at='0',session_id='s',sequence=0)
+    unstable=row(.001,False);stable=row(1.,True)
+    assert policy.reward(2.,unstable)<0
+    stats={'random':ArmStatistics()}
+    policy.initialize(stats,SimpleNamespace(observations=[unstable,stable],active_context_id='shape'),{})
+    assert stats['random'].pulls==2 and stats['random'].successes==1
+    assert stats['random'].last_reward>0
+
+
 def history(a):
     def record(config, score, stationary):
         return SimpleNamespace(config=config, config_id=a.config_id(config), score=score,

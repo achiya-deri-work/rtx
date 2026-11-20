@@ -9,7 +9,7 @@ from functools import lru_cache
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float8E4M3FN, Float8E8M0FNU, Int64, Uint8
+from cutlass import BFloat16, Float8E4M3FN, Float8E8M0FNU, Uint8
 
 
 @cute.jit
@@ -32,9 +32,12 @@ class BytePackedGemm:
     def __init__(self,inner):self.inner=inner
 
     @cute.jit
-    def __call__(self,qx,qw,sx,sw,out,aux,stream):
+    def __call__(self,qx,qw,sx,sw,out,aux,stream,active_capacity=None):
         # GLU's existing auxiliary ABI already stores raw scale bytes.
-        self.inner(qx,qw,_e8(sx),_e8(sw),out,aux,stream)
+        if cutlass.const_expr(active_capacity is None):
+            self.inner(qx,qw,_e8(sx),_e8(sw),out,aux,stream)
+        else:
+            self.inner(qx,qw,_e8(sx),_e8(sw),out,aux,stream,active_capacity)
 
 
 class ByteLegacyLinear:
@@ -47,7 +50,7 @@ class ByteLegacyLinear:
 
 
 class ByteJointRecompute:
-    def __init__(self,inner):self.inner=inner
+    def __init__(self,inner,active=False):self.inner,self.active=inner,active
 
     @cute.jit
     def __call__(self,qx,qw,sx,sw,dh,aux,stream):
@@ -55,7 +58,10 @@ class ByteJointRecompute:
         # BF16 derivative and both independently quantized axes are unchanged.
         typed=(aux[0],aux[1],_e8(aux[2]),aux[3],_e8(aux[4]),
                aux[5],_e8(aux[6]),aux[7],_e8(aux[8]))
-        self.inner(qx,qw,_e8(sx),_e8(sw),dh,typed,stream)
+        if cutlass.const_expr(self.active):
+            self.inner(qx,qw,_e8(sx),_e8(sw),dh,typed,stream,aux[9])
+        else:
+            self.inner(qx,qw,_e8(sx),_e8(sw),dh,typed,stream)
 
 
 class ByteHiddenDequant:
@@ -70,8 +76,8 @@ class BytePackedGather:
     def __init__(self,inner):self.inner=inner
 
     @cute.jit
-    def __call__(self,global_q,global_sf,x,ids,inverse,out,out_sf,gathered,stream):
-        self.inner(global_q,_e8(global_sf),x,ids,inverse,out,_e8(out_sf),gathered,stream)
+    def __call__(self,global_q,global_sf,x,ids,inverse,out,out_sf,gathered,stream,active_capacity=None):
+        self.inner(global_q,_e8(global_sf),x,ids,inverse,out,_e8(out_sf),gathered,stream,active_capacity)
 
 
 def _fake(dtype,rows,cols,alignment=16):
@@ -79,15 +85,17 @@ def _fake(dtype,rows,cols,alignment=16):
 
 
 @lru_cache(maxsize=128)
-def compile_expert_quant(experts,specs,config,transpose_mode='staged',grid_mode='operand'):
+def compile_expert_quant(experts,specs,config,transpose_mode='staged',grid_mode='operand',warp_tokens=8,warp_raster='features'):
     from .mxfp8_moe_prepared import compile_expert_quant as original
-    return original(experts,specs,config,transpose_mode,grid_mode,_byte_scales=True)
+    return original(experts,specs,config,transpose_mode,grid_mode,warp_tokens,warp_raster,_byte_scales=True)
 
 
 @lru_cache(maxsize=128)
-def compile_expert_packed_gemm(experts,problem,config,kind='linear',transport='tma'):
+def compile_expert_packed_gemm(experts,problem,config,kind='linear',transport='tma',split=1,
+                              active_m_alignment=0,active_k=False,glu_engine='legacy'):
     from .mxfp8_moe_prepared import compile_expert_packed_gemm as original
-    return original(experts,problem,config,kind,transport,_byte_scales=True)
+    return original(experts,problem,config,kind,transport,_byte_scales=True,split=split,
+                    active_m_alignment=active_m_alignment,active_k=active_k,glu_engine=glu_engine)
 
 
 @lru_cache(maxsize=128)
@@ -99,9 +107,10 @@ def compile_grouped_linear(experts,problem,config,a_orientation='row',b_orientat
 
 
 @lru_cache(maxsize=128)
-def compile_expert_joint_recompute(experts,problem,config,quant):
+def compile_expert_joint_recompute(experts,problem,config,quant,engine='legacy',active_m_alignment=0,gradient_warps=3):
     from .mxfp8_moe_prepared import compile_expert_joint_recompute as original
-    return original(experts,problem,config,quant,_byte_scales=True)
+    return original(experts,problem,config,quant,_byte_scales=True,engine=engine,
+                    active_m_alignment=active_m_alignment,gradient_warps=gradient_warps)
 
 
 @lru_cache(maxsize=128)
@@ -124,16 +133,9 @@ def compile_native_hidden_scales(e,rows,k,threads=128):
 
 
 @lru_cache(maxsize=128)
-def compile_packed_input_gather(n,d,e,c,k,storage_c,threads=128,scale_layout='row_major',copy_bf16=False):
-    from .mxfp8_moe_input import PackedInputGather
-    inner=PackedInputGather(n,d,e,c,k,storage_c,threads,scale_layout,copy_bf16)
-    qx=_fake(Float8E4M3FN,n,inner.width)
-    sx=_fake(Uint8,n,inner.scale_cols)
-    x=_fake(BFloat16,n,d,2)
-    ids,inverse=_fake(Int64,e,c),_fake(Int64,n,k)
-    qout=_fake(Float8E4M3FN,e*storage_c,inner.width)
-    sout=_fake(Uint8,e*storage_c,inner.scale_cols)
-    gathered=_fake(BFloat16,e*storage_c,d) if copy_bf16 else x
-    stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    return cute.compile(BytePackedGather(inner),qx,sx,x,ids,inverse,qout,sout,gathered,stream,
-                        options='--enable-tvm-ffi --opt-level 3')
+def compile_packed_input_gather(n,d,e,c,k,storage_c,threads=128,scale_layout='row_major',
+                                copy_bf16=False,emit_index=False,active_m_alignment=0,row_tile_m=1,
+                                map_tile_ks=(),full_map=False):
+    from .mxfp8_moe_input import compile_packed_input_gather as original
+    return original(n,d,e,c,k,storage_c,threads,scale_layout,copy_bf16,emit_index,
+                    active_m_alignment,row_tile_m,map_tile_ks,full_map,_byte_scales=True)

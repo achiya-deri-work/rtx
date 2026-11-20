@@ -50,6 +50,19 @@ def _has_sm120() -> bool:
 
 
 class TestMXFP8BwdConfiguration(unittest.TestCase):
+    def test_compound_none_quant_b_resets_to_updated_a_schedule(self):
+        base=DEFAULT_SEPARATE_DECOMPOSED_MXFP8_BWD_CONFIG
+        self.assertNotEqual(base.dx.quant_a,base.dx.resolved_quant_b())
+        candidate=update_bwd_config(base,{'dx':{
+            'quant_a':{'quant_vec':8,'load_bits':64},'quant_b':None}})
+        self.assertIsNone(candidate.dx.quant_b)
+        self.assertEqual(candidate.dx.resolved_quant_b(),candidate.dx.quant_a)
+        self.assertEqual(candidate.dx.quant_a.quant_vec,8)
+        # An omitted or empty B update retains a deliberately distinct policy.
+        for patch in ({},{'quant_b':{}}):
+            unchanged=update_bwd_config(base,{'dx':patch})
+            self.assertEqual(unchanged.dx.resolved_quant_b(),base.dx.resolved_quant_b())
+
     def test_default_is_measured_safe_seed_and_fused_family_is_exposed(self) -> None:
         problem = MXFP8Problem(512, 1536, 1536)
         self.assertIsNone(DEFAULT_MXFP8_BWD_CONFIG.rejection(problem))

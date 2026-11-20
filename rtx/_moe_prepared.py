@@ -16,7 +16,7 @@ def default_schedules():
 DEFAULT_QUANT=DEFAULT_PREPARED_MOE_CONFIG.quant
 
 
-def prepare(operands,quant=DEFAULT_QUANT,transpose_mode='staged',grid_mode='operand'):
+def prepare(operands,quant=DEFAULT_QUANT,transpose_mode='staged',grid_mode='operand',warp_tokens=8,warp_raster='features'):
     """Fuse unrelated expert/orientation quantization tasks into one launch."""
     compile_quant=load_kernel_symbol('mxfp8_moe_prepared','compile_expert_quant')
     specs=[];sources=[];packed=[];scales=[]
@@ -28,7 +28,7 @@ def prepare(operands,quant=DEFAULT_QUANT,transpose_mode='staged',grid_mode='oper
         sources.append(value.flatten(0,1))
         packed.append(torch.empty((e,rows,width),device=value.device,dtype=torch.float8_e4m3fn))
         scales.append(torch.empty((e,rows,width//32),device=value.device,dtype=torch.float8_e8m0fnu))
-    compile_quant(e,tuple(specs),quant,transpose_mode,grid_mode)(sources[0],tuple(sources),tuple(t.flatten(0,1) for t in packed),
+    compile_quant(e,tuple(specs),quant,transpose_mode,grid_mode,warp_tokens,warp_raster)(sources[0],tuple(sources),tuple(t.flatten(0,1) for t in packed),
                                       tuple(t.flatten(0,1) for t in scales))
     return tuple(zip(packed,scales))
 

@@ -5,6 +5,123 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Add a public-API BalancedMoE training example and application-side review:
+  checkpoint/optimizer restoration, fresh-process tuning-cache reuse, packed
+  inputs and standard module workflows. Document the unresolved cold
+  inference-mode tuning and BF16-autocast integration failures in the README.
+
+- Consolidate BalancedMoE layer usage: dense independent `[B,T,D]` pools,
+  simple effort aliases, optional all-component `autotune_`, concise repr and
+  standard reset without changing optimizer/state-dict identities. Preserve
+  packed and advanced APIs. Fix zero-copy virtual weights under compiled
+  no-grad/inference and frozen-weight input-gradient execution.
+
+- Integrate optional flat-router sharded FP32 columns and warp rows into
+  source-safe first-hit/cache/backward execution. Cover them early in bounded
+  progressive search and add coupled transport proposals to the shared UCB
+  orchestration. Keep packed-pool choices independent. Stabilize selected-
+  softmax adjoints for nearly constant upstreams without hiding Torch work
+  inside custom launch operations; retain strict independent FP64 gates.
+
+- Fix shared-MLP tuning identities that treated unused on-chip gate tiles as
+  distinct prepared programs. Retain active on-chip settings and shared SiLU
+  policy; revision 50 separates corrected evidence and runtime winner keys.
+  Verify collapsed aliases through compiled output/all-gradient equivalence.
+
+- Add adapter-owned execution-region openings and protected candidate-pool
+  representatives, with shape/SM-driven flat-router coverage. Named effort
+  presets use progressive/mixed search; direct policy construction retains
+  legacy defaults. Add retrieval-only/ranker-only ablations, normalized donor
+  IDs, portable feature cleanup and timing-eligible bandit rewards. Learned
+  artifacts remain opt-in; record matched whole-MoE HOME evidence separately
+  from BF16 comparisons.
+
+- Add reusable MoE shape/input/packing profiling with residual per-context
+  results and CSV/Parquet analysis. Document 45-context qualification, stronger
+  BF16 compaction controls, conditional-graph trace limitations and scalar
+  router-gradient sensitivity. Production kernels/defaults are unchanged.
+
+- Add optional fragment-owned forward GLU quantization and paired-orientation
+  backward weight preparation to the composable MoE search. Preserve exact
+  bytes/gradients and compiler-visible allocation; retain slower split-warp
+  recomputation as experimental rather than forcing it into light tuning.
+  Fix shared/general MLP complete backward seeds for half-aligned transpose
+  extents; qualify fresh progressive 8/16-trial searches. Invalidate stale
+  winners through MoE revision 13/portfolio 23 and MLP revision 48.
+
+- Add optional shared-panel unsplit expert dW, independent route-adjoint tiles
+  and paired upstream loads, with bounded first-hit search proposals and
+  revision-safe cache identities. Retain indexed in-GEMM quantization as an
+  experimental negative result, not a default. Validate explicit policies
+  before scratch allocation, reject unsupported singleton TMA dimensions,
+  and preserve deterministic FP32/BF16 numerical contracts.
+
+- Add autotunable common MXFP8 hybrid output stores: TMA for complete interior
+  tiles and masked direct stores only at boundaries, including persistent
+  output-buffer draining. Expose store geometry/buffering in bounded MLP/MoE
+  first-hit proposals; preserve numerical policies and compiler-visible memory.
+  Qualify 8/16/32-trial searches, paired SGD updates, and three-SKU tail tests;
+  retain unstable laptop timings without promoting them as performance wins.
+
+- Fix VirtualLayer compiler/autotuner storage extents using a zero-copy,
+  non-persistent full-span alias; preserve independent logical parameters,
+  state-dict keys and one physical allocation. Make collection supervision
+  abort entire owned process groups on sticky CUDA faults, even after an inner
+  autotuner swallows them. Add guarded completion/source identities and
+  quarantine-aware audit/offline ingestion; preserve contaminated evidence.
+
+- Integrate bounded compiler-visible router-affinity layout selection, optional
+  K32/K64 expert weight-gradient schedules and packed per-pool persistent
+  Sinkhorn with staged fallback. Keep negative timing controls and independent
+  gradient/graph/memory checks. Correct offline MoE shape grouping, contextual
+  similarity and flat/named device aliases; add balanced progressive study and
+  CSV/Parquet candidate-budget diagnostics. No learned prior is enabled by default.
+
+- Add optional persistent small-pool Sinkhorn, retired-TMA-operand joint
+  recompute schedules, and device-side packed expert active-prefix execution.
+  Preserve FP32 activation/reductions, independent MXFP8 scale groups,
+  compiler-visible allocations and legacy defaults. Qualify numerical/graph
+  behavior and matched HOME GPU0 timings, retaining negative controls.
+  Protect legal new execution families in actual bounded first-hit trials;
+  preserve progressive 8-to-16 resumption and caller workspace-free APIs.
+  Rebase compact recompute recipes on measured traffic-policy incumbents;
+  qualify additive routing/recompute gains through the ordinary compiled MoE
+  and paired persistent-winner loading, rather than adding isolated speedups.
+
+- Add experimental packed `cu_seqlens` to BalancedRouter/BalancedMoE: independent
+  sequence-local Sinkhorn/QB/repair, GPU-only hot boundaries, shared expert GEMM
+  batches and 32-aligned per-sequence expert reduction blocks. Integrate shared
+  bounded UCB first-hit selection, length-profile residuals and separate packed
+  expert cache identity. Preserve flat-pool behavior when offsets are omitted.
+  Add optional register-resident warp Sinkhorn rows and exact bounded-cache
+  QB column selection to shared tuning, with column-grid coverage seeds and
+  CTA/workspace model features. Preserve legacy routing tokens and invalidate
+  packed timing winners through revision-2/source identities. Add independent
+  packed expert oracles, compiled optimizer/replay checks and matched saved/
+  checkpointed BF16 profiling tools.
+  Tighten static packed workspace bounds without boundary readbacks, and fuse
+  affinity finiteness checking into the existing packing launch instead of
+  a full-score reduction. Preserve NaN/Inf rejection and graph-replay reset.
+
+- Add optional stable CuTe router metadata and its FP32 saved-softmax adjoint,
+  plus exact register-cached/early-exit segmented quota-selection templates.
+  Expose all geometry/backend choices to shared UCB tuning; routing revision 2
+  now measures metadata and its adjoint as part of the objective. Preserve
+  legacy execution-token decoding without reusing incompatible timing winners.
+  Fix stale source counters in target quota packing, including severe valid
+  imbalance and E>M primitive cases. Add whole-MoE checkpointed-BF16 comparisons
+  with actual backward, exact assignment identities and all-Parameter checks.
+
+- Make fixed/bound BalancedRouter Sinkhorn workspaces and hard-schedule outputs
+  compiler-visible, with launch-only mutation operations, immutable saved
+  backward policies and a shape-local cold-to-hot selection transition.
+  Preserve FP32 saved-state Sinkhorn and exact GPU-controlled balance repair;
+  keep conditional graph state in bounded automatic stream-local owners.
+  Expose optional exact warp-local QB row selection for E<=128 in the shared
+  autotuner. Promote legal derivative-quantization fusion proposals early for
+  already-prequantized MLP incumbents, retaining existing timing caches and
+  numerical policies rather than forcing a retune.
+
 - Move bound BalancedMoE expert allocation/views outside the launch-only
   mutation op, with typed liveness-planned scratch and immutable backward
   selections. Transition real-input first-hit tuning to an ordinary compiled

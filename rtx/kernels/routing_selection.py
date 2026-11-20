@@ -125,6 +125,70 @@ def compile_quantile(n,e,rank,threads,column):
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),options='--enable-tvm-ffi --opt-level 3')
 
 
+class WarpQuantileKernel:
+    """Exact row order statistic, one warp/row and no CTA-wide barriers.
+
+    Sorting operates on the same ordered FP32 keys as radix selection. Padding
+    keys are below every valid ordered value; descending rank is unchanged.
+    """
+    def __init__(self,n,e,rank,threads):
+        if n<1 or not 1<=e<=128 or not 0<=rank<e or threads not in (64,128,256):
+            raise ValueError('Warp quantile requires N>0, E=1..128, a valid rank and 64/128/256 threads')
+        self.n,self.e,self.rank,self.threads=n,e,rank,threads
+        self.width=max(32,1<<(e-1).bit_length())
+        self.items=self.width//32
+        self.levels=self.width.bit_length()-1
+
+    @cute.jit
+    def __call__(self,src,dst,stream:cuda.CUstream):
+        self.kernel(src,dst).launch(grid=(cute.ceil_div(self.n,self.threads//32),1,1),
+                                    block=(self.threads,1,1),stream=stream)
+
+    @cute.kernel
+    def kernel(self,src,dst):
+        tidx,_,_=cute.arch.thread_idx()
+        block,_,_=cute.arch.block_idx()
+        lane=tidx%32
+        row=block*(self.threads//32)+tidx//32
+        keys=cute.make_rmem_tensor((self.items,),Uint32)
+        updated=cute.make_rmem_tensor((self.items,),Uint32)
+        for item in cutlass.range_constexpr(self.items):
+            column=lane+item*32
+            key=Uint32(0)
+            if row<self.n and column<self.e:key=ordered_float(src[row*self.e+column])
+            keys[item]=key
+        for level in cutlass.range_constexpr(self.levels):
+            width=1<<(level+1)
+            for part in cutlass.range_constexpr(level+1):
+                distance=1<<(level-part)
+                for item in cutlass.range_constexpr(self.items):
+                    value=keys[item]
+                    if cutlass.const_expr(distance<32):
+                        peer=cute.arch.shuffle_sync_bfly(value,distance)
+                    else:
+                        peer=keys[item^(distance//32)]
+                    index=lane+item*32
+                    ascending=(index&width)==0
+                    lower=(index&distance)==0
+                    lo=value if value<peer else peer
+                    hi=value if value>peer else peer
+                    updated[item]=lo if ascending==lower else hi
+                # Register-bank distances must read the old bank throughout
+                # each comparator layer, not a partner already overwritten.
+                for item in cutlass.range_constexpr(self.items):keys[item]=updated[item]
+        target=self.width-1-self.rank
+        if row<self.n and lane==target%32:
+            dst[row]=unordered_float(keys[target//32])
+
+
+@lru_cache(maxsize=128)
+def compile_warp_quantile(n,e,rank,threads):
+    src=cute.runtime.make_fake_tensor(Float32,(n*e,),stride=(1,),assumed_align=4)
+    dst=cute.runtime.make_fake_tensor(Float32,(n,),stride=(1,),assumed_align=4)
+    return cute.compile(WarpQuantileKernel(n,e,rank,threads),src,dst,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),options='--enable-tvm-ffi --opt-level 3')
+
+
 class QuotaKernel:
     def __init__(self,m,e,k,threads,mode,target=False):
         self.m,self.e,self.k,self.threads=m,e,k,threads
@@ -138,6 +202,8 @@ class QuotaKernel:
         if cutlass.const_expr(self.mode=='init'):blocks=cute.ceil_div(self.e,self.threads)
         if cutlass.const_expr(self.mode=='prefix'):blocks=1
         if cutlass.const_expr(self.mode=='select'):blocks=self.e
+        if cutlass.const_expr(self.mode=='mark' and not self.target):
+            blocks=cute.ceil_div(max(self.m,self.e),self.threads)
         self.kernel(sources,targets,gains,surplus,deficit,slots,loads,phase,counts,offsets,keys,
                     thresholds,source_mask,target_mask,result,new_loads,new_phase).launch(
             grid=(blocks,1,1),block=(self.threads,1,1),stream=stream)
@@ -227,6 +293,14 @@ class QuotaKernel:
             else:
                 if tidx==0:thresholds[block]=Uint64(0)
         elif cutlass.const_expr(self.mode=='mark'):
+            # Source packing used counts as per-expert cursors. Target
+            # counting must start from zero, even when the source and target
+            # quota sets are disjoint: stale counts shift target offsets and
+            # can exceed the M-key workspace under severe valid imbalance.
+            # No mark thread reads counts, so the reset needs no extra launch
+            # or cross-CTA synchronization inside this stage.
+            if cutlass.const_expr(not self.target):
+                if index<self.e:counts[index]=Int32(0)
             if index<self.m:
                 accept=Boolean(False)
                 if self.active(groups,gains,quotas,source_mask,index):

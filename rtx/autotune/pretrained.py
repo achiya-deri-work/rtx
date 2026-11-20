@@ -25,13 +25,14 @@ import numpy as np
 from .core import FeatureMap, Observation, canonical_json
 from .cost_model import GradientBoostedCostModel, GradientBoostedFeasibilityModel
 from .outcomes import TrialOutcome
+from .collection_health import HEALTH_FILENAME, assert_healthy_path, check_health_document
 
 
 PRETRAINED_SCHEMA_VERSION = 1
 # Bump this whenever training, validation, or deployment semantics change in a
 # way that can alter how an otherwise identical set of model files is used.
 # Schema version describes readability; trainer revision describes behavior.
-PRETRAINED_TRAINER_REVISION = 6
+PRETRAINED_TRAINER_REVISION = 7
 _ALL_FAILURES = (
     "compile_error",
     "runtime_error",
@@ -79,8 +80,12 @@ def _observation_documents(
     seen_files: set[str] = set()
     for raw in paths:
         path = Path(raw).expanduser()
+        assert_healthy_path(path)
         if path.is_file() and path.suffix.lower() == ".zip":
             with zipfile.ZipFile(path) as archive:
+                for name in archive.namelist():
+                    if name == HEALTH_FILENAME or name.endswith('/'+HEALTH_FILENAME):
+                        check_health_document(archive.read(name).decode('utf-8'), f'{path}!{name}')
                 for member in archive.infolist():
                     if member.is_dir() or not member.filename.endswith(
                         "/observations.jsonl"
@@ -110,6 +115,7 @@ def _observation_documents(
             else path.rglob("observations.jsonl")
         )
         for candidate in candidates:
+            assert_healthy_path(candidate)
             identity = str(candidate.resolve())
             if campaigns and not any(
                 campaign in candidate.parts for campaign in campaigns
@@ -161,10 +167,39 @@ def portable_features(features: Mapping[str, object]) -> FeatureMap:
             result[name] = numeric
     baseline = analytical_baseline_ms(result)
     result["offline.analytical_baseline_ms"] = baseline
+    if result.get('context.family=balanced_router_affinity'):
+        # Read early affinity residuals which recorded tensor signatures
+        # before explicit named geometry was added to the adapter.
+        for name,index in (('tokens',(0,0)),('d_model',(0,1)),
+                           ('router_dim',(1,0)),('experts',(2,0))):
+            key=f'context.workload.shapes_strides_dtypes[{index[0]}][0][{index[1]}]'
+            if key in result:result.setdefault('context.workload.'+name,result[key])
     for axis in ("m", "n", "k"):
         value = result.get(f"context.workload.{axis}")
         if value is not None and value > 0:
             result[f"offline.log2_{axis}"] = math.log2(value)
+    # MoE uses named geometry, not GEMM m/n/k. Keep these pre-compilation
+    # proxies available to every existing model head, with identical feature
+    # construction offline and when ranking a new runtime context.
+    axes=('tokens','d_model','experts','capacity','top_k','hidden')
+    geometry=[result.get('context.workload.'+name) for name in axes]
+    if all(value is not None and value>0 for value in geometry):
+        n,d,e,c,k,h=geometry
+        for name,value in zip(axes,geometry):result['offline.moe.log2_'+name]=math.log2(value)
+        result.update({'offline.moe.rows_per_expert':n*k/e,
+            'offline.moe.slot_amplification':e*c/(n*k),
+            'offline.moe.weight_bytes':6*e*d*h,
+            'offline.moe.activation_to_compute_proxy':1/d+1/h,
+            'offline.moe.weight_to_compute_proxy':e/(n*k)})
+        sms=result.get('context.device.multiprocessor_count',0)
+        if sms>0:result['offline.moe.experts_per_sm']=e/sms
+        l2=result.get('context.device.l2_cache_size',0)
+        if l2>0:result['offline.moe.weight_to_l2_ratio']=6*e*d*h/l2
+        # These are semantic packing facts, not provenance. Do not retain
+        # arbitrary tags, source hashes, context IDs or observed winner data.
+        sequences=features.get('context.tags.batch_contract.sequences')
+        if sequences is not None and math.isfinite(float(sequences)) and float(sequences)>0:
+            result['offline.moe.sequences']=float(sequences)
     return result
 
 
@@ -265,6 +300,7 @@ def load_offline_observations(
             continue
         unique.setdefault((observation.context_id, observation.observation_id), observation)
     observations = list(unique.values())
+    device_aliases = _reconcile_device_aliases(observations)
     dataset_digest = hashlib.sha256()
     for item in sorted(
         observations, key=lambda value: (value.context_id, value.observation_id)
@@ -297,6 +333,7 @@ def load_offline_observations(
             for item in observations
         ),
         "malformed": malformed,
+        "device_aliases": device_aliases,
         "latency_view": {
             "policy": "exclude_explicitly_nonstationary_successes",
             "excluded_nonstationary_successes": nonstationary_successes,
@@ -389,6 +426,7 @@ class NormalizedCostModel:
 
     @classmethod
     def load(cls, path: Path | str) -> "NormalizedCostModel":
+        assert_healthy_path(Path(path))
         return cls.from_state_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
@@ -451,6 +489,7 @@ class ContextRankingModel:
 
     @classmethod
     def load(cls, path: Path | str) -> "ContextRankingModel":
+        assert_healthy_path(Path(path))
         return cls.from_state_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
@@ -565,21 +604,72 @@ class ConditionalRuleSet:
 
     @classmethod
     def load(cls, path: Path | str) -> "ConditionalRuleSet":
+        assert_healthy_path(Path(path))
         return cls.from_state_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
 def _device_key(item: Observation[object]) -> str:
     for key in item.features:
         if key.startswith("context.device.sku.sku_family="):
-            return key.split("=", 1)[1]
+            label=key.split("=", 1)[1]
+            if label not in ('unknown','<none>',''):return label
     sms = item.features.get("context.device.multiprocessor_count", -1.0)
-    bus = item.features.get("context.device.sku.memory_bus_width_bits", -1.0)
+    bus = item.features.get("context.device.sku.memory_bus_width_bits",
+                            item.features.get("context.device.memory_bus_width_bits", -1.0))
     return f"sms-{sms:g}-bus-{bus:g}"
+
+
+def _reconcile_device_aliases(rows):
+    """Prevent known-SKU versus flat-profile aliases leaking device folds.
+
+    Use only positive SM/bus/L2 specs and a unique observed named SKU. Never
+    infer a marketing SKU from an SM-count table or merge two explicit SKUs
+    that happen to have identical specs. Ambiguity stays visible in the audit.
+    """
+    def signature(item):
+        f=item.features
+        values=(f.get('context.device.multiprocessor_count',0),
+            f.get('context.device.sku.memory_bus_width_bits',f.get('context.device.memory_bus_width_bits',0)),
+            f.get('context.device.properties.l2_cache_size',f.get('context.device.l2_cache_size',0)))
+        return values if all(v>0 for v in values) else None
+    named=defaultdict(set)
+    for item in rows:
+        key=signature(item)
+        label=_device_key(item)
+        if key and not label.startswith('sms-'):named[key].add(label)
+    changed=ambiguous=0
+    for item in rows:
+        if not _device_key(item).startswith('sms-'):continue
+        labels=named.get(signature(item),set())
+        if len(labels)>1:ambiguous+=1;continue
+        if len(labels)!=1:continue
+        for key in tuple(item.features):
+            if key.startswith('context.device.sku.sku_family='):item.features.pop(key)
+        item.features['context.device.sku.sku_family='+next(iter(labels))]=1.
+        changed+=1
+    return dict(reconciled_rows=changed,ambiguous_rows=ambiguous,
+                policy='unique_observed_sku_matching_positive_sm_bus_l2')
 
 
 def _shape_group_key(item: Observation[object]) -> tuple[object, ...]:
     """Validation group which cannot leak through regimes or replicates."""
-
+    moe=('tokens','d_model','experts','capacity','top_k','hidden')
+    if all('context.workload.'+axis in item.features for axis in moe):
+        return (item.family,item.kernel_revision,'moe',
+                *(int(item.features['context.workload.'+axis]) for axis in moe),
+                int(item.features.get('offline.moe.sequences',0)))
+    affinity=('tokens','d_model','experts','router_dim')
+    if all('context.workload.'+axis in item.features for axis in affinity):
+        return (item.family,item.kernel_revision,'router-affinity',
+                *(int(item.features['context.workload.'+axis]) for axis in affinity))
+    # Packed routing likewise does not name its total token axis `m`.
+    if 'context.workload.total_tokens' in item.features:
+        return (item.family,item.kernel_revision,'packed-routing',
+                int(item.features['context.workload.total_tokens']),
+                int(item.features.get('context.workload.experts',item.features.get(
+                    'context.workload.num_experts',item.features.get('context.workload.n',0)))),
+                int(item.features.get('context.workload.top_k',item.features.get('context.workload.k',0))),
+                int(item.features.get('context.workload.sequences',0)))
     return (
         item.family,
         item.kernel_revision,
@@ -1039,6 +1129,7 @@ def load_pretrained_family(
     device_family: str | None = None,
 ) -> PretrainedFamilyModels:
     root = Path(root)
+    assert_healthy_path(root)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     if (
         manifest.get("schema_version") != PRETRAINED_SCHEMA_VERSION

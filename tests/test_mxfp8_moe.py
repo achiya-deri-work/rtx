@@ -143,6 +143,7 @@ def test_pipeline_seeds_are_proposals_not_only_pool_metadata():
     assert ('grouped_staged','cpasync','cooperative') in kinds
     assert ('grouped_staged','tma','warp_specialized') in kinds
     assert ('grouped_staged','tma','three_role') in kinds
+    assert any(c.family=='grouped_prepared' and c.prepared.forward_engine=='onchip' for c in pool[:8])
     assert all(adapter.rejection(c) is None for c in pool[:8])
     onchip=next(c for c in pool if c.family=='grouped_onchip')
     from dataclasses import replace
@@ -152,6 +153,8 @@ def test_pipeline_seeds_are_proposals_not_only_pool_metadata():
     quick=make_moe_tuner(light,InMemoryTuningStore(),AutotunePolicy.preset('quick'))
     assert light.axes['family']==('grouped_staged','grouped_prepared')
     assert all(c.family!='grouped_onchip' for c in quick.strategies['structural'].pool)
+    assert light.axes['prepared.forward_engine']==('packed',)
+    assert all(c.prepared.forward_engine=='packed' for c in quick.strategies['structural'].pool)
 
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='RTX CUDA required')

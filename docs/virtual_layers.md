@@ -151,6 +151,15 @@ There is no new dispatcher/custom-kernel boundary. The view's autograd mapping
 is traced by AOTAutograd; default-mode Inductor compiles the surrounding model.
 There are no library-owned execution graphs or user-managed scratch buffers.
 
+The owner retains a **non-persistent full-span storage alias** so compiler
+benchmark workers see the complete physical allocation, not only the first
+small logical Parameter. This is metadata over the same storage: no extra
+GPU allocation, forward copy, optimizer Parameter or state-dict entry.
+The alias is refreshed with packing, moves, deepcopy and assign-loading.
+This also supports `torch.compile` max-autotuning in subprocesses; older
+first-Parameter `as_strided` exposure could give those workers undersized
+scratch allocations. See the [GPU0 incident](balanced_moe_gpu0_incident_20261118.md).
+
 ## Initialization, moves and checkpoints
 
 - Construct the virtual owner **before** optimizer creation, compilation and

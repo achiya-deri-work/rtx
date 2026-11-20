@@ -80,6 +80,10 @@ class MXFP8GemmKernel:
         self.batch_count = 1
         self.batch_output_shape = None
         self.batch_extra_shape = None
+        # Private, opt-in grouped-expert scheduling. Tensor map extents and
+        # expert strides always retain the compiler-visible bound.
+        self.active_m_alignment = 0
+        self.active_k = False
         self.glu_scratch_elems = 0
         self.sf_dtype = Float8E8M0FNU
         self.sf_vec_size = SF_VEC_SIZE
@@ -569,6 +573,7 @@ class MXFP8GemmKernel:
         out: cute.Tensor,
         output_scale,
         stream: cuda.CUstream,
+        active_capacity=None,
     ):
         if cutlass.const_expr(self.glu and not self.glu_interleaved_operands):
             hidden_rows=self.problem.n//2
@@ -617,7 +622,7 @@ class MXFP8GemmKernel:
             (scale_b_tile_elems, cfg.stages),
             stride=(1, scale_b_tile_elems),
         )
-        if cutlass.const_expr(cfg.epilogue == "tma" or self.glu_tma_store):
+        if cutlass.const_expr(cfg.epilogue in ("tma", "hybrid") or self.glu_tma_store):
             out_view = cute.make_tensor(
                 out.iterator,
                 cute.make_layout(
@@ -670,7 +675,7 @@ class MXFP8GemmKernel:
             out: cute.struct.Align[
                 cute.struct.MemRange[
                     BFloat16,
-                    cute.cosize(self.out_layout) if cfg.epilogue == "tma" or self.glu_tma_store else 0,
+                    cute.cosize(self.out_layout) if cfg.epilogue in ("tma", "hybrid") or self.glu_tma_store else 0,
                 ],
                 1024,
             ]
@@ -748,7 +753,7 @@ class MXFP8GemmKernel:
                 tma_out, tma_out_tensor, self.tiled_mma,
                 self.a_layout, self.b_layout,
                 self.sfa_layout, self.sfb_layout,
-                scale_a_flat_layout, scale_b_flat_layout, self.out_layout,
+                scale_a_flat_layout, scale_b_flat_layout, self.out_layout, active_capacity,
             )
             if cutlass.const_expr(self.cluster_output):
                 launch.launch(
@@ -774,7 +779,7 @@ class MXFP8GemmKernel:
                 tma_out, tma_out_tensor, self.tiled_mma,
                 self.a_layout, self.b_layout,
                 self.sfa_layout, self.sfb_layout,
-                scale_a_flat_layout, scale_b_flat_layout, self.out_layout,
+                scale_a_flat_layout, scale_b_flat_layout, self.out_layout, active_capacity,
             )
             if cutlass.const_expr(self.cluster_output):
                 launch.launch(
@@ -820,6 +825,37 @@ class MXFP8GemmKernel:
         scale_a_flat_layout: cute.Layout,
         scale_b_flat_layout: cute.Layout,
         out_layout: cute.ComposedLayout,
+        active_capacity,
+    ):
+        m_tiles = self.m_tiles
+        launch_tile = True
+        if cutlass.const_expr(self.active_m_alignment):
+            # This policy only admits one output tile per CTA. Compact the
+            # existing raster to active rows and let all suffix CTAs exit
+            # before pipeline initialization, register reallocation or TMA.
+            rows = cutlass.min(self.problem.m, cute.ceil_div(
+                active_capacity[0], self.active_m_alignment) * self.active_m_alignment)
+            m_tiles = cute.ceil_div(rows, self.config.tile_m)
+            launch_tile = cute.arch.block_idx()[0] < m_tiles * self.n_tiles
+        compute_k_tiles = self.num_k_tiles
+        if cutlass.const_expr(self.active_k):
+            compute_k_tiles = cutlass.min(
+                self.num_k_tiles, cute.ceil_div(active_capacity[0], self.config.tile_k))
+        if launch_tile:
+            self._kernel_body(
+                qx,qw,sx,sw,out,output_scale,tma_x,tma_x_tensor,tma_w,tma_w_tensor,
+                tma_sx,tma_sx_tensor,tma_sw,tma_sw_tensor,tma_out,tma_out_tensor,
+                tiled_mma,a_layout,b_layout,sfa_layout,sfb_layout,scale_a_flat_layout,
+                scale_b_flat_layout,out_layout,m_tiles,compute_k_tiles,
+            )
+
+    @cute.jit
+    def _kernel_body(
+        self,
+        qx,qw,sx,sw,out,output_scale,tma_x,tma_x_tensor,tma_w,tma_w_tensor,
+        tma_sx,tma_sx_tensor,tma_sw,tma_sw_tensor,tma_out,tma_out_tensor,
+        tiled_mma,a_layout,b_layout,sfa_layout,sfb_layout,scale_a_flat_layout,
+        scale_b_flat_layout,out_layout,m_tiles,compute_k_tiles,
     ):
         cfg = self.config
         expert=Int32(0)
@@ -889,7 +925,6 @@ class MXFP8GemmKernel:
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         cta_idx, _, _ = cute.arch.block_idx()
-        m_tiles = cute.ceil_div(self.problem.m, cfg.tile_m)
         n_tiles = cute.ceil_div(self.problem.n, cfg.tile_n)
 
         storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage)
@@ -964,7 +999,7 @@ class MXFP8GemmKernel:
             # barriers below rather than barrier.cluster phase reuse.
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
-        if cutlass.const_expr(cfg.epilogue == "tma"):
+        if cutlass.const_expr(cfg.epilogue in ("tma", "hybrid")):
             s_out = storage.out.get_tensor(
                 out_layout.outer, swizzle=out_layout.inner
             )
@@ -1275,7 +1310,7 @@ class MXFP8GemmKernel:
             # across an outer constexpr loop currently produces non-dominating
             # SSA in CuTe DSL, while the phase itself is fully determined by
             # the number of K stages completed by preceding work slots.
-            pipeline_count = work_slot * self.num_k_tiles
+            pipeline_count = work_slot * compute_k_tiles
             pipeline_index = pipeline_count % cfg.stages
             pipeline_phase = (pipeline_count // cfg.stages) & 1
             producer_state = pipeline.PipelineState(
@@ -1318,7 +1353,7 @@ class MXFP8GemmKernel:
             accumulators = cute.make_rmem_tensor(t_cc_out.shape, Float32)
             accumulators.fill(0.0)
 
-            if cutlass.const_expr(cfg.epilogue == "tma"):
+            if cutlass.const_expr(cfg.epilogue in ("tma", "hybrid")):
                 epilogue_stage = Int32(
                     work_slot % cfg.epilogue_stages
                 )
@@ -1386,7 +1421,7 @@ class MXFP8GemmKernel:
                 cfg.tile_m + cfg.tile_n
             ) * scale_chunks_per_row
             first_k_tile = Int32(0)
-            final_k_tile = Int32(num_k_tiles)
+            final_k_tile = Int32(compute_k_tiles)
             if cutlass.const_expr(self.split_reduction > 1):
                 if cutlass.const_expr(self.split_partition == 'balanced'):
                     first_k_tile = (split_id * num_k_tiles) // self.split_reduction
@@ -1688,7 +1723,7 @@ class MXFP8GemmKernel:
                     tma_pipeline.producer_tail(producer_state)
 
             if cutlass.const_expr(
-                cfg.epilogue == "tma" and self.cache_regional_output_scales
+                cfg.epilogue in ("tma", "hybrid") and self.cache_regional_output_scales
             ):
                 if warp_idx < cfg.num_mma_warps:
                     if cutlass.const_expr(self.fragment_register_output_scales):
@@ -2092,7 +2127,28 @@ class MXFP8GemmKernel:
                                     )
             else:
                 if active_tile:
-                    if warp_idx < cfg.num_mma_warps:
+                    if cutlass.const_expr(cfg.epilogue == "hybrid"):
+                        bulk_tile = ((block_m + 1) * cfg.tile_m <= self.problem.m) & (
+                            (block_n + 1) * cfg.tile_n <= self.problem.n)
+                        if not bulk_tile:
+                            # Output stages advance with work_slot, whereas
+                            # only interior tiles commit bulk-copy groups.
+                            # A skipped group can otherwise wrap the SMEM
+                            # stage index before the old reader has finished.
+                            # Drain on the boundary; consecutive full tiles
+                            # retain the existing multibuffer overlap.
+                            if cutlass.const_expr(cfg.epilogue_stages > 1):
+                                if warp_idx == 0:
+                                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                            if warp_idx < cfg.num_mma_warps:
+                                for elem in cutlass.range(cute.size(accumulators), unroll_full=True):
+                                    coord = t_cc_out[elem]
+                                    if coord[0] < self.problem.m and coord[1] < self.problem.n:
+                                        t_cg_out[elem] = BFloat16(
+                                            global_output_scale * accumulators[elem])
+                    else:
+                        bulk_tile = True
+                    if bulk_tile and warp_idx < cfg.num_mma_warps:
                         for elem in cutlass.range(
                             cute.size(r_out), unroll_full=True
                         ):
@@ -2133,7 +2189,7 @@ class MXFP8GemmKernel:
             # Balanced persistence may raise the launch grid above the
             # tiles-per-CTA cap, reducing the actual constexpr work slots.
             # Drain the phases advanced by this CTA, not the requested cap.
-            final_count = self.work_tiles_per_cta * self.num_k_tiles
+            final_count = self.work_tiles_per_cta * compute_k_tiles
             final_index = final_count % cfg.stages
             final_phase = (final_count // cfg.stages) & 1
             final_producer_state = pipeline.PipelineState(
@@ -2149,7 +2205,7 @@ class MXFP8GemmKernel:
                 # stale mbarrier phases and intermittently consumes old data.
                 tma_pipeline.producer_tail(final_producer_state)
 
-        if cutlass.const_expr(cfg.epilogue == "tma" or self.glu_tma_store):
+        if cutlass.const_expr(cfg.epilogue in ("tma", "hybrid") or self.glu_tma_store):
             if warp_idx == 0:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
 
@@ -2176,6 +2232,7 @@ def compile_mxfp8_gemm(
     atomic_output: bool = False,
     cluster_output: bool = False,
     split_partition: str = "uniform",
+    _byte_scales: bool = False,
 ):
     kernel = MXFP8GemmKernel(
         problem,
@@ -2186,6 +2243,10 @@ def compile_mxfp8_gemm(
         cluster_output=cluster_output,
         split_partition=split_partition,
     )
+    scale_dtype = Uint8 if _byte_scales else Float8E8M0FNU
+    if _byte_scales:
+        from ._mxfp8_byte_scales import ByteGemm
+        kernel = ByteGemm(kernel)
     qx = cute.runtime.make_fake_tensor(
         Float8E4M3FN,
         preserve_tma_singletons((problem.m, problem.k)),
@@ -2200,39 +2261,39 @@ def compile_mxfp8_gemm(
     )
     if config.scale_layout == "row_major":
         sx = cute.runtime.make_fake_tensor(
-            Float8E8M0FNU,
+            scale_dtype,
             (problem.m, problem.k // SF_VEC_SIZE),
             stride=(problem.k // SF_VEC_SIZE, 1),
             assumed_align=16,
         )
         sw = cute.runtime.make_fake_tensor(
-            Float8E8M0FNU,
+            scale_dtype,
             (problem.n, problem.k // SF_VEC_SIZE),
             stride=(problem.k // SF_VEC_SIZE, 1),
             assumed_align=16,
         )
     elif config.scale_layout == "mma128":
         sx = cute.runtime.make_fake_tensor(
-            Float8E8M0FNU,
+            scale_dtype,
             (problem.m // 128, problem.k // 128, 512),
             stride=(problem.k // 128 * 512, 512, 1),
             assumed_align=16,
         )
         sw = cute.runtime.make_fake_tensor(
-            Float8E8M0FNU,
+            scale_dtype,
             (problem.n // 128, problem.k // 128, 512),
             stride=(problem.k // 128 * 512, 512, 1),
             assumed_align=16,
         )
     else:
         sx = cute.runtime.make_fake_tensor(
-            Float8E8M0FNU,
+            scale_dtype,
             (problem.m // 64, problem.k // 128, 512),
             stride=(problem.k // 128 * 512, 512, 1),
             assumed_align=16,
         )
         sw = cute.runtime.make_fake_tensor(
-            Float8E8M0FNU,
+            scale_dtype,
             (problem.n // 128, problem.k // 128, 512),
             stride=(problem.k // 128 * 512, 512, 1),
             assumed_align=16,

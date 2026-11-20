@@ -26,6 +26,17 @@ def distance(a,b):
     return sum(a.get(k)!=b.get(k) for k in keys)/max(1,len(keys))
 
 
+def _signature(value):
+    return frozenset(value),frozenset(value.items())
+
+
+def _signature_distance(a,b):
+    # Exact categorical Hamming distance, with set intersections in C instead
+    # of visiting hundreds of dictionary fields for every diversity pair.
+    total=len(a[0]|b[0])
+    return (total-len(a[1]&b[1]))/max(1,total)
+
+
 @dataclass(frozen=True)
 class StructuralSamplingPolicy:
     pool_size:int=128
@@ -90,16 +101,16 @@ def select_portfolio(adapter,raw,limit,*,effective=lambda x:x):
             key=json.dumps(view,sort_keys=True)
             if key in seen:
                 audit.append(dict(row,status='effective_duplicate'));continue
-            seen.add(key);candidates.append((c,flatten(view),row))
+            seen.add(key);candidates.append((c,_signature(flatten(view)),row))
         except (ValueError,TypeError,KeyError) as exc:
             audit.append(dict(row,status='construction_error',reason=str(exc)))
     if not candidates:return [],audit
     selected=[candidates.pop(0)]
-    minimum=[distance(x[1],selected[0][1]) for x in candidates]
+    minimum=[_signature_distance(x[1],selected[0][1]) for x in candidates]
     while candidates and len(selected)<limit:
         index=max(range(len(candidates)),key=lambda i:minimum[i])
         item=candidates.pop(index);minimum.pop(index);selected.append(item)
-        minimum=[min(d,distance(x[1],item[1])) for d,x in zip(minimum,candidates)]
+        minimum=[min(d,_signature_distance(x[1],item[1])) for d,x in zip(minimum,candidates)]
     for _,_,row in selected:audit.append(dict(row,status='selected'))
     for _,_,row in candidates:audit.append(dict(row,status='diversity_not_selected'))
     return [x[0] for x in selected],audit

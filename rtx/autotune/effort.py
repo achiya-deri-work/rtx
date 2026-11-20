@@ -35,6 +35,8 @@ class AutotunePolicy:
     initial_neighborhood_trials: int = 0
     local_anchor_tolerance: float = 0.0
     prior_artifact: str | None = None
+    prior_search: str = 'hybrid'
+    region_coverage: bool = True
     predictor_artifact: str | None = None
     predictor_heads: tuple[str, ...] = ('residual', 'mlp')
     allow_research_prior: bool = False
@@ -53,6 +55,10 @@ class AutotunePolicy:
     preparation_selection: bool = False
 
     def __post_init__(self):
+        if self.prior_search not in ('hybrid','retrieval','ranker'):
+            raise ValueError('prior_search must be hybrid, retrieval or ranker')
+        if type(self.region_coverage) is not bool:
+            raise ValueError('region_coverage must be bool')
         if type(self.preparation_selection) is not bool:
             raise ValueError('preparation_selection must be bool')
         if self.backward_measurement_mode not in ('host','cuda_graph','auto'):
@@ -112,7 +118,10 @@ class AutotunePolicy:
         sizes={'quick':(8,15.),'balanced':(16,30.),'thorough':(32,90.),'extensive':(64,180.)}
         if name not in sizes:raise ValueError(f'unknown effort preset: {name}')
         trials,seconds=sizes[name]
-        return cls(**{'max_trials':trials,'max_seconds':seconds,**overrides})
+        # Named effort levels are the modern, resumable first-hit interface.
+        # Explicit legacy constructor/overrides remain available for replay.
+        return cls(**{'max_trials':trials,'max_seconds':seconds,
+                      'search_schedule':'progressive','candidate_mix':'mixed',**overrides})
 
     def for_pass(self,backward=False):
         trials=self.backward_trials if backward else self.forward_trials
@@ -140,7 +149,7 @@ class AutotunePolicy:
         from .runtime_coordinates import process_l2_policy
         return stable_id(dict(schema=1,policy=values,
             runtime_measurement_revision=1, runtime_l2_policy=process_l2_policy(),
-            runtime_search_space_revision=1,
+            runtime_search_space_revision=2,
             **({'schedule_revision':2} if self.search_schedule=='progressive' else {})))
 
     def coordinate(self,*,rtol=.05,atol=.5):
@@ -184,6 +193,7 @@ class ProgressiveBanditScheduler(AdaptiveBanditScheduler):
 def make_effort_autotuner(adapter,store,policy,*,progress=None,candidates=(),started_at=None):
     """Compose existing strategies/UCB. No new timing or persistence engine."""
     started_at=time.monotonic() if started_at is None else started_at
+    region_opening=(list(adapter.opening_fn()) if policy.region_coverage and getattr(adapter,'opening_fn',None) else [])
     backward_seeds=[]
     if (adapter.context.family=='mxfp8_bwd' and 'dw_backend' in adapter.axes
         and any(v.get('dw',{}).get('backend')=='decomposed' for v in adapter.axes['dw_backend'])
@@ -219,24 +229,30 @@ def make_effort_autotuner(adapter,store,policy,*,progress=None,candidates=(),sta
     if policy.candidate_mix == 'mixed':
         from .sampling import mixed_pool, StructuralSearch
         source = prior if prior is not None else predictor
-        retrieved = [] if source is None else source.retrieval(adapter, limit=policy.pool_size)
+        retrieved = ([] if source is None or (prior is not None and policy.prior_search=='ranker')
+                     else source.retrieval(adapter, limit=policy.pool_size))
         mixed, pool_audit = mixed_pool(adapter, limit=policy.pool_size,
             seed=policy.seed, retrieved=retrieved, seeds=candidates,
-            structural_proposals=policy.structural_proposals)
+            structural_proposals=policy.structural_proposals,
+            protected=[p.config for p in region_opening],
+            skip_discarded_generation=adapter.context.tags.get('skip_discarded_pool_generation',False))
         structural = [c for c in mixed if pool_audit['origins'][adapter.config_id(c)] == 'structural']
         if structural:
             strategies.append(StructuralSearch(structural))
         if progress:
             progress(f'POOL mixed counts={pool_audit["counts"]} static={pool_audit["structural_statuses"]}')
+            if pool_audit.get('generation_skipped'):
+                progress(f'POOL skip={pool_audit["generation_skipped"]}')
     if prior is not None or predictor is not None:
         retrieval_source=prior if prior is not None else predictor
-        retrieved=retrieval_source.retrieval(adapter,limit=policy.pool_size)
+        retrieved=(retrieval_source.retrieval(adapter,limit=policy.pool_size)
+                   if predictor is not None or policy.prior_search!='ranker' else [])
         pool = mixed if mixed is not None else bounded_candidates(adapter,
             [*retrieved,*candidates,adapter.initial_config,
              *adapter.sample(random.Random(policy.seed),policy.pool_size,[adapter.initial_config])],policy.pool_size)
         if predictor is not None:
             strategies[:0]=[PortablePredictorSearch(predictor,pool,h) for h in policy.predictor_heads]
-        else:
+        elif policy.prior_search!='retrieval':
             strategies.insert(0,FrozenPriorSearch(prior,pool))
         # The mandatory initial candidate counts too; never spend the entire
         # user budget on warmup or mandatory arm pulls.
@@ -314,6 +330,20 @@ def make_effort_autotuner(adapter,store,policy,*,progress=None,candidates=(),sta
                    and adapter.rejection(c) is None][:3]
         ids={adapter.config_id(p.config) for p in protected}
         coverage=protected+[p for p in coverage if adapter.config_id(p.config) not in ids]
+    if region_opening:
+        # A bounded adapter-owned opening, not a family-name dispatch table.
+        # Five proposals + mandatory incumbent leave actual execution slots
+        # for exploration and adaptive refinement in an eight-trial budget.
+        geometries=[p for p in region_opening if p.metadata.get('opening_role')=='geometry']
+        fallback=[p for p in region_opening if p.metadata.get('opening_role')!='geometry']
+        donors=[p for p in coverage if p.strategy=='retrieval']
+        selected=[];seen={adapter.config_id(adapter.initial_config)}
+        for proposal in [*geometries,*donors,*fallback,*coverage]:
+            cid=adapter.config_id(proposal.config)
+            if cid in seen or adapter.rejection(proposal.config) is not None:continue
+            seen.add(cid);selected.append(proposal)
+            if len(selected)==5:break
+        coverage=selected
     if prior is None and predictor is None and policy.max_trials>=16 and not progressive:
         from .cost_model import GradientBoostedCostModel
         strategies.append(CostModelGuidedSearch(model=GradientBoostedCostModel(n_estimators=16,ensembles=2),

@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from rtx.autotune.deployment_qualification import qualify_pair
+from rtx.autotune.deployment_qualification import DeploymentQualificationError, qualify_pair
 
 
 def outcome(value=1., status='ok'):
@@ -28,8 +28,11 @@ def test_challenger_failure_preserves_incumbent():
 
 
 def test_unverified_incumbent_cannot_be_returned():
-    with pytest.raises(RuntimeError,match='incumbent'):
+    with pytest.raises(DeploymentQualificationError,match='incumbent') as failure:
         qualify_pair('old','new',lambda c: outcome(float('nan')) if c=='old' else outcome())
+    assert not failure.value.decision['promoted']
+    assert len(failure.value.decision['failures']) == 6
+    assert failure.value.decision['samples_ms']['incumbent'] == []
 
 
 def test_order_sensitive_gain_is_not_promoted():

@@ -17,6 +17,8 @@ def isolated_caches(monkeypatch):
     monkeypatch.setattr(tuning,'_choices',BoundedCache(256))
     monkeypatch.setattr(selection,'_CELLS',{})
     monkeypatch.setattr(selection,'_RECENCY',OrderedDict())
+    monkeypatch.setattr(selection,'_ATTRS',{})
+    monkeypatch.setattr(selection,'_SOURCES',selection.SelectionSources())
 
 
 def test_moe_launch_cache_clear_respects_preserve_compiled(isolated_caches):

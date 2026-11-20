@@ -10,6 +10,8 @@ import statistics
 from typing import Iterable, Mapping
 import zipfile
 
+from .collection_health import HEALTH_FILENAME, assert_healthy_path, check_health_document
+
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -125,6 +127,21 @@ def _audit_bundle(reader: _BundleReader) -> dict[str, object]:
     prefix = reader.prefix + "/" if reader.prefix else ""
     errors: list[str] = []
     warnings: list[str] = []
+    try:
+        if reader._zip is None:
+            assert_healthy_path(reader.source / reader.prefix)
+        else:
+            # A marker above a discovered machine.json still applies to it.
+            directory=PurePosixPath(reader.prefix)
+            for parent in (directory,*directory.parents):
+                marker=str(parent/HEALTH_FILENAME)
+                if marker in reader._zip.namelist():
+                    check_health_document(reader.read_text(marker),f'{reader.source}!{marker}')
+        for name in names:
+            if name == HEALTH_FILENAME or name.endswith('/'+HEALTH_FILENAME):
+                check_health_document(reader.read_text(name),f'{reader.source}!{name}')
+    except (ValueError, UnicodeError) as error:
+        errors.append(str(error))
     machine, error = _json_document(reader, prefix + "machine.json")
     if error:
         errors.append(error)

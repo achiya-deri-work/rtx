@@ -40,7 +40,9 @@ def test_structural_seeds_include_legal_dw_for_both_mlps():
     base = replace(DEFAULT_MLP_CONFIG,
         gate_backward=_default_bwd_config(MXFP8Problem(11296,3072,256)),
         down_backward=_default_bwd_config(MXFP8Problem(11296,256,1536)))
-    adapter = SimpleNamespace(initial_config=base, update_fn=lambda c,*args:c)
+    adapter = SimpleNamespace(initial_config=base, update_fn=lambda c,*args:c,
+        rejection=lambda c:None,
+        context=SimpleNamespace(workload=dict(m=11296,k=256,h=1536,o=256,phase='train'),device={}))
     seeds = mlp_structural_seeds(adapter, 'mxfp8', 'train')
     assert any(c.gate_backend == base.gate_backend and c.down_backend == 'prequant'
                for c in seeds)

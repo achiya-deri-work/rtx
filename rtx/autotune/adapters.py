@@ -136,7 +136,7 @@ def _gemm_smem_bytes(config: object) -> int:
     )
     out_bytes = (
         config.epilogue_stages * config.tile_m * config.tile_n * 2
-        if config.epilogue == "tma"
+        if config.epilogue in ("tma", "hybrid")
         else 0
     )
     accumulator_handoff_bytes = (
@@ -201,6 +201,7 @@ def _gemm_features(
     materialized_quant: bool,
     split_reduction: int = 1,
 ) -> dict[str, float]:
+    from .output_transport import row_store_features
     profile = _device_dict(device)
     m_tiles = (problem.m + config.tile_m - 1) // config.tile_m
     n_tiles = (problem.n + config.tile_n - 1) // config.tile_n
@@ -291,14 +292,14 @@ def _gemm_features(
             config.tile_m * config.tile_n * 4
             if warp_specialized_epilogue
             else config.epilogue_stages * config.tile_m * config.tile_n * 2
-            if config.epilogue == "tma"
+            if config.epilogue in ("tma", "hybrid")
             else 0
         ),
         epilogue_async_overlap_tiles=float(
             min(1, work_tiles_per_cta - 1)
             if warp_specialized_epilogue
             else min(config.epilogue_stages, work_tiles_per_cta)
-            if config.epilogue == "tma"
+            if config.epilogue in ("tma", "hybrid")
             else 0
         ),
         epilogue_warp_specialized=float(warp_specialized_epilogue),
@@ -337,6 +338,7 @@ def _gemm_features(
             )
         ),
     )
+    geometry.update(row_store_features(config,problem))
     return geometry
 
 
@@ -652,7 +654,7 @@ def make_mxfp8_fwd_adapter(
             epilogue_stages=float(config.epilogue_stages),
             epilogue_smem_bytes=float(
                 config.epilogue_stages * config.tile_m * config.tile_n * 2
-                if config.epilogue == "tma"
+                if config.epilogue in ("tma", "hybrid")
                 else 0
             ),
             epilogue_async_overlap_tiles=float(
@@ -660,7 +662,7 @@ def make_mxfp8_fwd_adapter(
                     config.epilogue_stages,
                     natural_ctas / max(1, grid_ctas),
                 )
-                if config.epilogue == "tma"
+                if config.epilogue in ("tma", "hybrid")
                 else 0
             ),
             bf16_values_quantized_per_output_cta=float(

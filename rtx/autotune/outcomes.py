@@ -21,6 +21,7 @@ _FATAL_DEVICE_CONTEXT_MARKERS = (
     "cudaerrorillegalinstruction",
     "illegal instruction was encountered",
     "cudaerrorillegaladdress",
+    "illegal memory access",
     "illegal memory access was encountered",
     "cudaerrorassert",
     "device-side assert triggered",

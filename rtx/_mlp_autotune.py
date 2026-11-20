@@ -56,13 +56,31 @@ def deferred_spec(config, precision, mode, policy, cache_dir, *, training_mix=No
         cache_dir=None if cache_dir is None else str(Path(cache_dir).expanduser())), sort_keys=True)
 
 
-def _runtime_variant(out_features,activation,training,initial,replay,mix=None):
+def _runtime_variant(out_features,activation,training,initial,replay,mix=None,*,dw_opening=None):
     """Preserve legacy identities only when the legacy objective is requested."""
     from .autotune.core import stable_id
     return stable_id(dict(out_features=out_features,activation=activation,
         training=training,initial=initial,frontend_revision=2,
         measurement_mode='private_replay' if replay else 'selected_direct',
+        **({'independent_dw_opening_revision':dw_opening} if dw_opening is not None else {}),
         **({'execution_mix':mix.contract()} if mix is not None else {})))
+
+
+def _mlp_runtime_winner_key(problem, out_features, activation, training, initial, replay, mix, *, device):
+    """Scope the new search identity to potentially affected training plans."""
+    from .mlp import MXFP8MLPConfig
+    from .autotune.mlp import (MLP_AUTOTUNE_REVISION, MLP_INDEPENDENT_DW_OPENING_REVISION,
+                               _mlp_hardware, mlp_independent_dw_opening)
+    from .autotune.winners import runtime_winner_key
+
+    revision=None
+    if training and mlp_independent_dw_opening(
+            MXFP8MLPConfig.from_dict(initial), problem.m, problem.k, problem.n//2, out_features,
+            _mlp_hardware(str(device)).get('multiprocessor_count')):
+        revision=MLP_INDEPENDENT_DW_OPENING_REVISION
+    return runtime_winner_key('mxfp8_recompute_mlp',problem,device=device,
+        kernel_revision=MLP_AUTOTUNE_REVISION,
+        variant=_runtime_variant(out_features,activation,training,initial,replay,mix,dw_opening=revision))
 
 
 @lru_cache(maxsize=128)
@@ -85,10 +103,10 @@ def _bound_plan(spec_key, shape, gate_shape, down_shape, device, dtype, activati
 def _select(x, gu, down, activation, spec_key, training, *, replay=False):
     from .mlp import MXFP8MLPConfig
     from .kernels.mxfp8 import MXFP8Problem
-    from .autotune.mlp import MLP_AUTOTUNE_REVISION, tune_mxfp8_mlp
+    from .autotune.mlp import tune_mxfp8_mlp
     from .autotune.core import stable_id
     from .autotune.legacy import default_cache_dir
-    from .autotune.winners import (runtime_winner_key, load_runtime_winner,
+    from .autotune.winners import (load_runtime_winner,
                                   save_runtime_winner, runtime_tuning_lock)
     identity = (tuple(x.shape), tuple(gu.shape), tuple(down.shape), str(x.device),
                 activation, spec_key, training, replay)
@@ -123,9 +141,8 @@ def _select(x, gu, down, activation, spec_key, training, *, replay=False):
             mix.validate_phase(phase)
         root = default_cache_dir() if spec["cache_dir"] is None else Path(spec["cache_dir"])
         problem = MXFP8Problem(x.numel() // x.shape[-1], gu.shape[0], x.shape[-1])
-        key = runtime_winner_key("mxfp8_recompute_mlp",
-            problem, device=x.device, kernel_revision=MLP_AUTOTUNE_REVISION,
-            variant=_runtime_variant(down.shape[0],activation,training,spec['initial'],replay,mix))
+        key = _mlp_runtime_winner_key(problem,down.shape[0],activation,training,spec['initial'],replay,mix,
+                                      device=x.device)
         def cached():
             return load_runtime_winner(key, MXFP8MLPConfig.from_dict, root=root,
                 tuning_policy=policy if spec["mode"] == "balanced" else None)
@@ -301,7 +318,7 @@ def _replay_forward(x, gu, down, activation, key):
                 raise RuntimeError("warm selected MLP replay before CUDA graph capture")
             def execute(x, gu, down):
                 y = torch.empty((*x.shape[:-1], down.shape[0]), dtype=x.dtype, device=x.device)
-                _run_forward(x, gu, down, activation, _parse(key), y)
+                _run_forward(x, gu, down, activation, _parse(key), y, config_key=key)
                 return (y,)
             runner = KernelReplay(execute, (x, gu, down))
             FORWARDS[identity] = runner
@@ -319,7 +336,7 @@ def _selected_forward(x, gu, down, activation, spec, training, *, replay=False):
         output = _replay_forward(x, gu, down, activation, key)
     else:
         output = torch.empty((*x.shape[:-1], down.shape[0]), dtype=x.dtype, device=x.device)
-        _run_forward(x, gu, down, activation, _parse(key), output)
+        _run_forward(x, gu, down, activation, _parse(key), output, config_key=key)
     return output, saved
 
 

@@ -7,7 +7,7 @@ from .core import Proposal
 
 
 def mixed_pool(adapter, *, limit=128, seed=1729, retrieved=(), seeds=(),
-               structural_proposals=512):
+               structural_proposals=512, skip_discarded_generation=False, protected=()):
     """Reserve slots for retrieval, structural coverage and local candidates.
 
     The adapter's config ID is authoritative for active-schedule deduplication.
@@ -18,18 +18,10 @@ def mixed_pool(adapter, *, limit=128, seed=1729, retrieved=(), seeds=(),
         raise ValueError('limit must be positive')
     if type(structural_proposals) is not int or structural_proposals < 1:
         raise ValueError('structural_proposals must be positive')
-    raw = raw_portfolio(adapter, StructuralSamplingPolicy(
-        min(limit, structural_proposals), structural_proposals, seed))
-    structural, audit = select_portfolio(adapter, raw, limit)
-    local = adapter.sample(random.Random(seed), limit, [adapter.initial_config])
     # Explicit caller anchors are not ordinary local-fill candidates. Keep
     # them before retrieval/structural quotas; a full pool previously silently
     # discarded every seed after the initial configuration.
     seeds = list(seeds)
-    sources = [('seed', [adapter.initial_config, *seeds], min(limit, 1 + len(seeds))),
-               ('retrieval', list(retrieved), limit // 4),
-               ('structural', structural, max(1, limit // 4)),
-               ('local', list(local), limit)]
     pool = []; seen = set(); origins = {}; counts = Counter()
 
     def take(name, configs, quota):
@@ -45,11 +37,36 @@ def mixed_pool(adapter, *, limit=128, seed=1729, retrieved=(), seeds=(),
             seen.add(key); pool.append(config); origins[key] = name
             counts[name] += 1; accepted += 1
 
+    # Adapter opt-in only: default callers keep the historical seed order.
+    # Protect a few complete regions before a long mutation/seed list can
+    # fill the pool. These are still validated proposals, never forced wins.
+    protected=list(protected)
+    if protected:
+        take('seed',[adapter.initial_config],1)
+        take('region',protected,min(5,max(0,limit-1)))
+        take('retrieval',retrieved,min(2,max(0,limit-len(pool))))
+        take('seed',seeds,limit)
+    else:take('seed',[adapter.initial_config,*seeds],limit)
+    if skip_discarded_generation and len(pool)==limit:
+        # Explicit anchors have always had first priority. Generating and
+        # ranking thousands of assignments that cannot enter a full pool
+        # wastes first-hit budget without changing a single candidate.
+        return pool,dict(schema=1,origins=origins,counts=dict(counts),
+            structural_statuses={},construction_failures={},generation_skipped='explicit_pool_full')
+    raw = raw_portfolio(adapter, StructuralSamplingPolicy(
+        min(limit, structural_proposals), structural_proposals, seed))
+    structural, audit = select_portfolio(adapter, raw, limit)
+    local = adapter.sample(random.Random(seed), limit, [adapter.initial_config])
+    sources = [('retrieval', list(retrieved), limit // 4),
+               ('structural', structural, max(1, limit // 4)),
+               ('local', list(local), limit)]
     for name, configs, quota in sources:
         take(name, configs, quota)
     for name, configs, _ in sources:
         take(name, configs, limit)
     return pool, dict(schema=1, origins=origins, counts=dict(counts),
+                     **({'regions':dict(Counter(adapter.region_fn(c) for c in pool))}
+                        if getattr(adapter,'region_fn',None) else {}),
                      structural_statuses=dict(Counter(x['status'] for x in audit)),
                      construction_failures=raw['construction_failures'])
 

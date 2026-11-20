@@ -57,6 +57,38 @@ def _quantile_fake(matrix,rank,threads,column):
     return torch.empty(matrix.shape[1] if column else matrix.shape[0],device=matrix.device,dtype=matrix.dtype)
 
 
+@torch.library.custom_op('rtx_routing::warp_quantile_into',mutates_args=('out',),device_types='cuda')
+def warp_quantile_into(source:torch.Tensor,out:torch.Tensor,n:int,e:int,rank:int,threads:int)->None:
+    with torch.cuda.device(source.device):
+        from .routing import _validate_native_device
+        from .runtime import load_kernel_symbol
+        _validate_native_device(source.device.index)
+        key=('warp_quantile',source.device.index,n,e,rank,threads)
+        function=_quantile_stages.get(key)
+        if function is None:
+            if torch.cuda.is_current_stream_capturing():raise RuntimeError('Warm warp quantiles before capture')
+            compile_warp_quantile=load_kernel_symbol('routing_selection','compile_warp_quantile')
+            function=compile_warp_quantile(n,e,rank,threads)
+            _quantile_stages[key]=function
+        function(source,out)
+
+
+@warp_quantile_into.register_fake
+def _warp_quantile_fake(source,out,n,e,rank,threads):
+    return None
+
+
+def warp_quantile(matrix,rank,threads):
+    if matrix.ndim!=2 or matrix.dtype!=torch.float32 or not matrix.is_contiguous():
+        raise ValueError('Warp quantile requires contiguous CUDA FP32 [N,E]')
+    n,e=matrix.shape
+    if n<1 or not 1<=e<=128 or not 0<=rank<e or threads not in (64,128,256):
+        raise ValueError('Unsupported warp quantile geometry/rank')
+    result=torch.empty(n,device=matrix.device,dtype=torch.float32)
+    warp_quantile_into(matrix.view(-1),result,n,e,rank,threads)
+    return result
+
+
 def _initialize_native(scores,k,iterations,backend,threads):
     n,e=scores.shape
     if k==e:
@@ -67,8 +99,9 @@ def _initialize_native(scores,k,iterations,backend,threads):
     capacity=n*k//e
     for _ in range(iterations):
         margins=values-prices[None,:]
-        cutoff=(quantile(margins,k,threads,False)[:,None] if backend=='native'
-                else torch.topk(margins,k+1,dim=1).values[:,k:k+1])
+        if backend=='native_warp':cutoff=warp_quantile(margins,k,threads)[:,None]
+        elif backend=='native':cutoff=quantile(margins,k,threads,False)[:,None]
+        else:cutoff=torch.topk(margins,k+1,dim=1).values[:,k:k+1]
         prices=quantile(values-cutoff,capacity,threads,True)
     ids=torch.topk(values-prices[None,:],k,dim=1).indices
     return ids,reference.assignment_loads(ids,e)
@@ -109,18 +142,26 @@ def repair_step(scores, tie_break, current, loads, phase, token):
     return result, new_loads, phase+1
 
 
-def prepare_quota(m,e,device,k=1,segmented=True):
+def prepare_quota(m,e,device,k=1,segmented=True,cache_items=0,threads=128,early_exit=False):
     if not 1<=e<=1024 or not 0<=m<2**31:raise ValueError('Quota kernel supports E<=1024, M<2**31')
     dev=torch.device(device)
     if dev.type!='cuda':raise ValueError('CUDA device required')
     if not segmented and m>4096:raise ValueError('Direct quota implementation supports at most 4096 proposals')
-    key=('quota',dev.index if dev.index is not None else torch.cuda.current_device(),m,e,k,segmented)
+    if cache_items not in (0,4,8,16) or threads not in (64,128,256) or type(early_exit)is not bool:
+        raise ValueError('Invalid quota cache/thread/early-exit geometry')
+    cache_items=cache_items if segmented else 0
+    early_exit=early_exit if segmented else False
+    key=('quota',dev.index if dev.index is not None else torch.cuda.current_device(),m,e,k,segmented,cache_items,threads,early_exit)
     stages=_quota_stages.get(key)
     if stages is None:
         if torch.cuda.is_current_stream_capturing():raise RuntimeError('Prepare quota workspace before capture')
         from .runtime import load_kernel_symbol
-        compile_quota=load_kernel_symbol('routing_selection','compile_quota')
-        stages=compile_quota(m,e,k,segmented=segmented)
+        if segmented and (cache_items or early_exit):
+            compile_quota=load_kernel_symbol('routing_quota_cached','compile_quota_cached')
+            stages=compile_quota(m,e,k,threads=threads,items=cache_items,early_exit=early_exit)
+        else:
+            compile_quota=load_kernel_symbol('routing_selection','compile_quota')
+            stages=compile_quota(m,e,k,threads=threads,segmented=segmented)
         _quota_stages[key]=stages
     return stages
 
@@ -128,7 +169,8 @@ def prepare_quota(m,e,device,k=1,segmented=True):
 @torch.library.custom_op('rtx_routing::quota_apply',mutates_args=(),device_types='cuda')
 def quota_apply(sources:torch.Tensor,targets:torch.Tensor,gains:torch.Tensor,
                 surplus:torch.Tensor,deficit:torch.Tensor,slots:torch.Tensor,
-                loads:torch.Tensor,phase:torch.Tensor,segmented:bool=True)->tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
+                loads:torch.Tensor,phase:torch.Tensor,segmented:bool=True,cache_items:int=0,
+                threads:int=128,early_exit:bool=False)->tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
     if slots.ndim!=2 or loads.ndim!=1 or phase.ndim!=0:raise ValueError('Invalid state shapes')
     n,k=slots.shape;m=n*k;e=loads.numel()
     integer_inputs=(sources,targets,surplus,deficit,slots,loads,phase)
@@ -139,7 +181,7 @@ def quota_apply(sources:torch.Tensor,targets:torch.Tensor,gains:torch.Tensor,
     if any(v.shape!=(m,) for v in (sources,targets,gains)) or surplus.shape!=(e,) or deficit.shape!=(e,):
         raise ValueError('Proposal/state size mismatch')
     if m==0:raise ValueError('Positive routing work required')
-    stages=prepare_quota(m,e,sources.device,k,segmented);device=sources.device
+    stages=prepare_quota(m,e,sources.device,k,segmented,cache_items,threads,early_exit);device=sources.device
     counts=torch.empty(e,device=device,dtype=torch.int32)
     offsets=torch.empty(e+1,device=device,dtype=torch.int32)
     keys=torch.empty(m,device=device,dtype=torch.uint64)
@@ -154,11 +196,11 @@ def quota_apply(sources:torch.Tensor,targets:torch.Tensor,gains:torch.Tensor,
 
 
 @quota_apply.register_fake
-def fake_apply(sources,targets,gains,surplus,deficit,slots,loads,phase,segmented=True):
+def fake_apply(sources,targets,gains,surplus,deficit,slots,loads,phase,segmented=True,cache_items=0,threads=128,early_exit=False):
     return torch.empty(slots.shape,device=slots.device,dtype=torch.int64),torch.empty_like(loads),torch.empty_like(phase)
 
 
-def _repair_step_fused(scores, tie_break, current, loads, phase, token,segmented=True):
+def _repair_step_fused(scores, tie_break, current, loads, phase, token,segmented=True,cache_items=0,threads=128,early_exit=False):
     """One functional round, matching repair_balanced_assignment verbatim."""
     n, e = scores.shape
     k = current.shape[1]
@@ -176,7 +218,7 @@ def _repair_step_fused(scores, tie_break, current, loads, phase, token,segmented
     source_values, source_slots = torch.sort(scores.gather(1, current).masked_fill(surplus[current] <= 0, float('inf')), dim=1, stable=True)
     sources = current.gather(1, source_slots)
     gains = (target_values - source_values).flatten()
-    return quota_apply(sources.flatten(),targets.flatten(),gains,surplus,deficit,source_slots,loads,phase,segmented)
+    return quota_apply(sources.flatten(),targets.flatten(),gains,surplus,deficit,source_slots,loads,phase,segmented,cache_items,threads,early_exit)
 
 
 def _repair_step_direct(scores,tie_break,current,loads,phase,token):
@@ -203,7 +245,8 @@ class HardRoutingPlan:
     tie:torch.Tensor
     token:torch.Tensor
 
-    def __init__(self,scores,k,qb_rounds,rounds,segmented=True,quota_threshold=1024,qb_backend='torch',qb_threads=128):
+    def __init__(self,scores,k,qb_rounds,rounds,segmented=True,quota_threshold=1024,qb_backend='torch',qb_threads=128,
+                 quota_cache_items=0,quota_threads=128,quota_early_exit=False):
         from ._resources import install_graph_resource_tracking
         install_graph_resource_tracking()
         self.n,self.e=scores.shape;self.k=k
@@ -217,10 +260,13 @@ class HardRoutingPlan:
         self.tie=reference._deterministic_tie_break(self.n,self.e,device=scores.device,magnitude=1e-6)
         self.token=torch.arange(self.n,device=scores.device,dtype=torch.int64)[:,None]
         self.scores.copy_(scores)
-        if qb_backend not in ('torch','native_column','native'):raise ValueError('Invalid QB backend')
+        if qb_backend not in ('torch','native_column','native','native_warp'):raise ValueError('Invalid QB backend')
+        if qb_backend=='native_warp' and self.e>128:raise ValueError('Warp QB row selection supports at most 128 experts')
         packed=segmented and self.n*k>=quota_threshold
-        body=_repair_step_packed if packed else _repair_step_direct
-        prepare_quota(self.n*k,self.e,scores.device,k,packed)
+        def body(*arguments):
+            return _repair_step_fused(*arguments,segmented=packed,cache_items=quota_cache_items,
+                                      threads=quota_threads,early_exit=quota_early_exit)
+        prepare_quota(self.n*k,self.e,scores.device,k,packed,quota_cache_items,quota_threads,quota_early_exit)
         e=self.e
         def initialize(value):
             if qb_backend!='torch':return _initialize_native(value,k,qb_rounds,qb_backend,qb_threads)
@@ -249,9 +295,22 @@ class HardRoutingPlan:
         self.current.copy_(current);self.loads.copy_(loads);self.phase.copy_(phase)
 
     def __call__(self,scores):
+        out=torch.empty_like(self.current)
+        self.launch_into(scores,out)
+        return out
+
+    def launch_into(self,scores,out):
+        """Launch into caller-owned IDs; no hot Torch allocation or arithmetic.
+
+        Conditional graph nodes require fixed-address internal state. That
+        state belongs to this bounded, stream-local cold plan; it never escapes
+        as a returned alias. Only the immutable graph is submitted here.
+        """
         stream=torch.cuda.current_stream(scores.device).cuda_stream
         if stream!=self.stream.cuda_stream:raise RuntimeError('Internal routing plan stream mismatch')
-        out=torch.empty_like(self.current)
+        if (out.shape!=(self.n,self.k) or out.dtype!=torch.int64
+                or out.device!=scores.device or not out.is_contiguous()):
+            raise ValueError('Hard routing output must be contiguous CUDA int64 [N,K]')
         # Native copies, graph submission and extraction are one host-critical
         # section. Hidden mutable state never escapes as an aliased output.
         with self.lock:
@@ -259,7 +318,6 @@ class HardRoutingPlan:
             copy_async(self.scores.data_ptr(),scores.data_ptr(),scores.numel()*4,stream)
             self.graph.launch(stream)
             copy_async(out.data_ptr(),self.current.data_ptr(),out.numel()*8,stream)
-        return out
 
     def __del__(self):
         if getattr(self,'graph',None) is not None:
@@ -270,7 +328,8 @@ class HardRoutingPlan:
             self.graph=None
 
 
-def _schedule(scores,k,qb_rounds,rounds,segmented,owner_id,quota_threshold=1024,qb_backend='torch',qb_threads=128):
+def _get_plan(scores,k,qb_rounds,rounds,segmented,owner_id,quota_threshold=1024,qb_backend='torch',qb_threads=128,
+              quota_cache_items=0,quota_threads=128,quota_early_exit=False):
     if scores.dtype!=torch.float32 or scores.ndim!=2 or not scores.is_contiguous():
         raise ValueError('Hard routing requires contiguous CUDA FP32 scores')
     reference.uniform_capacity(*scores.shape,k)
@@ -280,7 +339,10 @@ def _schedule(scores,k,qb_rounds,rounds,segmented,owner_id,quota_threshold=1024,
     from ._managed import install
     install()
     stream=torch.cuda.current_stream(scores.device).cuda_stream
-    key=(scores.device.index,stream,owner_id,*scores.shape,k,qb_rounds,rounds,segmented,quota_threshold,qb_backend,qb_threads)
+    packed=segmented and scores.shape[0]*k>=quota_threshold
+    if not packed:quota_cache_items=0;quota_early_exit=False
+    key=(scores.device.index,stream,owner_id,*scores.shape,k,qb_rounds,rounds,segmented,quota_threshold,qb_backend,qb_threads,
+         quota_cache_items,quota_threads,quota_early_exit)
     with _plans._lock:
         plan=_plans.get(key)
         if plan is None:
@@ -291,23 +353,60 @@ def _schedule(scores,k,qb_rounds,rounds,segmented,owner_id,quota_threshold=1024,
                 # Cold extension preparation must not inherit below-autograd
                 # or SchemaCheck TLS from the custom-op dispatcher.
                 with torch.cuda.device(scores.device),torch.cuda.stream(caller_stream),torch.no_grad():
-                    return HardRoutingPlan(scores,k,qb_rounds,rounds,segmented,quota_threshold,qb_backend,qb_threads)
+                    return HardRoutingPlan(scores,k,qb_rounds,rounds,segmented,quota_threshold,qb_backend,qb_threads,
+                                           quota_cache_items,quota_threads,quota_early_exit)
             with ThreadPoolExecutor(max_workers=1,thread_name_prefix='rtx-routing-prepare') as worker:
                 plan=worker.submit(prepare).result()
             _plans[key]=plan
-    return plan(scores)
+    return plan
+
+
+def _schedule(scores,k,qb_rounds,rounds,segmented,owner_id,quota_threshold=1024,qb_backend='torch',qb_threads=128,
+              quota_cache_items=0,quota_threads=128,quota_early_exit=False):
+    return _get_plan(scores,k,qb_rounds,rounds,segmented,owner_id,quota_threshold,qb_backend,qb_threads,
+                     quota_cache_items,quota_threads,quota_early_exit)(scores)
+
+
+@torch.library.custom_op('rtx_routing::hard_schedule_into',mutates_args=('out',),device_types='cuda')
+@guard_submission
+def hard_schedule_into(scores:torch.Tensor,out:torch.Tensor,k:int,qb_rounds:int,rounds:int,
+                       segmented:bool=True,owner_id:int=0,quota_threshold:int=1024,
+                       qb_backend:str='torch',qb_threads:int=128,quota_cache_items:int=0,
+                       quota_threads:int=128,quota_early_exit:bool=False)->None:
+    with torch.cuda.device(scores.device):
+        plan=_get_plan(scores,k,qb_rounds,rounds,segmented,owner_id,quota_threshold,qb_backend,qb_threads,
+                       quota_cache_items,quota_threads,quota_early_exit)
+        plan.launch_into(scores,out)
+
+
+@hard_schedule_into.register_fake
+def _hard_into_fake(scores,out,k,qb_rounds,rounds,segmented=True,owner_id=0,
+                    quota_threshold=1024,qb_backend='torch',qb_threads=128,quota_cache_items=0,quota_threads=128,quota_early_exit=False):
+    pass
+
+
+def dispatch_hard(scores,k,qb_rounds,rounds,segmented=True,owner_id=0,
+                  quota_threshold=1024,qb_backend='torch',qb_threads=128,quota_cache_items=0,quota_threads=128,quota_early_exit=False):
+    """Traceable output ownership around GPU-controlled fixed-policy routing."""
+    out=torch.empty((scores.shape[0],k),device=scores.device,dtype=torch.int64)
+    hard_schedule_into(scores,out,k,qb_rounds,rounds,segmented,owner_id,
+                       quota_threshold,qb_backend,qb_threads,quota_cache_items,quota_threads,quota_early_exit)
+    return out
 
 
 @torch.library.custom_op('rtx_routing::hard_schedule',mutates_args=(),device_types='cuda')
 @guard_submission
 def hard_schedule(scores:torch.Tensor,k:int,qb_rounds:int,rounds:int,segmented:bool=True,owner_id:int=0,
-                  quota_threshold:int=1024,qb_backend:str='torch',qb_threads:int=128)->torch.Tensor:
+                  quota_threshold:int=1024,qb_backend:str='torch',qb_threads:int=128,quota_cache_items:int=0,
+                  quota_threads:int=128,quota_early_exit:bool=False)->torch.Tensor:
     with torch.cuda.device(scores.device):
-        return _schedule(scores,k,qb_rounds,rounds,segmented,owner_id,quota_threshold,qb_backend,qb_threads)
+        return _schedule(scores,k,qb_rounds,rounds,segmented,owner_id,quota_threshold,qb_backend,qb_threads,
+                          quota_cache_items,quota_threads,quota_early_exit)
 
 
 @hard_schedule.register_fake
-def _hard_fake(scores,k,qb_rounds,rounds,segmented=True,owner_id=0,quota_threshold=1024,qb_backend='torch',qb_threads=128):
+def _hard_fake(scores,k,qb_rounds,rounds,segmented=True,owner_id=0,quota_threshold=1024,qb_backend='torch',qb_threads=128,
+               quota_cache_items=0,quota_threads=128,quota_early_exit=False):
     return torch.empty((scores.shape[0],k),device=scores.device,dtype=torch.int64)
 
 

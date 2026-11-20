@@ -1,0 +1,534 @@
+{
+  "status": "qualified",
+  "uuid": "GPU-09db6472-cc08-c4cb-90db-560de232e5aa",
+  "argv": [
+    "/home/achiya/vs_code_main/rtx/benchmarks/review_moe_precision_factorial.py",
+    "--source-result",
+    "autotune_reports/moe_gap_and_prior_20261118/first-hit/large/result.json",
+    "--output",
+    "reports/moe_precision_factorial_review_20261118/large-v1.json"
+  ],
+  "torch": "2.13.0+cu132",
+  "cuda": "13.2",
+  "source_result": "autotune_reports/moe_gap_and_prior_20261118/first-hit/large/result.json",
+  "first_hit_sha256": "0c5c4296b304699387c2f77d2839befa73cb61a7d79bcd186b8a8a120cafdaab",
+  "driver_sha256": "57324bc5de6091aaafe01701908c61bf69964c3cde7bc774c73abe9d88918de7",
+  "runtime_sha256": "5f0417fd1666264dd5cc7d828e8b84bf27f53081d490314603aa42bf8cbd275f",
+  "lengths": [
+    29504
+  ],
+  "case": {
+    "id": "d384_e32_k4_h128",
+    "d_model": 384,
+    "num_shared_experts": 1,
+    "shared_hidden_dim": 256,
+    "num_experts": 32,
+    "top_k": 4,
+    "expert_hidden_dim": 128
+  },
+  "checks": {
+    "MM": {
+      "replay_nrms": [
+        0.0,
+        0.0
+      ],
+      "live_allocations": [
+        393232384,
+        393232384,
+        393232384,
+        393232384,
+        393232384,
+        393232384,
+        393232384
+      ],
+      "all_leaves": 105
+    },
+    "MB": {
+      "replay_nrms": [
+        0.0,
+        0.0
+      ],
+      "live_allocations": [
+        474803712,
+        474803712,
+        474803712,
+        474803712,
+        474803712,
+        474803712,
+        474803712
+      ],
+      "all_leaves": 105
+    },
+    "BB": {
+      "replay_nrms": [
+        0.00025089175323955715,
+        0.00021701172227039933
+      ],
+      "live_allocations": [
+        555564032,
+        555564032,
+        555564032,
+        555564032,
+        555564032,
+        555564032,
+        555564032
+      ],
+      "all_leaves": 105
+    },
+    "BM": {
+      "replay_nrms": [
+        0.00021804508287459612,
+        0.0002269518590765074
+      ],
+      "live_allocations": [
+        681642496,
+        681642496,
+        681642496,
+        681642496,
+        681642496,
+        681642496,
+        681642496
+      ],
+      "all_leaves": 105
+    }
+  },
+  "visits": {
+    "MM": [
+      {
+        "median_ms": 4.727071762084961,
+        "min_ms": 4.721436023712158,
+        "max_ms": 4.7392802238464355,
+        "samples_ms": [
+          4.727071762084961,
+          4.728363990783691,
+          4.724708080291748,
+          4.721436023712158,
+          4.7224040031433105,
+          4.735219955444336,
+          4.7392802238464355
+        ],
+        "relative_mad": 0.000987452523799129,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      },
+      {
+        "median_ms": 4.729556083679199,
+        "min_ms": 4.727603912353516,
+        "max_ms": 4.731967926025391,
+        "samples_ms": [
+          4.727603912353516,
+          4.729487895965576,
+          4.729740142822266,
+          4.729556083679199,
+          4.728640079498291,
+          4.731967926025391,
+          4.73095178604126
+        ],
+        "relative_mad": 0.00019367656598241002,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      },
+      {
+        "median_ms": 4.73391580581665,
+        "min_ms": 4.726955890655518,
+        "max_ms": 4.748348236083984,
+        "samples_ms": [
+          4.73440408706665,
+          4.73391580581665,
+          4.740479946136475,
+          4.748348236083984,
+          4.7334160804748535,
+          4.732019901275635,
+          4.726955890655518
+        ],
+        "relative_mad": 0.0004004939290821547,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      },
+      {
+        "median_ms": 4.740935802459717,
+        "min_ms": 4.729536056518555,
+        "max_ms": 4.7539520263671875,
+        "samples_ms": [
+          4.7539520263671875,
+          4.740935802459717,
+          4.7454681396484375,
+          4.747879981994629,
+          4.734355926513672,
+          4.729536056518555,
+          4.730524063110352
+        ],
+        "relative_mad": 0.0014647276032105929,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      }
+    ],
+    "MB": [
+      {
+        "median_ms": 4.47049617767334,
+        "min_ms": 4.468987941741943,
+        "max_ms": 4.475379943847656,
+        "samples_ms": [
+          4.468987941741943,
+          4.47076416015625,
+          4.469520092010498,
+          4.469240188598633,
+          4.475379943847656,
+          4.47049617767334,
+          4.473820209503174
+        ],
+        "relative_mad": 0.0002809507098965261,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      },
+      {
+        "median_ms": 4.472352027893066,
+        "min_ms": 4.467944145202637,
+        "max_ms": 4.482039928436279,
+        "samples_ms": [
+          4.476612091064453,
+          4.477635860443115,
+          4.482039928436279,
+          4.472352027893066,
+          4.470215797424316,
+          4.467944145202637,
+          4.468587875366211
+        ],
+        "relative_mad": 0.0009525330619811792,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      },
+      {
+        "median_ms": 4.473780155181885,
+        "min_ms": 4.4688520431518555,
+        "max_ms": 4.48089599609375,
+        "samples_ms": [
+          4.48089599609375,
+          4.479156017303467,
+          4.471764087677002,
+          4.469188213348389,
+          4.474748134613037,
+          4.473780155181885,
+          4.4688520431518555
+        ],
+        "relative_mad": 0.0010264120440020604,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      },
+      {
+        "median_ms": 4.4809160232543945,
+        "min_ms": 4.473336219787598,
+        "max_ms": 4.4952921867370605,
+        "samples_ms": [
+          4.4809160232543945,
+          4.492119789123535,
+          4.4952921867370605,
+          4.4866437911987305,
+          4.479179859161377,
+          4.476851940155029,
+          4.473336219787598
+        ],
+        "relative_mad": 0.0012782582656338157,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      }
+    ],
+    "BM": [
+      {
+        "median_ms": 4.4250078201293945,
+        "min_ms": 4.423379898071289,
+        "max_ms": 4.4285078048706055,
+        "samples_ms": [
+          4.4285078048706055,
+          4.427484035491943,
+          4.4250078201293945,
+          4.423379898071289,
+          4.4237518310546875,
+          4.424315929412842,
+          4.427311897277832
+        ],
+        "relative_mad": 0.00036789134037233537,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      },
+      {
+        "median_ms": 4.43450403213501,
+        "min_ms": 4.431995868682861,
+        "max_ms": 4.444888114929199,
+        "samples_ms": [
+          4.434219837188721,
+          4.434815883636475,
+          4.431995868682861,
+          4.444888114929199,
+          4.43450403213501,
+          4.433844089508057,
+          4.434783935546875
+        ],
+        "relative_mad": 7.03238736970325e-05,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      },
+      {
+        "median_ms": 4.443056106567383,
+        "min_ms": 4.429160118103027,
+        "max_ms": 4.4506120681762695,
+        "samples_ms": [
+          4.449031829833984,
+          4.443056106567383,
+          4.445352077484131,
+          4.429403781890869,
+          4.4506120681762695,
+          4.433316230773926,
+          4.429160118103027
+        ],
+        "relative_mad": 0.0017006225957214628,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      },
+      {
+        "median_ms": 4.428016185760498,
+        "min_ms": 4.4235758781433105,
+        "max_ms": 4.441199779510498,
+        "samples_ms": [
+          4.425300121307373,
+          4.4258599281311035,
+          4.4235758781433105,
+          4.428016185760498,
+          4.431519985198975,
+          4.432651996612549,
+          4.441199779510498
+        ],
+        "relative_mad": 0.0007912797269675734,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      }
+    ],
+    "BB": [
+      {
+        "median_ms": 4.164559841156006,
+        "min_ms": 4.159244060516357,
+        "max_ms": 4.177140235900879,
+        "samples_ms": [
+          4.166940212249756,
+          4.177140235900879,
+          4.159244060516357,
+          4.1648478507995605,
+          4.162856101989746,
+          4.164559841156006,
+          4.160292148590088
+        ],
+        "relative_mad": 0.0005715780741643161,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      },
+      {
+        "median_ms": 4.167223930358887,
+        "min_ms": 4.164356231689453,
+        "max_ms": 4.1798319816589355,
+        "samples_ms": [
+          4.178403854370117,
+          4.167223930358887,
+          4.1798319816589355,
+          4.167223930358887,
+          4.164356231689453,
+          4.1650800704956055,
+          4.175764083862305
+        ],
+        "relative_mad": 0.0006881556444668006,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      },
+      {
+        "median_ms": 4.166024208068848,
+        "min_ms": 4.160572052001953,
+        "max_ms": 4.177192211151123,
+        "samples_ms": [
+          4.164768218994141,
+          4.166024208068848,
+          4.160572052001953,
+          4.161843776702881,
+          4.169256210327148,
+          4.177192211151123,
+          4.169003963470459
+        ],
+        "relative_mad": 0.0007758001626685145,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      },
+      {
+        "median_ms": 4.16188383102417,
+        "min_ms": 4.1582441329956055,
+        "max_ms": 4.171060085296631,
+        "samples_ms": [
+          4.1704559326171875,
+          4.171060085296631,
+          4.163219928741455,
+          4.16188383102417,
+          4.1582441329956055,
+          4.158728122711182,
+          4.158535957336426
+        ],
+        "relative_mad": 0.0008044130551621584,
+        "timing_batch_revision": 1,
+        "requested_calls_per_sample": 8,
+        "actual_calls_per_sample": 8,
+        "min_batch_ms": 5.0
+      }
+    ]
+  },
+  "timings": {
+    "MM": 4.731735944747925,
+    "MB": 4.473066091537476,
+    "BM": 4.431260108947754,
+    "BB": 4.165292024612427
+  },
+  "warm_compile_capture_s": {
+    "MM": 23.476040926005226,
+    "MB": 32.196880790012074,
+    "BB": 34.454496419013594,
+    "BM": 6.092539236997254
+  },
+  "identities": {
+    "input": "dad5b8126a310864f960ad7e1d265c913c2bf95b34aee122107a3317b34475d5",
+    "upstream": "63e4e6385dbf745cd5c681da823e6432b1ca5774bc1381a4c012d2d9449f66ec",
+    "parameters": {
+      "router.projection_weight": "cd1a59056a2ff7c40e4926b6e3e1fb17de04e44ea45d5979bd724866101be127",
+      "router.expert_tokens": "4430f1a953e8b8cc41e25ca468b1691032b713cc3d6bfd3f457be0c5dd4d3e43",
+      "router.logit_scale": "8d55b290649e2284fecced0a654604b6281dd48989c6d5770db8742d92a1cb6d",
+      "router.score_bias": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+      "gate_up.projections.e0_gate.weight": "df19e989ed47d83fc8657ef2fad71c5d02cd7bf9e7a7059148fcfd0b855d5960",
+      "gate_up.projections.e0_up.weight": "350523de7e5ee2341d4879c7cf724587e27d033ea3aec07a629d244f59d3249c",
+      "gate_up.projections.e1_gate.weight": "c1b04cc397066635833d1f59e63001dc3442785b8aae60d9c2068a234f1029e9",
+      "gate_up.projections.e1_up.weight": "7a3fa4b68573a511e8ce47189ead702cf9e80f2027efb78fddd3406703af733d",
+      "gate_up.projections.e2_gate.weight": "6037f3bb52c8f6db9f0bebd33c9528fbeec171f779174fba68cf95e8c90f820d",
+      "gate_up.projections.e2_up.weight": "4a44ee2e3fc237c09ef4d2bf96097bcf3eff76ad2401be210e03eca13b6a1e6b",
+      "gate_up.projections.e3_gate.weight": "e55dc40a690461d187303bf39711c7a5a7249fceeb3fb59d6e366c4a117ff16f",
+      "gate_up.projections.e3_up.weight": "14a74c52da077333553327c64b10547efd3ec94e45a9b9ce51416a186a9e6158",
+      "gate_up.projections.e4_gate.weight": "3fc0573b929b41ff6bbbef384a0a7e03745d5706451b73f07e63ffc885754e27",
+      "gate_up.projections.e4_up.weight": "f8668330a41d2c25a8cffc00a9eeef6c0f1b4ddfd8d2588a0278f8279aec649b",
+      "gate_up.projections.e5_gate.weight": "64ed5548a98b37ea16e3b5fce2e43eda6e5aa0fdad69cfc882f1d61102fe4fdd",
+      "gate_up.projections.e5_up.weight": "f41e13c3e00963f2f7b0579ca699636433d123e3ca0fce9b85476d1e205a6a62",
+      "gate_up.projections.e6_gate.weight": "d005a8660b51f84fbff80e7c461f68a450a7775e9a07ce5ed1276dfb6a2c73c8",
+      "gate_up.projections.e6_up.weight": "0454e74a3689e3f5a32cf3f352387d3b7f5defd92da7734ed57d558f13a55a1e",
+      "gate_up.projections.e7_gate.weight": "ffece0a8a194ff42c88447bd2bd3ca72bec9cf0a6d76a76dd018d0940613e9b8",
+      "gate_up.projections.e7_up.weight": "9ece1245f03ce19768bf1bc4e2d924b02d04863dc17dd6b9caa598e0a7fbde0f",
+      "gate_up.projections.e8_gate.weight": "a3a16c3491c42ccfce585a97ba7ad52d16c96759106e54e799509a697360d94e",
+      "gate_up.projections.e8_up.weight": "9b5415b38f598418f06afe671d3bd7d55711bf266500718bac209929e478d3de",
+      "gate_up.projections.e9_gate.weight": "c2f1f1dce2172609ee28b7e83d8e61732b9c3584d1af10b08295ca18a766e867",
+      "gate_up.projections.e9_up.weight": "a68ce5df58bb065d9f268abb854f85efb4b5bd496c2ee89c39b2a244288036b3",
+      "gate_up.projections.e10_gate.weight": "a0b47139783053f443418e120316e80484211011af044b0355859aadfb979432",
+      "gate_up.projections.e10_up.weight": "8cbdd8ebb665511aee90a5e3e3428a78cd15fd058fa48d1443117a7a914c9c95",
+      "gate_up.projections.e11_gate.weight": "fc448eff462d62b5a4fa2050d249e924f8e08b997a547f6edb0afcfe3af2598a",
+      "gate_up.projections.e11_up.weight": "c99bd7270fdb149aacc9df31af9b8c743bad64233968c25c885a8b36aaa24453",
+      "gate_up.projections.e12_gate.weight": "a67e96ca47d9317c7e67c1f40ebe9fbff3e222ac9c91f4f83a75665d7d932f15",
+      "gate_up.projections.e12_up.weight": "9e042c462eebcfff7dad5724fca22024dfd93b2206439025d1c7e38357d2da28",
+      "gate_up.projections.e13_gate.weight": "cda31db044ab032d510afc510809e3b70318027a120104d313011b02fff8380e",
+      "gate_up.projections.e13_up.weight": "8f577ac98fb497a4bdfed24f2a79e94ce653d383cda4022951458c78ac10b364",
+      "gate_up.projections.e14_gate.weight": "042dd680bb0a62dba2f94f05d4fa6f99e751e980a44550984545b53dd3eab8ab",
+      "gate_up.projections.e14_up.weight": "70b1615f4ce915d2ceb60bfe27ff296ed9f4cdd143ceb9fd116e618f98acbc4e",
+      "gate_up.projections.e15_gate.weight": "e90eab606d0c2bd9435c8bdb3b09d141ffbf9079ac168655f035ffe61c80b966",
+      "gate_up.projections.e15_up.weight": "14c1595ec7b422d11003ab59df712c50e902db9a1585c8ea0675211c233c0d6f",
+      "gate_up.projections.e16_gate.weight": "37322a81dd10698bece993003243bf60880a7ff0bf0ac9e18621434aaf32b958",
+      "gate_up.projections.e16_up.weight": "0e3cbf59fef7f97a02abea1ae995e7cbad7b144ee6ad30e5596888f111df75df",
+      "gate_up.projections.e17_gate.weight": "747158002704b1e7efbc582fa1ef944e36501ab2ff7e066330ba8df8162ce4ee",
+      "gate_up.projections.e17_up.weight": "87bc15057fc92699f0b2f78217dca34cc349f6ad0660e9fbe69495e4e6888db8",
+      "gate_up.projections.e18_gate.weight": "77bcc767e7fd320bf2db4711a985290c23ceae7f4d789ed0dd9d5fa29baf49b1",
+      "gate_up.projections.e18_up.weight": "3f5456ab47ae320a76976ff5941f99e88a5aeab82b1815db6f9f53c82bd8b17e",
+      "gate_up.projections.e19_gate.weight": "0fba465c62ab6ca5268d3b203dab5dc914c63b67fadb603782affc46bfac50f2",
+      "gate_up.projections.e19_up.weight": "bc91c821e55072254da4489b2b988bba65187f154006ebc7f4ae554ad782a743",
+      "gate_up.projections.e20_gate.weight": "49ce245cbfba67d9b474d692554a8ae7208ff9dcde038f0e577eac7bc661528a",
+      "gate_up.projections.e20_up.weight": "262500866924a43bae89dfe141b1369a84c1a38e5783f85b95b7886a0e269fbc",
+      "gate_up.projections.e21_gate.weight": "003bb409d223ea3cc1bd83a1f8e66714ae02fb31cfbe68bd74be3c210b76ac36",
+      "gate_up.projections.e21_up.weight": "a0a8e34ca9f4fd59e35b39843630c3492e63010e02a9d8dcf52c898a3865b0c2",
+      "gate_up.projections.e22_gate.weight": "b8649aaaff4f40fd47ded3249fddb8af91eb0b7deff7385437d448e726ffa9c4",
+      "gate_up.projections.e22_up.weight": "92789858f234dfd89e90f7dae1036c838ad98ac25c84563a9d5a9a964298e654",
+      "gate_up.projections.e23_gate.weight": "6bf749acae539413dc811d8e14a4fdbd1b2da51ba5e34fd07911a463f096f633",
+      "gate_up.projections.e23_up.weight": "eff879639004c46cbd3e0d5bbc81f115818faedd45ceabec844e2fb3fa8bd217",
+      "gate_up.projections.e24_gate.weight": "9d4293353888b157a4dba27f5b1748e45a84631c606d27af67bdda7a871e34b9",
+      "gate_up.projections.e24_up.weight": "9cd467cfac3faa7bb58563e0428506d4d6f220fa3a839be28bc8d0522b54ba50",
+      "gate_up.projections.e25_gate.weight": "591ef1112fd2142e9e95dd17de22b2bc3ef00c63a9f9128bcf32edc65cbfa02a",
+      "gate_up.projections.e25_up.weight": "a85f30c543b1af4a54a7dc5d53df98d8a7aafa20ad6ff521382397d2ec011a63",
+      "gate_up.projections.e26_gate.weight": "673dd15f98878a538b0cfe715ec203270507fe37332300150056c799387b7eee",
+      "gate_up.projections.e26_up.weight": "1ecca87b776171af63acfbb1dde0bac061af07a1515816f217cad523a61206c7",
+      "gate_up.projections.e27_gate.weight": "b0110d36e996677009547c303f8b8c7cfc15d470585d31ca4f86c1734e7a1a4c",
+      "gate_up.projections.e27_up.weight": "b17228ebad7e6d920d07b531a0303454a9da4ec1a9585f231fca14b73c0534b9",
+      "gate_up.projections.e28_gate.weight": "0913ea86b197c02b4f905bdb780a7d17d3c6851ab2e275e2e2dd8ca5cc0b0912",
+      "gate_up.projections.e28_up.weight": "ffd93c3c7bdad337de37005eb4c9c90b38ee636630a0d70812907389782dde94",
+      "gate_up.projections.e29_gate.weight": "8e403aeb588ce773e32366990a4fae2549412f89a5cdd9cfbf50cf38a7280620",
+      "gate_up.projections.e29_up.weight": "49eedc3d2a41111e121594079c62fbd6ce546a7c9a512c4609b554a7f6606515",
+      "gate_up.projections.e30_gate.weight": "b3255c441f44d1df9f6c504a5aed78985097bb429575735368db922bd69e13a6",
+      "gate_up.projections.e30_up.weight": "a3ae19b422c5e2b81da27d66601be25eb1db86224aef971e269c1c1105edae89",
+      "gate_up.projections.e31_gate.weight": "013796b81bb19a1414f24f8af79b9cce153b43bdb7f900e3850a48b5251441bd",
+      "gate_up.projections.e31_up.weight": "06a7455f57ec57fd790e5f736550bb3f6f4bad26fda8ce13ece7dcd6f6eae830",
+      "down.projections.e0.weight": "e1b822a84a5c37956d47998490e6cea240de52161f95f4d29773881d31ce1b97",
+      "down.projections.e1.weight": "baeb691f6690fe5a5286bdc61d7fb1583593ed6e03c73b71d92985f253a3b0ef",
+      "down.projections.e2.weight": "175a9395956af4d24677b785830b1709f5b6640780a897eadbaba84261b9e1cb",
+      "down.projections.e3.weight": "b351feda00deb1bfde703584b91feafc52473099768ab2bb045a2a11de475844",
+      "down.projections.e4.weight": "1db0d59f2a42aab5041b5882309e20dd10f6502b23f9837331b98c0bcf78cb26",
+      "down.projections.e5.weight": "59b7676a880cbfd2f2fa8eac2d0f31e9fa0f55ebef280025853b8402858275b9",
+      "down.projections.e6.weight": "a510a7ece5aeb46a4d59be3b9e4abb3613de06b0bf0f8a3a474007b87719ac84",
+      "down.projections.e7.weight": "e94c999b8145993007909bf7cc0b4614f96382ede60b3a125b058c4f05b32b41",
+      "down.projections.e8.weight": "f6d6ad99576cdd6df45f0e7eb46bc41f760220988af20e825fe44512395bd083",
+      "down.projections.e9.weight": "418170ce2e864284f6e3d73ab019aa4824377e5eacf2d3979450d227c43ac790",
+      "down.projections.e10.weight": "19140f841735eac36b1db0b154f3e0affd967ce21773099053e5d47379efecaf",
+      "down.projections.e11.weight": "bcea4fdda05f5107cc9d835369bcdadef11f1cf08a5bbd757e852332a2dad20b",
+      "down.projections.e12.weight": "7e98e95cd25a4c1ce02fd2d136ab491bb36eef4fb7b585deefce801b9049b511",
+      "down.projections.e13.weight": "175bf70a037d94a2ca23cd452c1dcf95b75ce2d6356d957199ae7b6a5f58af14",
+      "down.projections.e14.weight": "1dc8d27be4a87cb54a59f5c2a65ed7664974f3b5a400134d126d550fc76eb1eb",
+      "down.projections.e15.weight": "ed06acbbdb67d6da85ac4b8e6ec585e71f5c4ab2ddb445b74120e23f748f5892",
+      "down.projections.e16.weight": "1f7bf161cdb997daf28781b8c004143411622b4e869c2f6ce8bb023226379b25",
+      "down.projections.e17.weight": "5cc21629b2165985d8ff8a3ebf2a5d89b1e58fc8ae4bbbec034f681af49495dc",
+      "down.projections.e18.weight": "bf6c25ba1d89f05977930ff946da66416a11e98c94a65f89617870d5fa38026f",
+      "down.projections.e19.weight": "84d8b07869d24942ec3c027f0946d3eb068d05f74b33b2408e4599bf43adca6e",
+      "down.projections.e20.weight": "7f88442801bbbba28739823cf797a42835de00d0386593c472aedb675629444d",
+      "down.projections.e21.weight": "d548ed474013552f9f54bd18b3597415c879a1ad5c75e48a9dc7692eed665d91",
+      "down.projections.e22.weight": "c5ae69ebbf0e7809ef323bd4c78dea610b72604b144be897336f18a48a26548f",
+      "down.projections.e23.weight": "fbcf678ba70a284e61ca3a53e682efeb4349008c3520bbb7c2e97a0a440673d9",
+      "down.projections.e24.weight": "f1e20f2ccac3556bccdc8528500ed50f7aca8870ae5c94f16018803c47b7bc8a",
+      "down.projections.e25.weight": "5a68e68115305c94eec64cc16767bee539256722ade80a29e75954062a407890",
+      "down.projections.e26.weight": "2f060c1e02ad5ccea8a947b50fb267b7875aea9e8297e74d1531a2e3657590fb",
+      "down.projections.e27.weight": "3fc52e818e2ee9f1fbb21c252dc52173afca6aee4190ba121a1e268d0ad3a21d",
+      "down.projections.e28.weight": "fee518674429aec1507f358ab998928f997f959bfa5f88764ec9b3c621112969",
+      "down.projections.e29.weight": "96a48619972842c66f653d0e3b48afee422a4e57e18c1aa3e71d5b00689b22fd",
+      "down.projections.e30.weight": "32c8ef95cd342bf13835696f34158b1e4b6a9fae2ab65fc9c013beab04b1e51e",
+      "down.projections.e31.weight": "6433e1f2374e60627d155b67efef5f29e9885be0b1717df439280252f24aa19a",
+      "shared_gate_up.0.projections.gate.weight": "3a4f137ba8fae83ad51c897a6d7235c54701f2799145f9ef71a77e0d49e08caa",
+      "shared_gate_up.0.projections.up.weight": "23354591fb902f416267845fb70e893a764fd377c288c0ac52ec82dfdd605779",
+      "shared_down.0.weight": "39b58eefc87e9e2c314a273cd24df4aded5c20f51f2b01ffc54dd7eb2782ebb3"
+    },
+    "routing": {
+      "expert_ids": "f2adbea028d6adcce60298bcff0d6e42bff1d5fd15ae8fc3e15b03e723647eaf",
+      "inverse": "4e1fc0646a0d9c2fa6cb769f550519fae4bb1ef6f35c666eab5ffd429abeec3a"
+    }
+  }
+}

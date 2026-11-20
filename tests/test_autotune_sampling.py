@@ -1,5 +1,6 @@
 """Mixed first-hit pools: legality, quota isolation, identity and resume."""
 import unittest
+from unittest.mock import patch
 from rtx.autotune.sampling import mixed_pool
 from rtx.autotune.effort import AutotunePolicy, make_effort_autotuner
 from rtx.autotune.store import InMemoryTuningStore
@@ -7,6 +8,33 @@ from tests.test_autotune_coverage import adapter, Config
 
 
 class MixedSamplingTests(unittest.TestCase):
+    def test_full_explicit_pool_skips_only_work_that_cannot_enter_pool(self):
+        a=adapter()
+        seeds=[Config(2,2),Config(1,2)]
+        with patch('rtx.autotune.sampling.raw_portfolio',side_effect=AssertionError('unused broad pool')):
+            with patch.object(type(a),'sample',side_effect=AssertionError('unused local pool')):
+                pool,audit=mixed_pool(a,limit=3,seeds=seeds,retrieved=[Config(0,1)],skip_discarded_generation=True)
+        self.assertEqual(pool,[a.initial_config,*seeds])
+        self.assertEqual(audit['counts'],{'seed':3})
+        self.assertEqual(audit['generation_skipped'],'explicit_pool_full')
+
+    def test_legacy_pool_audit_stays_compatible_without_explicit_opt_in(self):
+        a=adapter()
+        pool,audit=mixed_pool(a,limit=3,seeds=[Config(2,2),Config(1,2)])
+        self.assertEqual(len(pool),3)
+        self.assertNotIn('generation_skipped',audit)
+        self.assertTrue(audit['structural_statuses'])
+
+    def test_optimized_diversity_distance_is_exact_for_flattened_configs(self):
+        import random
+        from rtx._sampling import _signature,_signature_distance,distance,flatten
+        rng=random.Random(17)
+        values=[flatten({str(i):rng.choice([None,1,2,'x',True])
+                         for i in range(30) if rng.random()<.7}) for _ in range(20)]
+        for a in values:
+            for b in values:
+                self.assertEqual(distance(a,b),_signature_distance(_signature(a),_signature(b)))
+
     def test_explicit_seeds_are_not_lost_to_pool_fill(self):
         a = adapter()
         seeds = [Config(2, 2), Config(1, 2)]
@@ -41,6 +69,14 @@ class MixedSamplingTests(unittest.TestCase):
         self.assertEqual(len(pool), len({a.config_id(c) for c in pool}))
         self.assertTrue(all(a.rejection(c) is None for c in pool))
         self.assertEqual((pool, audit), mixed_pool(a, limit=8, retrieved=retrieval))
+
+    def test_opt_in_regions_survive_a_seed_saturated_pool(self):
+        a=adapter();protected=[Config(2,2),Config(1,2)]
+        seeds=[Config(i,j) for i in range(3) for j in range(3)]
+        pool,audit=mixed_pool(a,limit=5,seeds=seeds,protected=protected,retrieved=[Config(0,1)])
+        self.assertEqual(pool[:3],[a.initial_config,*protected])
+        self.assertIn(Config(0,1),pool)
+        self.assertEqual(audit['counts']['region'],2)
 
     def test_active_identity_and_small_pool(self):
         a = adapter()

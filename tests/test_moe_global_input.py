@@ -16,7 +16,7 @@ def test_global_input_is_optional_roundtrips_and_has_a_search_axis():
     assert MXFP8MoEConfig.from_dict(config.to_dict())==config
     shape=(2000,768,48,250,6,256)
     adapter=make_moe_adapter(shape,None,initial=DEFAULT_MOE_CONFIG)
-    assert adapter.axes['prepared.input_preparation']==('gather_bf16','quantize_once')
+    assert adapter.axes['prepared.input_preparation']==('gather_bf16','quantize_once','indexed_transpose')
     selected=adapter.update_fn(DEFAULT_MOE_CONFIG,'prepared.input_preparation','quantize_once')
     assert adapter.config_id(selected)!=adapter.config_id(DEFAULT_MOE_CONFIG)
     assert any(c.prepared.input_preparation=='quantize_once' for c in structural_seeds(shape))

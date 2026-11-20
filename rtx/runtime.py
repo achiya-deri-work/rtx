@@ -443,7 +443,7 @@ def runtime_cache_stats() -> dict[str, dict[str, object]]:
     result = {}
     for name in ('fp8', 'fp8_bwd', 'fp4', 'glu', 'mlp', '_mlp_autotune',
                  'fp4_mlp', '_nvfp4_mlp_autotune', '_routing_hard', '_routing_autotune',
-                 '_moe_execution'):
+                 '_moe_execution', '_routing_execution', '_routing_metadata', '_routing_varlen', '_routing_varlen_autotune'):
         module = sys.modules.get(f'rtx.{name}')
         if module is not None:
             for key, value in tuple(vars(module).items()):

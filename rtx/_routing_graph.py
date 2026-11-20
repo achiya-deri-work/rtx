@@ -53,7 +53,7 @@ def append_flat_body(destination,source):
 
 
 class ConditionalRoutingGraph:
-    def __init__(self,initializer,body,loads,phase,e,capacity,rounds,device):
+    def __init__(self,initializer,body,loads,phase,e,capacity,rounds,device,*,condition=None):
         import torch
         import cutlass
         from .kernels.routing_selection import compile_condition
@@ -66,7 +66,7 @@ class ConditionalRoutingGraph:
         self.initializer=cuda.CUgraph(initializer.raw_cuda_graph())
         self.body=cuda.CUgraph(body.raw_cuda_graph())
         self.context=checked(cuda.cuDevicePrimaryCtxRetain(device))
-        self.condition=compile_condition(e,capacity,rounds)
+        self.condition=compile_condition(e,capacity,rounds) if condition is None else condition
         temporary=checked(cuda.cuGraphCreate(0))
         try:
             handle=checked(cuda.cuGraphConditionalHandleCreate(temporary,self.context,1,1))
