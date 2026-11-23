@@ -5,6 +5,12 @@ project follows semantic versioning while it is in active alpha development.
 
 ## Unreleased
 
+- Fix the long-reduction MXFP8 dW scale-transport cliff on half-aligned token
+  counts. Native TMA scales can use a zero-filled final packed tile without
+  padding BF16 inputs. Reach this transport and alternative split counts in
+  light backward autotuning while retaining FP32 partials/reduction and
+  row-major/fused fallbacks. Backward search revision 32, frontend 7.
+
 - Add a public-API BalancedMoE training example and application-side review:
   checkpoint/optimizer restoration, fresh-process tuning-cache reuse, packed
   inputs and standard module workflows. Document the unresolved cold

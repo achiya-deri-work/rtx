@@ -549,11 +549,14 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
     view. No transpose copy exists in GMEM or SMEM.
     """
 
-    def __init__(self, rows: int, k: int, config: MXFP8QuantConfig):
-        super().__init__(rows, k, config)
-        rejection = config.transposed_rejection(rows, k)
+    def __init__(self, rows: int, k: int, config: MXFP8QuantConfig, *, pad_native_k=False):
+        rejection = config._transposed_rejection(rows, k, pad_native_k=pad_native_k)
         if rejection is not None:
             raise ValueError(f"illegal logical-transpose quantizer: {rejection}")
+        packed_k = cute.ceil_div(k, 128) * 128 if pad_native_k else k
+        super().__init__(rows, packed_k, config)
+        self.k = k
+        self.pad_native_k = pad_native_k
         if rows % config.transposed_tile_rows:
             raise ValueError("logical-transpose rows must contain full SMEM tiles")
         rows_per_phase = config.num_warps * config.quant_vec
@@ -562,7 +565,7 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
                 "transposed_tile_rows must be divisible by num_warps * quant_vec"
             )
         self.task_groups = (
-            rows // config.transposed_tile_rows * cute.ceil_div(k, config.transposed_tile_k)
+            rows // config.transposed_tile_rows * cute.ceil_div(packed_k, config.transposed_tile_k)
         )
         sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
         self.grid_ctas = min(
@@ -805,6 +808,7 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
                 task_group,
                 self.scale_tile_rows,
                 self.k,
+                self.pad_native_k,
             )
 
     @cute.jit
@@ -819,6 +823,7 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
         task_group: Int32,
         scale_tile_rows: cutlass.Constexpr,
         k: cutlass.Constexpr,
+        pad_native_k: cutlass.Constexpr = False,
     ):
         """Quantize one tile using two layouts over the same SMEM bytes."""
 
@@ -828,7 +833,9 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         physical_stride = cfg.transposed_tile_rows + cfg.transposed_smem_padding
         blocks_per_tile = cfg.transposed_tile_k // SF_VEC_SIZE
-        k_tiles = cute.ceil_div(k, cfg.transposed_tile_k)
+        k_tiles = cute.ceil_div(
+            cute.ceil_div(k, 128) * 128 if pad_native_k else k, cfg.transposed_tile_k
+        )
         tile_values = cfg.transposed_tile_rows * cfg.transposed_tile_k
         values_per_load = cfg.load_bits // BFloat16.width
         load_tasks = tile_values // values_per_load
@@ -896,7 +903,24 @@ class MXFP8TransposedQuantKernel(MXFP8QuantKernel):
                 src_ptr = src.iterator + src.layout(
                     (row_base + row_local, k_base + k_local)
                 )
-                if cutlass.const_expr(k % cfg.transposed_tile_k != 0):
+                if cutlass.const_expr(pad_native_k):
+                    # Bound the original contiguous BF16 source, not the
+                    # destination. Every padded block is written through the
+                    # usual quantization path, including a finite E8M0 scale.
+                    if k_base + k_local < k:
+                        if cutlass.const_expr(values_per_load == 1):
+                            physical_smem[k_local, row_local] = src[
+                                row_base + row_local, k_base + k_local
+                            ]
+                        else:
+                            loaded = nvvm.load_ext(src_ptr, dtype=Uint16,
+                                                   count=values_per_load).bitcast(BFloat16)
+                            for vec in cutlass.range_constexpr(values_per_load):
+                                physical_smem[k_local, row_local + vec] = loaded[vec]
+                    else:
+                        for vec in cutlass.range_constexpr(values_per_load):
+                            physical_smem[k_local, row_local + vec] = BFloat16(0.0)
+                elif cutlass.const_expr(k % cfg.transposed_tile_k != 0):
                     for vec in cutlass.range_constexpr(values_per_load):
                         value=BFloat16(0.0)
                         if k_base+k_local<k:
@@ -1962,6 +1986,8 @@ def compile_mxfp8_transposed_quant(
     rows: int,
     k: int,
     config: MXFP8QuantConfig = MXFP8QuantConfig(),
+    *,
+    pad_native_k: bool = False,
 ):
     """Compile quantization from a CuTe logical transpose layout.
 
@@ -1969,7 +1995,7 @@ def compile_mxfp8_transposed_quant(
     JIT entry creates its logical ``[rows, K]`` CuTe layout on-chip.
     """
 
-    kernel = MXFP8TransposedQuantKernel(rows, k, config)
+    kernel = MXFP8TransposedQuantKernel(rows, k, config, pad_native_k=pad_native_k)
     src = cute.runtime.make_fake_tensor(
         BFloat16,
         (k, rows),
@@ -1978,11 +2004,11 @@ def compile_mxfp8_transposed_quant(
     )
     quantized = cute.runtime.make_fake_tensor(
         Float8E4M3FN,
-        (rows, cute.ceil_div(k, SF_VEC_SIZE)*SF_VEC_SIZE),
-        stride=(cute.ceil_div(k, SF_VEC_SIZE)*SF_VEC_SIZE, 1),
+        (rows, kernel.storage_k),
+        stride=(kernel.storage_k, 1),
         assumed_align=16,
     )
-    scales = _fake_quant_scales(rows, k, config.scale_layout)
+    scales = _fake_quant_scales(rows, kernel.storage_k if pad_native_k else k, config.scale_layout)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile(
         kernel,

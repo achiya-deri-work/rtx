@@ -104,6 +104,31 @@ def balanced_dw_candidates(problem,initial,sm_count=None):
                 operand_storage='separate')
             if candidate.implementation_rejection(problem) is None:
                 choices.append(candidate)
+    native_choices=[]
+    for tm,am,stages,layout,a_layout in (
+            (128,4,2,'mma128','mma128'),
+            (64,2,1,'mma64x128','mma64')):
+        if p.m % tm or p.n % 128:
+            continue
+        # Both quantizers own their full packed K extent, even when the
+        # last source tile is partial. TMA moves the scales with the FP8 data
+        # and does not need a producer/consumer scale rendezvous per K tile.
+        qa=replace(leg.quant_a,scale_layout=a_layout,transposed_tile_k=32)
+        qn=replace(leg.resolved_quant_b(),scale_layout='mma128',transposed_tile_k=32)
+        gemm=replace(leg.gemm,tile_m=tm,atom_layout_m=am,stages=stages,
+                     scale_layout=layout,scale_role='tma',scale_load_vec=4,
+                     scale_schedule='before_wait',scale_recycle='barrier',
+                     scale_smem_store='scalar',scale_l2_prefetch='none',
+                     scale_l1_evict='default',scale_cache='default')
+        native=replace(leg,quant_a=qa,quant_b=None if qa==qn else qn,gemm=gemm)
+        for parts in (8,16,32,64):
+            if parts*problem.n*problem.k*4>128*1024**2:
+                continue
+            candidate=replace(initial,dw=split_leg(native,problem.m,parts,partition='balanced'),
+                quant_schedule='per_matmul',stream_schedule='single',execution_order='dx_first',
+                operand_storage='separate')
+            if candidate.implementation_rejection(problem) is None:
+                native_choices.append(candidate)
     if sm_count:
         # One/two/four device waves are proposals, not occupancy predictions.
         def rank(c):
@@ -111,7 +136,11 @@ def balanced_dw_candidates(problem,initial,sm_count=None):
             ctas=((p.m+g.tile_m-1)//g.tile_m)*((p.n+g.tile_n-1)//g.tile_n)*c.dw.split_reduction
             return (ctas<sm_count,min(abs(math.log2(ctas/(sm_count*w))) for w in (1,2,4)))
         choices.sort(key=rank)
-    return choices
+        native_choices.sort(key=rank)
+    # Offer the transport change before spending a light budget on many
+    # near-identical producer-staged split counts. Row-major remains legal on
+    # non-native M/N, or when the tuner measures it faster.
+    return native_choices+choices
 
 
 def backward_structural_seeds(problem, initial, *, sm_count=None):
@@ -158,6 +187,15 @@ def backward_structural_seeds(problem, initial, *, sm_count=None):
         complete=replace(balanced[0],dx=dx)
         if complete.implementation_rejection(problem) is None:
             seeds.insert(1,complete)
+        if balanced[0].dw.gemm.scale_role=='tma':
+            # Reserve a second, less overpartitioned TMA candidate while
+            # keeping the first row-major/fused alternatives reachable.
+            alt=next((c for c in balanced[1:] if c.dw.gemm==balanced[0].dw.gemm
+                      and c.dw.split_reduction<balanced[0].dw.split_reduction),None)
+            if alt is not None:
+                complete=replace(alt,dx=dx)
+                if complete.implementation_rejection(problem) is None:
+                    seeds.insert(2,complete)
     return seeds+balanced
 
 

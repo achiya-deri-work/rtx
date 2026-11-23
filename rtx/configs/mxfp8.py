@@ -95,7 +95,19 @@ class MXFP8QuantConfig:
         return None
 
     def transposed_rejection(self, rows: int, k: int) -> str | None:
-        reason = self.rejection(rows, k)
+        return self._transposed_rejection(rows, k)
+
+    def _transposed_rejection(
+        self, rows: int, k: int, *, pad_native_k: bool = False,
+    ) -> str | None:
+        # Standalone backward quantizers can write a complete native packed
+        # tile directly from a masked BF16 source. Keep the default strict for
+        # other callers (notably row/transpose dual and quad quantization).
+        if pad_native_k and (k <= 0 or self.scale_layout == "row_major"
+                            or self.transposed_load_engine != "register"):
+            return "native K padding requires a positive K and register-loaded native scales"
+        packed_k = (k + 127) // 128 * 128 if pad_native_k else k
+        reason = self.rejection(rows, packed_k)
         if reason is not None:
             return reason
         if rows % self.transposed_tile_rows:
@@ -104,9 +116,9 @@ class MXFP8QuantConfig:
             return "transposed_tile_rows must be divisible by num_warps * quant_vec"
         ragged_tail=(self.scale_layout=='row_major' and self.transposed_tile_k==32
                      and self.transposed_load_engine=='register')
-        if k % SF_VEC_SIZE and not ragged_tail:
+        if packed_k % SF_VEC_SIZE and not ragged_tail:
             return "ragged logical-transpose K requires row-major scales and register-loaded 32-value tiles"
-        if k % self.transposed_tile_k and not ragged_tail:
+        if packed_k % self.transposed_tile_k and not ragged_tail:
             return "logical-transpose K must contain full SMEM tiles"
         if self.native_scale_store == "packed" and self.transposed_tile_k != 128:
             return "packed transposed native scales require tile_k=128"

@@ -82,7 +82,7 @@ def compile_mxfp8_backward_quad_quant(*args, **kwargs):
 if TYPE_CHECKING:
     from .autotune import CoordinateDescentPolicy
 
-BWD_FRONTEND_REVISION = 6
+BWD_FRONTEND_REVISION = 7
 
 
 def _zero_tensor_async(tensor: torch.Tensor) -> None:
@@ -121,9 +121,10 @@ def _serial_operand_views(dx_problem, dw_problem, dx_config, dw_config, device):
     within a GEMM. Both runners own views of the same storage for graph pins.
     """
     def shapes(p,c):
-        return ((p.m,p.storage_k),(p.n,p.storage_k),
-                _scale_shape(p.m,p.k,c.quant_a.scale_layout),
-                _scale_shape(p.n,p.k,c.resolved_quant_b().scale_layout))
+        k = c._packed_reduction_k(p)
+        return ((p.m,k),(p.n,k),
+                _scale_shape(p.m,k,c.quant_a.scale_layout),
+                _scale_shape(p.n,k,c.resolved_quant_b().scale_layout))
     left,right=[],[]
     for i,(a,b) in enumerate(zip(shapes(dx_problem,dx_config),shapes(dw_problem,dw_config))):
         dtype=torch.float8_e4m3fn if i<2 else torch.float8_e8m0fnu
@@ -436,14 +437,16 @@ def _build_matmul_runner(
                 b_orientation=config.b_orientation,
             )
         )
-    a_shape = (problem.m, problem.storage_k)
-    b_shape = (problem.n, problem.storage_k)
+    packed_k = config._packed_reduction_k(problem)
+    pad_native_k = config._pads_native_reduction(problem)
+    a_shape = (problem.m, packed_k)
+    b_shape = (problem.n, packed_k)
     quant_b_config = config.resolved_quant_b()
     if operands is None:
         quantized_a = torch.empty(a_shape, dtype=torch.float8_e4m3fn, device=device)
         quantized_b = torch.empty(b_shape, dtype=torch.float8_e4m3fn, device=device)
-        scales_a = _allocate_scales(problem.m,problem.k,config.quant_a.scale_layout,device)
-        scales_b = _allocate_scales(problem.n,problem.k,quant_b_config.scale_layout,device)
+        scales_a = _allocate_scales(problem.m,packed_k,config.quant_a.scale_layout,device)
+        scales_b = _allocate_scales(problem.n,packed_k,quant_b_config.scale_layout,device)
     else:
         quantized_a,quantized_b,scales_a,scales_b = operands
     if not compile_quantizer:
@@ -471,12 +474,13 @@ def _build_matmul_runner(
             if config.b_orientation == "transpose"
             else compile_mxfp8_quant
         )
-        quant_a_launcher = compile_a(problem.m, problem.k, config.quant_a)
-        quant_b_launcher = compile_b(problem.n, problem.k, quant_b_config)
+        kwargs = {"pad_native_k": True} if pad_native_k else {}
+        quant_a_launcher = compile_a(problem.m, problem.k, config.quant_a, **kwargs)
+        quant_b_launcher = compile_b(problem.n, problem.k, quant_b_config, **kwargs)
     workspace = None
     reducer = None
     zero_workspace = False
-    packed_problem=MXFP8Problem(problem.m,problem.n,problem.storage_k)
+    packed_problem=MXFP8Problem(problem.m,problem.n,packed_k)
     if config.reduction == "split_fp32_workspace":
         workspace = split_workspace(
             config.split_reduction * problem.m * problem.n,
@@ -1755,8 +1759,9 @@ def mxfp8_linear_backward(
     """Compute BF16 dX and dW using independently quantized MXFP8 GEMMs.
 
     Leading dimensions of ``x`` and ``grad_output`` are flattened into the
-    token/reduction dimension. Ragged reductions use the fused path and are
-    zero-filled only through the final on-chip 32-value MXFP8 scale block.
+    token/reduction dimension. The fused fallback handles ragged dimensions.
+    Eligible decomposed split dW schedules can zero-fill the last native TMA
+    scale tile while packing the logical reduction, without a BF16 copy.
     """
 
     if x.ndim < 1 or grad_output.ndim < 1 or weight.ndim != 2:

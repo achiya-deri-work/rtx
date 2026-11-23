@@ -76,6 +76,20 @@ class MXFP8BwdMatmulConfig:
         quant_b = self.resolved_quant_b()
         return replace(self, quant_b=None if quant_b == self.quant_a else quant_b)
 
+    def _pads_native_reduction(self, problem: MXFP8Problem) -> bool:
+        """Only standalone transpose/transpose workspace dW owns a padded K."""
+        return (
+            problem.k % 128 != 0 and self.backend == "decomposed"
+            and self.reduction == "split_fp32_workspace"
+            and self.a_orientation == self.b_orientation == "transpose"
+            and self.quant_launches == "separate"
+            and self.gemm.scale_layout in ("mma128", "mma64x128")
+        )
+
+    def _packed_reduction_k(self, problem: MXFP8Problem) -> int:
+        return ((problem.k + 127) // 128 * 128 if self._pads_native_reduction(problem)
+                else problem.storage_k)
+
     def rejection(self, problem: MXFP8Problem) -> str | None:
         if self.a_orientation not in ("row", "transpose"):
             return "A orientation must be row or transpose"
@@ -207,15 +221,16 @@ class MXFP8BwdMatmulConfig:
         if problem.k%32 and self.quant_launches!='separate':
             return "ragged decomposed reductions require separate quantizer launches"
         quant_b = self.resolved_quant_b()
+        pad_native_k = self._pads_native_reduction(problem)
         reason = (
-            self.quant_a.transposed_rejection(problem.m, problem.k)
+            self.quant_a._transposed_rejection(problem.m, problem.k, pad_native_k=pad_native_k)
             if self.a_orientation == "transpose"
             else self.quant_a.rejection(problem.m, problem.k)
         )
         if reason is not None:
             return f"A quantizer: {reason}"
         reason = (
-            quant_b.transposed_rejection(problem.n, problem.k)
+            quant_b._transposed_rejection(problem.n, problem.k, pad_native_k=pad_native_k)
             if self.b_orientation == "transpose"
             else quant_b.rejection(problem.n, problem.k)
         )
@@ -340,7 +355,9 @@ class MXFP8BwdMatmulConfig:
             or self.tile_locality != "raster"
         ):
             return "static tile scheduling has no persistence/reuse coordinates"
-        return self.gemm.rejection(problem)
+        gemm_problem = (MXFP8Problem(problem.m, problem.n, self._packed_reduction_k(problem))
+                        if pad_native_k else problem)
+        return self.gemm.rejection(gemm_problem)
 
     def implementation_rejection(self, problem: MXFP8Problem) -> str | None:
         reason = self.rejection(problem)

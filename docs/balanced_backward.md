@@ -23,6 +23,15 @@ Allowed counts are powers of two through 128. Fused/atomic/cluster split
 support is unchanged; large counts are not silently enabled in those paths.
 No BF16 operand padding or physical transpose is introduced.
 
+Split dW can also use TMA for E8M0 scales when the output widths admit a
+native scale layout, even if the logical token reduction ends mid-tile.
+The standalone transpose-aware quantizers mask the original BF16 loads and
+write zeros plus finite scales into the final **packed** 128-value tile.
+There is no BF16 pad/copy kernel. The TMA transaction barrier covers both
+operand data and scales, so the producer and consumers no longer rendezvous
+on a separate scale-ready barrier every K tile. The existing row-major and
+fused fallbacks remain intact.
+
 For example, M=208192 and tile-K=128 gives 1627 tiles. Uniformly assigning
 26 tiles to each of 64 partitions would create an empty last partition.
 Balanced mode instead gives each partition 25 or 26 tiles and covers the
@@ -44,7 +53,10 @@ the normal backward-config argument.
 
 The shared search adds compound `dw_balanced` moves covering legal 64×64,
 64×128, 128×64 and 128×128 row-major output geometries and independently
-selected split counts. Proposals preserve each operand's numerical policy.
+selected split counts, plus native 128×128 and 64×128 TMA-scale proposals
+where legal. The long-reduction opening gives the native transport family
+and a second split count a chance before local refinement. Proposals
+preserve each operand's numerical policy.
 Automatic candidates are bounded to small-output problems and at most 128 MiB
 of partial workspace per leg; this is a search/resource bound, not an API shape
 restriction. Explicit legal schedules remain available outside that subset.
@@ -58,8 +70,9 @@ so that a small budget can discover preparation savings without more splits.
 
 Uniform default fields are omitted from canonical backward dictionaries, and
 old JSON schedules continue to load with uniform semantics. Search/runtime
-identities are updated: backward search 30, backward frontend 6, MLP search 44
-(including the later both-orientation recompute expansion).
+identities for this change are backward search 32 and backward frontend 7.
+Explicit old schedules still have their old behavior; retune them to select
+native transport.
 Do not transplant winners from another device, source or application fixture.
 
 ## Qualification and deployment boundary
@@ -69,7 +82,9 @@ Both laptop 5070 and laptop 5060 passed the initial 19-case suite on Torch
 long/ragged reductions through 208192 rows, changed-buffer graphs and compiled
 recomputed-MLP output plus all gradients. Follow-up memory/legacy regression
 results are recorded with the implementation report, not inferred from this
-initial suite. No 5090 timing or real G2DETR training improvement is asserted.
+initial suite. The [5090 transport follow-up](g2detr_long_dw_20261123.md)
+measures the reported G2DETR dW geometry and paired linear backward, not a
+whole-detector training improvement.
 
 The focused application-policy driver composes the existing tuner, independent
 oracle, residual store and paired deployment qualification:
