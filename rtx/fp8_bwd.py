@@ -363,6 +363,10 @@ def _build_matmul_runner(
     workspace_lane: str = 'ordered',
 ) -> _MatmulRunner | _FusedMatmulRunner | _SplitFusedMatmulRunner | _AtomicSplitFusedMatmulRunner:
     from .execution import split_workspace
+    from .kernels.mxfp8_bwd import BF16_DW_BACKEND
+    if config.backend == BF16_DW_BACKEND:
+        from ._cublas_dw import CublasBF16DW
+        return _FusedMatmulRunner(CublasBF16DW(problem))
     if config.backend == "fused":
         if config.reduction == "split_fp32_workspace":
             workspace = split_workspace(
@@ -639,7 +643,10 @@ class _BwdAutotuneRequest:
 
 def _bwd_measurement_variant(policy):
     mode = getattr(policy, 'backward_measurement_mode', 'host')
-    return 'default' if mode in ('host','auto') else f'measurement_{mode}_v1'
+    variant = 'default' if mode in ('host','auto') else f'measurement_{mode}_v1'
+    if getattr(policy, 'allow_bf16_dw', True):
+        return f'{variant}_bf16_dw_v1'
+    return variant
 
 
 _MEASUREMENT_REQUEST_PREFIX = 'bwd-measurement-v1:'
@@ -866,6 +873,9 @@ def _resolve_bwd_context(
                 selected = load_cached_mxfp8_bwd_config(
                     problem, device=x.device, cache_dir=request.cache_dir
                 )
+                if (selected is not None and selected.dw.backend == "cublas_bf16"
+                        and not getattr(request.policy, "allow_bf16_dw", True)):
+                    selected = None
             if selected is None and request.mode in ("balanced", "coordinate"):
                 with runtime_tuning_lock(winner_key, root=request.cache_dir):
                     selected = load_runtime_winner(
@@ -1843,6 +1853,9 @@ def mxfp8_linear_backward(
                     device=x.device,
                     cache_dir=autotune_cache_dir,
                 )
+                if (cached is not None and cached.dw.backend == "cublas_bf16"
+                        and not getattr(tuning_policy, "allow_bf16_dw", True)):
+                    cached = None
             if cached is not None:
                 selected = cached
             elif mode in ("balanced", "coordinate"):

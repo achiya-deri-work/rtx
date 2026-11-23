@@ -368,7 +368,8 @@ class MLPCandidate:
         mix = None if mix_values is None else MLPExecutionMix(**mix_values)
         m, k, h, o = self.shape
         key = _mlp_runtime_winner_key(MXFP8Problem(m, 2*h, k), o, self.activation,
-            self.phase == 'train', spec['initial'], False, mix, device=device)
+            self.phase == 'train', spec['initial'], False, mix, device=device,
+            allow_bf16_dw=spec['policy'].get('allow_bf16_dw', True))
         # Same eligibility as require_cached_(): never increase effort or fall
         # back to the initial config. A missing/invalid winner is a coverage gap.
         selected = load_runtime_winner(key, MXFP8MLPConfig.from_dict,

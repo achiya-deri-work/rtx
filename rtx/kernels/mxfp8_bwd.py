@@ -19,6 +19,8 @@ from .mxfp8 import (
 )
 from ..configs import MXFP8GemmConfig, MXFP8QuantConfig
 
+BF16_DW_BACKEND = "cublas_bf16"
+
 
 @dataclass(frozen=True, slots=True)
 class MXFP8BwdMatmulConfig:
@@ -95,8 +97,18 @@ class MXFP8BwdMatmulConfig:
             return "A orientation must be row or transpose"
         if self.b_orientation not in ("row", "transpose"):
             return "B orientation must be row or transpose"
+        if self.backend == BF16_DW_BACKEND:
+            if (self.a_orientation, self.b_orientation) != ("transpose", "transpose"):
+                return "cuBLAS BF16 is a transpose/transpose dW backend only"
+            if (self.reduction != "full_fp32" or self.split_reduction != 1
+                    or self.reduction_tile != 0 or self.split_partition != "uniform"
+                    or self.workspace_epilogue != "none" or self.tile_scheduler != "static"):
+                return "cuBLAS BF16 dW owns its FP32 reduction and scheduling"
+            if max(problem.m, problem.n, problem.k) >= 2**31:
+                return "cuBLAS BF16 dW dimensions must fit int32"
+            return None
         if self.backend not in ("fused", "decomposed"):
-            return "backend must be fused or decomposed"
+            return "backend must be fused, decomposed, or cublas_bf16"
         if self.split_partition not in ("uniform", "balanced"):
             return "split_partition must be uniform or balanced"
         if self.split_partition == "balanced" and (

@@ -291,7 +291,7 @@ def test_measured_long_shared_strict_runtime_cache(tmp_path,monkeypatch):
     spec=layer.export_tuning_spec()
     initial=spec['initial']
     problem=MXFP8Problem(m,2*h,k)
-    key=_mlp_runtime_winner_key(problem,o,'silu',True,initial,False,None,device=device)
+    key=_mlp_runtime_winner_key(problem,o,'silu',True,initial,False,None,device=device,allow_bf16_dw=True)
     evidence_id=hashlib.sha256(raw).hexdigest()
     winner=winners.save_runtime_winner(key,measured.to_dict(),root=cache,
         config_id=stable_id(measured.to_dict()),median_ms=side['median_ms'],

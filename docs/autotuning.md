@@ -211,6 +211,28 @@ logical tails, changed-input graph replay, persistent cache hits and stable
 live allocations. These are bounded qualification results, not universal
 shape/SKU certification. See [evidence and limits](operand_preparation_plan.md).
 
+## Final BF16 weight-gradient trial
+
+The usual MXFP8 linear backward tuner reserves its last trial for cuBLAS
+BF16 dW. dX keeps the best measured MXFP8 configuration. The mixed candidate
+must pass the independent BF16-input FP32 dW reference and improve
+complete backward latency before it can win. cuBLAS writes into the
+existing dW buffer with FP32 reduction; it takes the original BF16
+operands without packing or materializing a transpose.
+
+MXFP8 MLP training with an effort policy uses the same comparison for
+both weight gradients and measures the whole MLP. It retains both
+MXFP8 input-gradient kernels and accounts for producing any BF16
+intermediates that a packed-only plan omitted.
+
+The trial counts against the configured budget. A one-trial budget
+keeps the native seed; an exhausted time budget can skip the comparison.
+Cache keys distinguish mixed-precision-enabled searches from strict
+MXFP8 searches. To keep dW MXFP8, pass
+`tuning_policy=rtx.AutotunePolicy.preset("balanced", allow_bf16_dw=False)`.
+Inference, explicit backward configs, and experimental preparation
+selection are unchanged.
+
 ## GLU/MLP distinction
 
 Feature-branch modules default to tuning off, but accept the same

@@ -1542,6 +1542,8 @@ def make_mxfp8_bwd_adapter(
                         if smem_limit and required > smem_limit
                         else None
                     )
+                elif matmul.backend == "cublas_bf16":
+                    reason = None
                 else:
                     reason = _gemm_smem_rejection(matmul.gemm, device)
                 if reason is not None:
@@ -1565,6 +1567,12 @@ def make_mxfp8_bwd_adapter(
                 values.update(cached)
                 continue
             keys_before = set(values)
+            if matmul.backend == "cublas_bf16":
+                # Library-internal tiling, split-K, and launch count are not
+                # known to RTX. Never report native quantization geometry.
+                values[f"{name}_backend_cublas_bf16"] = 1.0
+                values[f"{name}_total_kernel_launches"] = 1.0  # lower bound
+                continue
             if matmul.backend == "fused":
                 fused = matmul.fused
                 profile = _device_dict(device)
@@ -1897,7 +1905,7 @@ def make_mxfp8_bwd_adapter(
             if is_quad
             else sum(
                 0
-                if matmul.backend == "fused"
+                if matmul.backend != "decomposed"
                 else (1 if matmul.quant_launches == "dual" else 2)
                 for matmul in (dx_matmul, dw_matmul)
             )

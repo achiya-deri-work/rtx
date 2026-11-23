@@ -56,17 +56,20 @@ def deferred_spec(config, precision, mode, policy, cache_dir, *, training_mix=No
         cache_dir=None if cache_dir is None else str(Path(cache_dir).expanduser())), sort_keys=True)
 
 
-def _runtime_variant(out_features,activation,training,initial,replay,mix=None,*,dw_opening=None):
+def _runtime_variant(out_features,activation,training,initial,replay,mix=None,*,dw_opening=None,
+                     allow_bf16_dw=False):
     """Preserve legacy identities only when the legacy objective is requested."""
     from .autotune.core import stable_id
     return stable_id(dict(out_features=out_features,activation=activation,
         training=training,initial=initial,frontend_revision=2,
         measurement_mode='private_replay' if replay else 'selected_direct',
+        **({'bf16_dw_final_trial':1} if training and allow_bf16_dw else {}),
         **({'independent_dw_opening_revision':dw_opening} if dw_opening is not None else {}),
         **({'execution_mix':mix.contract()} if mix is not None else {})))
 
 
-def _mlp_runtime_winner_key(problem, out_features, activation, training, initial, replay, mix, *, device):
+def _mlp_runtime_winner_key(problem, out_features, activation, training, initial, replay, mix, *, device,
+                            allow_bf16_dw=False):
     """Scope the new search identity to potentially affected training plans."""
     from .mlp import MXFP8MLPConfig
     from .autotune.mlp import (MLP_AUTOTUNE_REVISION, MLP_INDEPENDENT_DW_OPENING_REVISION,
@@ -80,7 +83,8 @@ def _mlp_runtime_winner_key(problem, out_features, activation, training, initial
         revision=MLP_INDEPENDENT_DW_OPENING_REVISION
     return runtime_winner_key('mxfp8_recompute_mlp',problem,device=device,
         kernel_revision=MLP_AUTOTUNE_REVISION,
-        variant=_runtime_variant(out_features,activation,training,initial,replay,mix,dw_opening=revision))
+        variant=_runtime_variant(out_features,activation,training,initial,replay,mix,dw_opening=revision,
+                                 allow_bf16_dw=allow_bf16_dw))
 
 
 @lru_cache(maxsize=128)
@@ -142,7 +146,7 @@ def _select(x, gu, down, activation, spec_key, training, *, replay=False):
         root = default_cache_dir() if spec["cache_dir"] is None else Path(spec["cache_dir"])
         problem = MXFP8Problem(x.numel() // x.shape[-1], gu.shape[0], x.shape[-1])
         key = _mlp_runtime_winner_key(problem,down.shape[0],activation,training,spec['initial'],replay,mix,
-                                      device=x.device)
+                                      device=x.device,allow_bf16_dw=policy.allow_bf16_dw)
         def cached():
             return load_runtime_winner(key, MXFP8MLPConfig.from_dict, root=root,
                 tuning_policy=policy if spec["mode"] == "balanced" else None)

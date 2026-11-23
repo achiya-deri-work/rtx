@@ -5,6 +5,21 @@ import math
 from .kernels.mxfp8 import MXFP8Problem
 
 
+def bf16_dw_challenger(config):
+    """Change only weight-gradient arithmetic; keep the chosen dX kernels."""
+    from .kernels.mxfp8_bwd import BF16_DW_BACKEND, MXFP8BwdMatmulConfig
+
+    return replace(
+        config,
+        dw=MXFP8BwdMatmulConfig(a_orientation="transpose", b_orientation="transpose",
+                               backend=BF16_DW_BACKEND),
+        quant_schedule="per_matmul",
+        operand_storage="separate",
+        execution_order="dx_first" if config.execution_order == "interleaved"
+        else config.execution_order,
+    )
+
+
 def reduction_chunk(length, parts, alignment):
     """Smallest aligned covering chunk; legality still rejects empty partitions."""
     return ((length + parts * alignment - 1) // (parts * alignment)) * alignment
@@ -260,6 +275,9 @@ def active_backward_dict(config):
     result=asdict(config.normalized())
     for name in ('dx','dw'):
         leg=result[name]
+        if leg['backend']=='cublas_bf16':
+            result[name]={field:leg[field] for field in ('backend','a_orientation','b_orientation')}
+            continue
         if leg['split_partition']=='uniform':
             leg.pop('split_partition')
         inactive=('quant_a','quant_b','quant_launches','gemm') if leg['backend']=='fused' else ('fused',)
@@ -277,6 +295,10 @@ def backward_coverage(configs, problem):
     for config in configs:
         for name,m,n in (('dx',problem.m,problem.k),('dw',problem.n,problem.k)):
             leg=getattr(config,name)
+            if leg.backend=='cublas_bf16':
+                row=dict(backend=leg.backend,reduction=leg.reduction)
+                if row not in result[name]:result[name].append(row)
+                continue
             tile=leg.fused if leg.backend=='fused' else leg.gemm
             row=dict(backend=leg.backend,reduction=leg.reduction,parts=leg.split_reduction,
                 split_partition=leg.split_partition,

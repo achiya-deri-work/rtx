@@ -20,6 +20,8 @@ class AutotunePolicy:
     a higher max_trials resumes durable history; runtime winner hits refine
     only with ``cache_behavior='refine'``. Time is a soft admission limit: an in-flight
     compilation/measurement is not preempted. Research priors require opt-in.
+    Set `allow_bf16_dw=False` to disable the last cuBLAS weight-gradient trial
+    for standard MXFP8 backward and effort-tuned MXFP8 MLP training.
     """
     max_trials: int = 16
     search_schedule: str = 'legacy'
@@ -52,6 +54,7 @@ class AutotunePolicy:
     backward_measurement_mode: str = 'host'
     forward_trials: int | None = None
     backward_trials: int | None = None
+    allow_bf16_dw: bool = True
     preparation_selection: bool = False
 
     def __post_init__(self):
@@ -61,6 +64,8 @@ class AutotunePolicy:
             raise ValueError('region_coverage must be bool')
         if type(self.preparation_selection) is not bool:
             raise ValueError('preparation_selection must be bool')
+        if type(self.allow_bf16_dw) is not bool:
+            raise ValueError('allow_bf16_dw must be bool')
         if self.backward_measurement_mode not in ('host','cuda_graph','auto'):
             raise ValueError('backward_measurement_mode must be host, cuda_graph or auto')
         if type(self.ranked_opening_trials) is not int or not 0 <= self.ranked_opening_trials <= 2:
@@ -136,6 +141,9 @@ class AutotunePolicy:
         import hashlib
         from .core import stable_id
         values=asdict(self)
+        # Terminal dW is scoped to the affected runtime keys and adapters.
+        # It does not change forward-only policy/evidence identity.
+        values.pop('allow_bf16_dw')
         if values['backward_measurement_mode']=='host':
             values.pop('backward_measurement_mode')
         if not values['ranked_opening_trials']:
@@ -364,6 +372,10 @@ def make_effort_autotuner(adapter,store,policy,*,progress=None,candidates=(),sta
         TuningBudget(policy.max_trials,policy.max_seconds),seed=policy.seed,
         max_trials_includes_resumed=True,transfer_history=False,coverage_proposals=coverage,
         confirmation=ConfirmationPolicy(policy.confirmation_repeats,.02,True),progress=progress,started_at=started_at)
+    if (policy.allow_bf16_dw and adapter.context.tags.get('bf16_dw_final_trial')
+            and adapter.context.family == 'mxfp8_bwd'):
+        from .._bwd_search import bf16_dw_challenger
+        tuner.final_proposal = lambda c: Proposal(bf16_dw_challenger(c), 'final_challenger')
     if progressive:
         from dataclasses import asdict
         from .core import stable_id
@@ -371,6 +383,7 @@ def make_effort_autotuner(adapter,store,policy,*,progress=None,candidates=(),sta
         # online-model fit state is not enabled in this initial schedule;
         # frozen prior arms, local search and exploration are restartable.
         contract = asdict(policy)
+        contract.pop('allow_bf16_dw')
         if contract['backward_measurement_mode']=='host':
             contract.pop('backward_measurement_mode')
         if not contract['ranked_opening_trials']:
@@ -418,7 +431,9 @@ def tune_legacy_effort(kind,x,weight,*,policy,initial,axes,cache_dir,progress,gr
     adapter=factory(evaluator.problem,evaluator,initial=initial,axes=axes,device=DeviceFingerprint.current(x.device),
         tags={'measurement':'effort_v1','warmup':policy.warmup,'samples':policy.samples,
               'calls_per_sample':policy.calls_per_sample,'correctness_rtol':rtol,'correctness_atol':atol,
-              **({'measurement_mode':policy.backward_measurement_mode} if kind=='backward' else {})})
+              **({'measurement_mode':policy.backward_measurement_mode,
+                  **({'bf16_dw_final_trial': 1} if policy.allow_bf16_dw else {})}
+                 if kind=='backward' else {})})
     from .runtime_coordinates import runtime_schedule_adapter
     adapter=runtime_schedule_adapter(adapter)
     root=(default_cache_dir() if cache_dir is None else Path(cache_dir))/'effort'/adapter.context.identifier

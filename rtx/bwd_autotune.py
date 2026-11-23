@@ -1082,6 +1082,22 @@ class BwdJsonTuningDatabase:
             return None
         return bwd_config_from_dict(best["config"]), float(best["median_ms"])
 
+    def best_native(self, problem: MXFP8Problem) -> tuple[MXFP8BwdConfig, float] | None:
+        """A terminal vendor winner must not become a native search basin."""
+        with self._locked():
+            trials = self._read()["trials"]
+        best = None
+        for row in trials.values():
+            if row["config"]["dw"]["backend"] == "cublas_bf16":
+                continue
+            outcome = TrialOutcome.from_dict(row["outcome"])
+            if not outcome.timing_eligible or (best is not None and outcome.median_ms >= best[1]):
+                continue
+            config = bwd_config_from_dict(row["config"])
+            if config.implementation_rejection(problem) is None:
+                best = config, float(outcome.median_ms)
+        return best
+
 
 class MXFP8BwdEvaluator:
     def __init__(
@@ -1101,6 +1117,7 @@ class MXFP8BwdEvaluator:
         self.policy = policy
         self.problem = MXFP8Problem(x.shape[0], weight.shape[0], x.shape[1])
         self._reference: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._bf16_dw_reference: torch.Tensor | None = None
 
     def reference(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._reference is None:
@@ -1141,6 +1158,12 @@ class MXFP8BwdEvaluator:
             max_error: float | None = None
             if self.policy.correctness != "none":
                 ref_dx, ref_dw = self.reference()
+                if config.dw.backend == "cublas_bf16" and self.policy.correctness != "torch":
+                    if self._bf16_dw_reference is None:
+                        self._bf16_dw_reference = (
+                            self.grad_output.float().T @ self.x.float()
+                        ).to(torch.bfloat16)
+                    ref_dw = self._bf16_dw_reference
                 max_error = max(
                     float((dx.float() - ref_dx.float()).abs().max()),
                     float((dw.float() - ref_dw.float()).abs().max()),
@@ -1339,8 +1362,14 @@ class BwdCoordinateDescentTuner:
         self.started = time.monotonic()
         self.session = self.database.start_session(self.policy)
         status = "failed"
+        final_trial = self.policy.allow_bf16_dw and self.policy.max_trials != 1
+        search_trials = None if self.policy.max_trials is None else self.policy.max_trials - int(final_trial)
+        search_seconds = self.policy.time_budget_s - (
+            min(.5, .1 * self.policy.time_budget_s) if final_trial else 0.)
         try:
             cached = self.database.best() if self.policy.resume else None
+            if cached is not None and cached[0].dw.backend == "cublas_bf16":
+                cached = self.database.best_native(self.evaluator.problem)
             if cached is not None and cached[0].implementation_rejection(self.evaluator.problem) is not None:
                 self._log("SKIP  cached best violates current legality; using initial seed")
                 cached = None
@@ -1356,8 +1385,8 @@ class BwdCoordinateDescentTuner:
                         sm_count=getattr(getattr(self.database,'fingerprint',None),'multiprocessor_count',None))
                         if 'dw_backend' in self.axes and 'dw_reduction' in self.axes else [])
             for candidate in structural[:3]:
-                if (time.monotonic()-self.started >= self.policy.time_budget_s or
-                    (self.policy.max_trials is not None and self.evaluated>=self.policy.max_trials)):
+                if (time.monotonic()-self.started >= search_seconds or
+                    (search_trials is not None and self.evaluated>=search_trials)):
                     break
                 outcome=self._evaluate(candidate,-1,'structural_family',None)
                 if outcome.successful and float(outcome.median_ms)<best_score:
@@ -1388,10 +1417,10 @@ class BwdCoordinateDescentTuner:
                     for coordinate in coordinates:
                         if (
                             time.monotonic() - self.started
-                            >= self.policy.time_budget_s
+                            >= search_seconds
                             or (
-                                self.policy.max_trials is not None
-                                and self.evaluated >= self.policy.max_trials
+                                search_trials is not None
+                                and self.evaluated >= search_trials
                             )
                         ):
                             budget_stop = True
@@ -1402,10 +1431,10 @@ class BwdCoordinateDescentTuner:
                         for variant in variants:
                             if (
                                 time.monotonic() - self.started
-                                >= self.policy.time_budget_s
+                                >= search_seconds
                                 or (
-                                    self.policy.max_trials is not None
-                                    and self.evaluated >= self.policy.max_trials
+                                    search_trials is not None
+                                    and self.evaluated >= search_trials
                                 )
                             ):
                                 budget_stop = True
@@ -1435,6 +1464,13 @@ class BwdCoordinateDescentTuner:
                     best_config, best_score = current, current_score
                 if budget_stop:
                     break
+            if final_trial and time.monotonic() - self.started < self.policy.time_budget_s:
+                from ._bwd_search import bf16_dw_challenger
+                candidate = bf16_dw_challenger(best_config)
+                if candidate != best_config and candidate.implementation_rejection(self.evaluator.problem) is None:
+                    final = self._evaluate(candidate, -1, "final_challenger", None)
+                    if final.timing_eligible and final.median_ms < best_score * (1 - self.policy.min_improvement):
+                        best_config, best_score = candidate, float(final.median_ms)
             status = "budget_exhausted" if budget_stop else "complete"
             self.database.select(best_config, best_score, self.session)
             return BwdTuningResult(

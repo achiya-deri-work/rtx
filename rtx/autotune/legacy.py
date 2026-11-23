@@ -150,6 +150,7 @@ class CoordinateDescentPolicy:
     randomize_coordinates: bool = False
     seed: int = 0
     coordinate_order: tuple[str, ...] = FWD_COORDINATE_ORDER
+    allow_bf16_dw: bool = True
 
     def __post_init__(self) -> None:
         if self.time_budget_s <= 0:
@@ -164,6 +165,8 @@ class CoordinateDescentPolicy:
             raise ValueError("warmup must be nonnegative and timing counts positive")
         if not 0 <= self.min_improvement < 1:
             raise ValueError("min_improvement must be in [0, 1)")
+        if type(self.allow_bf16_dw) is not bool:
+            raise ValueError("allow_bf16_dw must be bool")
 
 
 @dataclass(frozen=True, slots=True)

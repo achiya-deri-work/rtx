@@ -134,6 +134,8 @@ def main():
         graphs[name] = graph
         graph.replay()
         ref = reference.float()
+        if name != "bf16" and configs[name].backend == "cublas_bf16":
+            ref = (dy.float().T @ x.float()).bfloat16().float()
         delta = out.float() - ref
         ref_rms = ref.square().mean().sqrt()
         rms = delta.square().mean().sqrt()

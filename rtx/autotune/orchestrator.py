@@ -144,6 +144,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         self.finalist_margin = 0.005
         self.finalist_reserve_s = 0.
         self.effort_contract = None
+        self.final_proposal: Callable[[ConfigT], Proposal[ConfigT] | None] | None = None
 
     def _log(self, started: float, message: str) -> None:
         if self.progress is not None:
@@ -166,7 +167,10 @@ class AutotuneOrchestrator(Generic[ConfigT]):
 
     def _tune_locked(self) -> ComposableTuningResult[ConfigT]:
         started = time.monotonic() if self.started_at is None else self.started_at
-        search_seconds = max(0., self.budget.time_budget_s - self.finalist_reserve_s)
+        final_seconds = max(0., self.budget.time_budget_s - self.finalist_reserve_s)
+        terminal = self.final_proposal is not None and self.budget.max_trials > 1
+        search_limit = self.budget.max_trials - int(terminal)
+        search_seconds = max(0., final_seconds - (min(.5, .1 * final_seconds) if terminal else 0.))
         rng = random.Random(self.seed)
         restored: list[Observation[ConfigT]] = []
         if self.resume:
@@ -189,7 +193,9 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                     restored.append(observation)
                 except (KeyError, TypeError, ValueError):
                     continue
-        history = SearchHistory(restored, self.adapter.context.identifier)
+        final_records = [o for o in restored if o.strategy == "final_challenger"]
+        history = SearchHistory([o for o in restored if o.strategy != "final_challenger"],
+                                self.adapter.context.identifier)
         by_config = {}
         for item in history.current:
             by_config.setdefault(item.config_id, []).append(item)
@@ -204,11 +210,12 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         abandoned_ids = {
             str(item.get("config_id", "")) for item in abandoned
         } - {""}
-        abandoned_ids -= {o.config_id for o in history.current}
+        abandoned_ids -= {o.config_id for o in restored if o.context_id == self.adapter.context.identifier}
         history.excluded_config_ids.update(abandoned_ids)
-        resumed_active = (
-            len(history.current) + len(abandoned_ids) if self.max_trials_includes_resumed else 0
-        )
+        resumed_native = len(history.current) + len(abandoned_ids) if self.max_trials_includes_resumed else 0
+        resumed_final = (sum(o.context_id == self.adapter.context.identifier for o in final_records)
+                         if self.max_trials_includes_resumed else 0)
+        resumed_active = resumed_native + resumed_final
         session_id = self.store.start_session(
             self.adapter.context,
             {
@@ -423,7 +430,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 # measurement. Recovery can rebuild state from this evidence.
                 self.store.record_observation(observation)
                 raise
-            if self.checkpoint_key:
+            if self.checkpoint_key and proposal.strategy != "final_challenger":
                 observation.metadata['search_checkpoint'] = dict(
                     key=self.checkpoint_key, count=len(history.current), rng=rng.getstate(),
                     history_digest=stable_id([(o.config_id, o.outcome.status) for o in history.current]),
@@ -457,7 +464,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         initial_id = self.adapter.config_id(self.adapter.initial_config)
         if (
             initial_id not in history.seen_ids | abandoned_ids
-            and resumed_active + evaluated < self.budget.max_trials
+            and resumed_active + evaluated < search_limit
             and time.monotonic()-started<search_seconds
         ):
             initial = run(Proposal(self.adapter.initial_config, "initial"))
@@ -475,7 +482,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
         # confirmations and history; they are not unrecorded pilot timings.
         coverage_evaluated = 0
         for proposal in self.coverage_proposals:
-            if (resumed_active + evaluated >= self.budget.max_trials
+            if (resumed_active + evaluated >= search_limit
                     or time.monotonic() - started >= search_seconds):
                 break
             if self.adapter.config_id(proposal.config) in history.seen_ids:
@@ -488,10 +495,10 @@ class AutotuneOrchestrator(Generic[ConfigT]):
 
         names = tuple(self.strategies)
         empty_attempts = 0
-        while resumed_active + evaluated < self.budget.max_trials:
+        while resumed_active + evaluated < search_limit:
             if time.monotonic() - started >= search_seconds:
                 break
-            trial_index = resumed_active + evaluated
+            trial_index = resumed_native + evaluated
             arm_name = self.scheduler.select(names, statistics, trial_index)
             if arm_name is None:
                 break
@@ -594,6 +601,25 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 and item.outcome.max_abs_error is not None
                 and math.isfinite(item.outcome.max_abs_error)), None)
             raise NoEligibleTimingError(None if checked_seed is None else checked_seed.config)
+        final_observation = None
+        if terminal:
+            proposal = self.final_proposal(best.config)
+            if proposal is not None and self.adapter.rejection(proposal.config) is None:
+                proposal.strategy = "final_challenger"
+                proposal.parent_config_id = best.config_id
+                cid = self.adapter.config_id(proposal.config)
+                if cid != best.config_id:
+                    if (cid not in abandoned_ids and resumed_active + evaluated < self.budget.max_trials
+                            and time.monotonic() - started < final_seconds):
+                        final_observation = run(proposal)
+                    else:
+                        final_observation = next((o for o in reversed(final_records)
+                            if o.context_id == self.adapter.context.identifier and o.config_id == cid), None)
+                        if final_observation is not None:
+                            history.observations.append(final_observation)
+                    if (final_observation is not None and final_observation.outcome.timing_eligible
+                            and final_observation.score < best.score * (1 - self.finalist_margin)):
+                        best = final_observation
         decision = None
         search_elapsed = time.monotonic() - started
         selected_score = best.score
@@ -624,6 +650,7 @@ class AutotuneOrchestrator(Generic[ConfigT]):
                 "evaluated_trials": evaluated,
                 "elapsed_s": elapsed,
                 "resumed_trials": resumed_active,
+                "final_challenger": None if final_observation is None else final_observation.config_id,
                 "stop_reason": ('trial_budget' if resumed_active+evaluated>=self.budget.max_trials
                                 else 'confirmation_reserve' if search_elapsed>=search_seconds and self.finalist_reserve_s
                                 else 'time_budget' if elapsed>=self.budget.time_budget_s else 'search_exhausted'),
@@ -648,7 +675,9 @@ class AutotuneOrchestrator(Generic[ConfigT]):
             evaluated_trials=evaluated,
             elapsed_s=elapsed,
             strategy_trials={**{name: arm.pulls for name, arm in statistics.items()},
-                             **({"coverage": coverage_evaluated} if self.coverage_proposals else {})},
+                             **({"coverage": coverage_evaluated} if self.coverage_proposals else {}),
+                             **({"final_challenger": int(final_observation.session_id == session_id)}
+                                if final_observation is not None else {})},
             store_path=None if self.store.path is None else str(self.store.path),
             winner_decision=decision,
             tuning_evidence=(None if self.effort_contract is None else dict(

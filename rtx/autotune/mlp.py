@@ -47,17 +47,20 @@ def mlp_geometry_features(config,m,k,h,o,profile,precision="mxfp8",phase="train"
     down=config.down if precision=="mxfp8" and config.down_backend=="onchip" else config.down_gemm
     roles={"gate_up":(m,2*h if precision=="mxfp8" else h,k,gate,1),
            "down":(m,o,h,down,1)}
+    result={}
     for name,rows,cols,reduction,bwd in (
         ("gate_dx",m,k,2*h,config.gate_backward.dx),
         ("gate_dw",2*h,k,m,config.gate_backward.dw),
         ("down_dx",m,h,o,config.down_backward.dx),
         ("down_dw",o,h,m,config.down_backward.dw)):
         if phase=="train":
+            if bwd.backend=="cublas_bf16":
+                result[name+".backend_cublas_bf16"]=1.0
+                continue
             roles[name]=(rows,cols,reduction,bwd.fused if bwd.backend=="fused" else bwd.gemm,bwd.split_reduction)
     if phase=="train":
         recompute=config.gate_up if config.recompute_backend=="onchip" else config.recompute.gemm
         roles["recompute"]=(m,2*h if precision=="mxfp8" else h,k,recompute if precision=="mxfp8" else gate,1)
-    result={}
     for name,(rows,cols,reduction,schedule,split) in roles.items():
         ctas=((rows+schedule.tile_m-1)//schedule.tile_m)*((cols+schedule.tile_n-1)//schedule.tile_n)*split
         values=geometry_features(m=rows,n=cols,k=reduction,tile_m=schedule.tile_m,
@@ -118,6 +121,9 @@ def active_schedule(config,precision,phase):
                 bwd.pop('operand_storage',None)
             for name in ("dx","dw"):
                 leg=bwd[name]
+                if leg["backend"] == "cublas_bf16":
+                    bwd[name]={field:leg[field] for field in ("backend","a_orientation","b_orientation")}
+                    continue
                 inactive=("quant_a","quant_b","gemm","quant_launches") if leg["backend"]=="fused" else ("fused",)
                 for field in inactive:
                     leg.pop(field,None)
@@ -139,7 +145,7 @@ def active_schedule(config,precision,phase):
     return result
 
 
-def reference(x,gu,down,dy,activation,precision="mxfp8"):
+def reference(x,gu,down,dy,activation,precision="mxfp8",*,bf16_dw=(False,False)):
     """Independent FP32 arithmetic, with explicit per-GEMM MXFP8 rounding."""
     def q(t):
         width=t.shape[1]
@@ -156,7 +162,7 @@ def reference(x,gu,down,dy,activation,precision="mxfp8"):
     h=(a*u).bfloat16() if precision=="bf16_gate" else q(a*u).bfloat16()
     y=((q(h) if precision=="bf16_gate" else h.float())@q(down).T).bfloat16()
     dh=(q(dy)@q(down.T).T).bfloat16().float()
-    dd=(q(dy.T)@q(h.T).T).bfloat16()
+    dd=((dy.float().T@h.float()) if bf16_dw[1] else (q(dy.T)@q(h.T).T)).bfloat16()
     if activation=="silu":
         s=torch.sigmoid(g);d=s*(1+g*(1-s))
     elif activation=="gelu":
@@ -165,14 +171,14 @@ def reference(x,gu,down,dy,activation,precision="mxfp8"):
         d=(g>0).float()
     dp=torch.cat((dh*u*d,dh*a),-1).bfloat16()
     dx=(q(dp)@q(gu.T).T).bfloat16()
-    dg=(q(dp.T)@q(x.T).T).bfloat16()
+    dg=((dp.float().T@x.float()) if bf16_dw[0] else (q(dp.T)@q(x.T).T)).bfloat16()
     return y,dx,dg,dd
 
 
 def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT_MLP_CONFIG,
                      precision="mxfp8",warmup=3,samples=7,calls_per_sample=3,
                      measurement_mode="outer_capture",_reference_cache=None,execution_mix=None,
-                     _calibrated_timing=None):
+                     _calibrated_timing=None,_bf16_dw_final=False):
     mix=execution_mix if execution_mix is not None else (MLPExecutionMix() if phase=='train' else MLPExecutionMix(training_pairs=0,inference_forwards=1))
     if not isinstance(mix,MLPExecutionMix):
         raise TypeError('execution_mix must be MLPExecutionMix')
@@ -208,6 +214,7 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
             expected=reference(x,gu,down,dy,activation,precision)
         if _reference_cache is not None:
             _reference_cache['values']=(dy,expected)
+    mixed_references = {} if _reference_cache is None else _reference_cache.setdefault('mixed_dw', {})
     axes={f"gate_up.{name}":values for name,values in GLU_SEARCH_SPACE.items()}
     # Activation arithmetic is a user numerical policy, not a timing choice.
     axes.pop("gate_up.glu_silu_math",None)
@@ -543,7 +550,16 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
             stream.synchronize()
             errors=[]
             numerics={}
-            for name,a,b in zip(('output','dx','dgate_up','ddown'),actual,expected):
+            bf16_dw = tuple(getattr(c, group).dw.backend == "cublas_bf16"
+                            for group in ("gate_backward", "down_backward"))
+            candidate_expected = expected
+            if phase == "train" and any(bf16_dw):
+                if bf16_dw not in mixed_references:
+                    with torch.no_grad():
+                        mixed_references[bf16_dw] = reference(
+                            x,gu,down,dy,activation,precision,bf16_dw=bf16_dw)
+                candidate_expected = mixed_references[bf16_dw]
+            for name,a,b in zip(('output','dx','dgate_up','ddown'),actual,candidate_expected):
                 difference=a.detach().float()-b.float()
                 error=(difference.norm()/b.float().norm().clamp_min(1e-20)).item()
                 errors.append(error)
@@ -589,6 +605,7 @@ def make_mlp_adapter(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT
                                     "structural_seed_revision":17,
                                     "skip_discarded_pool_generation":True,
                                     "recompute_pipeline_search_revision":1,
+                                    **({'bf16_dw_final_trial':1} if _bf16_dw_final else {}),
                                     **({'independent_dw_opening_revision':MLP_INDEPENDENT_DW_OPENING_REVISION}
                                        if dw_opening else {}),
                                     **({'execution_mix':mix.contract()} if execution_mix is not None else {}),
@@ -1008,6 +1025,21 @@ def mlp_structural_seeds(adapter,precision,phase):
     return unique
 
 
+def _mlp_bf16_dw_challenger(config):
+    from .._bwd_search import bf16_dw_challenger
+
+    # Both BF16 dWs need original BF16 dP and hidden, not the two packed
+    # transposed intermediates emitted by the quantized-only variant.
+    return replace(
+        config,
+        gate_backward=bf16_dw_challenger(config.gate_backward),
+        down_backward=bf16_dw_challenger(config.down_backward),
+        hidden_quantization="separate",
+        gradient_quantization=("recompute" if config.gradient_quantization == "recompute_both"
+                               else config.gradient_quantization),
+    )
+
+
 def make_mlp_tuner(adapter,store,policy,*,progress=None,candidates=(),started_at=None):
     """Shared engine, with complete output-transport recipes before local moves."""
     from .effort import make_effort_autotuner
@@ -1015,6 +1047,8 @@ def make_mlp_tuner(adapter,store,policy,*,progress=None,candidates=(),started_at
     candidates=tuple(candidates)
     tuner=make_effort_autotuner(adapter,store,policy,progress=progress,
                               candidates=candidates,started_at=started_at)
+    if policy.allow_bf16_dw and adapter.context.tags.get('bf16_dw_final_trial'):
+        tuner.final_proposal = lambda c: Proposal(_mlp_bf16_dw_challenger(c), 'final_challenger')
     ranked=any(name=='frozen_ranker' or name.startswith('portable_') for name in tuner.strategies)
     if (adapter.context.workload.get('precision')=='mxfp8'
             and not ranked and not policy.initial_neighborhood_trials
@@ -1030,9 +1064,9 @@ def make_mlp_tuner(adapter,store,policy,*,progress=None,candidates=(),started_at
                 key=adapter.config_id(c)
                 if key not in seen and adapter.rejection(c) is None:
                     protected.append(Proposal(c,'structural'));seen.add(key)
-                if len(protected)==6:break
+                if len(protected)==(5 if tuner.final_proposal is not None else 6):break
             for proposal in coverage:
-                if len(protected)>=6:break
+                if len(protected)>=(5 if tuner.final_proposal is not None else 6):break
                 key=adapter.config_id(proposal.config)
                 if key not in seen:
                     protected.append(proposal);seen.add(key)
@@ -1084,10 +1118,12 @@ def tune_mxfp8_mlp(x,gu,down,*,activation="silu",phase="train",initial=DEFAULT_M
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("tune before CUDA graph capture")
         reference_cache={}
+        bf16_dw_final = (phase == "train" and precision == "mxfp8" and tuning_policy is not None
+                         and tuning_policy.allow_bf16_dw)
         adapter=make_mlp_adapter(x,gu,down,activation=activation,phase=phase,initial=initial,precision=precision,
                                  warmup=warmup,samples=samples,calls_per_sample=calls_per_sample,
                                  measurement_mode=measurement_mode,_reference_cache=reference_cache,
-                                 execution_mix=execution_mix)
+                                 execution_mix=execution_mix,_bf16_dw_final=bf16_dw_final)
         if tuning_policy is not None and tuning_policy.search_schedule == 'progressive':
             from .runtime_coordinates import runtime_schedule_adapter
             adapter=runtime_schedule_adapter(adapter)
