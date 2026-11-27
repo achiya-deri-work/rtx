@@ -188,6 +188,11 @@ No caller scratch/stream management. [Layer guide](docs/balanced_moe.md) ·
 [Runnable training example](examples/balanced_moe.py) ·
 [Measured BF16 comparison](docs/mxfp8_bf16_broad_20261120.md).
 
+Training recomputes routed intermediates by default. To also benchmark saved
+activations and a final eligible BF16 cuBLAS weight-gradient trial, pass
+`tuning_policy=rtx.AutotunePolicy.preset("quick", allow_saved_moe=True)`.
+Set `allow_bf16_dw=False` on that policy to keep both gradients on the MXFP8 path.
+
 Inputs must be contiguous BF16. This remains experimental, not a general
 speedup over compiled BF16 MoE. **Known integration limitations:** cold
 first-hit tuning under `torch.inference_mode()` fails (use `torch.no_grad()`

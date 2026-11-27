@@ -31,7 +31,7 @@ def _product(a,b):
 
 
 @torch.no_grad()
-def operational_reference(x,gu,down,ids,weights,inverse,dy=None):
+def operational_reference(x,gu,down,ids,weights,inverse,dy=None,*,bf16_dw=False):
     n,d=x.shape
     e,c=ids.shape
     h=down.shape[2]
@@ -52,10 +52,10 @@ def operational_reference(x,gu,down,ids,weights,inverse,dy=None):
     dh=_product(quantize_decode(slot_dy),quantize_decode(down.transpose(1,2))).bfloat16()
     dp=torch.cat((dh.float()*up*sigmoid*(1+gate*(1-sigmoid)),
                   dh.float()*activation),-1).bfloat16()
-    ddown=_product(quantize_decode(slot_dy.transpose(1,2)),
-                   quantize_decode(hidden.bfloat16().transpose(1,2))).bfloat16()
-    dgu=_product(quantize_decode(dp.transpose(1,2)),
-                 quantize_decode(gathered.transpose(1,2))).bfloat16()
+    operand=(lambda a:a) if bf16_dw else quantize_decode
+    ddown=_product(operand(slot_dy.transpose(1,2)),
+                   operand(hidden.bfloat16().transpose(1,2))).bfloat16()
+    dgu=_product(operand(dp.transpose(1,2)),operand(gathered.transpose(1,2))).bfloat16()
     dxg=_product(quantize_decode(dp),quantize_decode(gu.transpose(1,2))).bfloat16()
     dx=dxg.flatten(0,1)[inverse].float().sum(1).bfloat16()
     return result,dx,dgu,ddown,dweights

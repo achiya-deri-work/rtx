@@ -7,6 +7,7 @@ _LAZY_EXPORTS = {
     "VirtualLayer": ("virtual", "VirtualLayer"),
     "BalancedRouter": ("routing", "BalancedRouter"),
     "BalancedMoE": ("moe", "BalancedMoE"),
+    "balanced_moe_checkpoint_policy": ("moe", "balanced_moe_checkpoint_policy"),
     "MXFP8MoEConfig": ("moe", "MXFP8MoEConfig"),
     "MXFP8PreparedMoEConfig": ("configs.moe", "MXFP8PreparedMoEConfig"),
     "mxfp8_routed_experts": ("moe", "mxfp8_routed_experts"),

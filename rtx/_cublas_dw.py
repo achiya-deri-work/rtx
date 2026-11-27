@@ -27,6 +27,12 @@ def _bindings():
         ptr, num, num, ptr, ptr, num, num, num, num,
     )
     lib.cublasGemmEx.restype = num
+    stride = C.c_longlong
+    lib.cublasGemmStridedBatchedEx.argtypes = (
+        ptr, num, num, num, num, num, ptr, ptr, num, num, stride,
+        ptr, num, num, stride, ptr, ptr, num, num, stride, num, num, num,
+    )
+    lib.cublasGemmStridedBatchedEx.restype = num
     for mode, suffix in (("MathMode", ""), ("PointerMode", "_v2")):
         get = getattr(lib, f"cublasGet{mode}{suffix}")
         get.argtypes, get.restype = (ptr, C.POINTER(num)), num
@@ -43,9 +49,12 @@ def _check(status, action):
 class CublasBF16DW:
     """Uses PyTorch's current device/stream BLAS handle; creates no tensors."""
 
-    __slots__ = ("lib", "rows", "cols", "tokens")
+    __slots__ = ("lib", "rows", "cols", "tokens", "batches")
 
-    def __init__(self, problem):
+    def __init__(self, problem, batches=1):
+        if type(batches) is not int or batches < 1:
+            raise ValueError("Expected a positive expert batch")
+        self.batches = batches
         self.rows, self.cols, self.tokens = problem.m, problem.n, problem.k
         self.lib = _bindings()
 
@@ -67,6 +76,15 @@ class CublasBF16DW:
                 try:
                     # Row-major dW = dY.T @ X corresponds to a column-major
                     # dW.T = X.T @ dY. No transpose view or copy is required.
+                    if self.batches > 1:
+                        _check(lib.cublasGemmStridedBatchedEx(
+                            handle, _OP_N, _OP_T, self.cols, self.rows, self.tokens,
+                            C.byref(_ONE), x.data_ptr(), _CUDA_R_16BF, self.cols, self.tokens*self.cols,
+                            dy.data_ptr(), _CUDA_R_16BF, self.rows, self.tokens*self.rows,
+                            C.byref(_ZERO), out.data_ptr(), _CUDA_R_16BF, self.cols, self.rows*self.cols,
+                            self.batches, _COMPUTE_32F, _GEMM_DEFAULT,
+                        ), "GemmStridedBatchedEx")
+                        return
                     _check(lib.cublasGemmEx(
                         handle, _OP_N, _OP_T, self.cols, self.rows, self.tokens,
                         C.byref(_ONE), x.data_ptr(), _CUDA_R_16BF, self.cols,

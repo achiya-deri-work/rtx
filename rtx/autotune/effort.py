@@ -22,6 +22,10 @@ class AutotunePolicy:
     compilation/measurement is not preempted. Research priors require opt-in.
     Set `allow_bf16_dw=False` to disable the last cuBLAS weight-gradient trial
     for standard MXFP8 backward and effort-tuned MXFP8 MLP training.
+    Experimental `allow_saved_moe=True` also admits saved routed activations
+    to MoE training search. Where supported, the last in-budget challenger
+    uses batched BF16 cuBLAS for expert weight gradients only, unless
+    `allow_bf16_dw=False`. This trades activation memory for recomputation.
     """
     max_trials: int = 16
     search_schedule: str = 'legacy'
@@ -56,8 +60,11 @@ class AutotunePolicy:
     backward_trials: int | None = None
     allow_bf16_dw: bool = True
     preparation_selection: bool = False
+    allow_saved_moe: bool = False
 
     def __post_init__(self):
+        if type(self.allow_saved_moe) is not bool:
+            raise ValueError('allow_saved_moe must be bool')
         if self.prior_search not in ('hybrid','retrieval','ranker'):
             raise ValueError('prior_search must be hybrid, retrieval or ranker')
         if type(self.region_coverage) is not bool:
@@ -144,6 +151,7 @@ class AutotunePolicy:
         # Terminal dW is scoped to the affected runtime keys and adapters.
         # It does not change forward-only policy/evidence identity.
         values.pop('allow_bf16_dw')
+        values.pop('allow_saved_moe')
         if values['backward_measurement_mode']=='host':
             values.pop('backward_measurement_mode')
         if not values['ranked_opening_trials']:

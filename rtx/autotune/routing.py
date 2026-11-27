@@ -74,7 +74,7 @@ def make_routing_adapter(n,e,k,evaluator,*,initial=None,phase='train',device=Non
                        backward=backward_seed if phase=='forward' else (
                            replace(c.backward,row_groups=1) if warp else c.backward),
                        flat_column_shards_backward=0 if phase=='forward' else c.flat_column_shards_backward,
-                       packed_column_cache_items=0,packed_row_backend='cta',
+                       packed_column_cache_items=0,packed_row_backend='cta',packed_repair_backend='mixed',
                        packed_column_shards_forward=0,packed_column_shards_backward=0,
                        packed_qb_column_backend='row_major',packed_sinkhorn_backend='staged',packed_persistent_threads=0)
     initial=normalize(initial)

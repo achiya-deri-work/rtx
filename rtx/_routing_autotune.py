@@ -28,7 +28,7 @@ def decode_token(values):
 
 def execution_config(token):
     from .routing import ROUTING_TOKEN_SIZE
-    sizes=(10,14,15,17,19,20,22,ROUTING_TOKEN_SIZE)
+    sizes=(10,14,15,17,19,20,22,25,ROUTING_TOKEN_SIZE)
     if token.device.type!='cpu' or token.dtype!=torch.int64 or token.ndim!=1 or token.numel() not in sizes:
         raise ValueError(f'Routing execution token must be CPU int64 with length in {sizes}; CUDA readback is forbidden')
     return decode_token(tuple(token.tolist()))

@@ -61,6 +61,17 @@ def test_opening_actual_prefix_and_progressive_checkpoint(tmp_path):
     assert [r['config_id'] for r in read()]==prefixes[-1]
 
 
+def test_bounded_detector_search_times_repair_alternative(tmp_path):
+    lengths=(1680,1512,1512,1512,1470,1470,1470,1470,1386,1323,1323,1323,
+             1134,1134,1029,756,0)
+    tuner,read=_engine(tmp_path,lengths=lengths)
+    tuner.tune()
+    rows=read()
+    assert len(rows)==8 and rows[0]['config'].get('packed_repair_backend','mixed')=='mixed'
+    assert any(r['strategy']=='structural' and r['config'].get('packed_repair_backend')=='split_warp'
+               for r in rows)
+
+
 def test_forward_only_and_legacy_keep_the_challenger_and_controls(tmp_path):
     legacy=replace(EFFORT,max_trials=4,search_schedule='legacy')
     tuner,rows=_engine(tmp_path/'legacy',policy=legacy)

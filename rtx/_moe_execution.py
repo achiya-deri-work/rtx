@@ -459,7 +459,11 @@ def references(value):
 def plan(key):
     from .moe import _parse
     shape,config_key,phase=json.loads(key)
-    builder=Builder(tuple(shape),_parse(config_key),phase).build()
+    builder_type=Builder
+    if phase.startswith('saved_'):
+        from ._moe_saved import SavedBuilder
+        builder_type=SavedBuilder
+    builder=builder_type(tuple(shape),_parse(config_key),phase).build()
     aliases=getattr(builder,'aliases',{})
     last=[b.birth for b in builder.buffers]
     for index,(_,_,_,arguments) in enumerate(builder.steps):

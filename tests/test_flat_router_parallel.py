@@ -16,9 +16,9 @@ def parallel():
 def test_token_migration_and_parallel_roundtrip():
     from rtx._routing_autotune import execution_config
     c=parallel();default=RoutingKernelConfig()
-    assert ROUTING_TOKEN_SIZE==25 and RoutingKernelConfig.from_token(c.to_token())==c
+    assert ROUTING_TOKEN_SIZE==26 and RoutingKernelConfig.from_token(c.to_token())==c
     assert RoutingKernelConfig.from_dict(c.to_dict())==c
-    for size in (10,14,15,17,19,20,22):
+    for size in (10,14,15,17,19,20,22,25):
         assert execution_config(torch.tensor(default.to_token()[:size]))==default
     for kwargs in (dict(flat_row_backend='unknown'),dict(flat_column_shards_forward=True),
                    dict(flat_column_shards_backward=3)):

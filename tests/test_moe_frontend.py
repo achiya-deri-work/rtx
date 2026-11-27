@@ -30,6 +30,37 @@ def test_advanced_and_existing_explicit_config_remain_supported():
             rtx.BalancedMoE(16,8,16,top_k=k,shared_hidden_features=16)
 
 
+def test_refining_effort_preserves_memory_and_precision_permissions():
+    from rtx.moe import _refinement_policy
+    policy = rtx.AutotunePolicy.preset("quick", allow_saved_moe=True, allow_bf16_dw=False,
+                                       backward_measurement_mode="cuda_graph", forward_trials=4)
+    model = layer(tuning_policy=policy)
+    refined = _refinement_policy(model.tuning_policy, "thorough")
+    assert refined.allow_saved_moe and not refined.allow_bf16_dw
+    assert refined.max_trials == 32 and refined.for_pass(False).max_trials == 32
+    assert refined.backward_measurement_mode == "cuda_graph"
+    assert refined.cache_behavior == "refine" and policy.cache_behavior == "reuse"
+    assert _refinement_policy(policy,None).forward_trials == 4
+
+
+def test_public_selective_checkpoint_policy_delegates_other_ops():
+    from torch.utils.checkpoint import CheckpointPolicy as P
+    import rtx._routing_varlen  # register operators without launching CUDA
+    hard = torch.ops.rtx_routing.varlen_hard.default
+    other = torch.ops.aten.add.Tensor
+    default = rtx.balanced_moe_checkpoint_policy()
+    assert default(None, hard) is P.MUST_SAVE
+    assert default(None, other) is P.PREFER_RECOMPUTE
+    calls = []
+    def fallback(ctx, op, *args, **kw):
+        calls.append((ctx, op, args, kw))
+        return P.MUST_RECOMPUTE
+    composed = rtx.balanced_moe_checkpoint_policy(fallback)
+    assert composed(None, hard) is P.MUST_SAVE
+    assert composed("ctx", other, 1, alpha=2) is P.MUST_RECOMPUTE
+    assert calls == [("ctx", other, (1,), {"alpha": 2})]
+
+
 @pytest.mark.parametrize('shared',[0,1,2])
 def test_dense_equals_packed_with_all_cpu_gradients(shared):
     model=layer(backend='torch',num_shared_experts=shared)

@@ -85,6 +85,13 @@ def _fake(dtype,rows,cols,alignment=16):
 
 
 @lru_cache(maxsize=128)
+def compile_batched_bf16_dw(experts, rows, cols, tokens):
+    from .._cublas_dw import CublasBF16DW
+    from .mxfp8 import MXFP8Problem
+    return CublasBF16DW(MXFP8Problem(rows, cols, tokens), batches=experts)
+
+
+@lru_cache(maxsize=128)
 def compile_expert_quant(experts,specs,config,transpose_mode='staged',grid_mode='operand',warp_tokens=8,warp_raster='features'):
     from .mxfp8_moe_prepared import compile_expert_quant as original
     return original(experts,specs,config,transpose_mode,grid_mode,warp_tokens,warp_raster,_byte_scales=True)

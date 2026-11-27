@@ -53,7 +53,7 @@ def append_flat_body(destination,source):
 
 
 class ConditionalRoutingGraph:
-    def __init__(self,initializer,body,loads,phase,e,capacity,rounds,device,*,condition=None):
+    def __init__(self,initializer,body,loads,phase,e,capacity,rounds,device,*,condition=None,early=None):
         import torch
         import cutlass
         from .kernels.routing_selection import compile_condition
@@ -64,9 +64,10 @@ class ConditionalRoutingGraph:
             f'({missing}); install rtx-blackwell[routing]. Tested cuda-python: 13.3.1.')
         self.device=device;self.graph=None;self.executable=None;self.context=None
         self.initializer=cuda.CUgraph(initializer.raw_cuda_graph())
-        self.body=cuda.CUgraph(body.raw_cuda_graph())
         self.context=checked(cuda.cuDevicePrimaryCtxRetain(device))
-        self.condition=compile_condition(e,capacity,rounds) if condition is None else condition
+        condition=compile_condition(e,capacity,rounds) if condition is None else condition
+        stages=[(body,condition)] if early is None else [early,(body,condition)]
+        self.stages=[]
         temporary=checked(cuda.cuGraphCreate(0))
         try:
             handle=checked(cuda.cuGraphConditionalHandleCreate(temporary,self.context,1,1))
@@ -75,13 +76,15 @@ class ConditionalRoutingGraph:
             # above loads the kernel; never execute a setter as a warmup launch.
             capture=torch.cuda.Stream(device=device)
             capture.wait_stream(torch.cuda.current_stream(device))
-            self.condition_template=torch.cuda.CUDAGraph(keep_graph=True)
-            with torch.cuda.graph(self.condition_template,stream=capture):
-                self.condition(loads,phase.view(-1),cutlass.Uint64(int(handle)))
-            capture.synchronize()
-            template_nodes=nodes(cuda.CUgraph(self.condition_template.raw_cuda_graph()))
-            if len(template_nodes)!=1:raise RuntimeError('Expected one CuTe conditional-predicate node')
-            self.condition_node=template_nodes[0]
+            for stage,predicate in stages:
+                template=torch.cuda.CUDAGraph(keep_graph=True)
+                with torch.cuda.graph(template,stream=capture):
+                    predicate(loads,phase.view(-1),cutlass.Uint64(int(handle)))
+                capture.synchronize()
+                template_nodes=nodes(cuda.CUgraph(template.raw_cuda_graph()))
+                if len(template_nodes)!=1:raise RuntimeError('Expected one CuTe conditional-predicate node')
+                # Keep functions and owning CUDAGraphs alive for future outer captures.
+                self.stages.append((stage,predicate,template,template_nodes[0]))
         finally:checked(cuda.cuGraphDestroy(temporary))
         self.graph=checked(cuda.cuGraphCreate(0))
         self.append(self.graph,[])
@@ -97,8 +100,8 @@ class ConditionalRoutingGraph:
         node=checked(cuda.cuGraphAddNode(graph,deps or None,None,len(deps),params))
         return node,params.conditional.phGraph_out[0]
 
-    def _add_check(self,graph,deps,handle):
-        params=checked(cuda.cuGraphNodeGetParams(self.condition_node))
+    def _add_check(self,graph,deps,handle,node):
+        params=checked(cuda.cuGraphNodeGetParams(node))
         # This private CuTe kernel's ABI is (loads*, phase*, uint64 handle).
         # Copy pointer addresses, never mutate the driver's original storage.
         previous=ctypes.cast(params.kernel.kernelParams,ctypes.POINTER(ctypes.c_void_p))
@@ -106,17 +109,18 @@ class ConditionalRoutingGraph:
         arguments=(ctypes.c_void_p*3)(previous[0],previous[1],ctypes.addressof(value))
         params.kernel.kernelParams=ctypes.addressof(arguments)
         result=checked(cuda.cuGraphAddNode(graph,deps or None,None,len(deps),params))
-        checked(cuda.cuGraphKernelNodeCopyAttributes(result,self.condition_node))
+        checked(cuda.cuGraphKernelNodeCopyAttributes(result,node))
         return result
 
     def append(self,graph,deps):
-        initial=checked(cuda.cuGraphAddChildGraphNode(graph,deps or None,len(deps),self.initializer))
-        handle=checked(cuda.cuGraphConditionalHandleCreate(graph,self.context,1,1))
-        first=self._add_check(graph,[initial],handle)
-        loop,body=self._add_conditional(graph,[first],handle)
-        last=append_flat_body(body,self.body)
-        self._add_check(body,[last],handle)
-        return loop
+        previous=checked(cuda.cuGraphAddChildGraphNode(graph,deps or None,len(deps),self.initializer))
+        for stage,_,_,node in self.stages:
+            handle=checked(cuda.cuGraphConditionalHandleCreate(graph,self.context,1,1))
+            first=self._add_check(graph,[previous],handle,node)
+            previous,body=self._add_conditional(graph,[first],handle)
+            last=append_flat_body(body,cuda.CUgraph(stage.raw_cuda_graph()))
+            self._add_check(body,[last],handle,node)
+        return previous
 
     def launch(self,stream):
         stream=cuda.CUstream(stream)

@@ -185,6 +185,50 @@ def _retire_preparation(graph, device):
             _stats['retired_storage_bytes'] += tensor_storage_bytes(removed)
 
 
+def _uses_rtx(compiled):
+    source = getattr(compiled, 'source_code', '') or ''
+    return any(marker in source for marker in (
+        '_rtx_', 'torch.ops.rtx.', 'torch.ops.rtx_routing.',
+    ))
+
+
+def _virtual_weight_view_backward(compiled):
+    # AOTAutograd can compile VirtualLayer's packed-gradient split separately
+    # in DDP. After lowering it contains only reinterpret_tensor views; there
+    # are no RTX op names left in the generated wrapper. Attribute this case
+    # by the originating function, not by a tensor shape or a global device.
+    if (getattr(compiled, 'kernel_free_cudagraph', False) is not True
+            or getattr(compiled, 'partition_maps', None) != []):
+        return False
+    import re
+    graph = getattr(compiled, 'inductor_post_grad_graph_str', '') or ''
+    return re.search(r'^\s*# Backward of forward node: File: [^\n]*[/\\]rtx[/\\]virtual\.py:\d+ in backward, code:',
+                     graph, re.MULTILINE) is not None
+
+
+def _guard_backward_generation(original):
+    """Skip a backward tree handoff when its forward had no CUDA graph.
+
+    Inductor only sets the device box while wrapping an eligible forward
+    graph or partition. A skipped backward can still reach the handoff with
+    that box unset (e.g. after cold CPU-token MoE selection). Looking up a
+    manager by the backward's device would be incorrect: it could belong to
+    a different compiled graph. Keep normal notices for paired forwards
+    and leave unrelated graphs on the stock Inductor path.
+    """
+    @wraps(original)
+    def notify(compiled, boxed_forward_device_index):
+        if (boxed_forward_device_index is not None
+                and boxed_forward_device_index.value is None
+                and compiled.current_callable is not None
+                and compiled.fx_kwargs.get('is_backward')
+                and (_uses_rtx(compiled) or _virtual_weight_view_backward(compiled))):
+            return None
+        return original(compiled, boxed_forward_device_index)
+
+    return notify
+
+
 def install():
     """Install the tested cold-path integration without initializing CUDA."""
     global _installed
@@ -192,7 +236,8 @@ def install():
         if _installed:
             return
         from torch._inductor import cudagraph_trees as trees
-        from torch._inductor.output_code import CompiledFxGraph
+        from torch._inductor import output_code
+        CompiledFxGraph = output_code.CompiledFxGraph
         from .execution import ExecutionResources, current_owner
         manager_type = trees.CUDAGraphTreeManager
         warmup, record = manager_type.run_eager, manager_type.record_function
@@ -209,10 +254,8 @@ def install():
         @wraps(post_compile)
         def post_compile_with_resources(compiled, *args, **kwargs):
             result = post_compile(compiled, *args, **kwargs)
-            source = getattr(compiled, 'source_code', '') or ''
             target = compiled.current_callable
-            if (target is not None and ('_rtx_' in source or 'torch.ops.rtx.' in source
-                                       or 'torch.ops.rtx_routing.' in source)
+            if (target is not None and _uses_rtx(compiled)
                     and not getattr(target, '_rtx_compiled_resources', False)):
                 owner = ManagedResources()
 
@@ -281,6 +324,11 @@ def install():
         manager_type.run_eager = run_eager
         manager_type.record_function = record_function
         CompiledFxGraph.post_compile = post_compile_with_resources
+        # This is an Inductor-internal compatibility hook. On versions that
+        # do not expose the helper, keep the existing post-compile path.
+        notify = getattr(output_code, 'maybe_handle_backward_generation', None)
+        if notify is not None:
+            output_code.maybe_handle_backward_generation = _guard_backward_generation(notify)
         _installed = True
 
 

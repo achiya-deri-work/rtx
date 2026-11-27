@@ -32,7 +32,7 @@ _LOG=logging.getLogger('rtx.moe.autotune')
 @lru_cache(maxsize=1)
 def source_revision():
     root=Path(__file__).resolve().parents[1]
-    names=('moe.py','_moe_reference.py','autotune/moe.py','kernels/mxfp8_moe.py',
+    names=('moe.py','_moe_reference.py','_moe_saved.py','_cublas_dw.py','autotune/moe.py','kernels/mxfp8_moe.py',
            'kernels/mxfp8_fwd.py','kernels/mxfp8_glu.py','kernels/mxfp8_mlp.py',
            'kernels/mxfp8.py','kernels/mxfp8_moe_onchip.py','configs/glu.py',
            '_execution_plan_token.py','_moe_prepared.py','_moe_execution.py','_moe_selection.py','_moe_shared.py','configs/moe.py','configs/mxfp8.py',
@@ -112,6 +112,12 @@ def prepared_row_store_features(config,shape,phase):
 
 def rejection(config,shape,phase='train'):
     from ..configs.moe_backward import token_reduce_rejection
+    if config.training_state!='recompute':
+        p=config.prepared
+        if (phase!='train' or config.family!='grouped_prepared' or p.forward_engine!='packed'
+                or p.forward_row_layout!='original' or p.active_prefix or p.quant.scale_layout!='row_major'
+                or shape[1]%32 or shape[5]%32 or p.physical_capacity(shape[3])%32 or p.gate_dw_engine=='indexed'):
+            return 'Saved experts require static original rows and aligned, row-major grouped prepared GEMMs'
     if why:=token_reduce_rejection(config,shape,phase):return why
     if config.family=='grouped_prepared':
         if why:=config.prepared.compact_forward_rejection(shape):return why
@@ -594,9 +600,16 @@ def make_moe_adapter(shape,evaluator,*,initial=DEFAULT_MOE_CONFIG,phase='train',
     @lru_cache(maxsize=4096)
     def identifier(config):
         return stable_id(serialize(config))
+    def legal(c):
+        if c.training_state!='recompute':
+            state=(tags or {}).get('saved_expert_trial')
+            if not state or (c.training_state=='saved_bf16_dw' and state!='mx_and_blas'):
+                return ('implementation_rejected','Saved state or BF16 dW not enabled for this tuning context')
+        why=rejection(c,shape,phase)
+        return ('implementation_rejected',why) if why else None
     return DiscreteKernelAdapter(context,initial,axes,identifier,
         serialize,lambda values:normalize(MXFP8MoEConfig.from_dict(values)),update,evaluator,
-        lambda c:None if (why:=rejection(c,shape,phase)) is None else ('implementation_rejected',why),
+        legal,
         lambda c:dict(assignments=e*shape[3],input_bytes=n*d*2,expert_weights_bytes=e*3*d*h*2,
                       bounded_gather=c.prepared.bounded_gather,
                       bounded_dy=phase=='train' and c.prepared.bounded_dy,
@@ -641,6 +654,9 @@ class MoEEvaluator:
 
     def call(self,config):
         from ..moe import _run_forward,_run_backward
+        if self.phase=='train' and config.training_state!='recompute':
+            from .._moe_saved import saved_train_call
+            return saved_train_call(self.operands,self.gradient,config)
         y=_run_forward(*self.operands,config)
         return (y,*_run_backward(*self.operands,self.gradient,config)) if self.phase=='train' else (y,)
 
@@ -649,10 +665,16 @@ class MoEEvaluator:
         from .measurement import measure_cuda_batches,runtime_timing_metadata
         started=time.monotonic();stage='compile';graph=None
         try:
+            expected_outputs=self.expected
+            if config.training_state=='saved_bf16_dw':
+                from .._moe_reference import operational_reference
+                if not hasattr(self,'bf16_weight_grads'):
+                    self.bf16_weight_grads=operational_reference(*self.operands,self.gradient,bf16_dw=True)[2:4]
+                expected_outputs=(*self.expected[:2],*self.bf16_weight_grads,self.expected[4])
             actual=self.call(config)
             torch.cuda.synchronize(self.operands[0].device)
             stage='correctness';errors={}
-            for name,value,expected in zip(('output','dx','gate_dw','down_dw','route_dw'),actual,self.expected):
+            for name,value,expected in zip(('output','dx','gate_dw','down_dw','route_dw'),actual,expected_outputs):
                 if not bool(value.isfinite().all()):raise AssertionError(f'{name}: nonfinite values')
                 delta=value.float()-expected.float()
                 nrms=(delta.norm()/expected.float().norm().clamp_min(1e-12)).item()
@@ -678,7 +700,7 @@ class MoEEvaluator:
             # Some pipeline hazards appear only after repeated fast replay,
             # not on the initial synchronized correctness call.
             stage='correctness';replay_errors={}
-            for name,value,expected in zip(('output','dx','gate_dw','down_dw','route_dw'),result,self.expected):
+            for name,value,expected in zip(('output','dx','gate_dw','down_dw','route_dw'),result,expected_outputs):
                 if not bool(value.isfinite().all()):raise AssertionError(f'{name}: nonfinite replay output')
                 delta=value.float()-expected.float()
                 nrms=(delta.norm()/expected.float().norm().clamp_min(1e-12)).item()
@@ -1064,6 +1086,8 @@ def _contract(operands,spec,training):
     policy=AutotunePolicy(**values).for_pass(training)
     variant=dict(shape=shape,train=training,source=source_revision(),initial=spec['initial'],
                  measurement=MEASUREMENT_CONTRACT,effort=policy.evidence_contract())
+    if training and policy.allow_saved_moe:
+        variant['saved_expert_trial']='mx_and_blas' if policy.allow_bf16_dw else 'mx_only'
     if 'batch_contract' in spec:variant['batch_contract']=spec['batch_contract']
     key=runtime_winner_key('mxfp8_balanced_experts',MXFP8Problem(shape[0],shape[1],shape[5]),
         device=x.device,kernel_revision=MOE_KERNEL_REVISION,
@@ -1161,7 +1185,6 @@ def structural_seeds(shape,initial=DEFAULT_MOE_CONFIG,*,training=True):
     entire seed before it ever reaches a timing trial.
     """
     yield replace(initial,family='grouped_prepared',gather_mode='warp')
-    yield from token_reduce_seeds(shape,initial,training=training)
     base=initial.prepared if initial.family=='grouped_prepared' else DEFAULT_PREPARED_MOE_CONFIG
     if base.physical_capacity(shape[3])>=2*shape[3]:
         # An inherited aligned-output winner can waste most rows at a new
@@ -1185,6 +1208,9 @@ def structural_seeds(shape,initial=DEFAULT_MOE_CONFIG,*,training=True):
             candidate=replace(initial,family='grouped_prepared',gather_mode='warp',
                 prepared=replace(DEFAULT_PREPARED_MOE_CONFIG,input_preparation=mode))
             if rejection(candidate,shape,'train' if training else 'forward') is None:yield candidate
+    # When inherited padding doubles the work, offer a legal compact shape
+    # before spending the opening budget on reduction variants of that padding.
+    yield from token_reduce_seeds(shape,initial,training=training)
     if training:
         yield from joint_recompute_seeds(shape,initial)
         yield from short_dw_seeds(shape,initial)
@@ -1396,7 +1422,6 @@ def make_moe_tuner(adapter,store,policy,*,progress=None):
     packed_opening=()
     if (policy.max_trials>=8 and not ranked_opening and not policy.initial_neighborhood_trials
             and policy.exploration_trials==1 and not policy.baseline_trials):
-        from .core import Proposal
         inherited=list(tuner.coverage_proposals)
         protected=[]
         covered={adapter.config_id(adapter.initial_config)}
@@ -1567,6 +1592,20 @@ def make_moe_tuner(adapter,store,policy,*,progress=None):
         opening_revision=dict(cold_packed_opening=1) if packed_opening else {}
         tuner.checkpoint_key=stable_id(dict(shared=tuner.checkpoint_key,expert_portfolio_revision=27,
                                            portfolio=[adapter.config_id(c) for c in portfolio],**opening_revision))
+    state=adapter.context.tags.get('saved_expert_trial')
+    if state and policy.allow_saved_moe and adapter.context.workload['phase']=='train':
+        def saved_proposal(anchor,kind):
+            for config in (anchor,indexed,base):
+                candidate=replace(config,training_state=kind)
+                if adapter.rejection(candidate) is None:return Proposal(candidate,'saved_expert')
+            return None
+        saved=saved_proposal(indexed,'saved_mx')
+        if saved is not None:
+            coverage=list(tuner.coverage_proposals)
+            coverage.insert(2,saved)
+            tuner.coverage_proposals=coverage[:6]
+            if state=='mx_and_blas' and policy.allow_bf16_dw:
+                tuner.final_proposal=lambda incumbent:saved_proposal(incumbent,'saved_bf16_dw')
     return tuner
 
 
@@ -1610,6 +1649,8 @@ def tune_moe(operands,spec,*,training=True,progress=None):
     if initial_rejection and progress:
         progress(f'SEED inherited configuration rejected ({initial_rejection}); validating a legal replacement')
     tags=dict(source=source_revision(),initial=spec['initial'],measurement=MEASUREMENT_CONTRACT,effort=policy.evidence_contract())
+    if training and policy.allow_saved_moe:
+        tags['saved_expert_trial']='mx_and_blas' if policy.allow_bf16_dw else 'mx_only'
     if initial_rejection:tags['initial_rejection']=initial_rejection
     if 'batch_contract' in spec:tags['batch_contract']=spec['batch_contract']
     adapter=make_moe_adapter(shape,evaluator.evaluate,initial=initial,

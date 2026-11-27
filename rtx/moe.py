@@ -1,9 +1,9 @@
 """Experimental fixed-K balanced MXFP8 SwiGLU mixture of experts.
 
 The initial grouped family materializes expert-major inputs and expert outputs,
-but its forward hidden connection is MXFP8 and backward recomputes everything.
-No per-expert launch loop, hidden activation save, or eager CUDA tensor math
-exists inside the registered launchers. Shared addition remains compiler-visible.
+but its forward hidden connection is MXFP8 and backward recomputes by default.
+Optional prepared training plans retain typed forward tensors for backward.
+Shared addition remains compiler-visible.
 """
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
@@ -49,8 +49,11 @@ class MXFP8MoEConfig:
     onchip_down_stages: int = 1
     onchip_pipeline: str = 'serial'
     prepared: MXFP8PreparedMoEConfig = field(default_factory=MXFP8PreparedMoEConfig)
+    training_state: str = 'recompute'
 
     def __post_init__(self):
+        if self.training_state not in ('recompute','saved_mx','saved_bf16_dw'):
+            raise ValueError('Unknown MoE training state')
         if self.family not in ('grouped_staged','grouped_onchip','grouped_prepared'):
             raise ValueError('Expert family must be grouped_staged/grouped_onchip/grouped_prepared')
         if not isinstance(self.prepared,MXFP8PreparedMoEConfig):raise TypeError('Expected prepared expert schedules')
@@ -76,7 +79,12 @@ class MXFP8MoEConfig:
                 raise TypeError('Gate and recompute configurations must be MXFP8GLUConfig')
 
     def to_dict(self):
-        return asdict(self)
+        values = asdict(self)
+        # Preserve the historical config IDs used by the proposal priors.
+        # Runtime winners are separately scoped by kernel source revision.
+        if self.training_state == "recompute":
+            values.pop("training_state")
+        return values
 
     @classmethod
     def from_dict(cls, values):
@@ -90,6 +98,39 @@ class MXFP8MoEConfig:
 
 
 DEFAULT_MOE_CONFIG = MXFP8MoEConfig()
+
+
+def balanced_moe_checkpoint_policy(fallback=None):
+    """Build a PyTorch selective-checkpoint policy that saves packed hard assignments.
+
+    Use with create_selective_checkpoint_contexts and non-reentrant checkpoint.
+    Other operations follow the supplied PyTorch policy, or PREFER_RECOMPUTE.
+    This does not enable checkpointing or change expert activation precision.
+    """
+    from torch.utils.checkpoint import CheckpointPolicy
+    if fallback is not None and not callable(fallback):
+        raise TypeError("fallback must be a callable checkpoint policy")
+
+    def policy(ctx, op, *args, **kwargs):
+        if str(op) == "rtx_routing.varlen_hard.default":
+            return CheckpointPolicy.MUST_SAVE
+        if fallback is None:
+            return CheckpointPolicy.PREFER_RECOMPUTE
+        return fallback(ctx, op, *args, **kwargs)
+
+    return policy
+
+
+def _refinement_policy(current, effort):
+    from dataclasses import replace
+    from .autotune.effort import AutotunePolicy
+    if current is None:
+        return AutotunePolicy.preset(effort or "balanced", cache_behavior="refine")
+    if effort is None:
+        return replace(current, cache_behavior="refine")
+    budget = AutotunePolicy.preset(effort)
+    return replace(current, max_trials=budget.max_trials, max_seconds=budget.max_seconds,
+                   forward_trials=None, backward_trials=None, cache_behavior="refine")
 
 
 @lru_cache(maxsize=128)
@@ -238,6 +279,11 @@ def _run_forward(x,gu,down,ids,weights,inverse,config):
 
 
 def _run_backward(x,gu,down,ids,weights,inverse,dy,config):
+    if config.training_state!='recompute':
+        # The cold selector has a fixed output ABI. Recreate the selected
+        # forward state for its first backward only; bound calls retain it.
+        from ._moe_saved import saved_train_call
+        return saved_train_call((x,gu,down,ids,weights,inverse),dy,config)[1:]
     from ._moe_execution import run_phase
     return run_phase(x,gu,down,ids,weights,inverse,config,dy)
 
@@ -327,8 +373,10 @@ def mxfp8_routed_experts(x,gate_up_weight,down_weight,route,*,config=DEFAULT_MOE
 
     X/parameters are BF16; metadata must satisfy BalancedRouter's contract.
     Hidden is MXFP8, activations/combine FP32, parameter/input gradients BF16.
-    Backward saves only X, weights, route metadata and immutable CPU plan data.
-    Shared FFNs are not included. This first-order STE uses MXFP8 backward.
+    Default backward saves only X, weights, route metadata and immutable plan
+    data. The optional saved-state plans also retain packed operands and BF16
+    expert outputs; the cuBLAS variant changes only the two weight gradients
+    to BF16 GEMMs. Shared FFNs are not included. Autograd is first order.
     """
     if not x.is_cuda:
         raise ValueError('MXFP8 routed execution requires an RTX CUDA device; use torch_routed_experts for a baseline')
@@ -353,6 +401,9 @@ def _dispatch_experts(x,gu,down,ids,weights,inverse,spec,training):
             return _experts_op(x,gu,down,ids,weights,inverse,spec,training)[0]
         family=_static_family(key)
     if family in ('grouped_prepared','grouped_staged','grouped_onchip'):
+        if training and _parse(key).training_state!='recompute':
+            from ._moe_saved import SavedExperts
+            return SavedExperts.apply(x,gu,down,ids,weights,inverse,key,_parse(key).training_state=='saved_bf16_dw')
         from ._moe_execution import prepared_experts
         return prepared_experts(x,gu,down,ids,weights,inverse,key)
     return _experts_op(x,gu,down,ids,weights,inverse,spec,training)[0]
@@ -372,6 +423,9 @@ class BalancedMoE(nn.Module):
     trials per component with soft deadlines. No tuning objects are needed.
     ``off`` pins schedules and ``cache`` reuses winners without searching.
     ``tuning_policy`` and schedule/router configs are optional expert controls.
+    Set ``tuning_policy=rtx.AutotunePolicy.preset("quick", allow_saved_moe=True)``
+    to compare saved and recomputed routed training plans. This never forces a
+    save. Set ``allow_bf16_dw=False`` on that policy to keep weight gradients MXFP8.
     ``backend='torch'`` explicitly selects the batched BF16 reference; it is
     never silently substituted for MXFP8. The prepared family is the default;
     staged and H=128 on-chip families remain autotuner choices. Expert scratch
@@ -522,16 +576,9 @@ class BalancedMoE(nn.Module):
         with torch.cuda.device(x.device):
             if torch.cuda.is_current_stream_capturing():raise RuntimeError('Call autotune_ before CUDA graph capture')
         flat,cu_seqlens=self._input_layout(x,cu_seqlens)
-        if effort is not None:
-            if tuning_policy is not None:raise ValueError('Choose effort or tuning_policy, not both')
-            from .autotune.effort import AutotunePolicy
-            tuning_policy=AutotunePolicy.preset(effort,cache_behavior='refine')
-        if tuning_policy is None:
-            from .autotune.effort import AutotunePolicy
-            from dataclasses import replace
-            tuning_policy=replace(self.tuning_policy or AutotunePolicy.preset('balanced'),
-                                  cache_behavior='refine')
-        policy=tuning_policy
+        if effort is not None and tuning_policy is not None:
+            raise ValueError('Choose effort or tuning_policy, not both')
+        policy=tuning_policy if tuning_policy is not None else _refinement_policy(self.tuning_policy, effort)
         cache_dir=self.autotune_cache_dir if output_dir is None else str(output_dir)
         expert_spec=_selection_spec(self.config,'balanced',policy,cache_dir)
         from ._mlp_autotune import deferred_spec

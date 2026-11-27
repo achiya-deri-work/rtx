@@ -356,6 +356,53 @@ def _tie(local,e,magnitude):
     return value.float()*(magnitude/mod)
 
 
+@torch.library.custom_op('rtx_routing::packed_row_topk',mutates_args=('values','ids'),device_types='cuda')
+def _packed_row_topk(src:torch.Tensor,values:torch.Tensor,ids:torch.Tensor,n:int,e:int,k:int)->None:
+    from .runtime import load_kernel_symbol
+    if (e not in (16,24,32) or k not in (4,16) or not 0<n*e<2**31
+            or src.shape!=(n*e,) or values.shape!=(n*k,) or ids.shape!=values.shape
+            or src.dtype!=torch.float32 or values.dtype!=src.dtype or ids.dtype!=torch.int64
+            or any(t.device!=src.device or not t.is_contiguous() for t in (src,values,ids))):
+        raise ValueError('Expected contiguous packed FP32 rows and FP32/int64 top-k outputs')
+    with torch.cuda.device(src.device):
+        fn=load_kernel_symbol('routing_topk','compile_select')(n,e,k)
+        fn(src,values,ids)
+
+
+@_packed_row_topk.register_fake
+def _packed_row_topk_fake(src,values,ids,n,e,k):pass
+
+
+def _select_row(matrix,k,warp=False):
+    # The fast path is qualified only for these specific ATen CUDA shapes;
+    # preserve stock routing for unsupported widths and ranks.
+    n,e=matrix.shape
+    if not warp or e not in (16,24,32) or k not in (4,16):
+        return matrix.topk(k,dim=1)
+    values=matrix.new_empty((n,k))
+    ids=torch.empty((n,k),dtype=torch.int64,device=matrix.device)
+    _packed_row_topk(matrix.contiguous().view(-1),values.view(-1),ids.view(-1),n,e,k)
+    return values,ids
+
+
+def packed_warp_repair_supported(n,e,k):
+    # Only large batches of short rows: smaller launches can dispatch a
+    # different ATen algorithm with different equal-key ordering.
+    return 4096<=n<=65535 and e in (24,32) and k==4
+
+
+def _repair_targets(pv,pt,pos,phase,k,stage,warp=False):
+    # Keep the original top-k and its ordering even at the phase boundary:
+    # recomputing a narrower top-k is not equivalent when scores tie.
+    if stage=='early':return pt[:,:k],pv[:,:k]
+    ph=(pos[:,None]*1103515245+pt*12345+pos[:,None]*pt*1013904223+
+        phase*(pt*2654435761+2246822519))%104729
+    _,diverse=_select_row(ph.float().masked_fill(~pv.isfinite(),float('-inf')),k,warp)
+    ids,values=pt.gather(1,diverse),pv.gather(1,diverse)
+    if stage=='late':return ids,values
+    return torch.where(phase>=16,ids,pt[:,:k]),torch.where(phase>=16,values,pv[:,:k])
+
+
 @dataclass(init=False)
 class HardPlan:
     """One conditional GPU repair loop, not a loop of per-sequence launches."""
@@ -366,13 +413,16 @@ class HardPlan:
     current:torch.Tensor
     load_caps:torch.Tensor
     phase:torch.Tensor
-    def __init__(self,scores,scheduled,sequence,local,key,qb_rounds,rounds,policy):
+    def __init__(self,scores,scheduled,sequence,local,key,qb_rounds,rounds,policy,*,split_repair=None,warp_topk=None):
         from ._routing_hard import _compile_body
         from ._routing_graph import ConditionalRoutingGraph
         from .runtime import load_kernel_symbol
         from .routing import RoutingKernelConfig
         execution=RoutingKernelConfig.from_token(policy)
         t,b,e,k,n,c,*_=key;self.key=key;self.lock=RLock();self.graph=None
+        if split_repair is None:split_repair=execution.packed_repair_backend!='mixed'
+        if warp_topk is None:
+            warp_topk=execution.packed_repair_backend=='split_warp' and packed_warp_repair_supported(n,e,k)
         segmented=execution.segmented_quotas and n*k>=execution.quota_threshold
         items=execution.quota_cache_items if segmented else 0
         early=execution.quota_early_exit if segmented else False
@@ -414,47 +464,59 @@ class HardPlan:
                         prices=sorted_values[:,index].T
                         prices=torch.where(length[:,None]>0,prices,0.)
                     else:prices=_quantile(column_values,cu,key)
-                chosen=(values-prices[seq]).topk(k,dim=1).indices
+                _,chosen=_select_row(values-prices[seq],k,warp_topk)
             ids=chosen+seq[:,None]*e
             mask=active[:,None].expand(n,k).to(torch.int64)
             loads=torch.zeros(b*e,device=value.device,dtype=torch.int64).scatter_add(0,ids.flatten(),mask.flatten())
             return ids,loads,caps
-        def body(value,cu,seq,pos,current,loads,caps,phase):
+        def body(value,cu,seq,pos,current,loads,caps,phase,stage='mixed'):
             active=torch.arange(n,device=value.device)<cu[-1]
             surplus=(loads-caps).clamp_min(0);deficit=(caps-loads).clamp_min(0)
             held=torch.zeros_like(value,dtype=torch.bool).scatter(1,current%e,True)
             eligible=(deficit.reshape(b,e)[seq]>0)&~held&active[:,None]
-            pv,pt=(value+_tie(pos,e,1e-6)).masked_fill(~eligible,float('-inf')).topk(min(e,max(2*k,16)),dim=1)
-            ph=(pos[:,None]*1103515245+pt*12345+pos[:,None]*pt*1013904223+
-                phase*(pt*2654435761+2246822519))%104729
-            diverse=ph.float().masked_fill(~pv.isfinite(),float('-inf')).topk(k,dim=1).indices
-            targets=torch.where(phase>=16,pt.gather(1,diverse),pt[:,:k])+seq[:,None]*e
-            target_values=torch.where(phase>=16,pv.gather(1,diverse),pv[:,:k])
+            pv,pt=_select_row((value+_tie(pos,e,1e-6)).masked_fill(~eligible,float('-inf')),min(e,max(2*k,16)),warp_topk)
+            targets,target_values=_repair_targets(pv,pt,pos,phase,k,stage,warp_topk)
+            targets=targets+seq[:,None]*e
             source_values,slots=value.gather(1,current%e).masked_fill(surplus[current]<=0,float('inf')).sort(dim=1,stable=True)
             sources=current.gather(1,slots)
             gains=(target_values-source_values).flatten()
             return _quota(sources.flatten(),targets.flatten(),gains,surplus,deficit,slots,loads,phase,
                           execution.quota_threads,segmented,items,early)
         self.init_op=_compile_body(initialize,(self.scores,self.scheduled,self.sequence,self.local))
-        self.body_op=_compile_body(body,(self.scores,self.scheduled,self.sequence,self.local,self.current,self.loads,self.caps,self.phase))
+        examples=(self.scores,self.scheduled,self.sequence,self.local,self.current,self.loads,self.caps,self.phase)
+        def compile_stage(stage):
+            def selected(value,cu,seq,pos,current,loads,caps,phase):
+                return body(value,cu,seq,pos,current,loads,caps,phase,stage)
+            return _compile_body(selected,examples)
+        needs_late=split_repair and rounds>16
+        self.body_op=compile_stage('late' if needs_late else 'early' if split_repair else 'mixed')
+        early_op=compile_stage('early') if needs_late else None
         capture=torch.cuda.Stream(device=scores.device);capture.wait_stream(self.stream)
         with torch.no_grad(),torch.cuda.stream(capture):
-            for _ in range(2):self.initialize();self.body()
+            for _ in range(2):
+                self.initialize();self.body()
+                if early_op is not None:self.body(early_op)
             self.init_graph=torch.cuda.CUDAGraph(keep_graph=True)
             with torch.cuda.graph(self.init_graph,stream=capture):self.initialize()
             self.body_graph=torch.cuda.CUDAGraph(keep_graph=True)
             with torch.cuda.graph(self.body_graph,stream=capture):self.body()
+            if early_op is not None:
+                early_graph=torch.cuda.CUDAGraph(keep_graph=True)
+                with torch.cuda.graph(early_graph,stream=capture):self.body(early_op)
         capture.synchronize();self.stream.wait_stream(capture)
-        condition=load_kernel_symbol('routing_varlen','compile_varlen_condition')(b*e,rounds)
+        make_condition=load_kernel_symbol('routing_varlen','compile_varlen_condition')
+        early=(early_graph,make_condition(b*e,16)) if needs_late else None
+        # The captured body references temporary storage owned by its compiled callable.
+        self.early_op=early_op
         self.graph=ConditionalRoutingGraph(self.init_graph,self.body_graph,self.load_caps,self.phase,
-                                          b*e,0,rounds,scores.device.index,condition=condition)
+                                          b*e,0,rounds,scores.device.index,condition=make_condition(b*e,rounds),early=early)
 
     def initialize(self):
         ids,loads,caps=self.init_op(self.scores,self.scheduled,self.sequence,self.local)
         self.current.copy_(ids);self.loads.copy_(loads);self.caps.copy_(caps);self.phase.zero_()
 
-    def body(self):
-        ids,loads,phase=self.body_op(self.scores,self.scheduled,self.sequence,self.local,self.current,self.loads,self.caps,self.phase)
+    def body(self,op=None):
+        ids,loads,phase=(self.body_op if op is None else op)(self.scores,self.scheduled,self.sequence,self.local,self.current,self.loads,self.caps,self.phase)
         self.current.copy_(ids);self.loads.copy_(loads);self.phase.copy_(phase)
 
     def launch(self,inputs,out,status):

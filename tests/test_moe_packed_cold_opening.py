@@ -82,7 +82,12 @@ def test_eight_real_admissions_compare_identical_ownership(b, length, d, h, tmp_
     assert adapter.config_id(result.config) == rows[6]['config_id']
 
 
-def test_progressive_packed_opening_is_prefix_of_uninterrupted_search(tmp_path):
+def test_progressive_packed_opening_is_prefix_of_uninterrupted_search(tmp_path,monkeypatch):
+    # This is a deterministic replay comparison between independent searches.
+    # Hold proposal/evaluation cost fixed as well as the synthetic kernel ms;
+    # otherwise unrelated host load legitimately changes the UCB rewards.
+    from rtx.autotune import bandit
+    monkeypatch.setattr(bandit, "observation_strategy_cost_s", lambda observation: 0.01)
     shape = _shape(8, 1152, 384, 128, 6, 192)
     _, short, rows = _engine(tmp_path/'resumed', shape, 8)
     short.tune()

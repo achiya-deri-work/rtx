@@ -13,7 +13,8 @@ from . import _routing_reference as reference
 QB_BACKENDS=('torch','native_column','native','native_warp')
 METADATA_BACKENDS=('torch','cute')
 PACKED_SINKHORN_BACKENDS=('staged','persistent_forward','persistent_backward','persistent')
-ROUTING_TOKEN_SIZE=25
+PACKED_REPAIR_BACKENDS=('mixed','split','split_warp')
+ROUTING_TOKEN_SIZE=26
 
 
 @lru_cache(maxsize=16)
@@ -114,8 +115,13 @@ class RoutingKernelConfig:
     flat_column_shards_forward: int = 0
     flat_column_shards_backward: int = 0
     flat_row_backend: str = 'cta'
+    # Packed hard repair only. Split specializes rounds <16 without changing
+    # the late proposal policy; split_warp additionally specializes row top-k.
+    packed_repair_backend: str = 'mixed'
 
     def __post_init__(self):
+        if self.packed_repair_backend not in PACKED_REPAIR_BACKENDS:
+            raise ValueError('Unknown packed_repair_backend')
         for name in ('flat_column_shards_forward','flat_column_shards_backward'):
             if type(getattr(self,name)) is not int or getattr(self,name) not in (0,4,8,16,32,64,128):
                 raise ValueError(f'{name} must be 0/4/8/16/32/64/128')
@@ -148,7 +154,11 @@ class RoutingKernelConfig:
         if type(self.packed_persistent_threads) is not int or self.packed_persistent_threads not in (0,512,1024):
             raise ValueError('packed_persistent_threads must be 0/512/1024')
 
-    def to_dict(self):return asdict(self)
+    def to_dict(self):
+        result=asdict(self)
+        # Do not renumber historical configurations for a dormant new axis.
+        if self.packed_repair_backend=='mixed':result.pop('packed_repair_backend')
+        return result
 
     @classmethod
     def from_dict(cls,value):
@@ -167,7 +177,8 @@ class RoutingKernelConfig:
                 self.packed_column_shards_forward,self.packed_column_shards_backward,
                 int(self.packed_qb_column_backend=='expert_keys'),
                 PACKED_SINKHORN_BACKENDS.index(self.packed_sinkhorn_backend),self.packed_persistent_threads,
-                self.flat_column_shards_forward,self.flat_column_shards_backward,int(self.flat_row_backend=='warp')]
+                self.flat_column_shards_forward,self.flat_column_shards_backward,int(self.flat_row_backend=='warp'),
+                PACKED_REPAIR_BACKENDS.index(self.packed_repair_backend)]
 
     @classmethod
     def from_token(cls,token):
@@ -179,9 +190,10 @@ class RoutingKernelConfig:
         if len(a)==19:a.append(0)
         if len(a)==20:a.extend((0,0))
         if len(a)==22:a.extend((0,0,0))
+        if len(a)==25:a.append(0)
         if len(a)!=ROUTING_TOKEN_SIZE:raise ValueError('Invalid immutable routing configuration token')
         if (not 0<=a[8]<len(QB_BACKENDS) or not 0<=a[10]<len(METADATA_BACKENDS)
-                or not 0<=a[20]<len(PACKED_SINKHORN_BACKENDS)):
+                or not 0<=a[20]<len(PACKED_SINKHORN_BACKENDS) or not 0<=a[25]<len(PACKED_REPAIR_BACKENDS)):
             raise ValueError('Invalid routing backend token index')
         return cls(SinkhornKernelConfig(*a[:3]),SinkhornKernelConfig(*a[3:6]),
                    bool(a[6]),a[7],QB_BACKENDS[a[8]],a[9],
@@ -189,7 +201,7 @@ class RoutingKernelConfig:
                    ('cta','warp')[a[16]] if a[16] in (0,1) else 'invalid',a[17],a[18],
                    ('row_major','expert_keys')[a[19]] if a[19] in (0,1) else 'invalid',
                    PACKED_SINKHORN_BACKENDS[a[20]],a[21],a[22],a[23],
-                   ('cta','warp')[a[24]] if a[24] in (0,1) else 'invalid')
+                   ('cta','warp')[a[24]] if a[24] in (0,1) else 'invalid',PACKED_REPAIR_BACKENDS[a[25]])
 
 
 class BalancedRouting(NamedTuple):

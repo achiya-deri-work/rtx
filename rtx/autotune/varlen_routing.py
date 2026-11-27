@@ -15,7 +15,7 @@ from .store import ResidualTuningStore
 from ..routing import PACKED_SINKHORN_BACKENDS,RoutingKernelConfig
 
 KERNEL_REVISION=7
-OPENING_REVISION=1  # Search order only; portable semantic priors still use revision 7.
+OPENING_REVISION=2  # Search order only; portable semantic priors still use revision 7.
 CONTRACT=dict(revision=7,independent_pools=True,expert_segment_alignment=32,
               objective='packed_router_forward_and_score_adjoint',timing='cuda_graph',oracle='segmented_fp64',
               per_pool_persistent=True,opening_revision=OPENING_REVISION)
@@ -27,6 +27,7 @@ def source_revision():
     files=('routing.py','_routing_varlen.py','_routing_varlen_autotune.py','_routing_graph.py',
            '_routing_autotune.py','_routing_reference.py','_moe_selection.py',
            'kernels/routing_varlen.py','kernels/routing_selection.py','kernels/routing_quota_cached.py',
+           'kernels/routing_topk.py',
            'kernels/routing_sinkhorn.py','kernels/routing_metadata.py','autotune/varlen_routing.py')
     digest=hashlib.sha256()
     for name in files:digest.update(name.encode());digest.update((root/name).read_bytes())
@@ -60,7 +61,7 @@ def contract(scores,cu,spec,training,strict,policy=None,lengths=None):
 
 def make_adapter(t,b,e,k,steps,initial,evaluator,*,training=True,device=None,tags=None,lengths=None,
                  dual_iterations=5,repair_rounds=64,strict=False):
-    from .._routing_varlen import layout,persistent_hybrid_rows,persistent_pool_rows
+    from .._routing_varlen import layout,persistent_hybrid_rows,persistent_pool_rows,packed_warp_repair_supported
     n=layout(t,b,e,k,steps,tuple(initial.to_token()))[4]
     hybrid=persistent_hybrid_rows(t,e,k,pools=b)
     # Cold lengths only affect which policies are worth measuring, never
@@ -81,7 +82,10 @@ def make_adapter(t,b,e,k,steps,initial,evaluator,*,training=True,device=None,tag
         row_backend='cta' if direct_f and (direct_b or not training) else c.packed_row_backend
         warp=row_backend=='warp'
         native_columns=c.qb_backend!='torch' and k<e
-        return replace(c,segmented_quotas=packed,quota_threshold=0,
+        repair=c.packed_repair_backend
+        if not repair_rounds or k==e:repair='mixed'
+        if repair=='split_warp' and not packed_warp_repair_supported(n,e,k):repair='split'
+        return replace(c,segmented_quotas=packed,quota_threshold=0,packed_repair_backend=repair,
             flat_column_shards_forward=0,flat_column_shards_backward=0,flat_row_backend='cta',
             quota_cache_items=c.quota_cache_items if packed else 0,
             quota_early_exit=c.quota_early_exit if packed else False,
@@ -121,6 +125,8 @@ def make_adapter(t,b,e,k,steps,initial,evaluator,*,training=True,device=None,tag
     for name in ('flat_column_shards_forward','flat_column_shards_backward','flat_row_backend'):
         axes.pop(name,None)
     if training:axes['packed_column_shards_backward']=shards
+    if repair_rounds and k<e:
+        axes['packed_repair_backend']=('mixed','split','split_warp') if packed_warp_repair_supported(n,e,k) else ('mixed','split')
     if small:
         axes['packed_sinkhorn_backend']=PACKED_SINKHORN_BACKENDS if training else PACKED_SINKHORN_BACKENDS[:2]
         axes['packed_persistent_threads']=(0,512,1024)
@@ -155,7 +161,8 @@ def make_adapter(t,b,e,k,steps,initial,evaluator,*,training=True,device=None,tag
         lambda c:normalize(RoutingKernelConfig.from_dict(c)),update,evaluator,reject,features)
 
 
-def packed_structural_seeds(initial,*,max_scheduled_length=None,persistent_eligible=False,training=True,mixed=False):
+def packed_structural_seeds(initial,*,max_scheduled_length=None,persistent_eligible=False,training=True,mixed=False,
+                            repair_challenger=None):
     """Cover row ownership AND column-grid parallelism before local search.
 
     B*E column vectors can otherwise collapse to far fewer CTAs than an RTX
@@ -192,6 +199,7 @@ def packed_structural_seeds(initial,*,max_scheduled_length=None,persistent_eligi
                    if max_scheduled_length is not None and max_scheduled_length<=threads*i),0)
     opening=replace(wide,qb_backend='native_warp',qb_threads=threads,packed_column_cache_items=capacity)
     yield opening
+    if repair_challenger:yield replace(opening,packed_repair_backend=repair_challenger)
     yield replace(opening,packed_qb_column_backend='expert_keys')
     yield parallel
     yield native
@@ -234,7 +242,8 @@ def make_packed_effort_autotuner(adapter, store, policy, *, lengths, training, p
     hybrid=persistent_hybrid_rows(t,e,k,pools=b)
     candidates=tuple(packed_structural_seeds(adapter.initial_config,max_scheduled_length=longest,
         persistent_eligible='packed_sinkhorn_backend' in adapter.axes,training=training,
-        mixed=bool(hybrid and longest>hybrid)))
+        mixed=bool(hybrid and longest>hybrid),
+        repair_challenger=adapter.axes['packed_repair_backend'][-1] if 'packed_repair_backend' in adapter.axes else None))
     tuner=make_effort_autotuner(adapter,store,policy,progress=progress,candidates=candidates,started_at=started_at)
 
     # A one-pool problem or a pack whose every sequence fits the persistent
@@ -307,6 +316,13 @@ class Evaluator:
             if self.upstream is None:
                 self.upstream=torch.randn((self.source.shape[1],key[5]),device=self.source.device,generator=self.generator)
             result,gradient=self.call(c);stage='correctness'
+            if c.packed_repair_backend!='mixed':
+                # Keep the same FP32 transport and quotas: assignment, slot
+                # ordering, and metadata must match before benchmarking.
+                with torch.no_grad():baseline=self.route(replace(c,packed_repair_backend='mixed'))
+                for field in ('expert_ids','inverse','route_weights'):
+                    torch.testing.assert_close(getattr(result,field),getattr(baseline,field),rtol=0,atol=0)
+                del baseline
             if key[17]&1:
                 # Holding the detached hard policy fixed is stronger than
                 # just checking the FP64 Jacobian on whichever route won.

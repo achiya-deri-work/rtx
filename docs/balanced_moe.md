@@ -226,7 +226,7 @@ forward hidden connection is MXFP8, not BF16. Expert outputs are BF16 before
 the FP32 mixture sum. Shared addition is compiler-visible FP32, followed by
 the final BF16 conversion.
 
-Backward uses an explicit MXFP8 straight-through recipe and **fully recomputes**
+By default backward uses an explicit MXFP8 straight-through recipe and **fully recomputes**
 gathered inputs, gate/up projections, hidden and expert outputs. Forward saves
 original input/weights, route metadata and an immutable configuration, not
 hidden activations or gathered buffers. Bound prepared execution keeps that
@@ -235,10 +235,63 @@ compatibility operation returns a CPU configuration token. The recomputed packed
 decoded to BF16 for down-weight gradients, matching the retained two-pass MLP
 recipe. Quantization reduction blocks never cross expert boundaries.
 
+To let training trade memory for speed, pass
+`tuning_policy=rtx.AutotunePolicy.preset("quick", allow_saved_moe=True)`
+when constructing `rtx.BalancedMoE`. No separate effort argument is needed.
+On supported packed expert configurations the tuner can keep the packed
+gathered input, gate/up weights, hidden, and BF16 expert output until
+backward. It still recomputes the activation derivative. With
+`allow_bf16_dw=True` (default), the last eligible trial uses batched cuBLAS
+BF16 for the two **weight gradients only**; dX remains MXFP8. Set it to
+`False` to compare saved and recomputed states without changing dW precision.
+Permission to save activations does not force saving: the measured winner
+determines the bound training plan. This option does not change inference.
+Calling `moe.autotune_(x, effort="thorough")` later changes the budget,
+not your permissions to save activations or use BF16 dW.
+
+If the containing block is activation-checkpointed, you can separately
+retain just the discrete packed routing decision across recomputation:
+
+```python
+from functools import partial
+from torch.utils.checkpoint import checkpoint, create_selective_checkpoint_contexts
+
+context_fn = partial(create_selective_checkpoint_contexts, rtx.balanced_moe_checkpoint_policy())
+y = checkpoint(block, x, use_reentrant=False, context_fn=context_fn)
+```
+
+Pass your existing policy as `rtx.balanced_moe_checkpoint_policy(existing_policy)`
+to leave every other operator's checkpoint decision unchanged. Ordinary
+training with no outer checkpoint needs no helper.
+
+In a real-data detector training check on one RTX 5090, replacing six
+coarse encoder SwiGLUs (width 384, hidden 768) with top-4 MoE (shared 256,
+routed 128) reached 111.15 images/s with 24 experts and 109.65 with 32,
+against 114.53 for the matched-active-FLOPs dense model. All three used
+the same direct FP32 gradient handoff and grouped optimizer. Batch size
+was 16 with two microbatches/update; updates 11–20 were measured. Both
+MoEs retained hard routing assignments but selected expert recomputation.
+These numbers characterize that trainer, not a general layer speedup.
+The benchmark-only [FP32 handoff](../benchmarks/g2detr_bound_update.py)
+and [grouped Muon step](../benchmarks/g2detr_grouped_muon.py) are included
+for integrations with that detector. They are not installed by constructing
+the layer, and the handoff does not support distributed gradient reduction.
+The [standalone check](../benchmarks/qualify_g2detr_bound_update.py) compares
+optimizer states, model parameters, and metrics on the staged detector runtime.
+
 Hard QB/repair assignment has no gradient. FP32 route-weight gradients flow
 through the selected Sinkhorn values and its saved normalization state. Sinkhorn
 is saved, not recomputed. This is first-order custom autograd; higher derivatives
 are not qualified.
+
+Packed routing autotunes the hard-repair loop independently of the expert
+backward policy. The stock loop (`packed_repair_backend="mixed"`) remains
+the default for an untuned configuration. `split` defers diversified proposals
+until round 16; it still executes that policy if needed. `split_warp` adds a
+warp-local top-k for large packed top-4 pools with 24 or 32 experts, and uses
+ordinary split repair elsewhere. Neither reduces the number of permitted
+repair rounds. Before timing, the tuner compares slot order, expert assignments
+and weights to stock repair with the same Sinkhorn execution geometry.
 
 ## Real implementation families and autotuning
 
